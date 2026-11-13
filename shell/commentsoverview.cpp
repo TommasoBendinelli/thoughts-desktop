@@ -7806,6 +7806,10 @@ bool CommentsOverview::resolveLiveAgentProposals(const QString &action, QString 
                     : i18np("Rejected — saved to TeX. Sync manually to update the PDF.", "%1 proposals rejected — saved to TeX. Sync manually to update the PDF.", count);
             if (failed > 0) summary += QLatin1Char(' ') + i18np("1 other proposal was left undecided: %2", "%1 other proposals were left undecided: %2", failed, failure);
             guard->m_summary->setText(summary);
+            // The decision changed sources, so a reload follows and redraws the list's counts
+            // here: it shows the outcome again when it ends.
+            guard->m_summaryAfterReload = summary;
+            guard->m_summaryAfterReloadDeadline = QDeadlineTimer(10000);
             if (guard->m_reloadDeferred) guard->m_reloadTimer->start();
         }, Qt::QueuedConnection);
     });
@@ -7859,6 +7863,7 @@ void CommentsOverview::undoLiveAgentProposalDecision()
                     : i18np("Rejection undone — proposal restored.", "Rejection undone — %1 proposals restored.", count);
             guard->m_summary->setText(message);
             guard->m_summaryAfterReload = message;
+            guard->m_summaryAfterReloadDeadline = QDeadlineTimer(10000);
             guard->startFullReload(false, QStringLiteral("proposal decision undone"));
         }, Qt::QueuedConnection);
     });
@@ -11223,7 +11228,10 @@ void CommentsOverview::finishFullReload(const QList<TrackedCommentDocument> &doc
                 m_summary->setText(i18n("The requested comment could not be found."));
             }
         }
-        if (!m_summaryAfterReload.isEmpty()) m_summary->setText(std::exchange(m_summaryAfterReload, {}));
+        if (!m_summaryAfterReload.isEmpty()) {
+            const QString outcome = std::exchange(m_summaryAfterReload, {});
+            if (!m_summaryAfterReloadDeadline.hasExpired()) m_summary->setText(outcome);
+        }
     }
     // The sources were just rescanned: finish marker removals left pending.
     if (m_reviewCardsWidget && !m_editorDirty) m_reviewCardsWidget->retryPendingMarkerRemovals();

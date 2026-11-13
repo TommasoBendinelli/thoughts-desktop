@@ -24,3 +24,6 @@ __pycache__/
 
 # Maintainer-only instructions (master copy outside the repository)
 /AGENTS.local.md
+
+# Disk images made by tools/macos/make-dmg.py
+/dist/

@@ -19,6 +19,7 @@
 #include <QSet>
 #include <QString>
 #include <QStringList>
+#include <QDeadlineTimer>
 #include <QElapsedTimer>
 #include <QVariantMap>
 
@@ -806,6 +807,8 @@ private:
     QString m_pendingRevealPdfPath;
     // Shown again once the reload a change asked for is in, e.g. after Undo.
     QString m_summaryAfterReload;
+    // Until when m_summaryAfterReload may still be shown: an outcome does not come back long after.
+    QDeadlineTimer m_summaryAfterReloadDeadline;
     QString m_pendingRevealAnnotationId;
     int m_pendingRevealFallbackRow = -1;
     bool m_mutationRunning = false;

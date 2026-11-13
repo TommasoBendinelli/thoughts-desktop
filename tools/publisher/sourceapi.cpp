@@ -375,13 +375,6 @@ Json SourceApi::requestRenderCheck(const QString &target)
     return postJson(QStringLiteral("/v1/render-checks"), Json::object({{QStringLiteral("target"), Json(target)}}), QStringLiteral("render_check"));
 }
 
-Json SourceApi::requestRepair(const QString &target)
-{
-    return postJson(QStringLiteral("/v1/builds"),
-                    Json::object({{QStringLiteral("target"), Json(target)}, {QStringLiteral("repair_mode"), Json(QStringLiteral("codex"))}}),
-                    QStringLiteral("repair_request"));
-}
-
 Json SourceApi::renderStatus(const QString &target)
 {
     return Py::loadsBytes(request("GET", QStringLiteral("/v1/render-status?target=") + Py::quote(target, QString())).body);

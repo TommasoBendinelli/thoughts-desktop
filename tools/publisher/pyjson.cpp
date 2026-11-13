@@ -6,8 +6,13 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 
 namespace Thoughts::Py
 {
@@ -574,6 +579,30 @@ std::optional<QByteArray> dumps(const Json &value, const DumpOptions &options, Q
 
 namespace
 {
+// A float literal as Decoder::parseNumber scanned it (JSON's grammar, ASCII
+// only) as the double Python's float() reads: correctly rounded to nearest,
+// ties to even, ±infinity past DBL_MAX, ±0 below the smallest subnormal.
+// Sync and publication hashes depend on these exact bits.
+double parseFloatLiteral(const std::string &literal)
+{
+#if defined(__APPLE__)
+    // Apple's libc++ has floating-point std::from_chars only from macOS 26.0,
+    // which would make that the app's minimum. strtod_l is correctly rounded
+    // as well (gdtoa); in the C locale it reads '.' whatever LC_NUMERIC the
+    // app runs with (Qt sets the user's locale on Unix), and it saturates and
+    // underflows as float() does.
+    return strtod_l(literal.c_str(), nullptr, LC_C_LOCALE);
+#else
+    double value = 0;
+    const auto result = std::from_chars(literal.data(), literal.data() + literal.size(), value);
+    if (result.ec == std::errc::result_out_of_range) {
+        // Python's float() saturates to infinity or underflows to 0.
+        value = std::strtod(literal.c_str(), nullptr);
+    }
+    return value;
+#endif
+}
+
 // Decodes over code points so error positions match Python's str indices.
 struct Decoder {
     const std::u32string &text;
@@ -740,13 +769,7 @@ struct Decoder {
         for (size_t index = begin; index < cursor; ++index) literal.push_back(char(text[index]));
         pos = cursor;
         if (isFloat) {
-            double value = 0;
-            const auto result = std::from_chars(literal.data(), literal.data() + literal.size(), value);
-            if (result.ec == std::errc::result_out_of_range) {
-                // Python's float() saturates to infinity or underflows to 0.
-                value = std::strtod(literal.c_str(), nullptr);
-            }
-            *out = Json(value);
+            *out = Json(parseFloatLiteral(literal));
             return true;
         }
         qint64 value = 0;

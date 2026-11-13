@@ -8,12 +8,14 @@
 #include <KSharedConfig>
 #include <KConfigGroup>
 #include <QApplication>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -48,7 +50,14 @@ namespace
 {
 constexpr char tokenService[] = "thoughts-github";
 constexpr char tokenAccount[] = "releases";
+#ifdef Q_OS_MACOS
+// Releases for the Mac carry the self-contained disk image (tools/macos/release.py).
+constexpr char tagPrefix[] = "mac-";
+constexpr char assetPattern[] = "^Thoughts-[A-Za-z0-9._-]+\\.dmg$";
+#else
 constexpr char tagPrefix[] = "windows-";
+constexpr char assetPattern[] = "^Thoughts-[A-Za-z0-9._-]+-setup\\.exe$";
+#endif
 constexpr qint64 backgroundInterval = 20 * 60 * 60;
 
 struct Release {
@@ -87,7 +96,11 @@ QNetworkRequest apiRequest(const QUrl &url, const QByteArray &accept)
 {
     QNetworkRequest request(url);
     request.setRawHeader("Accept", accept);
-    request.setRawHeader("Authorization", "Bearer " + token());
+    // A public repository answers without a token; one is sent only when the user stored it.
+    const QByteArray secret = token();
+    if (!secret.isEmpty()) {
+        request.setRawHeader("Authorization", "Bearer " + secret);
+    }
     // The token is GitHub's API's: a redirect to another origin is not followed with it.
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
     request.setRawHeader("X-GitHub-Api-Version", "2022-11-28");
@@ -96,11 +109,11 @@ QNetworkRequest apiRequest(const QUrl &url, const QByteArray &accept)
     return request;
 }
 
-// The newest windows-* release with a setup asset, from GET /releases.
+// The newest windows-* (mac-*) release with a setup (disk image) asset, from GET /releases.
 std::optional<Release> newestRelease(const QJsonArray &releases)
 {
     std::optional<Release> best;
-    static const QRegularExpression setupName(QStringLiteral("^Thoughts-[A-Za-z0-9._-]+-setup\\.exe$"), QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression setupName(QString::fromLatin1(assetPattern), QRegularExpression::CaseInsensitiveOption);
     for (const QJsonValue &value : releases) {
         const QJsonObject release = value.toObject();
         const QString tag = release.value(QLatin1String("tag_name")).toString();
@@ -132,8 +145,10 @@ std::optional<Release> newestRelease(const QJsonArray &releases)
     return best;
 }
 
-// Calls done(release, error); release is empty when there is nothing newer.
-void fetchUpdate(QObject *context, std::function<void(std::optional<Release>, QString)> done)
+// Calls done(release, error, refused); release is empty when there is nothing newer.
+// refused: GitHub did not show the releases to this request, as it does for a private
+// repository without a token that may read it.
+void fetchUpdate(QObject *context, std::function<void(std::optional<Release>, QString, bool)> done)
 {
     const QUrl url(QStringLiteral("https://api.github.com/repos/%1/releases?per_page=30").arg(repository()));
     QNetworkReply *reply = network()->get(apiRequest(url, "application/vnd.github+json"));
@@ -141,19 +156,22 @@ void fetchUpdate(QObject *context, std::function<void(std::optional<Release>, QS
         reply->deleteLater();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (status == 401 || status == 403 || status == 404) {
-            done({}, i18n("GitHub refused the token (HTTP %1). It needs read access to the contents of %2.", status, repository()));
+            done({},
+                 token().isEmpty() ? i18n("GitHub did not show the releases of %2 (HTTP %1).", status, repository())
+                                   : i18n("GitHub refused the token (HTTP %1). It needs read access to the contents of %2.", status, repository()),
+                 true);
             return;
         }
         if (reply->error() != QNetworkReply::NoError) {
-            done({}, i18n("Could not reach GitHub: %1", reply->errorString()));
+            done({}, i18n("Could not reach GitHub: %1", reply->errorString()), false);
             return;
         }
         const std::optional<Release> release = newestRelease(QJsonDocument::fromJson(reply->readAll()).array());
         if (!release || compareVersions(release->version, currentVersion()) <= 0) {
-            done({}, {});
+            done({}, {}, false);
             return;
         }
-        done(release, {});
+        done(release, {}, false);
     });
 }
 
@@ -171,13 +189,17 @@ bool askForToken(QWidget *parent, const QString &problem)
         html += QStringLiteral("<p><b>%1</b></p>").arg(problem.toHtmlEscaped());
     }
     html += i18n(
-        "<p>New versions of Thoughts for Windows are published as releases of the private GitHub repository <b>%1</b>. "
-        "To check for them, Thoughts needs a GitHub token that can read that repository.</p>"
+        "<p>New versions of Thoughts are published as releases of the GitHub repository <b>%1</b>. A public repository needs no token. "
+        "If that repository is private, Thoughts needs a GitHub token that can read it.</p>"
         "<p>Create one at <a href=\"https://github.com/settings/personal-access-tokens/new\">github.com › Settings › Developer settings › "
         "Fine-grained tokens</a>: choose the repository owner, <i>Only select repositories</i> › %1, and under "
-        "<i>Repository permissions</i> set <i>Contents</i> to <i>Read-only</i>.</p>"
-        "<p>The token is stored in Windows Credential Manager as thoughts-github/releases.</p>",
+        "<i>Repository permissions</i> set <i>Contents</i> to <i>Read-only</i>.</p>",
         repository());
+#ifdef Q_OS_MACOS
+    html += i18n("<p>The token is stored in your login Keychain as thoughts-github/releases.</p>");
+#else
+    html += i18n("<p>The token is stored in Windows Credential Manager as thoughts-github/releases.</p>");
+#endif
     text->setText(html);
     layout->addWidget(text);
     auto *form = new QFormLayout;
@@ -202,10 +224,50 @@ bool askForToken(QWidget *parent, const QString &problem)
     return true;
 }
 
+#ifdef Q_OS_MACOS
+// The bundle this process runs from: …/Thoughts.app/Contents/MacOS/thoughts.
+QString runningBundle()
+{
+    QDir directory(QCoreApplication::applicationDirPath());
+    if (!directory.cdUp() || !directory.cdUp()) {
+        return {};
+    }
+    const QString bundle = directory.canonicalPath();
+    return bundle.endsWith(QLatin1String(".app")) ? bundle : QString();
+}
+#endif
+
 // Closes every window (each may ask to save or refuse while busy), then starts the
 // installer, which waits for Thoughts to exit, installs over it and starts it again.
+// On macOS the installer is Contents/Resources/install-update.sh, run from a
+// temporary copy: it replaces this bundle with the one in the disk image only if
+// that one is signed like this one, and keeps this one on any failure.
 void installAndRestart(QWidget *parent, const QString &installer)
 {
+#ifdef Q_OS_MACOS
+    const QString bundle = runningBundle();
+    const QString helper = QDir(bundle).filePath(QStringLiteral("Contents/Resources/install-update.sh"));
+    if (bundle.isEmpty() || !QFileInfo::exists(helper)) {
+        KMessageBox::information(parent, i18n("This copy of Thoughts cannot update itself. Quit Thoughts, open %1 and drag Thoughts onto Applications.", installer), i18n("Update Thoughts"));
+        return;
+    }
+    const QString folder = QFileInfo(bundle).absolutePath();
+    if (!QFileInfo(folder).isWritable()) {
+        KMessageBox::information(parent,
+                                 i18n("Thoughts cannot replace itself in %1, because this account may not change that folder. Quit Thoughts, open %2 and drag Thoughts onto Applications.",
+                                      folder,
+                                      installer),
+                                 i18n("Update Thoughts"));
+        return;
+    }
+    // A copy outside the bundle, so replacing the bundle cannot change the running script.
+    const QString script = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath(QStringLiteral("thoughts-install-update.sh"));
+    QFile::remove(script);
+    if (!QFile::copy(helper, script)) {
+        KMessageBox::error(parent, i18n("Could not prepare the update in %1.", script), i18n("Update Thoughts"));
+        return;
+    }
+#endif
     QApplication::closeAllWindows();
     for (QWidget *window : QApplication::topLevelWidgets()) {
         if (window->isVisible() && window->isWindow() && !window->inherits("QMenu")) {
@@ -213,10 +275,18 @@ void installAndRestart(QWidget *parent, const QString &installer)
             return;
         }
     }
+#ifdef Q_OS_MACOS
+    const QStringList arguments {script, QString::number(QCoreApplication::applicationPid()), installer, bundle};
+    if (!QProcess::startDetached(QStringLiteral("/bin/sh"), arguments)) {
+        KMessageBox::error(nullptr, i18n("Could not start the update. It is saved at %1.", installer), i18n("Update Thoughts"));
+        return;
+    }
+#else
     if (!QProcess::startDetached(installer, {QStringLiteral("/S"), QStringLiteral("/RELAUNCH")})) {
         KMessageBox::error(nullptr, i18n("Could not start the installer %1.", installer), i18n("Update Thoughts"));
         return;
     }
+#endif
     QCoreApplication::quit();
 }
 
@@ -343,8 +413,13 @@ bool installerMatches(const QByteArray &expectedSha256, const QByteArray &bytes)
 
 QString installerFileName(const QString &assetName)
 {
-    static const QRegularExpression plain(QStringLiteral("^Thoughts-[A-Za-z0-9._-]{1,80}-setup\\.exe$"), QRegularExpression::CaseInsensitiveOption);
-    return plain.match(assetName).hasMatch() && !assetName.contains(QLatin1String("..")) ? assetName : QStringLiteral("Thoughts-setup.exe");
+    // A Mac release's asset is a disk image, a Windows release's a setup program.
+    const bool image = assetName.endsWith(QLatin1String(".dmg"), Qt::CaseInsensitive);
+    static const QRegularExpression plain(QStringLiteral("^Thoughts-[A-Za-z0-9._-]{1,80}(-setup\\.exe|\\.dmg)$"), QRegularExpression::CaseInsensitiveOption);
+    if (plain.match(assetName).hasMatch() && !assetName.contains(QLatin1String(".."))) {
+        return assetName;
+    }
+    return image ? QStringLiteral("Thoughts.dmg") : QStringLiteral("Thoughts-setup.exe");
 }
 
 QString saveInstaller(const QByteArray &bytes, const QString &assetName)
@@ -401,16 +476,18 @@ void checkInteractively(QWidget *parent)
     if (!available()) {
         return;
     }
-    if (token().isEmpty() && !askForToken(parent, {})) {
-        return;
-    }
     QPointer<QWidget> guard(parent);
-    fetchUpdate(parent, [guard](std::optional<Release> release, const QString &error) {
+    fetchUpdate(parent, [guard](std::optional<Release> release, const QString &error, bool refused) {
         QWidget *parent = guard.data();
-        if (!error.isEmpty()) {
+        if (refused) {
+            // A private repository: ask for a token that may read it, then check again.
             if (askForToken(parent, error)) {
                 checkInteractively(parent);
             }
+            return;
+        }
+        if (!error.isEmpty()) {
+            KMessageBox::error(parent, error, i18n("Update Thoughts"));
             return;
         }
         state().writeEntry("LastCheck", QDateTime::currentSecsSinceEpoch());
@@ -424,7 +501,7 @@ void checkInteractively(QWidget *parent)
 
 void checkInBackground(QWidget *parent)
 {
-    if (!available() || token().isEmpty() || qEnvironmentVariableIsSet("THOUGHTS_NO_UPDATE_CHECK")) {
+    if (!available() || qEnvironmentVariableIsSet("THOUGHTS_NO_UPDATE_CHECK")) {
         return;
     }
     const qint64 last = state().readEntry("LastCheck", qint64(0));
@@ -433,7 +510,7 @@ void checkInBackground(QWidget *parent)
     }
     QPointer<QWidget> guard(parent);
     QTimer::singleShot(30000, parent, [guard] {
-        fetchUpdate(guard, [guard](std::optional<Release> release, const QString &error) {
+        fetchUpdate(guard, [guard](std::optional<Release> release, const QString &error, bool) {
             if (!error.isEmpty() || !guard) {
                 return;
             }

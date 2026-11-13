@@ -74,6 +74,11 @@ private Q_SLOTS:
             QVERIFY(QFileInfo(saved).dir().dirName().startsWith(QStringLiteral("Thoughts-update-")));
             QDir(QFileInfo(saved).absolutePath()).removeRecursively();
         }
+        // A Mac release's disk image keeps its name by the same rule.
+        QCOMPARE(installerFileName(QStringLiteral("Thoughts-2026.11.12.1.dmg")), QStringLiteral("Thoughts-2026.11.12.1.dmg"));
+        for (const QString &name : {QStringLiteral("Thoughts-../x.dmg"), QStringLiteral("Thoughts-a/b.dmg"), QStringLiteral("Thoughts-...dmg"), QStringLiteral("evil.dmg"), QStringLiteral("Thoughts-1 .dmg")}) {
+            QCOMPARE(installerFileName(name), QStringLiteral("Thoughts.dmg"));
+        }
     }
 
     void redirectsStayOnHttpsAndTheTokenOnItsOrigin()

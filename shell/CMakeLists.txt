@@ -103,10 +103,11 @@ if (HAVE_X11)
     target_link_libraries(thoughts Qt6::GuiPrivate)
 endif()
 
-# Release builds (tools/windows/cross) name their version and the GitHub repository
-# whose releases bring updates; Help › Check for Updates exists only then.
+# Release builds (tools/windows/cross, tools/macos/release.py) name their version and
+# the GitHub repository whose releases bring updates; Help › Check for Updates exists
+# only then.
 set(THOUGHTS_RELEASE_VERSION "" CACHE STRING "Version of a published Thoughts release build")
-set(THOUGHTS_UPDATE_REPOSITORY "" CACHE STRING "GitHub owner/repository whose windows-* releases update this build")
+set(THOUGHTS_UPDATE_REPOSITORY "" CACHE STRING "GitHub owner/repository whose windows-* (or, on macOS, mac-*) releases update this build")
 set_property(SOURCE updatecheck.cpp APPEND PROPERTY COMPILE_DEFINITIONS
     THOUGHTS_RELEASE_VERSION="${THOUGHTS_RELEASE_VERSION}" THOUGHTS_UPDATE_REPOSITORY="${THOUGHTS_UPDATE_REPOSITORY}")
 
@@ -169,6 +170,10 @@ if(APPLE)
             VERBATIM
         )
     endforeach()
+    # Updates (updatecheck.cpp) install a downloaded Thoughts.dmg with this script,
+    # run from a temporary copy once Thoughts has quit.
+    target_sources(thoughts PRIVATE ../tools/macos/install-update.sh)
+    set_source_files_properties(../tools/macos/install-update.sh PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     # Keep macOS privacy permissions associated with the same app across builds:
     # sign with the persistent local identity of tools/macos/setup-signing.py.
     # On by default where that identity exists; signing then fails rather than

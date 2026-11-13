@@ -23,7 +23,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -66,8 +65,8 @@ def serve(script: Script):
                 status, value = script.next("render", spec.get("render", [[200, {}]]))
                 return self.respond(status, value)
             if self.command == "POST" and path == "/v1/builds":
-                status, value = script.next("repair", spec.get("repair", [[409, {"detail": "no"}]]))
-                return self.respond(status, value)
+                # The watcher only reads; a build request here is a failure the recorded requests show.
+                return self.respond(422, {"detail": "unexpected build request"})
             match = re.fullmatch(r"/v1/builds/([^/?]+)(/output\?offset=(\d+))?", path)
             if not match:
                 return self.respond(404, {"detail": "Not Found"})
@@ -140,37 +139,23 @@ SCENARIOS = {
         "args": ["--build-id", "b1", "--target", "m.pdf"],
         "builds": {"b1": {"records": [record("running")], "outputs": [[200, {"next_offset": "x"}]]}},
     },
-    "repair-yes": {
+    # On a terminal a failed build ends like anywhere else: no question, no further request.
+    "failed-terminal": {
+        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "y\n",
+        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT)], "outputs": [chunk("", 0, True)]}},
+    },
+    "attention-terminal": {
         "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "Yes\n",
-        "builds": {"b1": {"records": [record("attention", result=FAILED_RESULT, target="all")], "outputs": [chunk("", 0, True)]},
-                   "b2": {"records": [[200, {"id": "b2", "status": "succeeded", "repair_mode": "codex"}]], "outputs": [chunk("ok\n", 3, True)]}},
-        "render": [[200, {"status": "attention", "build": {"id": "b1"}}]],
-        "repair": [[200, {"id": "b2"}]],
+        "builds": {"b1": {"records": [record("attention", result=FAILED_RESULT, target="all")], "outputs": [chunk("", 0, True)]}},
     },
-    "repair-declined": {
-        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "\n",
-        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT)], "outputs": [chunk("", 0, True)]}},
-        "render": [[200, {"status": "error", "build": {"id": "b1"}}]],
+    # Old build records carry other repair_mode values; they read like any other record.
+    "old-record-repair-mode": {
+        "args": ["--build-id", "b1", "--target", "m.pdf"],
+        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT, repair_mode="codex")], "outputs": [chunk("", 0, True)]}},
     },
-    "repair-stale": {
-        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "y\n",
-        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT)], "outputs": [chunk("", 0, True)]}},
-        "render": [[200, {"status": "synced", "build": {"id": "b9"}}]],
-    },
-    "repair-status-error": {
-        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "y\n",
-        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT)], "outputs": [chunk("", 0, True)]}},
-        "render": [[500, b""]],
-    },
-    "repair-rejected": {
-        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "y\n",
-        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT, target="a/b")], "outputs": [chunk("", 0, True)]}},
-        "render": [[200, {"status": "error", "build": {"id": "b1"}}]], "repair": [[409, {"detail": "busy"}]],
-    },
-    "repair-same-id": {
-        "args": ["--build-id", "b1", "--target", "m.pdf"], "tty": "yes\n",
-        "builds": {"b1": {"records": [record("failed", result=FAILED_RESULT)], "outputs": [chunk("", 0, True)]}},
-        "render": [[200, {"status": "error", "build": {"id": "b1"}}]], "repair": [[200, {"id": "b1"}]],
+    "old-record-repair-mode-succeeded": {
+        "args": ["--build-id", "b1", "--target", "m.pdf"],
+        "builds": {"b1": {"records": [record("succeeded", repair_mode="review_cards")], "outputs": [chunk("ok\n", 3, True)]}},
     },
     "run-directory": {
         "args": ["--run-directory", "run"],
@@ -221,42 +206,14 @@ def run(command, scenario, directory, args):
             master, slave = pty.openpty()
             process = subprocess.Popen(arguments, cwd=directory, env=environment, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             os.close(slave)
-            if args.windows:
-                # Wine's console switches the pty to raw mode when the read starts, which drops typeahead, and
-                # there Enter is "\r"; answer a moment after the prompt is out.
-                captured = {"stdout": bytearray(), "stderr": bytearray()}
-                prompted = threading.Event()
-
-                def pump(stream, sink):
-                    while chunk := stream.read1(65536):
-                        sink += chunk
-                        if b"[y/N] " in captured["stdout"] or b"[y/N] " in captured["stderr"]:
-                            prompted.set()
-
-                pumps = [threading.Thread(target=pump, args=(process.stdout, captured["stdout"])),
-                         threading.Thread(target=pump, args=(process.stderr, captured["stderr"]))]
-                for thread in pumps:
-                    thread.start()
-                if prompted.wait(60):
-                    time.sleep(1)
-                    os.write(master, scenario["tty"].replace("\n", "\r").encode())
-                try:
-                    code = process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    code = "timeout"
-                for thread in pumps:
-                    thread.join()
-                stdout, stderr = bytes(captured["stdout"]), bytes(captured["stderr"])
-            else:
-                os.write(master, scenario["tty"].encode())
-                try:
-                    stdout, stderr = process.communicate(timeout=60)
-                    code = process.returncode
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    code = "timeout"
+            os.write(master, scenario["tty"].encode())
+            try:
+                stdout, stderr = process.communicate(timeout=60)
+                code = process.returncode
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                code = "timeout"
             os.close(master)
         else:
             # Windows' isatty() is true for NUL (Python's too), and Wine maps /dev/null to NUL, so use an empty pipe.

@@ -51,7 +51,6 @@ public:
     Py::Json requestBuild(const QString &target, const Py::Json &sourceFrontier, const std::optional<Py::Json> &inputSnapshotSha256,
                           const std::optional<QString> &requestId = std::nullopt);
     Py::Json requestRenderCheck(const QString &target);
-    Py::Json requestRepair(const QString &target);
     Py::Json renderStatus(const QString &target);
     Py::Json build(const QString &buildId);
     Py::Json buildOutput(const QString &buildId, qint64 offset);

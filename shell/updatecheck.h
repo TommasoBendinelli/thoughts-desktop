@@ -6,17 +6,20 @@
 
 class QWidget;
 
-// Updates for builds published as GitHub Releases (the Windows installer). A release
-// is tagged windows-<version> and carries one Thoughts-<version>-setup.exe asset.
-// The repository is private, so reading its releases needs a GitHub token, kept with
-// the other secrets (Credential Manager) as thoughts-github/releases.
+// Updates for builds published as GitHub Releases. A Windows release is tagged
+// windows-<version> and carries one Thoughts-<version>-setup.exe asset; a Mac release
+// is tagged mac-<version> and carries one Thoughts-<version>.dmg asset
+// (tools/macos/release.py). A public repository is read without a token. When GitHub
+// does not show the releases (a private repository), Thoughts asks for a GitHub token
+// and keeps it with the other secrets (Credential Manager, the macOS Keychain) as
+// thoughts-github/releases.
 namespace Thoughts::Updates
 {
 // True when this build was made with a release version and an update repository.
 bool available();
 QString currentVersion();
 
-// The Help menu action: asks for the token if there is none, then reports.
+// The Help menu action: reports; asks for a token only when GitHub refuses the check.
 void checkInteractively(QWidget *parent);
 // Shortly after startup, at most once a day; silent unless an update exists.
 void checkInBackground(QWidget *parent);
@@ -29,7 +32,8 @@ int compareVersions(const QString &a, const QString &b);
 // without a digest matches nothing, so its installer is never run.
 bool installerMatches(const QByteArray &expectedSha256, const QByteArray &bytes);
 // The name the installer is saved under: the asset's name if it is a plain
-// Thoughts-<version>-setup.exe, else a fixed name. Never a path.
+// Thoughts-<version>-setup.exe or Thoughts-<version>.dmg, else a fixed name.
+// Never a path.
 QString installerFileName(const QString &assetName);
 // Saves the installer in a new folder with an unpredictable name, which only
 // this user can write to, and returns the file's path; empty on failure.

@@ -481,6 +481,12 @@ ecm_add_test(publisherserveridstest.cpp
     LINK_LIBRARIES Qt6::Core Qt6::Network Qt6::Test thoughtspublisher
 )
 
+# Floating-point JSON numbers read to the same doubles as Python's json.loads (tools/publisher/pyjson.cpp).
+ecm_add_test(pyjsonfloattest.cpp
+    TEST_NAME "pyjsonfloattest"
+    LINK_LIBRARIES Qt6::Core Qt6::Test thoughtspublisher
+)
+
 # Sync's three-way text merge with git's compiled-in xdiff (tools/publisher/xdiff).
 ecm_add_test(sourcemergetest.cpp
     TEST_NAME "sourcemergetest"

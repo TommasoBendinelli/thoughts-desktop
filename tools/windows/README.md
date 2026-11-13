@@ -56,17 +56,17 @@ Thoughts checks for a newer release 30 seconds after it starts, at most once a d
 - The installer it downloads is checked against the release's SHA-256.
 - Thoughts closes, the installer replaces the program files, and Thoughts opens again.
 
-Releases come from the repository the installer was built for (`THOUGHTS_UPDATE_REPOSITORY`). When that repository is private, the check needs a GitHub token. The first **Check for Updates…** asks for one and stores it in Credential Manager as `thoughts-github/releases`. To make the token:
+Releases come from the repository the installer was built for (`THOUGHTS_UPDATE_REPOSITORY`; the published installers use the public `TommasoBendinelli/thoughts-desktop`). A public repository needs no token. When the installer was built for a private repository, GitHub refuses the check; **Check for Updates…** then asks for a GitHub token and stores it in Credential Manager as `thoughts-github/releases`. To make the token:
 
 1. Go to GitHub › Settings › Developer settings › **Fine-grained tokens** › Generate new token.
 2. Under **Repository access**, choose *Only select repositories* › the desktop repository.
 3. Under **Repository permissions**, set **Contents** to *Read-only*.
 
-Without a token Thoughts never checks; set `THOUGHTS_NO_UPDATE_CHECK=1` to stop the daily check.
+Set `THOUGHTS_NO_UPDATE_CHECK=1` to stop the daily check.
 
 ### Publishing a release
 
-On the Mac, from a clean checkout whose `HEAD` is pushed:
+On the Mac, from a clean clone of the public repository whose `HEAD` is on its `main` (the script refuses a published release from anything else, and from a checkout with a private remote):
 
 ```sh
 export THOUGHTS_WINDOWS_BUILDERS=builder.example.org   # SSH host(s) of the Linux builder
@@ -75,7 +75,8 @@ python3 tools/windows/release.py --no-publish   # only builds the installer
 ```
 
 - The build runs on a Linux builder, not on the Mac. It is cross-compiled with clang-cl against KDE Craft's Windows libraries; see `tools/windows/cross/README.md`.
-- The release goes to the `origin` remote's GitHub repository unless `--repository` or `THOUGHTS_RELEASE_REPOSITORY` names another; the installer checks that repository for updates.
+- The release goes to `TommasoBendinelli/thoughts-desktop` unless `--repository` or `THOUGHTS_RELEASE_REPOSITORY` names another; the installer checks that repository for updates.
+- Before the installer is packed, its files are scanned for personal or private strings (`tools/release_scan.py`: home folders, tailnet hosts, keys, tokens, and your own markers from `~/.config/thoughts/release-private-patterns.txt`). A hit stops a published release.
 - The release notes default to the commit subjects since the previous release.
 - The installer is kept in `~/.cache/thoughts-windows-releases`.
 
@@ -202,7 +203,7 @@ These Windows builds have already passed on a Mac, cross-compiled with clang-cl 
 - The native publisher matched the (since retired) Python publisher on the same files:
   - the source manifest, the progress lines, the candidates, and every build-input entry and snapshot hash;
   - publications and editable-source installs against a local thoughts-server, compared step by step: output, events, state, and the files written on both sides. 19 of 20 scenarios matched, including three-way merges through Git for Windows.
-  - `thoughts-watch-build`: 26 of 27 scenarios matched, including the Codex repair prompt.
+  - `thoughts-watch-build`: 26 of 27 scenarios matched.
   - Where they differed, the message came from Windows itself: a missing path is reported as `[WinError 3] … 'C:\\…'`.
 - `tools/publisher/tests` holds golden tests (`publisher_golden.py`, `publish_golden.py`, `watch_golden.py`) with expected outcomes recorded on the Mac. Pass `--windows` to `publish_golden.py` and `watch_golden.py` for a Windows build; messages that come from Windows itself still differ.
 

@@ -5,8 +5,9 @@
 
   python3 pyjson_differential.py <build>/bin/pyjsoncheck [seed]
 
-Generates random documents and malformed inputs, runs the checker on them and
-compares every result with json.dumps(json.loads(...)) byte for byte. Use the
+Generates random documents, float literals (exact ties between doubles,
+subnormals, the ends of the range) and malformed inputs, runs the checker on
+them and compares every result with json.dumps(json.loads(...)) byte for byte. Use the
 Python version the thoughts-server publisher runs on; error wording changes
 between Python versions."""
 import json, random, os, sys, subprocess, shutil, tempfile
@@ -43,6 +44,61 @@ for b in bad:
 rawbad=[b'"a\xc3',b'"\xe2\x82',b'"\xf0\x9f\x98',b'"\xf0\x9f\x98x"',b'"\xe2x"',b'"\xff"',b'["a\xc3"]',b'"\xc3\x28"',b'"\xe0\x80\x80"',b'"\xed\xa0\x80"',b'"\xf4\x90\x80\x80"',b'"\xf0\x9f\x98\x80"',b'"\xc0\xaf"',b'\xef\xbb\xbf{}',b'{"k":"\xe2\x82"}']
 for b in rawbad:
     cases.append((b, dict(indent=None,sort_keys=False,ensure_ascii=True,allow_nan=True,separators=None,reject_duplicates=False)))
+# Float literals spelled as other writers spell them, not only as repr: Python
+# reads each with float() (correctly rounded, ties to even), and the doubles
+# must be the same, which json.dumps's repr shows bit for bit. Exact midpoints
+# between neighbouring doubles (Decimal of a double is exact) and the digits
+# just either side of them are the cases a parser gets wrong.
+import math, struct
+from decimal import Decimal, getcontext
+getcontext().prec = 1200
+DBL_MAX = 1.7976931348623157e308
+def rdouble():
+    k = random.random()
+    if k < 0.2: return random.uniform(-1, 1) * 2.0 ** -1022  # subnormal
+    if k < 0.3: return random.choice([1, -1]) * random.choice([DBL_MAX, random.uniform(1.6e308, DBL_MAX)])
+    if k < 0.4: return float(random.randint(2 ** 52, 2 ** 54))
+    while True:
+        x = struct.unpack('<d', random.getrandbits(64).to_bytes(8, 'little'))[0]
+        if math.isfinite(x): return x
+def rliteral():
+    k = random.random()
+    if k < 0.5:
+        x = rdouble()
+        y = math.nextafter(x, math.inf)
+        upper = Decimal(y) if math.isfinite(y) else Decimal(2) ** 1024
+        sign, digits, exponent = ((Decimal(x) + upper) / 2).as_tuple()
+        sign, digits = '-' if sign else '', ''.join(map(str, digits))
+        choice = random.random()
+        if choice < 0.4:    # the exact tie
+            pass
+        elif choice < 0.6:  # just past it
+            digits, exponent = digits + '1', exponent - 1
+        else:               # cut to fewer digits: just short of it, or 15 to 25 digits
+            cut = random.randint(1, max(1, len(digits) - 1)) if choice < 0.8 else min(len(digits), random.randint(15, 25))
+            digits, exponent = digits[:cut], exponent + len(digits) - cut
+        form = random.random()
+        if form < 0.4:
+            return f'{sign}{digits}e{exponent}'
+        if form < 0.7:
+            shown = exponent + len(digits) - 1
+            return f"{sign}{digits[0]}.{digits[1:] or '0'}E{'+' if shown >= 0 and random.random() < 0.5 else ''}{shown}"
+        return f'{sign}0.{digits}e{exponent + len(digits)}'
+    if k < 0.8:
+        text = random.choice(['', '-']) + str(random.randint(0, 10 ** random.randint(1, 40)))
+        fraction = ''.join(random.choice('0123456789') for _ in range(random.randint(0, 30)))
+        if fraction:
+            text += '.' + fraction
+        if not fraction or random.random() < 0.7:
+            text += random.choice('eE') + random.choice(['', '+', '-']) + str(random.randint(0, 400)).zfill(random.randint(1, 4))
+        return text
+    return random.choice(['0.0', '-0.0', '-0e0', '0e999999999999999999999', '-0.0E-9999', '5e-324', '-5e-324', '2.4703282292062327e-324',
+                          '2.4703282292062328e-324', '2.2250738585072011e-308', '1.7976931348623158e308', '1.7976931348623159e308',
+                          '-1.7976931348623159e308', '1e309', '1e-400', '-1e-400', '1e999999999999999999999', '0.' + '1' * 800,
+                          '9' * 400 + '.5e-100', '9007199254740993.0', '0.30000000000000004', '1e22', '1e23'])
+for i in range(1500):
+    text = '[' + ', '.join(rliteral() for _ in range(random.randint(1, 12))) + ']'
+    cases.append((text, dict(indent=None,sort_keys=False,ensure_ascii=True,allow_nan=True,separators=None,reject_duplicates=False)))
 for idx,(text,opts) in enumerate(cases):
     if isinstance(text, bytes):
         open(f'{d}/c{idx:05d}.json','wb').write(text)

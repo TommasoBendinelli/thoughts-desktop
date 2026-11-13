@@ -9286,7 +9286,8 @@ void CommentsOverviewTest::testMixedSelectionDecidesItsProposals()
     QCOMPARE(remaining.at(0), QStringLiteral("A plain comment"));
     QCOMPARE(remaining.at(1), QStringLiteral("Removed outside."));
     QVERIFY(remaining.at(2).startsWith(QStringLiteral("This proposal cannot be accepted or rejected")));
-    QVERIFY(overview.m_summary->text().contains(QStringLiteral("3 proposals accepted")));
+    // The reload that follows the decision redraws the list's counts, then shows the outcome again.
+    QTRY_VERIFY2(overview.m_summary->text().contains(QStringLiteral("3 proposals accepted")), qPrintable(overview.m_summary->text()));
 
     // Undo puts both sources back, and their proposals are listed again.
     overview.undoOverviewChange();

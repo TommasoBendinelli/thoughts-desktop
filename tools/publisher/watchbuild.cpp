@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // thoughts-watch-build: follow one Fedora build in a terminal (the native
 // replacement for thoughts_server.build_watch). It polls the build and its
-// renderer output, stamps every line with the local time, summarizes errors,
-// and offers the server-side Codex repair when run interactively.
+// renderer output, stamps every line with the local time and summarizes the
+// errors of a failed build.
 
 #include "argparse.h"
 #include "pyerror.h"
@@ -26,8 +26,6 @@
 #include <windows.h>
 
 #include <shellapi.h>
-#define isatty _isatty
-#define fileno _fileno
 #else
 #include <unistd.h>
 #endif
@@ -39,9 +37,7 @@ using Py::Json;
 namespace
 {
 const QSet<QString> terminalStatuses{QStringLiteral("succeeded"), QStringLiteral("attention"), QStringLiteral("failed"), QStringLiteral("cancelled")};
-const QSet<QString> repairableStatuses{QStringLiteral("attention"), QStringLiteral("failed")};
-const QString codexRepairModel = QStringLiteral("gpt-5.6-sol");
-const QString codexRepairReasoningEffort = QStringLiteral("max");
+const QSet<QString> failedStatuses{QStringLiteral("attention"), QStringLiteral("failed")};
 
 QString timestamp()
 {
@@ -322,104 +318,6 @@ void printFailureSummary(const Json &build, const QString &target)
     }
 }
 
-bool isLatestFailedBuild(SourceApi &api, const QString &buildId, const QString &target)
-{
-    Json status;
-    try {
-        status = api.renderStatus(target);
-    } catch (const Py::Exception &error) {
-        if (error.type != Py::apiErrorType) {
-            throw;
-        }
-        printEvent(QStringLiteral("Codex repair not offered because the latest PDF state could not be verified: ") + error.message, true);
-        return false;
-    }
-    const Json build = Py::get(status, QStringLiteral("build"));
-    const Json currentBuild = build.isObject() ? build : Json::object();
-    const Json state = Py::get(status, QStringLiteral("status"));
-    if ((state == Json(QStringLiteral("attention")) || state == Json(QStringLiteral("error"))) && currentBuild.value(QStringLiteral("id")) == Json(buildId)) {
-        return true;
-    }
-    printEvent(QStringLiteral("Codex repair not offered because this is no longer the latest failed build for %1.").arg(target));
-    return false;
-}
-
-// input(prompt): the prompt goes to stderr on a terminal, else stdout.
-std::optional<QString> readAnswer(const QString &prompt)
-{
-    const QByteArray text = prompt.toUtf8();
-    if (isatty(fileno(stdin)) && isatty(fileno(stdout))) {
-        Py::writeError(text);
-    } else {
-        Py::writeOut(text);
-    }
-    std::string line;
-    int c;
-    bool any = false;
-    while ((c = std::fgetc(stdin)) != EOF) {
-        any = true;
-        if (c == '\n') {
-            break;
-        }
-        line.push_back(char(c));
-    }
-    if (!any) {
-        return std::nullopt;
-    }
-    return QString::fromUtf8(QByteArray::fromStdString(line));
-}
-
-bool confirmCodexRepair()
-{
-    const QString prompt = QStringLiteral("\nRun Codex to repair these errors using %1 (standard mode, %2 reasoning)? [y/N] ").arg(codexRepairModel, codexRepairReasoningEffort);
-    const std::optional<QString> answer = readAnswer(timestampText(prompt));
-    if (!answer) {
-        return false;
-    }
-    const QString folded = Py::casefold(Py::strip(*answer));
-    return folded == QLatin1String("y") || folded == QLatin1String("yes");
-}
-
-int watchBuildId(SourceApi &api, const QString &buildId, const QString &target, double pollInterval);
-
-std::optional<int> maybeRunRepair(SourceApi &api, const QString &buildId, const QString &target, const Json &build, double pollInterval)
-{
-    const Json status = Py::get(build, QStringLiteral("status"));
-    if (!status.isString() || !repairableStatuses.contains(status.toString())
-        || Py::get(build, QStringLiteral("repair_mode"), Json(QStringLiteral("none"))) == Json(QStringLiteral("codex")) || !isatty(fileno(stdin))) {
-        return std::nullopt;
-    }
-    if (!isLatestFailedBuild(api, buildId, target)) {
-        return std::nullopt;
-    }
-    if (!confirmCodexRepair()) {
-        printEvent(QStringLiteral("Codex repair not started."));
-        return 1;
-    }
-    const Json repairTargetValue = Py::get(build, QStringLiteral("target"));
-    QString repairTarget = target;
-    if (repairTargetValue.isString() && (repairTargetValue.toString() == QLatin1String("all") || isPdfName(repairTargetValue.toString()))) {
-        repairTarget = repairTargetValue.toString();
-    }
-    Json repair;
-    try {
-        repair = api.requestRepair(repairTarget);
-    } catch (const Py::Exception &error) {
-        if (error.type != Py::apiErrorType) {
-            throw;
-        }
-        printEvent(QStringLiteral("Could not queue Codex repair: ") + error.message, true);
-        return 1;
-    }
-    const Json repairId = Py::get(repair, QStringLiteral("id"));
-    if (!repairId.isString() || repairId.toString().isEmpty() || repairId.toString() == buildId) {
-        printEvent(QStringLiteral("Could not queue Codex repair: the server returned an invalid build ID."), true);
-        return 1;
-    }
-    printEvent(QStringLiteral("Codex repair queued as build %1.").arg(repairId.toString()));
-    return watchBuildId(api, repairId.toString(), target, pollInterval);
-}
-
 int watchBuildId(SourceApi &api, const QString &buildId, const QString &target, double pollInterval)
 {
     printEvent(QStringLiteral("Build ID: ") + buildId);
@@ -467,11 +365,8 @@ int watchBuildId(SourceApi &api, const QString &buildId, const QString &target, 
                 }
                 printTimingSummary(result);
                 printEvent(QStringLiteral("Build %1.").arg(statusKey.first));
-                if (repairableStatuses.contains(statusKey.first)) {
+                if (failedStatuses.contains(statusKey.first)) {
                     printFailureSummary(build, target);
-                    if (const std::optional<int> repairResult = maybeRunRepair(api, buildId, target, build, pollInterval)) {
-                        return *repairResult;
-                    }
                 }
                 return statusKey.first == QLatin1String("succeeded") ? 0 : 1;
             }

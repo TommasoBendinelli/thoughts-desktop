@@ -26,9 +26,11 @@ cd build && QT_QPA_PLATFORM=offscreen ctest --output-on-failure
 - Every autotest runs with a temporary `HOME`, Library and application data, and an unreachable server
   (`autotests/testhome.cpp`); it refuses to start if it could reach real user data or the build's own servers.
 - The Python tools have their own tests: `tools/mcp/test_server.py` and `tools/mcp/test_agent_notes.py` (in a virtual
-  environment with `tools/mcp/requirements.txt`) and `tools/hooks/test_thoughts_card_link.py` (standard library only).
+  environment with `tools/mcp/requirements.txt`), and `tools/hooks/test_thoughts_card_link.py` and
+  `tools/test_release_scan.py` (standard library only). `sh tools/macos/test-install-update.sh` tests the Mac updater
+  on throwaway bundles.
   `tools/vscode-pdf-links` runs `npm test`.
-- Windows: `tools/windows/README.md`. macOS signing (optional): `tools/macos/README.md`.
+- Windows: `tools/windows/README.md`. macOS signing (optional), the disk image and releases: `tools/macos/README.md`.
 
 Build options specific to Thoughts:
 
@@ -40,7 +42,7 @@ Build options specific to Thoughts:
 | `THOUGHTS_AB_TESTING_URL` | empty | The page File › A/B testing opens in the browser. Empty: the entry is hidden. The environment variable of the same name overrides it. |
 | `THOUGHTS_HTML_VIEW` | on when Qt WebView is found | The HTML view of documents. |
 | `THOUGHTS_MACOS_PERSISTENT_SIGNING` | on when the identity of `tools/macos/setup-signing.py` exists | Sign the macOS app bundle on build and install. |
-| `THOUGHTS_RELEASE_VERSION`, `THOUGHTS_UPDATE_REPOSITORY` | empty | Version and GitHub repository of a published Windows release; Help › Check for Updates exists only with them. |
+| `THOUGHTS_RELEASE_VERSION`, `THOUGHTS_UPDATE_REPOSITORY` | empty | Version and GitHub repository of a published Windows or Mac release; Help › Check for Updates exists only with them. The release tools (`tools/windows/release.py`, `tools/macos/release.py`) set both, the repository to `TommasoBendinelli/thoughts-desktop` unless told otherwise. |
 
 On macOS, quit Thoughts normally before replacing or signing an installed copy, and install matching core, part,
 generator and shell components with the generated CMake installers (`tools/macos/install-local.py` does both), so the
