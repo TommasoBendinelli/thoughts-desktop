@@ -1,0 +1,2 @@
+ecm_install_icons( ICONS 128-apps-okular.png  16-apps-okular.png  22-apps-okular.png  32-apps-okular.png  48-apps-okular.png  64-apps-okular.png DESTINATION ${KDE_INSTALL_ICONDIR} THEME hicolor )
+ecm_install_icons( ICONS 128-apps-thoughts.png  16-apps-thoughts.png  22-apps-thoughts.png  32-apps-thoughts.png  48-apps-thoughts.png  64-apps-thoughts.png DESTINATION ${KDE_INSTALL_ICONDIR} THEME hicolor )

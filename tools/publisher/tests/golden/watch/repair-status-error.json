@@ -1,0 +1,22 @@
+{
+ "exit": 1,
+ "requests": [
+  [
+   "GET",
+   "/v1/builds/b1",
+   ""
+  ],
+  [
+   "GET",
+   "/v1/builds/b1/output?offset=0",
+   ""
+  ],
+  [
+   "GET",
+   "/v1/render-status?target=m.pdf",
+   ""
+  ]
+ ],
+ "stderr": "[T] Codex repair not offered because the latest PDF state could not be verified: HTTP Error 500: Internal Server Error\n",
+ "stdout": "[T] Build ID: b1\n[T] PDF: m.pdf\n[T] Server renderer command is not available.\n\n[T] [failed]\n[T] Log object: abababababababababababababababababababababababababababababababab\n[T] Build timings: renderer 60.0s, cleanup 0.0s, total 1m 01.0s.\n[T] Build failed.\n\n[T] Errors found (3):\n[T] - m.pdf — docs-m/tex/main.tex:3: Undefined\n[T] second line\n[T] - n.pdf — boom\n[T] - 5 — s.tex — other\n"
+}

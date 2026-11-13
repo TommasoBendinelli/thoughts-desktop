@@ -1,0 +1,19 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: Project configuration is stored outside its default folder"
+   ],
+   "stdout": ""
+  }
+ ]
+}

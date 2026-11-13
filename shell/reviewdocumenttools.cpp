@@ -1,0 +1,1845 @@
+#include "../part/documentidentity.h"
+#include "../part/thoughtsplatform.h"
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "reviewdocumenttools.h"
+#include "agentproposalparser.h"
+#include "agentdocumentdescription.h"
+#include "../part/agentprompts.h"
+#include "../part/reviewcardfeedback.h"
+#include "part/sourceannotationindex.h"
+#include "part/docscommentsynchronizer.h"
+#include <poppler-qt6.h>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QImage>
+#include <QHash>
+#include <QMap>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QRegularExpression>
+#include <QSet>
+#include <QStandardPaths>
+#include <QUuid>
+#include <QtEndian>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <memory>
+namespace Thoughts {
+namespace {
+QByteArray read(const QString &path) { QFile f(path); return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray(); }
+QString digest(const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); }
+QString fingerprint(Poppler::Page &page) {
+    const QSizeF size = page.pageSizeF() * (96.0 / 72.0);
+    if (size.width() <= 0 || size.height() <= 0 || size.width() * size.height() > 32000000) return {};
+    const QImage rgb = page.renderToImage(96, 96).convertToFormat(QImage::Format_RGB888);
+    if (rgb.isNull()) return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData(QByteArray(reviewFingerprintMethod));
+    const quint32 dimensions[] {qToBigEndian(quint32(rgb.width())), qToBigEndian(quint32(rgb.height()))};
+    hash.addData(reinterpret_cast<const char *>(dimensions), sizeof(dimensions));
+    for (int y = 0; y < rgb.height(); ++y) hash.addData(reinterpret_cast<const char *>(rgb.constScanLine(y)), rgb.width() * 3);
+    return QString::fromLatin1(hash.result().toHex());
+}
+std::unique_ptr<Poppler::Document> document(const QByteArray &bytes) {
+    auto pdf = Poppler::Document::loadFromData(bytes);
+    if (pdf && !pdf->isLocked()) {
+        pdf->setRenderHint(Poppler::Document::Antialiasing);
+        pdf->setRenderHint(Poppler::Document::TextAntialiasing);
+        return pdf;
+    }
+    return {};
+}
+}
+bool isBasicReviewCard(const QJsonObject &card) {
+    const auto method = card.value(QStringLiteral("generation_method")).toString();
+    return method == QLatin1String("basic_half_page") || method == QLatin1String("basic_passages_v1") || method == QLatin1String("basic_passages_v2");
+}
+QString basicReviewSnapshotPath(const QString &docsRoot, const QJsonObject &card) {
+    const auto primary = card.value(QStringLiteral("primary")).toObject();
+    const auto sha = primary.value(QStringLiteral("pdf_sha256")).toString();
+    const auto stem = primary.value(QStringLiteral("pdf_stem")).toString();
+    if (!QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(sha).hasMatch()
+        || !QRegularExpression(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9._-]*$")).match(stem).hasMatch()) return {};
+    return QDir(docsRoot).filePath(QStringLiteral(".runtime/review-pdfs/%1/%2.pdf").arg(sha, stem));
+}
+QString reviewCardPdfPath(const QString &docsRoot, const QJsonObject &card) {
+    const auto primary = card.value(QStringLiteral("primary")).toObject();
+    const DocumentIdentityStore identities(docsRoot);
+    const auto id = primary.value(QStringLiteral("pdf_document_id")).toString(primary.value(QStringLiteral("document_id")).toString());
+    const auto readable = identities.readablePath(id);
+    if (!readable.isEmpty()) return readable;
+    const auto entry = identities.byId(id);
+    return entry.isEmpty() ? QString() : QDir(docsRoot).filePath(QStringLiteral("current_pdfs/") + entry.value(QStringLiteral("filename")).toString());
+}
+QJsonArray limitBasicCardExtent(const QJsonArray &candidates, const QString &pdfSha256) {
+    QJsonArray result;
+    for (const auto &value : candidates) {
+        const auto candidate = value.toObject();
+        if (!candidate.value(QStringLiteral("source_anchor")).toObject().isEmpty()) {
+            result.append(candidate); continue;
+        }
+        QMap<int, QJsonArray> pages;
+        for (const auto &region : candidate.value(QStringLiteral("regions")).toArray())
+            pages[region.toObject().value(QStringLiteral("page")).toInt()].append(region.toObject().value(QStringLiteral("rect")));
+        double extent = 0;
+        QMap<int, QPair<double, double>> bounds;
+        for (auto page = pages.cbegin(); page != pages.cend(); ++page) {
+            double top = 1, bottom = 0;
+            for (const auto &value : page.value()) {
+                const auto r = value.toArray();
+                top = std::min(top, r[1].toDouble()); bottom = std::max(bottom, r[3].toDouble());
+            }
+            bounds[page.key()] = {top, bottom}; extent += bottom - top;
+        }
+        if (extent <= .5 + 1e-9) { result.append(candidate); continue; }
+        // A clipped passage cannot retain an anchor to the entire source block.
+        // Keep its immutable PDF identity instead of expanding it during reflow.
+        for (auto page = pages.cbegin(); page != pages.cend(); ++page) {
+            const auto [top, bottom] = bounds[page.key()];
+            const int count = std::max(1, int(std::ceil((bottom-top)/.5 - 1e-9)));
+            for (int i=0; i<count; ++i) {
+                const double a = top+(bottom-top)*i/count, b = top+(bottom-top)*(i+1)/count;
+                QJsonArray clipped;
+                for (const auto &value : page.value()) {
+                    const auto r = value.toArray();
+                    if (r[1].toDouble() < b && r[3].toDouble() > a)
+                        clipped.append(QJsonObject{{QStringLiteral("page"),page.key()}, {QStringLiteral("rect"),QJsonArray{r[0],std::max(a,r[1].toDouble()),r[2],std::min(b,r[3].toDouble())}}});
+                }
+                if (clipped.isEmpty()) continue;
+                const QJsonArray identity {QStringLiteral("basic-card-limit-v1"),pdfSha256,candidate.value(QStringLiteral("key")),clipped};
+                result.append(QJsonObject{{QStringLiteral("key"),digest(QJsonDocument(identity).toJson(QJsonDocument::Compact))}, {QStringLiteral("regions"),clipped}});
+            }
+        }
+    }
+    return result;
+}
+QVariantMap prepareBasicReviewCards(const QString &pdfPath, const QString &bundleRoot) {
+    const auto bytes = read(pdfPath);
+    auto pdf = document(bytes);
+    if (!pdf || pdf->numPages() < 1)
+        return {{QStringLiteral("error"), QStringLiteral("The PDF could not be read.")}};
+    const QString root = bundleRoot.isEmpty() ? QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("thoughts-server/source-bundle")) : bundleRoot;
+    const auto pointer = QJsonDocument::fromJson(read(QDir(root).filePath(QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())))).object();
+    const auto artifactSha = pointer.value(QStringLiteral("artifact_sha256")).toString();
+    const auto artifact = QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(artifactSha).hasMatch() ? read(QDir(root).filePath(QStringLiteral("objects/%1").arg(artifactSha))) : QByteArray();
+    const auto manifest = QJsonDocument::fromJson(artifact).object();
+    const auto plan = manifest.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("basic_review")).toObject();
+    QJsonArray candidates;
+    if (digest(artifact) == artifactSha && plan.value(QStringLiteral("schema_version")).toInt() == 1
+        && plan.value(QStringLiteral("pdf_sha256")).toString() == digest(bytes)) candidates = plan.value(QStringLiteral("cards")).toArray();
+    const bool sourcePlan = !candidates.isEmpty();
+    if (!sourcePlan) {
+        const auto directory = QFileInfo(pdfPath).absoluteDir();
+        const auto sourceIndex = QJsonDocument::fromJson(read(directory.filePath(QStringLiteral(".thoughts-source-index.json")))).object();
+        const auto library = QJsonDocument::fromJson(read(directory.filePath(QStringLiteral(".thoughts-library-index.json")))).object();
+        bool needsSource = !pointer.isEmpty() && (digest(artifact) != artifactSha
+            || !manifest.value(QStringLiteral("sources")).toArray().isEmpty());
+        for (const auto &value : sourceIndex.value(QStringLiteral("pdfs")).toArray())
+            if (value.toObject().value(QStringLiteral("filename")).toString() == QFileInfo(pdfPath).fileName()) needsSource = true;
+        for (const auto &value : library.value(QStringLiteral("pdfs")).toArray()) {
+            const auto entry = value.toObject();
+            if (entry.value(QStringLiteral("filename")).toString() == QFileInfo(pdfPath).fileName()
+                && entry.value(QStringLiteral("kind")).toString() != QLatin1String("unlinked")) needsSource = true;
+        }
+        if (needsSource) return {{QStringLiteral("error"), QStringLiteral("The verified source passage plan is unavailable. Sync before generating source-backed cards.")}};
+    }
+    QVariantList pages;
+    for (int index = 0; index < pdf->numPages(); ++index) {
+        auto page = pdf->page(index);
+        const auto sha = page ? fingerprint(*page) : QString();
+        if (sha.isEmpty())
+            return {{QStringLiteral("error"), QStringLiteral("Page %1 could not be rendered.").arg(index + 1)}};
+        pages.append(sha);
+        if (!sourcePlan) {
+            // A whitespace cut cannot bisect a word. With no paragraph-sized gap,
+            // keep the page whole instead of inventing a half-page boundary.
+            const auto size = page->pageSizeF();
+            QList<QPair<double, double>> lines;
+            for (const auto &box : page->textList()) {
+                const auto r = box->boundingBox();
+                if (!box->text().trimmed().isEmpty()) lines.append({r.top()/size.height(), r.bottom()/size.height()});
+            }
+            std::sort(lines.begin(), lines.end());
+            QList<QPair<double,double>> bands;
+            for (const auto &line : lines) {
+                if (!bands.isEmpty() && line.first <= bands.last().second + .004) bands.last().second = std::max(bands.last().second, line.second);
+                else bands.append(line);
+            }
+            const auto raster = page->renderToImage(36, 36).convertToFormat(QImage::Format_RGB32);
+            double cut = -1;
+            for (int i=1; i<bands.size(); ++i) {
+                const double middle = (bands[i-1].second + bands[i].first)/2;
+                if (middle > .25 && middle < .75 && bands[i].first-bands[i-1].second >= .012
+                    && (cut < 0 || std::abs(middle-.5)<std::abs(cut-.5))) {
+                    bool clear = !raster.isNull();
+                    const int y = int(middle * raster.height());
+                    for (int row = std::max(0, y-1); clear && row <= std::min(raster.height()-1, y+1); ++row) {
+                        for (int x=0; x<raster.width(); ++x) {
+                            const auto pixel = raster.pixel(x,row);
+                            if (qRed(pixel)<240 || qGreen(pixel)<240 || qBlue(pixel)<240) { clear=false; break; }
+                        }
+                    }
+                    if (clear) cut=middle;
+                }
+            }
+            QList<double> cuts {0.0}; if (cut > 0) cuts.append(cut); cuts.append(1.0);
+            for (int i=1; i<cuts.size(); ++i) {
+                QJsonArray regions;
+                const int n = std::max(1, int(std::ceil((cuts[i]-cuts[i-1])/.5)));
+                for (int j=0; j<n; ++j) regions.append(QJsonObject{{QStringLiteral("page"),index+1},
+                    {QStringLiteral("rect"),QJsonArray{0.0,cuts[i-1]+(cuts[i]-cuts[i-1])*j/n,1.0,cuts[i-1]+(cuts[i]-cuts[i-1])*(j+1)/n}}});
+                candidates.append(QJsonObject {{QStringLiteral("key"), digest(digest(bytes).toUtf8()+QJsonDocument(regions).toJson(QJsonDocument::Compact))}, {QStringLiteral("regions"), regions}});
+            }
+        }
+    }
+    return {{QStringLiteral("pdf_path"), pdfPath},
+            {QStringLiteral("pdf_stem"), QFileInfo(pdfPath).completeBaseName()},
+            {QStringLiteral("pdf_sha256"), digest(bytes)},
+            {QStringLiteral("page_count"), pdf->numPages()},
+            {QStringLiteral("basic_page_fingerprints"), pages},
+            {QStringLiteral("basic_candidates"), limitBasicCardExtent(candidates, digest(bytes)).toVariantList()}};
+}
+QVariantMap fingerprintReviewPage(const QString &pdfPath, int page, const QString &expectedPdfSha256) {
+    const auto bytes = read(pdfPath);
+    if (bytes.isEmpty() || (!expectedPdfSha256.isEmpty() && digest(bytes) != expectedPdfSha256))
+        return {{QStringLiteral("error"), QStringLiteral("The PDF changed or is unavailable. Reopen it before creating the card.")}};
+    auto pdf = document(bytes);
+    auto selected = pdf && page > 0 && page <= pdf->numPages() ? pdf->page(page - 1) : nullptr;
+    const QString sha = selected ? fingerprint(*selected) : QString();
+    if (sha.isEmpty()) return {{QStringLiteral("error"), QStringLiteral("The selected PDF page could not be read.")}};
+    return {{QStringLiteral("page_visual_sha256"), sha}, {QStringLiteral("method"), QString::fromLatin1(reviewFingerprintMethod)}};
+}
+QVariantMap locateReviewPage(const QString &pdfPath, const QString &wanted) {
+    auto pdf = document(read(pdfPath));
+    int match = 0;
+    if (pdf && QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(wanted).hasMatch()) {
+        for (int index = 0; index < pdf->numPages(); ++index) {
+            auto page = pdf->page(index);
+            if (page && fingerprint(*page) == wanted) {
+                if (match) return {{QStringLiteral("error"), QStringLiteral("More than one page matches this card. Sync to retrieve verified answer locations.")}};
+                match = index + 1;
+            }
+        }
+    }
+    if (!match) return {{QStringLiteral("error"), QStringLiteral("The card’s page could not be identified uniquely. Sync to retrieve verified answer locations.")}};
+    return {{QStringLiteral("page"), match}};
+}
+// Marks each inclusive line range as one segment, in file order. Only complete, visible
+// top-level source lines are marked: never a macro argument, proposal, comment, preamble, or
+// table cell.
+static ReviewAnchorPlan markTexRanges(const QString &path, const QByteArray &source, QList<QPair<int, int>> ranges,
+                                      const QString &cardId, int *failedRange) {
+    ReviewAnchorPlan plan;
+    if (failedRange) *failedRange = -1;
+    const auto fail = [&plan, failedRange](const QString &error, int range = -1) {
+        plan.error = error;
+        if (failedRange) *failedRange = range;
+        return plan;
+    };
+    if (QUuid(cardId).isNull() || ranges.isEmpty() || source.contains(cardId.toUtf8())) return fail(QStringLiteral("The source selection or card identity is invalid."));
+    const QString text = QString::fromUtf8(source);
+    if (text.toUtf8() != source) return fail(QStringLiteral("The source is not valid UTF-8."));
+    const auto lines = source.split('\n');
+    QList<int> order(ranges.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&ranges](int a, int b) { return ranges[a].first < ranges[b].first; });
+    for (int i = 0; i < order.size(); ++i) {
+        const auto &range = ranges[order[i]];
+        if (range.first < 1 || range.second > lines.size() || range.first > range.second
+            || (i > 0 && range.first <= ranges[order[i - 1]].second))
+            return fail(QStringLiteral("The source line range is invalid."), order[i]);
+    }
+    if (ranges.size() > 20) return fail(QStringLiteral("The selection contains too many disjoint source ranges."));
+    // A pending proposal keeps its original next to its replacement. TeX shows
+    // only the replacement, so scan structure as TeX reads it: blank each
+    // wrapper's hidden part (keeping line breaks), and never mark inside it.
+    QString scanText = text;
+    QSet<int> inProposal;
+    for (const auto &[from, to] : latexAgentProposalHiddenRanges(text)) {
+        const int firstLine = int(QStringView(text).left(from).count(QLatin1Char('\n'))) + 1;
+        const int lastLine = int(QStringView(text).left(to).count(QLatin1Char('\n'))) + 1;
+        for (int line = firstLine; line <= lastLine; ++line) inProposal.insert(line);
+        for (int k = from; k < to; ++k)
+            if (scanText.at(k) != QLatin1Char('\n')) scanText[k] = QLatin1Char(' ');
+    }
+    const auto scanLines = scanText.toUtf8().split('\n');
+    int depth = 0; bool visible = !scanText.contains(QStringLiteral("\\begin{document}"));
+    QStringList environments;
+    QSet<int> safeBefore, safeAfter, hidden;
+    const QSet<QString> allowed {QStringLiteral("document"), QStringLiteral("itemize"), QStringLiteral("enumerate"), QStringLiteral("description")};
+    for (int index = 0; index < scanLines.size(); ++index) {
+        const auto line = scanLines[index];
+        bool plainContext = depth == 0 && visible;
+        for (const auto &env : environments) plainContext = plainContext && allowed.contains(env);
+        QByteArray active;
+        for (int j = 0; j < line.size(); ++j) {
+            if (line[j] == '%') break;
+            active += line[j];
+            if (line[j] == '\\' && j + 1 < line.size()) { active += line[++j]; continue; }
+            if (line[j] == '{') ++depth;
+            if (line[j] == '}') --depth;
+        }
+        static const QRegularExpression envPattern(QStringLiteral(R"(\\(begin|end)\{([^}]+)\})"));
+        auto matches = envPattern.globalMatch(QString::fromUtf8(active));
+        if (plainContext) safeBefore.insert(index + 1);
+        while (matches.hasNext()) { const auto m = matches.next();
+            if (m.captured(1) == QLatin1String("begin")) environments.append(m.captured(2));
+            else if (!environments.isEmpty() && environments.last() == m.captured(2)) environments.removeLast();
+            else return fail(QStringLiteral("The source environments are not balanced."));
+            if (m.captured(2) == QLatin1String("document")) visible = m.captured(1) == QLatin1String("begin");
+        }
+        bool after = depth == 0 && visible;
+        for (const auto &env : environments) after = after && allowed.contains(env);
+        if (after) safeAfter.insert(index + 1);
+        if (active.contains("\\def") || active.contains("\\newcommand") || active.contains("\\renewcommand")
+            || active.contains("\\ReviewCardMask") || inProposal.contains(index + 1)) hidden.insert(index + 1);
+        if (depth < 0) return fail(QStringLiteral("The source braces are not balanced."));
+    }
+    for (const int index : std::as_const(order)) {
+        const auto &range = ranges[index];
+        if (!safeBefore.contains(range.first) || !safeAfter.contains(range.second))
+            return fail(QStringLiteral("Select a complete source passage, including its surrounding equation or figure structure."), index);
+        for (int line = range.first; line <= range.second; ++line)
+            if (hidden.contains(line)) return fail(QStringLiteral("The selection contains hidden definitions or existing review markers."), index);
+    }
+    QByteArray output; QJsonArray segments; int range = 0;
+    for (int index = 0; index < lines.size(); ++index) {
+        if (range < order.size() && index + 1 == ranges[order[range]].first) {
+            const auto start = QByteArray("\\ReviewCardMaskStart{") + cardId.toUtf8() + "}{" + QByteArray::number(range) + "}";
+            const auto bodyStart = output.count('\n') + 1;
+            output += start + "%\n";
+            QByteArray body("%\n");
+            for (; index + 1 <= ranges[order[range]].second; ++index) { body += lines[index] + '\n'; output += lines[index] + '\n'; }
+            segments.append(QJsonObject {{QStringLiteral("segment_id"), QString::number(range)}, {QStringLiteral("source_file"), path},
+                {QStringLiteral("content_sha256"), digest(body)}, {QStringLiteral("line_start"), bodyStart}, {QStringLiteral("line_end"), output.count('\n') + 1}});
+            output += QByteArray("\\ReviewCardMaskEnd{") + cardId.toUtf8() + "}{" + QByteArray::number(range) + "}%\n";
+            --index; ++range;
+        } else { output += lines[index]; if (index + 1 < lines.size()) output += '\n'; }
+    }
+    for (int i = 0; i < segments.size(); ++i) { auto s = segments[i].toObject(); s.insert(QStringLiteral("source_sha256"), digest(output)); segments[i] = s; }
+    plan.path = path; plan.original = source; plan.replacement = output;
+    plan.anchor = {{QStringLiteral("version"), 2}, {QStringLiteral("segments"), segments}};
+    return plan;
+}
+static ReviewAnchorPlan markReviewSourceLinesImpl(const QString &path, const QByteArray &source, const QList<int> &selectedLines, const QString &cardId) {
+    ReviewAnchorPlan plan;
+    if (QUuid(cardId).isNull() || selectedLines.isEmpty() || source.contains(cardId.toUtf8())) {
+        plan.error = QStringLiteral("The source selection or card identity is invalid.");
+        return plan;
+    }
+    const auto lines = source.split('\n');
+    QList<int> selected = selectedLines; std::sort(selected.begin(), selected.end()); selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+    if (selected.first() < 1 || selected.last() > lines.size()) { plan.error = QStringLiteral("The source line range is invalid."); return plan; }
+    for (int line = selected.first(); line <= selected.last(); ++line) {
+        if (!selected.contains(line) && !lines[line - 1].trimmed().isEmpty()) {
+            plan.error = QStringLiteral("A card must contain one continuous source passage. Create separate cards for separated passages.");
+            return plan;
+        }
+    }
+    return markTexRanges(path, source, {{selected.first(), selected.last()}}, cardId, nullptr);
+}
+ReviewAnchorPlan markReviewSourceLines(const QString &path, const QByteArray &source, const QList<int> &selectedLines, const QString &cardId) {
+    if (path.endsWith(QLatin1String(".md"), Qt::CaseInsensitive) || path.endsWith(QLatin1String(".markdown"), Qt::CaseInsensitive)) {
+        ReviewAnchorPlan invalid;
+        if (selectedLines.isEmpty() || QUuid(cardId).isNull() || source.contains(cardId.toUtf8())) {
+            invalid.error = QStringLiteral("The source selection or card identity is invalid.");
+            return invalid;
+        }
+        const auto bounds = std::minmax_element(selectedLines.cbegin(), selectedLines.cend());
+        const auto lines = source.split('\n');
+        if (*bounds.first < 1 || *bounds.second > lines.size()) {
+            invalid.error = QStringLiteral("The source line range is invalid.");
+            return invalid;
+        }
+        for (int line = *bounds.first; line <= *bounds.second; ++line) {
+            if (!selectedLines.contains(line) && !lines[line - 1].trimmed().isEmpty()) {
+                invalid.error = QStringLiteral("A card must contain one continuous source passage.");
+                return invalid;
+            }
+        }
+        return markReviewSourceSelection(path, source, *bounds.first, *bounds.second + 1, cardId);
+    }
+    return markReviewSourceLinesImpl(path, source, selectedLines, cardId);
+}
+// Why lines [first, end) of a source cannot become one answer passage of @p cardId, or empty:
+// a pending or broken proposal or another card's markers in it, or for Markdown a boundary
+// that is not between complete top-level blocks.
+static QString sourceSelectionError(const QString &path, const QByteArray &source, int first, int end, const QString &cardId) {
+    const QString text = QString::fromUtf8(source);
+    const auto lines = source.split('\n');
+    const int lineCount = lines.size() - int(source.endsWith('\n'));
+    if (text.toUtf8() != source || source.contains('\0') || first < 1 || end <= first || end > lineCount + 1)
+        return QStringLiteral("Select complete source lines in a UTF-8 file.");
+    int startOffset = 0, endOffset = 0;
+    const auto textLines = text.split(QLatin1Char('\n'));
+    for (int i = 0; i < end - 1; ++i) {
+        if (i < first - 1) startOffset += textLines[i].size() + 1;
+        endOffset += textLines[i].size() + (i + 1 < textLines.size() ? 1 : 0);
+    }
+    if (text.mid(startOffset, endOffset - startOffset).trimmed().isEmpty()) return QStringLiteral("Select an answer passage.");
+    // Broken proposals occupy their span too; elsewhere they do not block a card.
+    const AgentProposalParse parsed = parseAgentProposals(path, text);
+    for (const auto &p : parsed.proposals)
+        if (startOffset < p.offset + p.length && p.offset < endOffset)
+            return QStringLiteral("Resolve the pending proposal before creating a card from this passage.");
+    for (const auto &issue : parsed.issues)
+        if (startOffset < issue.offset + issue.length && issue.offset < endOffset)
+            return QStringLiteral("Fix or remove the broken proposal before creating a card from this passage: %1").arg(agentProposalIssueMessage(issue));
+    const auto locations = scanAnnotationLocations(path, source, {}).value(QStringLiteral("locations")).toObject();
+    for (auto it = locations.begin(); it != locations.end(); ++it) {
+        // The card's own other passages are no obstacle; only other cards' are.
+        if (!it.key().startsWith(QLatin1String("review_card\n")) || it.key().endsWith(QLatin1Char('\n') + cardId)) continue;
+        for (const auto &value : it.value().toArray()) {
+            const auto range = value.toObject();
+            if (first <= range.value(QStringLiteral("end_line")).toInt() && range.value(QStringLiteral("start_line")).toInt() < end)
+                return QStringLiteral("A review card already covers part of this passage.");
+        }
+    }
+    if (path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) return {};
+    if (!path.endsWith(QLatin1String(".md"), Qt::CaseInsensitive) && !path.endsWith(QLatin1String(".markdown"), Qt::CaseInsensitive))
+        return QStringLiteral("Choose a LaTeX or Markdown source file.");
+    // Only top-level block boundaries are safe for Markdown HTML markers.
+    // Reject literal/HTML contexts and unfinished blocks rather than changing
+    // paragraph, list, table, or code structure as a side effect of anchoring.
+    QByteArray fence; bool html = false;
+    QSet<int> safe;
+    const QRegularExpression fenceStart(QStringLiteral(R"(^ {0,3}(`{3,}|~{3,}))"));
+    for (int i = 0; i <= lineCount; ++i) {
+        if (fence.isEmpty() && !html) safe.insert(i + 1);
+        if (i == lineCount) break;
+        const auto line = lines[i]; const auto trimmed = line.trimmed();
+        if (!fence.isEmpty()) {
+            int n = 0; while (n < trimmed.size() && trimmed[n] == fence[0]) ++n;
+            if (n >= fence.size() && trimmed.mid(n).isEmpty()) fence.clear();
+        } else if (const auto match = fenceStart.match(QString::fromUtf8(line)); match.hasMatch()) {
+            fence = match.captured(1).toLatin1();
+        } else {
+            if (line.contains("<!--")) html = true;
+            if (line.contains("-->")) html = false;
+        }
+    }
+    const auto heading = [](const QByteArray &line) { return QRegularExpression(QStringLiteral("^#{1,6}\\s")).match(QString::fromUtf8(line)).hasMatch(); };
+    if (!safe.contains(first) || !safe.contains(end)
+        || (first > 1 && !lines[first - 2].trimmed().isEmpty() && !lines[first - 1].trimmed().isEmpty() && !heading(lines[first - 1]))
+        || (end <= lineCount && !lines[end - 2].trimmed().isEmpty() && !lines[end - 1].trimmed().isEmpty() && !heading(lines[end - 1]))
+        || lines[first - 1].startsWith(' ') || lines[first - 1].startsWith('\t'))
+        return QStringLiteral("Select complete Markdown blocks, including the full paragraph, list, table, or code block.");
+    // Boundaries inside HTML blocks, front matter, nested lists and blockquotes
+    // cannot be proven neutral by this local editor path.
+    for (int i = first - 1; i < end - 1; ++i) {
+        const auto trimmed = lines[i].trimmed();
+        if (trimmed.startsWith('<') || trimmed.startsWith('>') || (i == 0 && (trimmed == "---" || trimmed == "+++")))
+            return QStringLiteral("Select rendered Markdown content outside HTML, front matter, and blockquotes.");
+    }
+    for (int i : {first - 2, end - 1}) {
+        const int direction = i < first - 1 ? -1 : 1;
+        // An unindented heading terminates a preceding list, even when the
+        // list's last item is the nearest nonblank line above the selection.
+        if (direction < 0 && heading(lines[first - 1])) continue;
+        while (i >= 0 && i < lineCount && lines[i].trimmed().isEmpty()) i += direction;
+        if (i >= 0 && i < lineCount && (lines[i].startsWith(' ') || lines[i].startsWith('\t')
+            || QRegularExpression(QStringLiteral(R"(^([-+*]|[0-9]+[.)])\s)")).match(QString::fromUtf8(lines[i])).hasMatch()))
+            return QStringLiteral("Include the entire Markdown list in the selection.");
+    }
+    return {};
+}
+static bool isMarkdownPath(const QString &path) {
+    return path.endsWith(QLatin1String(".md"), Qt::CaseInsensitive) || path.endsWith(QLatin1String(".markdown"), Qt::CaseInsensitive);
+}
+// Inclusive line ranges, each wrapped in its own answer:n marker pair (n in file order).
+static ReviewAnchorPlan markMarkdownRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
+                                           const QString &cardId, int *failedRange) {
+    ReviewAnchorPlan invalid;
+    if (failedRange) *failedRange = -1;
+    const auto fail = [&](const QString &message, int range = -1) {
+        invalid.error = message;
+        if (failedRange) *failedRange = range;
+        return invalid;
+    };
+    if (QUuid(cardId).isNull() || ranges.isEmpty() || source.contains(cardId.toUtf8()))
+        return fail(QStringLiteral("The source selection or card identity is invalid."));
+    if (ranges.size() > 20) return fail(QStringLiteral("The selection contains too many disjoint source ranges."));
+    QList<int> order(ranges.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&ranges](int a, int b) { return ranges[a].first < ranges[b].first; });
+    for (int i = 0; i < order.size(); ++i) {
+        const auto &range = ranges[order[i]];
+        if (range.first > range.second || (i > 0 && range.first <= ranges[order[i - 1]].second))
+            return fail(QStringLiteral("The source line range is invalid."), order[i]);
+        const QString error = sourceSelectionError(path, source, range.first, range.second + 1, cardId);
+        if (!error.isEmpty()) return fail(error, order[i]);
+    }
+    const QString text = QString::fromUtf8(source);
+    const auto textLines = text.split(QLatin1Char('\n'));
+    const auto offsetOfLine = [&textLines](int line) {
+        qsizetype offset = 0;
+        for (int i = 0; i < line - 1 && i < textLines.size(); ++i) offset += textLines[i].size() + 1;
+        return offset;
+    };
+    QString marked;
+    qsizetype copied = 0;
+    for (int segment = 0; segment < order.size(); ++segment) {
+        const auto &range = ranges[order[segment]];
+        const qsizetype startOffset = offsetOfLine(range.first);
+        const qsizetype endOffset = std::min<qsizetype>(offsetOfLine(range.second + 1), text.size());
+        QString body = text.mid(startOffset, endOffset - startOffset);
+        if (!body.endsWith(QLatin1Char('\n'))) body += QLatin1Char('\n');
+        marked += text.mid(copied, startOffset - copied);
+        marked += QStringLiteral("<!-- thoughts:v1:start review:%1:answer:%2 -->\n").arg(cardId).arg(segment);
+        marked += body;
+        marked += QStringLiteral("<!-- thoughts:v1:end review:%1:answer:%2 -->\n").arg(cardId).arg(segment);
+        copied = endOffset;
+    }
+    marked += text.mid(copied);
+    auto plan = readReviewSourceAnchor(path, marked.toUtf8(), cardId);
+    if (!plan.error.isEmpty()) return fail(plan.error);
+    if (plan.anchor.value(QStringLiteral("segments")).toArray().size() != ranges.size())
+        return fail(QStringLiteral("The source line range is invalid."));
+    plan.original = source; plan.replacement = marked.toUtf8();
+    return plan;
+}
+ReviewAnchorPlan markReviewSourceRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
+                                        const QString &cardId, int *failedRange) {
+    if (isMarkdownPath(path)) return markMarkdownRanges(path, source, ranges, cardId, failedRange);
+    if (!path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) {
+        if (failedRange) *failedRange = -1;
+        ReviewAnchorPlan invalid;
+        invalid.error = QStringLiteral("Choose a LaTeX or Markdown source file.");
+        return invalid;
+    }
+    return markTexRanges(path, source, ranges, cardId, failedRange);
+}
+ReviewAnchorPlan markReviewSourceSelection(const QString &path, const QByteArray &source, int first, int end, const QString &cardId) {
+    ReviewAnchorPlan invalid;
+    const QString error = sourceSelectionError(path, source, first, end, cardId);
+    if (!error.isEmpty()) { invalid.error = error; return invalid; }
+    if (path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) {
+        QList<int> selected;
+        for (int line = first; line < end; ++line) selected.append(line);
+        return markReviewSourceLines(path, source, selected, cardId);
+    }
+    return markMarkdownRanges(path, source, {{first, end - 1}}, cardId, nullptr);
+}
+QJsonObject reviewPdfComponentOrigin(const QString &bundleRoot, const QString &pdfPath,
+                                     const QString &pdfSha256, int page) {
+    if (page < 1 || digest(read(pdfPath)) != pdfSha256) return {};
+    const auto pointer = QJsonDocument::fromJson(read(QDir(bundleRoot).filePath(
+        QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())))).object();
+    const auto artifactSha = pointer.value(QStringLiteral("artifact_sha256")).toString();
+    if (artifactSha.size() != 64) return {};
+    const auto artifact = read(QDir(bundleRoot).filePath(QStringLiteral("objects/%1").arg(artifactSha)));
+    if (digest(artifact) != artifactSha) return {};
+    const auto manifest = QJsonDocument::fromJson(artifact).object();
+    const auto pdf = manifest.value(QStringLiteral("pdf")).toObject();
+    if (pdf.value(QStringLiteral("pdf_sha256")).toString() != pdfSha256) return {};
+    QJsonObject found;
+    for (const auto &value : pdf.value(QStringLiteral("segments")).toArray()) {
+        const auto segment = value.toObject();
+        const int first = segment.value(QStringLiteral("start_page")).toInt();
+        const int count = segment.value(QStringLiteral("page_count")).toInt();
+        if (first < 1 || count < 1 || page < first || page >= first + count) continue;
+        if (!found.isEmpty() || segment.value(QStringLiteral("source_available")).toBool(true)) return {};
+        const QString id = segment.value(QStringLiteral("source_id")).toString();
+        const QString componentSha = segment.value(QStringLiteral("fingerprint")).toString();
+        if (id.isEmpty() || componentSha.size() != 64) return {};
+        found = {{QStringLiteral("source_id"), id},
+                 {QStringLiteral("component_pdf_sha256"), componentSha},
+                 {QStringLiteral("local_page"), page - first + 1}};
+    }
+    return found;
+}
+ReviewAnchorPlan planReviewSourceAnchor(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
+                                      const QString &pdfSha256, int pageNumber, const QRectF &region, const QString &cardId) {
+    return planReviewSourceAnchors(docsRoot, bundleRoot, pdfPath, pdfSha256, {{pageNumber, region, false}}, cardId);
+}
+
+namespace {
+// Floats are typeset away from their source position and hold content (drawings, generated
+// tables) that maps to no authored line, so an area around one stands for all of it.
+struct FloatEnvironment { int begin = 0, end = 0; };
+QList<FloatEnvironment> texFloatEnvironments(const QByteArray &source) {
+    static const QSet<QString> floats{QStringLiteral("table"), QStringLiteral("table*"), QStringLiteral("figure"), QStringLiteral("figure*"),
+        QStringLiteral("algorithm"), QStringLiteral("wrapfigure"), QStringLiteral("wraptable"), QStringLiteral("sidewaystable"),
+        QStringLiteral("sidewaysfigure")};
+    static const QRegularExpression environment(QStringLiteral(R"(\\(begin|end)\s*\{([^}]+)\})"));
+    QList<FloatEnvironment> found;
+    QList<QPair<QString, int>> open;
+    const auto lines = source.split('\n');
+    for (int index = 0; index < lines.size(); ++index) {
+        QByteArray active;
+        const auto &line = lines[index];
+        for (int j = 0; j < line.size(); ++j) {
+            if (line[j] == '%') break;
+            active += line[j];
+            if (line[j] == '\\' && j + 1 < line.size()) active += line[++j];
+        }
+        auto matches = environment.globalMatch(QString::fromUtf8(active));
+        while (matches.hasNext()) {
+            const auto match = matches.next();
+            const QString name = match.captured(2).trimmed();
+            if (match.captured(1) == QLatin1String("begin")) {
+                open.append({name, index + 1});
+            } else {
+                for (int i = open.size() - 1; i >= 0; --i) {
+                    if (open[i].first != name) continue;
+                    if (floats.contains(name)) found.append({open[i].second, index + 1});
+                    open.erase(open.begin() + i, open.end());
+                    break;
+                }
+            }
+        }
+    }
+    return found;
+}
+// The smallest float environment around every line, or {0, 0}.
+FloatEnvironment enclosingFloat(const QList<FloatEnvironment> &floats, const QList<int> &lines) {
+    FloatEnvironment best;
+    if (lines.isEmpty()) return best;
+    const auto [low, high] = std::minmax_element(lines.cbegin(), lines.cend());
+    for (const auto &candidate : floats) {
+        if (candidate.begin <= *low && *high <= candidate.end && (!best.begin || candidate.end - candidate.begin < best.end - best.begin))
+            best = candidate;
+    }
+    return best;
+}
+bool ignorableSourceLine(const QByteArray &line, bool tex) {
+    const auto trimmed = line.trimmed();
+    return trimmed.isEmpty() || (tex && trimmed.startsWith('%'));
+}
+
+// Placing an area by its text (locateReviewTextInSource). Letters and digits a match needs,
+// so a few words cannot match by chance (the phone's rule).
+constexpr int minTextMatchLetters = 24;
+// Prose pieces with fewer letters are not looked up alone, only allowed for between the others.
+constexpr int minPieceLetters = 8;
+// Source letters outside math that the PDF text does not explain: between two matched pieces,
+// and on the passage's first line before it and last line after it.
+constexpr int gapSlackLetters = 12;
+constexpr int edgeSlackLetters = 3;
+
+// The rendered letters and digits of a TeX or Markdown source, NFKD-decomposed and case-folded:
+// command names, comments, card markers and the arguments of commands that print nothing
+// (\label, \cite, link targets, ...) are left out. Math is kept but flagged, because its PDF
+// text (Xi,Yi∈{0,1} for \(X_i, Y_i \in \{0,1\}\)) has the same letters in an unknown order.
+struct SourceLetters {
+    QString text;
+    QString letters;
+    QList<int> line, offset;
+    QList<bool> math;
+    QList<int> prose, all; // prefix counts of letters (not digits): outside math, and anywhere
+    QList<QPair<int, int>> displays; // line spans of display math
+    QList<int> lineStarts;           // offset of each line
+    int lineOf(int offset) const { return int(std::upper_bound(lineStarts.cbegin(), lineStarts.cend(), offset) - lineStarts.cbegin()); }
+    int indexOfOffset(int at) const { return int(std::lower_bound(offset.cbegin(), offset.cend(), at) - offset.cbegin()); }
+    int indexOfLine(int number) const { return int(std::lower_bound(line.cbegin(), line.cend(), number) - line.cbegin()); }
+    int proseBetween(int from, int to) const { return from < to ? prose[to] - prose[from] : 0; }
+    int lettersBetween(int from, int to) const { return from < to ? all[to] - all[from] : 0; }
+    bool wordStart(int index) const { return offset[index] == 0 || !text[offset[index] - 1].isLetterOrNumber(); }
+    bool wordEnd(int index) const { return offset[index] + 1 >= text.size() || !text[offset[index] + 1].isLetterOrNumber(); }
+    // Every boundary-respecting start of @p wanted (at most @p cap).
+    QList<int> find(const QString &wanted, int cap = 4096) const {
+        QList<int> found;
+        for (int at = letters.indexOf(wanted); at >= 0 && found.size() < cap; at = letters.indexOf(wanted, at + 1))
+            if (wordStart(at) && wordEnd(at + wanted.size() - 1)) found.append(at);
+        return found;
+    }
+};
+QString foldedLetters(QStringView text) {
+    QString folded;
+    for (const QChar c : text) {
+        if (c.unicode() < 128) { if (c.isLetterOrNumber()) folded += c.toCaseFolded(); continue; }
+        // The modifier apostrophes (ʻ ʼ ʽ, which PDF text may carry for ') count as letters in
+        // Unicode, but not here.
+        if (c.unicode() >= 0x02BB && c.unicode() <= 0x02BD) continue;
+        for (const QChar d : QString(c).normalized(QString::NormalizationForm_KD))
+            if (d.isLetterOrNumber()) folded += d.toCaseFolded();
+    }
+    return folded;
+}
+SourceLetters sourceLetters(const QString &path, const QString &text) {
+    static const QSet<QString> mathEnvironments{QStringLiteral("equation"), QStringLiteral("equation*"), QStringLiteral("align"),
+        QStringLiteral("align*"), QStringLiteral("gather"), QStringLiteral("gather*"), QStringLiteral("multline"), QStringLiteral("multline*"),
+        QStringLiteral("eqnarray"), QStringLiteral("eqnarray*"), QStringLiteral("flalign"), QStringLiteral("flalign*"),
+        QStringLiteral("alignat"), QStringLiteral("alignat*"), QStringLiteral("displaymath"), QStringLiteral("math")};
+    // Commands whose first n arguments print nothing.
+    static const QHash<QString, int> silent{{QStringLiteral("label"), 1}, {QStringLiteral("ref"), 1}, {QStringLiteral("eqref"), 1},
+        {QStringLiteral("cref"), 1}, {QStringLiteral("Cref"), 1}, {QStringLiteral("autoref"), 1}, {QStringLiteral("pageref"), 1},
+        {QStringLiteral("cite"), 1}, {QStringLiteral("citep"), 1}, {QStringLiteral("citet"), 1}, {QStringLiteral("citealp"), 1},
+        {QStringLiteral("nocite"), 1}, {QStringLiteral("SourceLabel"), 1}, {QStringLiteral("includegraphics"), 1},
+        {QStringLiteral("input"), 1}, {QStringLiteral("include"), 1}, {QStringLiteral("href"), 1}, {QStringLiteral("vspace"), 1},
+        {QStringLiteral("hspace"), 1}, {QStringLiteral("setlength"), 2}, {QStringLiteral("usepackage"), 1},
+        {QStringLiteral("documentclass"), 1}, {QStringLiteral("bibliography"), 1}, {QStringLiteral("bibliographystyle"), 1},
+        {QStringLiteral("PdfLink"), 2}, {QStringLiteral("CrossPdfLink"), 2}, {QStringLiteral("SourceLink"), 2},
+        {QStringLiteral("CrossSourceLink"), 2}, {QStringLiteral("ReviewCardMaskStart"), 2}, {QStringLiteral("ReviewCardMaskEnd"), 2},
+        // Retired on 2026-10-26, but older notes still use them.
+        {QStringLiteral("TexLink"), 2}, {QStringLiteral("CrossTexLink"), 2}};
+    const bool tex = path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive);
+    SourceLetters s;
+    s.text = text;
+    s.lineStarts.append(0);
+    for (int i = 0; i < text.size(); ++i) if (text[i] == QLatin1Char('\n')) s.lineStarts.append(i + 1);
+    const int n = text.size();
+    bool inlineMath = false;
+    int displayStart = 0;
+    QString displayKind;
+    const auto openDisplay = [&](int at, const QString &kind) { if (!displayStart) { displayStart = s.lineOf(at); displayKind = kind; } };
+    const auto closeDisplay = [&](int at, const QString &kind) {
+        if (displayStart && displayKind == kind) { s.displays.append({displayStart, s.lineOf(at)}); displayStart = 0; }
+    };
+    const auto skipBlanks = [&](int at) { while (at < n && (text[at] == QLatin1Char(' ') || text[at] == QLatin1Char('\t'))) ++at; return at; };
+    const auto skipGroup = [&](int at, QChar open, QChar close) {
+        for (int depth = 0; at < n; ++at) {
+            if (text[at] == QLatin1Char('\\')) { ++at; continue; }
+            if (text[at] == open) ++depth;
+            else if (text[at] == close && --depth == 0) return at + 1;
+        }
+        return n;
+    };
+    for (int i = 0; i < n;) {
+        const QChar c = text[i];
+        if (tex && c == QLatin1Char('%')) { while (i < n && text[i] != QLatin1Char('\n')) ++i; continue; }
+        if (!tex && QStringView(text).mid(i, 4) == QLatin1String("<!--")) {
+            const int end = text.indexOf(QLatin1String("-->"), i + 4);
+            i = end < 0 ? n : end + 3;
+            continue;
+        }
+        if (c == QLatin1Char('\\') && i + 1 < n) {
+            const QChar next = text[i + 1];
+            if ((next.unicode() < 128 && next.isLetter()) || next == QLatin1Char('@')) {
+                int j = i + 1;
+                while (j < n && ((text[j].unicode() < 128 && text[j].isLetter()) || text[j] == QLatin1Char('@'))) ++j;
+                const QString name = text.mid(i + 1, j - i - 1);
+                if (j < n && text[j] == QLatin1Char('*')) ++j;
+                i = j;
+                if (name == QLatin1String("begin") || name == QLatin1String("end")) {
+                    const int open = skipBlanks(i);
+                    const int close = open < n && text[open] == QLatin1Char('{') ? text.indexOf(QLatin1Char('}'), open) : -1;
+                    if (close < 0) continue;
+                    const QString environment = text.mid(open + 1, close - open - 1).trimmed();
+                    if (mathEnvironments.contains(environment)) {
+                        if (name == QLatin1String("begin")) openDisplay(i, environment);
+                        else closeDisplay(i, environment);
+                    }
+                    i = close + 1;
+                } else if (const int count = silent.value(name)) {
+                    for (int argument = 0; argument < count; ++argument) {
+                        int at = skipBlanks(i);
+                        while (at < n && text[at] == QLatin1Char('[')) at = skipBlanks(skipGroup(at, QLatin1Char('['), QLatin1Char(']')));
+                        if (at >= n || text[at] != QLatin1Char('{')) break;
+                        i = skipGroup(at, QLatin1Char('{'), QLatin1Char('}'));
+                    }
+                }
+                continue;
+            }
+            if (next == QLatin1Char('(')) inlineMath = true;
+            else if (next == QLatin1Char(')')) inlineMath = false;
+            else if (next == QLatin1Char('[')) openDisplay(i, QStringLiteral("\\["));
+            else if (next == QLatin1Char(']')) closeDisplay(i, QStringLiteral("\\["));
+            i += 2;
+            continue;
+        }
+        if (c == QLatin1Char('$')) {
+            if (i + 1 < n && text[i + 1] == QLatin1Char('$')) {
+                if (displayStart) closeDisplay(i, QStringLiteral("$$")); else openDisplay(i, QStringLiteral("$$"));
+                i += 2;
+            } else {
+                inlineMath = !inlineMath;
+                ++i;
+            }
+            continue;
+        }
+        const QString folded = foldedLetters(QStringView(text).mid(i, 1));
+        for (const QChar letter : folded) {
+            s.letters += letter;
+            s.line.append(s.lineOf(i));
+            s.offset.append(i);
+            s.math.append(inlineMath || displayStart);
+        }
+        ++i;
+    }
+    s.prose.append(0);
+    s.all.append(0);
+    for (int i = 0; i < s.letters.size(); ++i) {
+        s.prose.append(s.prose.last() + (!s.math[i] && s.letters[i].isLetter()));
+        s.all.append(s.all.last() + s.letters[i].isLetter());
+    }
+    return s;
+}
+
+// One word of the area's PDF text. Prose is Latin letters with inner hyphens or apostrophes;
+// anything else but punctuation (Xi,Yi∈{0,1}, =, p=0.03, θ) is treated as math.
+struct PdfWord {
+    QString letters; // letters and digits, folded like SourceLetters
+    enum Kind { Neutral, Prose, Math } kind = Neutral;
+    bool sentenceEnd = false;
+    int latinLetters = 0;
+};
+PdfWord pdfWord(const QString &word) {
+    PdfWord result;
+    result.letters = foldedLetters(word);
+    const QString decomposed = word.normalized(QString::NormalizationForm_KD);
+    int first = 0, last = decomposed.size();
+    while (first < last && decomposed[first].isPunct()) ++first;
+    while (last > first && (decomposed[last - 1].isPunct() || decomposed[last - 1].category() == QChar::Mark_NonSpacing)) {
+        if (QStringLiteral(".!?:;").contains(decomposed[last - 1])) result.sentenceEnd = true;
+        --last;
+    }
+    const QStringView core = QStringView(decomposed).mid(first, last - first);
+    if (core.isEmpty()) return result;
+    bool latin = true;
+    for (const QChar c : core) {
+        if (c.isLetter() && c.script() == QChar::Script_Latin) ++result.latinLetters;
+        else if (c.category() != QChar::Mark_NonSpacing && c != QLatin1Char('-') && c != QLatin1Char('\'') && c != QChar(0x2019) && c != QChar(0x02BC)) latin = false;
+    }
+    // Punctuation alone (a dash) joins prose; a symbol (=, \u2208, \u2211) is math.
+    result.kind = latin && result.latinLetters >= 2 ? PdfWord::Prose : PdfWord::Math;
+    return result;
+}
+}
+
+ReviewTextPlacement locateReviewTextInSource(const QString &path, const QByteArray &source, const QStringList &words) {
+    ReviewTextPlacement placement;
+    QList<PdfWord> pdf;
+    QString wanted;
+    for (const QString &word : words) {
+        for (const QString &part : word.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts)) {
+            pdf.append(pdfWord(part));
+            wanted += pdf.last().letters;
+        }
+    }
+    if (wanted.size() < minTextMatchLetters) return placement;
+    const QString text = QString::fromUtf8(source);
+    const SourceLetters s = sourceLetters(path, text);
+    const bool tex = path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive);
+    // A passage [from, to) of s is found once only if every match gives the same lines.
+    struct Found { int from = 0, to = 0, before = 0, after = 0, leading = 0, trailing = 0; };
+    QList<Found> found;
+    const auto distinctLines = [&s](const QList<Found> &matches) {
+        QSet<QPair<int, int>> lines;
+        for (const auto &match : matches) lines.insert({s.line[match.from], s.line[match.to - 1]});
+        return lines.size();
+    };
+
+    // 1. The exact text, apart from whitespace and TeX comments.
+    {
+        QString searchable;
+        QList<int> offsets;
+        for (int i = 0; i < text.size(); ++i) {
+            if (tex && text[i] == QLatin1Char('%') && (i == 0 || text[i - 1] != QLatin1Char('\\'))) {
+                while (i + 1 < text.size() && text[i + 1] != QLatin1Char('\n')) ++i;
+                continue;
+            }
+            if (text[i].isSpace()) {
+                if (!searchable.isEmpty() && searchable.back() != QLatin1Char(' ')) { searchable += QLatin1Char(' '); offsets.append(i); }
+                continue;
+            }
+            searchable += text[i];
+            offsets.append(i);
+        }
+        const QString selected = words.join(QLatin1Char(' ')).simplified();
+        for (int at = selected.isEmpty() ? -1 : searchable.indexOf(selected); at >= 0; at = searchable.indexOf(selected, at + 1)) {
+            const int end = at + selected.size();
+            if ((at > 0 && searchable[at - 1].isLetterOrNumber()) || (end < searchable.size() && searchable[end].isLetterOrNumber())) continue;
+            const int from = s.indexOfOffset(offsets[at]), to = s.indexOfOffset(offsets[end - 1] + 1);
+            if (from < to) found.append(Found{from, to});
+        }
+    }
+    // 2. Its letters and digits only: PDF text hyphenates words at line ends, joins source lines
+    //    and drops TeX markup.
+    if (found.isEmpty()) {
+        for (const int at : s.find(wanted)) found.append(Found{at, at + int(wanted.size())});
+    }
+    // 3. Its prose pieces one by one, in order, in one region of the source: the math between
+    //    them may be typeset in any order. Every piece has to be found; shorter prose and
+    //    single letters only allow for source prose between the pieces.
+    if (found.isEmpty()) {
+        struct Piece { QString letters; int firstWord = 0, lastWord = 0, before = 0; };
+        QList<Piece> pieces;
+        Piece current;
+        int pending = 0, currentLatin = 0;
+        const auto close = [&] {
+            if (current.letters.size() >= minPieceLetters) { current.before = pending; pieces.append(current); pending = 0; }
+            else pending += currentLatin;
+            current = {};
+            currentLatin = 0;
+        };
+        for (int w = 0; w < pdf.size(); ++w) {
+            const auto &word = pdf[w];
+            if (word.kind == PdfWord::Prose) {
+                if (current.letters.isEmpty()) current.firstWord = w;
+                current.letters += word.letters;
+                current.lastWord = w;
+                currentLatin += word.latinLetters;
+                if (word.sentenceEnd) close();
+            } else if (word.kind == PdfWord::Math) {
+                close();
+                if (word.latinLetters == 1 && word.letters.size() == 1) pending += 1;
+            }
+        }
+        close();
+        int matched = 0;
+        for (const auto &piece : std::as_const(pieces)) matched += piece.letters.size();
+        if (pieces.isEmpty() || matched < minTextMatchLetters) return placement;
+        const auto lettersOf = [&pdf](int from, int to) {
+            int count = 0;
+            for (int w = from; w < to; ++w) count += int(std::count_if(pdf[w].letters.cbegin(), pdf[w].letters.cend(), [](QChar c) { return c.isLetter(); }));
+            return count;
+        };
+        const int leading = lettersOf(0, pieces.first().firstWord), trailing = lettersOf(pieces.last().lastWord + 1, pdf.size());
+        // Text drawn inside a picture (a figure's labels and axes) is no source text, and may even
+        // repeat words of the caption. Where the source has a picture between two pieces, the
+        // chain may therefore jump over the pieces between them; the first and the last piece
+        // are always matched, and nowhere else may a piece be left out.
+        const auto pictureBetween = [&s](int from, int to) {
+            if (from <= 0 || to <= from || to >= s.offset.size()) return false;
+            const int begin = s.offset[from - 1], end = s.offset[to];
+            return QStringView(s.text).mid(begin, end - begin).contains(u"\\includegraphics");
+        };
+        // Each node is an occurrence of a piece, with the starts of the chains reaching it.
+        struct Node { int at = 0; QList<int> origins; };
+        QList<QList<Node>> occurrences(pieces.size());
+        for (int j = 0; j < pieces.size(); ++j)
+            for (const int at : s.find(pieces[j].letters)) occurrences[j].append(Node{at, {}});
+        if (occurrences.first().isEmpty() || occurrences.last().isEmpty()) return placement;
+        for (auto &node : occurrences.first()) node.origins.append(node.at);
+        constexpr int maximumJump = 40; // pieces drawn inside one picture
+        for (int j = 1; j < pieces.size(); ++j) {
+            for (auto &node : occurrences[j]) {
+                int skippedBefore = 0;
+                for (int i = j - 1; i >= 0 && i >= j - 1 - maximumJump; --i) {
+                    const bool across = i < j - 1;
+                    if (across) skippedBefore += pieces[i + 1].before;
+                    const int length = pieces[i].letters.size();
+                    const int allowance = pieces[j].before + skippedBefore + gapSlackLetters;
+                    for (const auto &from : std::as_const(occurrences[i])) {
+                        if (from.origins.isEmpty()) continue;
+                        const int fromEnd = from.at + length;
+                        if (node.at < fromEnd || s.proseBetween(fromEnd, node.at) > allowance) continue;
+                        if (across && !pictureBetween(fromEnd, node.at)) continue;
+                        for (const int origin : from.origins)
+                            if (!node.origins.contains(origin) && node.origins.size() < 4) node.origins.append(origin);
+                    }
+                }
+            }
+        }
+        const QList<Node> &previous = occurrences.last();
+        const int lastLength = pieces.last().letters.size();
+        for (const auto &node : std::as_const(previous))
+            for (const int origin : node.origins)
+                if (found.size() < 8) found.append(Found{origin, node.at + lastLength, pieces.first().before, pending, leading, trailing});
+    }
+    if (found.isEmpty()) return placement;
+    if (distinctLines(found) > 1) { placement.ambiguous = true; return placement; }
+    const Found match = found.first();
+    int first = s.line[match.from], last = s.line[match.to - 1];
+    // The area must hold whole source lines: prose on them outside the match is not in it.
+    const int lineBegin = s.indexOfLine(first), lineEnd = s.indexOfLine(last + 1);
+    if (s.proseBetween(lineBegin, match.from) > match.before + edgeSlackLetters
+        || s.proseBetween(match.to, lineEnd) > match.after + edgeSlackLetters) return placement;
+    // Never cut display math. Math the area starts or ends with that the matched lines do not
+    // hold is the display next to them.
+    const auto lines = text.split(QLatin1Char('\n'));
+    const auto blank = [&](int number) {
+        const QString trimmed = lines.value(number - 1).trimmed();
+        return trimmed.isEmpty() || (tex && trimmed.startsWith(QLatin1Char('%')));
+    };
+    for (const auto &display : s.displays) {
+        if (display.first < first && first <= display.second) first = display.first;
+        if (display.first <= last && last < display.second) last = display.second;
+    }
+    int unexplained = match.leading - s.lettersBetween(lineBegin, match.from);
+    while (unexplained >= 2) {
+        int above = first - 1;
+        while (above > 0 && blank(above)) --above;
+        const auto display = std::find_if(s.displays.cbegin(), s.displays.cend(), [above](const auto &d) { return d.second == above; });
+        if (above < 1 || display == s.displays.cend()) break;
+        unexplained -= s.lettersBetween(s.indexOfLine(display->first), s.indexOfLine(display->second + 1));
+        first = display->first;
+    }
+    unexplained = match.trailing - s.lettersBetween(match.to, lineEnd);
+    while (unexplained >= 2) {
+        int below = last + 1;
+        while (below <= lines.size() && blank(below)) ++below;
+        const auto display = std::find_if(s.displays.cbegin(), s.displays.cend(), [below](const auto &d) { return d.first == below; });
+        if (below > lines.size() || display == s.displays.cend()) break;
+        unexplained -= s.lettersBetween(s.indexOfLine(display->first), s.indexOfLine(display->second + 1));
+        last = display->second;
+    }
+    placement.first = first;
+    placement.last = last;
+    return placement;
+}
+
+ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
+                                         const QString &pdfSha256, const QList<ReviewArea> &areas, const QString &cardId,
+                                         bool replaceCardMarkers) {
+    ReviewAnchorPlan plan;
+    const auto fail = [&plan](const QString &error, int area = -1) { plan.error = error; plan.failedArea = area; return plan; };
+    const auto bytes = read(pdfPath);
+    plan.invalidPdf = true;
+    if (areas.isEmpty()) return fail(QStringLiteral("Draw at least one answer area."));
+    if (bytes.isEmpty() || digest(bytes) != pdfSha256) return fail(QStringLiteral("The PDF changed before source anchoring."));
+    auto pdf = document(bytes);
+    if (!pdf) return fail(QStringLiteral("The review page is unavailable."));
+    QHash<int, std::shared_ptr<Poppler::Page>> pages;
+    QHash<int, std::shared_ptr<std::vector<std::unique_ptr<Poppler::TextBox>>>> pageBoxes;
+    const auto pageAt = [&](int number) -> Poppler::Page * {
+        if (number < 1 || number > pdf->numPages()) return nullptr;
+        if (!pages.contains(number)) pages.insert(number, std::shared_ptr<Poppler::Page>(pdf->page(number - 1).release()));
+        return pages.value(number).get();
+    };
+    const auto boxesAt = [&](int number) -> const std::vector<std::unique_ptr<Poppler::TextBox>> & {
+        if (!pageBoxes.contains(number))
+            pageBoxes.insert(number, std::make_shared<std::vector<std::unique_ptr<Poppler::TextBox>>>(pageAt(number)->textList()));
+        return *pageBoxes.value(number);
+    };
+    QList<QRectF> selections;
+    QStringList answers;
+    for (int i = 0; i < areas.size(); ++i) {
+        auto *page = pageAt(areas[i].page);
+        const QRectF rect = areas[i].rect.normalized();
+        if (!page || rect.isEmpty() || rect.left() < -1e-9 || rect.top() < -1e-9 || rect.right() > 1 + 1e-9 || rect.bottom() > 1 + 1e-9)
+            return fail(QStringLiteral("The review page is unavailable."), i);
+        const auto size = page->pageSizeF();
+        selections.append(QRectF(rect.x()*size.width(), rect.y()*size.height(), rect.width()*size.width(), rect.height()*size.height()));
+        const QString text = page->text(selections.last()).simplified();
+        if (!text.isEmpty()) answers.append(text);
+    }
+    plan.invalidPdf = false;
+    const QString answer = answers.join(QLatin1Char(' '));
+    if (!answer.isEmpty()) plan.answerAnchor = {{QStringLiteral("version"), 1}, {QStringLiteral("normalized_text"), answer}, {QStringLiteral("text_sha256"), digest(answer.toUtf8())}};
+    const auto region = [&areas](int i) {
+        const QRectF r = areas[i].rect.normalized();
+        return QJsonObject{{QStringLiteral("page"), areas[i].page}, {QStringLiteral("rect"), QJsonArray{r.left(), r.top(), r.right(), r.bottom()}}};
+    };
+    const auto finishWithoutSource = [&] {
+        plan.withoutSource = true;
+        plan.componentOrigin = reviewPdfComponentOrigin(bundleRoot, pdfPath, pdfSha256, areas.first().page);
+        for (int i = 0; i < areas.size(); ++i) plan.regions.append(region(i));
+        if (auto *first = pageAt(areas.first().page)) plan.pageVisualSha256 = fingerprint(*first);
+        return plan;
+    };
+    const auto registered = DocumentIdentityStore(docsRoot).forFile(pdfPath, pdfSha256);
+    if (registered.value(QStringLiteral("kind")).toString() == QLatin1String("unlinked")) return finishWithoutSource();
+    const auto pointer = QJsonDocument::fromJson(read(QDir(bundleRoot).filePath(QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())))).object();
+    const auto artifactSha = pointer.value(QStringLiteral("artifact_sha256")).toString();
+    plan.sourceMapUnavailable = true;
+    if (!QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(artifactSha).hasMatch()) return fail(QStringLiteral("Sync this document to install its verified source information."));
+    const auto artifact = read(QDir(bundleRoot).filePath(QStringLiteral("objects/%1").arg(artifactSha)));
+    const auto manifest = QJsonDocument::fromJson(artifact).object();
+    if (digest(artifact) != artifactSha || manifest.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("pdf_sha256")).toString() != pdfSha256)
+        return fail(QStringLiteral("The source information belongs to a different PDF."));
+    if (manifest.value(QStringLiteral("schema_version")).toInt() != 1
+        || manifest.value(QStringLiteral("kind")).toString() != QLatin1String("thoughts-document-source-artifact"))
+        return fail(QStringLiteral("The source information is invalid."));
+    plan.sourceMapUnavailable = false;
+    const auto pdfSegments = manifest.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("segments")).toArray();
+    QList<bool> withoutSource;
+    for (const auto &area : areas) {
+        bool without = false;
+        for (const auto &value : pdfSegments) {
+            const auto segment = value.toObject();
+            const int first = segment.value(QStringLiteral("start_page")).toInt();
+            if (area.page >= first && area.page < first + segment.value(QStringLiteral("page_count")).toInt()
+                && segment.value(QStringLiteral("source_available")).isBool() && !segment.value(QStringLiteral("source_available")).toBool())
+                without = true;
+        }
+        withoutSource.append(without);
+    }
+    if (std::all_of(withoutSource.cbegin(), withoutSource.cend(), [](bool without) { return without; })) return finishWithoutSource();
+    if (manifest.value(QStringLiteral("sources")).isArray() && manifest.value(QStringLiteral("sources")).toArray().isEmpty()
+        && manifest.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("project")).toString().isEmpty())
+        return finishWithoutSource();
+    for (int i = 0; i < areas.size(); ++i) {
+        if (withoutSource[i]) return fail(QStringLiteral("This page has no editable source, unlike the card's other areas. Make a separate card for it."), i);
+    }
+    Okular::DocsCommentSynchronizer::Options options; options.docsRoot = docsRoot; options.sourceBundleRoot = bundleRoot; options.allowLegacySourceResolution = false; options.cacheSourceResolution = true;
+    Okular::DocsCommentSynchronizer resolver(options);
+    const QString stem = QFileInfo(pdfPath).completeBaseName();
+    // Poppler text boxes already use PDF points; only saved regions are normalized.
+    const auto resolveBox = [&](int pageNumber, const QRectF &selection, const std::unique_ptr<Poppler::TextBox> &box) {
+        const auto center = box->boundingBox().center();
+        auto mapped = resolver.resolveSource({stem, pageNumber, center.x(), center.y(), box->text(), pdfPath, true});
+        if (!mapped.success && mapped.problem == Okular::DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation) {
+            // A single word often cannot disambiguate a shifted or structural
+            // SyncTeX line. Supply its visual line as context, without widening
+            // the answer region or relaxing the source resolver's checks.
+            QStringList context;
+            for (const auto &neighbor : boxesAt(pageNumber)) {
+                const auto bounds = neighbor->boundingBox();
+                if (bounds.top() <= center.y() && bounds.bottom() >= center.y()
+                    && selection.intersects(bounds)) context.append(neighbor->text());
+            }
+            if (context.size() > 1) {
+                const auto contextual = resolver.resolveSource({stem, pageNumber, center.x(), center.y(), context.join(QLatin1Char(' ')), pdfPath, true});
+                const auto lines = QString::fromUtf8(read(contextual.sourcePath)).split(QLatin1Char('\n'));
+                if (contextual.success && contextual.sourcePath == mapped.fallbackSourcePath
+                    && contextual.line > 0 && contextual.line <= lines.size()
+                    && lines[contextual.line - 1].contains(box->text(), Qt::CaseInsensitive)) mapped = contextual;
+            }
+        }
+        return mapped;
+    };
+    QHash<QString, QByteArray> sources;
+    const auto sourceAt = [&](const QString &path) -> const QByteArray & {
+        if (!sources.contains(path)) sources.insert(path, read(path));
+        return sources[path];
+    };
+    // The build's entry for a source: its digest and snapshot object.
+    const auto builtEntry = [&manifest](const QString &id) {
+        for (const auto &value : manifest.value(QStringLiteral("sources")).toArray()) {
+            const auto entry = value.toObject();
+            if (entry.value(QStringLiteral("path")).toString() == id)
+                return qMakePair(entry.value(QStringLiteral("sha256")).toString(), entry.value(QStringLiteral("object")).toString());
+        }
+        return qMakePair(QString(), QString());
+    };
+    // Whether the PDF was built from the source as it is now (apart from the card's own markers
+    // when they move). Otherwise its lines name the build's lines, not current ones.
+    QHash<QString, bool> builtFromCurrent;
+    const auto builtFrom = [&](const QString &path, const QString &id) {
+        if (builtFromCurrent.contains(path)) return builtFromCurrent.value(path);
+        const auto [expected, builtObject] = builtEntry(id);
+        const auto &source = sourceAt(path);
+        bool same = !expected.isEmpty() && digest(source) == expected;
+        if (!same && !expected.isEmpty() && replaceCardMarkers) {
+            const auto strip = stripReviewCardMarkers(id, source, cardId);
+            const auto built = QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(builtObject).hasMatch()
+                ? read(QDir(bundleRoot).filePath(QStringLiteral("objects/%1").arg(builtObject))) : QByteArray();
+            const auto builtStrip = !built.isEmpty() && digest(built) == expected ? stripReviewCardMarkers(id, built, cardId) : ReviewMarkerStrip{};
+            // Broken markers of the card are reported when they are removed, as before.
+            same = !strip.error.isEmpty() || (!built.isEmpty() && builtStrip.error.isEmpty() && builtStrip.text == strip.text);
+        }
+        builtFromCurrent.insert(path, same);
+        return same;
+    };
+    // The manifest's name of a source file the resolver found but could not place.
+    const auto sourceIdOf = [&](const QString &path) {
+        const QString wanted = QFileInfo(path).canonicalFilePath();
+        for (const auto &value : manifest.value(QStringLiteral("sources")).toArray()) {
+            const QString id = value.toObject().value(QStringLiteral("path")).toString();
+            if (!id.isEmpty() && !wanted.isEmpty() && QFileInfo(QDir(docsRoot).filePath(id)).canonicalFilePath() == wanted) return id;
+        }
+        return QString();
+    };
+    const QString staleFailure = replaceCardMarkers
+        ? QStringLiteral("The source changed since this PDF was built. Sync before placing the card.")
+        : QStringLiteral("The TeX changed since this PDF was built. Sync before creating the card.");
+    // byText: placed by its text in the current source, not by the build's lines.
+    struct AreaLines { QString path, id; QList<int> lines; int first = 0, last = 0; bool whole = false, byText = false; };
+    QList<AreaLines> mappedAreas;
+    for (int i = 0; i < areas.size(); ++i) {
+        const int pageNumber = areas[i].page;
+        const QRectF &selection = selections[i];
+        QString firstFailure, generatedError;
+        QMap<QString, QList<int>> mapped;
+        QHash<QString, QString> ids;
+        // The area's words in reading order, and the editable files the resolver found for them.
+        QStringList words;
+        QSet<QString> files;
+        for (const auto &box : boxesAt(pageNumber)) {
+            if (box->text().trimmed().isEmpty() || !selection.intersects(box->boundingBox())) continue;
+            if (!selection.adjusted(-0.5,-0.5,0.5,0.5).contains(box->boundingBox()))
+                return fail(QStringLiteral("Select complete words when creating a source-linked card."), i);
+            words.append(box->text());
+            const auto result = resolveBox(pageNumber, selection, box);
+            if (result.success) files.insert(result.sourcePath);
+            else if (result.problem == Okular::DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation
+                     && !result.fallbackSourcePath.isEmpty()) files.insert(result.fallbackSourcePath);
+            // Citation numbers, reference labels and footnote marks ("[3],", "(2)")
+            // are typeset from macros, so their text never occurs in the source.
+            // Skip such letterless words; the real words around them still have to
+            // map, and the marked passage spans every line between them.
+            const auto text = box->text();
+            if (!result.success && result.problem == Okular::DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation
+                && std::none_of(text.cbegin(), text.cend(), [](QChar c) { return c.isLetter(); })) {
+                if (generatedError.isEmpty()) generatedError = QStringLiteral("%1 (selected text: %2)").arg(result.failureReason, text);
+                if (!result.fallbackSourcePath.isEmpty() && plan.fallbackSource.isEmpty()) plan.fallbackSource = QDir(docsRoot).relativeFilePath(result.fallbackSourcePath);
+                continue;
+            }
+            if (!result.success) {
+                if (!result.fallbackSourcePath.isEmpty()) plan.fallbackSource = QDir(docsRoot).relativeFilePath(result.fallbackSourcePath);
+                if (firstFailure.isEmpty()) firstFailure = QStringLiteral("%1 (selected text: %2)").arg(result.failureReason, text);
+                continue;
+            }
+            plan.fallbackSource = result.sourceId;
+            mapped[result.sourcePath].append(result.line);
+            ids.insert(result.sourcePath, result.sourceId);
+        }
+        const QString mappingFailure = !firstFailure.isEmpty() ? firstFailure : !generatedError.isEmpty() ? generatedError
+            : QStringLiteral("The selected region has no verifiable source-linked text.");
+        // When the build's lines cannot place the area, its whole text placed once in the
+        // current source still can. Never a guess: a missing, short or repeated text keeps the
+        // line mapping's error.
+        const QString textFile = files.size() == 1 ? *files.cbegin() : QString();
+        const QString textId = textFile.isEmpty() ? QString() : ids.contains(textFile) ? ids.value(textFile) : sourceIdOf(textFile);
+        AreaLines lines;
+        const auto placeByText = [&] {
+            if (textId.isEmpty()) return false;
+            const auto found = locateReviewTextInSource(textId, sourceAt(textFile), words);
+            if (!found.first) return false;
+            lines = {textFile, textId, {}, found.first, found.last, false, true};
+            for (int line = found.first; line <= found.last; ++line) lines.lines.append(line);
+            if (!areas[i].textSelection && textId.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) {
+                const auto environment = enclosingFloat(texFloatEnvironments(sourceAt(textFile)), lines.lines);
+                if (environment.begin) { lines.first = environment.begin; lines.last = environment.end; lines.whole = true; }
+            }
+            return true;
+        };
+        // The area's lines from the build's line mapping, or the reason they cannot be used.
+        const auto placeByLines = [&]() -> QString {
+            if (mapped.isEmpty()) return mappingFailure;
+            // A rectangle around a float stands for the whole environment; words in it from
+            // generated or unmapped content are then part of the float, not a failure.
+            QString file;
+            FloatEnvironment around;
+            if (!areas[i].textSelection) {
+                int candidates = 0;
+                for (auto it = mapped.cbegin(); it != mapped.cend(); ++it) {
+                    if (!ids.value(it.key()).endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) continue;
+                    const auto environment = enclosingFloat(texFloatEnvironments(sourceAt(it.key())), it.value());
+                    if (!environment.begin) continue;
+                    ++candidates; file = it.key(); around = environment;
+                }
+                if (candidates != 1) { file.clear(); around = {}; }
+            }
+            if (!around.begin) {
+                if (mapped.size() > 1) return QStringLiteral("Select content from one TeX source file.");
+                if (!firstFailure.isEmpty()) return firstFailure;
+                file = mapped.firstKey();
+            }
+            lines = {file, ids.value(file), mapped.value(file)};
+            std::sort(lines.lines.begin(), lines.lines.end());
+            lines.lines.erase(std::unique(lines.lines.begin(), lines.lines.end()), lines.lines.end());
+            if (around.begin) {
+                lines.first = around.begin; lines.last = around.end; lines.whole = true;
+                return {};
+            }
+            lines.first = lines.lines.first(); lines.last = lines.lines.last();
+            const auto sourceLines = sourceAt(file).split('\n');
+            for (int line = lines.first; line <= lines.last; ++line) {
+                if (line < 1 || line > sourceLines.size()) return QStringLiteral("The source line range is invalid.");
+                if (!lines.lines.contains(line) && !ignorableSourceLine(sourceLines[line - 1], file.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)))
+                    return areas.size() > 1
+                        ? QStringLiteral("The area covers separate source passages. Draw one area for each passage.")
+                        : QStringLiteral("A card must contain one continuous source passage. Create separate cards for separated passages.");
+            }
+            return {};
+        };
+        if (!textId.isEmpty() && !builtFrom(textFile, textId)) {
+            // The source changed since the build (a proposal accepted without a rebuild): the
+            // build's lines name lines of another text, so only the text can place the area.
+            if (!placeByText()) return fail(mapped.isEmpty() || !firstFailure.isEmpty() ? mappingFailure : staleFailure, i);
+        } else if (const QString error = placeByLines(); !error.isEmpty() && !placeByText()) {
+            return fail(error, i);
+        }
+        if (i > 0 && lines.path != mappedAreas.first().path)
+            return fail(QStringLiteral("Its text is in %1, but the first area's is in %2. A card's areas must come from one source file.")
+                .arg(lines.id, mappedAreas.first().id), i);
+        mappedAreas.append(lines);
+    }
+    const QString sourcePath = mappedAreas.first().path, sourceId = mappedAreas.first().id;
+    // Every rendering of a marked line must be inside the card's areas: elsewhere on an area's
+    // page the passage would be cut, and on another page it would be shown during review.
+    // Areas placed by their text are not checked: the build's lines of other words are what
+    // could not place them, and their whole lines hold no text outside the area.
+    QHash<int, int> lineOwner;
+    for (int i = 0; i < mappedAreas.size(); ++i) {
+        if (mappedAreas[i].byText) continue;
+        for (const int line : std::as_const(mappedAreas[i].lines)) if (!lineOwner.contains(line)) lineOwner.insert(line, i);
+    }
+    QSet<int> areaPages;
+    for (const auto &area : areas) areaPages.insert(area.page);
+    for (const int number : std::as_const(areaPages)) {
+        if (lineOwner.isEmpty()) break;
+        for (const auto &box : boxesAt(number)) {
+            if (box->text().trimmed().isEmpty()) continue;
+            bool inside = false;
+            for (int i = 0; i < areas.size() && !inside; ++i)
+                inside = areas[i].page == number && selections[i].adjusted(-0.5,-0.5,0.5,0.5).contains(box->boundingBox());
+            if (inside) continue;
+            const auto center = box->boundingBox().center();
+            const auto mapped = resolver.resolveSource({stem, number, center.x(), center.y(), box->text(), pdfPath, true});
+            if (mapped.success && mapped.sourcePath == sourcePath && lineOwner.contains(mapped.line))
+                return fail(QStringLiteral("The selection covers only part of a source line. Select the complete passage."), lineOwner.value(mapped.line));
+        }
+    }
+    for (const auto &value : pdfSegments) {
+        const auto segment = value.toObject();
+        bool usesSource = false;
+        for (const auto &input : segment.value(QStringLiteral("inputs")).toArray()) usesSource = usesSource || input.toObject().value(QStringLiteral("source_file")).toString() == sourceId;
+        if (!usesSource || lineOwner.isEmpty()) continue;
+        const int first = segment.value(QStringLiteral("start_page")).toInt();
+        const int count = segment.value(QStringLiteral("page_count")).toInt();
+        for (int number = first; number < first + count; ++number) {
+            if (areaPages.contains(number) || number < 1 || number > pdf->numPages()) continue;
+            if (!pageAt(number)) return fail(QStringLiteral("An associated PDF page is unavailable."));
+            for (const auto &box : boxesAt(number)) {
+                if (box->text().trimmed().isEmpty()) continue;
+                const auto center = box->boundingBox().center();
+                const auto mapped = resolver.resolveSource({stem, number, center.x(), center.y(), box->text(), pdfPath, true});
+                if (mapped.success && mapped.sourcePath == sourcePath && lineOwner.contains(mapped.line))
+                    return fail(areas.size() > 1
+                        ? QStringLiteral("Its source text also appears on page %1. Add an area there too, or choose a passage that appears once.").arg(number)
+                        : QStringLiteral("The selected source also renders on another page. Select a passage with one complete occurrence."),
+                        lineOwner.value(mapped.line));
+            }
+        }
+    }
+    const auto source = read(sourcePath); QString expected, builtObject;
+    for (const auto &value : manifest.value(QStringLiteral("sources")).toArray()) {
+        const auto entry = value.toObject();
+        if (entry.value(QStringLiteral("path")).toString() != sourceId) continue;
+        expected = entry.value(QStringLiteral("sha256")).toString();
+        builtObject = entry.value(QStringLiteral("object")).toString();
+    }
+    QByteArray base = source;
+    QList<int> lineMap;
+    for (int i = 0; i < source.count('\n') + 1; ++i) lineMap.append(i + 1);
+    // Text placement read the source as it is now: then it must still be that, and the build
+    // may be older.
+    const bool byText = std::any_of(mappedAreas.cbegin(), mappedAreas.cend(), [](const AreaLines &area) { return area.byText; });
+    if (byText && source != sourceAt(sourcePath)) return fail(staleFailure);
+    const bool stale = byText && !builtFrom(sourcePath, sourceId);
+    if (replaceCardMarkers) {
+        // The card's own markers move: the source without them must be the build's source
+        // without them, whether or not the PDF was built after they were placed.
+        const auto strip = stripReviewCardMarkers(sourceId, source, cardId);
+        if (!strip.error.isEmpty()) return fail(strip.error);
+        if (!stale && expected.isEmpty()) return fail(QStringLiteral("The source changed since this PDF was built. Sync before placing the card."));
+        if (!stale && digest(source) != expected) {
+            const auto built = QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(builtObject).hasMatch()
+                ? read(QDir(bundleRoot).filePath(QStringLiteral("objects/%1").arg(builtObject))) : QByteArray();
+            const auto builtStrip = digest(built) == expected ? stripReviewCardMarkers(sourceId, built, cardId) : ReviewMarkerStrip{};
+            if (built.isEmpty() || digest(built) != expected || !builtStrip.error.isEmpty() || builtStrip.text != strip.text)
+                return fail(QStringLiteral("The source changed since this PDF was built. Sync before placing the card."));
+        }
+        base = strip.text;
+        lineMap = strip.lineMap;
+    } else if (!stale && (expected.isEmpty() || digest(source) != expected)) {
+        return fail(QStringLiteral("The TeX changed since this PDF was built. Sync before creating the card."));
+    }
+    const auto baseLine = [&lineMap](int line) { return line >= 1 && line <= lineMap.size() ? lineMap[line - 1] : 0; };
+    // One segment per passage: areas whose lines overlap mark one passage together.
+    QList<int> order(mappedAreas.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&mappedAreas](int a, int b) { return mappedAreas[a].first < mappedAreas[b].first; });
+    struct Passage { int first = 0, last = 0; QList<int> areas; };
+    QList<Passage> passages;
+    for (const int i : std::as_const(order)) {
+        if (!passages.isEmpty() && mappedAreas[i].first <= passages.last().last) {
+            passages.last().last = std::max(passages.last().last, mappedAreas[i].last);
+            passages.last().areas.append(i);
+        } else {
+            passages.append({mappedAreas[i].first, mappedAreas[i].last, {i}});
+        }
+    }
+    QList<QPair<int, int>> ranges;
+    for (const auto &passage : std::as_const(passages)) {
+        const int first = baseLine(passage.first), last = baseLine(passage.last);
+        if (!first || !last) return fail(QStringLiteral("The source line range is invalid."), passage.areas.first());
+        ranges.append({first, last});
+    }
+    int failedRange = -1;
+    const auto answerAnchor = plan.answerAnchor;
+    const auto fallbackSource = plan.fallbackSource;
+    auto marked = markReviewSourceRanges(sourceId, base, ranges, cardId, &failedRange);
+    if (!marked.error.isEmpty()) return fail(marked.error, failedRange >= 0 ? passages[failedRange].areas.first() : -1);
+    plan.path = sourcePath;
+    plan.original = source;
+    plan.replacement = marked.replacement;
+    plan.anchor = marked.anchor;
+    plan.answerAnchor = answerAnchor;
+    plan.fallbackSource = fallbackSource;
+    for (const auto &passage : std::as_const(passages)) {
+        QList<int> members = passage.areas;
+        std::sort(members.begin(), members.end());
+        for (const int i : std::as_const(members)) plan.regions.append(region(i));
+    }
+    if (auto *first = pageAt(plan.regions.first().toObject().value(QStringLiteral("page")).toInt())) plan.pageVisualSha256 = fingerprint(*first);
+    return plan;
+}
+
+ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &source, const QString &cardId) {
+    ReviewAnchorPlan invalid;
+    invalid.error = QStringLiteral("Place one complete start/end marker pair around the answer in the source and save it.");
+    if (QUuid(cardId).isNull() || source.isEmpty()) return invalid;
+    if (isMarkdownPath(path)) {
+        if (QString::fromUtf8(source).toUtf8() != source) return invalid;
+        // One start/end pair per answer segment, numbered 0..n-1 in file order, never nested.
+        const QRegularExpression marker(QStringLiteral(R"(^ {0,3}<!-- thoughts:v1:(start|end) review:%1:answer:([0-9]+) -->\r?$)").arg(QRegularExpression::escape(cardId)));
+        const QRegularExpression fenceStart(QStringLiteral(R"(^ {0,3}(`{3,}|~{3,}))"));
+        const auto lines = source.split('\n');
+        QByteArray fence;
+        QJsonArray segments;
+        int startLine = 0, bodyStart = -1, offset = 0;
+        for (int i = 0; i < lines.size(); ++i) {
+            const QByteArray &line = lines.at(i);
+            const QString text = QString::fromUtf8(line);
+            const QString trimmed = text.trimmed();
+            if (!fence.isEmpty()) {
+                int fenceLength = 0;
+                while (fenceLength < trimmed.size() && trimmed.at(fenceLength).toLatin1() == fence.at(0)) ++fenceLength;
+                if (fenceLength >= fence.size() && trimmed.mid(fenceLength).isEmpty()) fence.clear();
+                else if (line.contains(cardId.toUtf8())) return invalid;
+            } else if (const auto match = fenceStart.match(text); match.hasMatch()) {
+                fence = match.captured(1).toLatin1();
+            } else if (const auto match = marker.match(text); match.hasMatch()) {
+                if (match.captured(2) != QString::number(segments.size())) return invalid;
+                if (match.captured(1) == QLatin1String("start")) {
+                    if (startLine) return invalid;
+                    startLine = i + 1;
+                    bodyStart = offset + line.size() + (i + 1 < lines.size() ? 1 : 0);
+                } else {
+                    if (!startLine) return invalid;
+                    const int bodyEnd = offset;
+                    if (bodyEnd <= bodyStart || source.mid(bodyStart, bodyEnd - bodyStart).trimmed().isEmpty()) return invalid;
+                    segments.append(QJsonObject{{QStringLiteral("segment_id"), QString::number(segments.size())}, {QStringLiteral("source_file"), path},
+                        {QStringLiteral("source_sha256"), digest(source)}, {QStringLiteral("content_sha256"), digest(source.mid(bodyStart, bodyEnd - bodyStart))},
+                        {QStringLiteral("line_start"), startLine + 1}, {QStringLiteral("line_end"), i + 1}});
+                    startLine = 0;
+                }
+            } else if (line.contains(cardId.toUtf8())) return invalid;
+            offset += line.size() + (i + 1 < lines.size() ? 1 : 0);
+        }
+        if (startLine || segments.isEmpty()) return invalid;
+        ReviewAnchorPlan plan;
+        plan.path = path;
+        plan.original = source;
+        plan.replacement = source;
+        plan.anchor = {{QStringLiteral("version"), 2}, {QStringLiteral("segments"), segments}};
+        return plan;
+    }
+    if (!path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) return invalid;
+    const QRegularExpression marker(QStringLiteral("^\\\\ReviewCardMask(Start|End)\\{%1\\}\\{([0-9]+)\\}%$").arg(QRegularExpression::escape(cardId)));
+    QByteArray unmarked;
+    QList<QPair<int, int>> ranges;
+    bool inside = false;
+    int segment = 0, unmarkedLine = 0;
+    const auto lines = source.split('\n');
+    for (int i = 0; i < lines.size(); ++i) {
+        const auto &line = lines[i];
+        const auto match = marker.match(QString::fromUtf8(line));
+        if (match.hasMatch()) {
+            if (match.captured(2) != QString::number(segment)) return invalid;
+            if (match.captured(1) == QLatin1String("Start")) {
+                if (inside) return invalid;
+                inside = true;
+                ranges.append({unmarkedLine + 1, unmarkedLine});
+            } else {
+                if (!inside || ranges.last().second < ranges.last().first) return invalid;
+                inside = false;
+                ++segment;
+            }
+        } else {
+            if (line.contains(cardId.toUtf8())) return invalid;
+            ++unmarkedLine;
+            if (inside) ranges.last().second = unmarkedLine;
+            unmarked += line;
+            if (i + 1 < lines.size()) unmarked += '\n';
+        }
+    }
+    if (!segment || inside) return invalid;
+    // Reuse the writer's visibility/nesting checks and canonical marker layout.
+    auto plan = markTexRanges(path, unmarked, ranges, cardId, nullptr);
+    if (!plan.error.isEmpty()) {
+        // The pair itself is complete; say why the passage around it is refused.
+        invalid.error = plan.error;
+        return invalid;
+    }
+    if (plan.replacement != source) return invalid;
+    return plan;
+}
+
+ReviewMarkerStrip stripReviewCardMarkers(const QString &path, const QByteArray &source, const QString &cardId) {
+    ReviewMarkerStrip strip;
+    const auto lines = source.split('\n');
+    if (QUuid(cardId).isNull()) { strip.error = QStringLiteral("The card identity is invalid."); return strip; }
+    if (!source.contains(cardId.toUtf8())) {
+        strip.text = source;
+        for (int i = 0; i < lines.size(); ++i) strip.lineMap.append(i + 1);
+        return strip;
+    }
+    if (!readReviewSourceAnchor(path, source, cardId).error.isEmpty()) {
+        strip.error = QStringLiteral("This card's markers in %1 are incomplete, nested, or appear more than once. Remove them from the source, then place the card again.").arg(path);
+        return strip;
+    }
+    const QRegularExpression marker(isMarkdownPath(path)
+        ? QStringLiteral(R"(^ {0,3}<!-- thoughts:v1:(start|end) review:%1:answer:([0-9]+) -->\r?$)").arg(QRegularExpression::escape(cardId))
+        : QStringLiteral("^\\\\ReviewCardMask(Start|End)\\{%1\\}\\{([0-9]+)\\}%$").arg(QRegularExpression::escape(cardId)));
+    QList<QByteArray> kept;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (marker.match(QString::fromUtf8(lines[i])).hasMatch()) { strip.lineMap.append(0); ++strip.removed; continue; }
+        kept.append(lines[i]);
+        strip.lineMap.append(kept.size());
+    }
+    strip.text = kept.join('\n');
+    if (strip.text.contains(cardId.toUtf8())) {
+        strip.error = QStringLiteral("This card's markers in %1 are incomplete, nested, or appear more than once. Remove them from the source, then place the card again.").arg(path);
+        strip.text.clear(); strip.lineMap.clear(); strip.removed = 0;
+    }
+    return strip;
+}
+
+// One marker of @p cardId's passage @p segment (any passage when empty), as written or tidied by hand.
+static QRegularExpression reviewCardMarkerPattern(const QString &path, const QString &cardId, const QString &segment)
+{
+    const QString id = QRegularExpression::escape(cardId);
+    const QString part = segment.isEmpty() ? QStringLiteral("[^}\\s:]+") : QRegularExpression::escape(segment);
+    return QRegularExpression(path.endsWith(QLatin1String(".tex"))
+        ? QStringLiteral(R"(\\ReviewCardMask(?:Start|End)\s*\{%1\}\s*\{%2\})").arg(id, part)
+        : QStringLiteral(R"(<!--\s*thoughts:v1:(?:start|end)\s+review:%1:answer:%2\s*-->)").arg(id, part));
+}
+
+QByteArray removeReviewCardMarkers(const QString &path, const QByteArray &source, const QString &cardId,
+                                   const QSet<QString> &segmentIds, QString *error)
+{
+    const auto fail = [error](const QString &reason) { if (error) *error = reason; return QByteArray(); };
+    if (error) error->clear();
+    const QString text = QString::fromUtf8(source);
+    if (text.toUtf8() != source) return fail(QStringLiteral("The source is not valid UTF-8."));
+    static const QRegularExpression lineRest(QStringLiteral(R"(^[ \t]*%?[ \t]*(?:\r?\n|$))"));
+    QList<QPair<qsizetype, qsizetype>> ranges;
+    for (const QString &segmentId : segmentIds) {
+        auto matches = reviewCardMarkerPattern(path, cardId, segmentId).globalMatch(text);
+        int found = 0;
+        while (matches.hasNext()) {
+            const auto match = matches.next();
+            qsizetype start = match.capturedStart(), end = match.capturedEnd();
+            const qsizetype line = text.lastIndexOf(QLatin1Char('\n'), start - 1) + 1;
+            const auto suffix = lineRest.match(text.mid(end));
+            if (text.mid(line, start - line).trimmed().isEmpty() && suffix.hasMatch()) { start = line; end += suffix.capturedLength(); }
+            ranges.append({start, end});
+            ++found;
+        }
+        if (found != 2) return fail(QStringLiteral("The source does not contain exactly one start and one end marker for each passage of the card."));
+    }
+    // Any other marker of the card would be left behind.
+    int all = 0;
+    for (auto matches = reviewCardMarkerPattern(path, cardId, {}).globalMatch(text); matches.hasNext(); matches.next()) ++all;
+    if (all != ranges.size()) return fail(QStringLiteral("The source contains markers of the card that its record does not list."));
+    std::sort(ranges.begin(), ranges.end());
+    QString edited = text;
+    for (auto it = ranges.crbegin(); it != ranges.crend(); ++it) edited.remove(it->first, it->second - it->first);
+    return edited.toUtf8();
+}
+
+ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByteArray &source, const QString &keptId,
+                                                const QStringList &mergedIds, const QHash<QString, QSet<QString>> &segmentIds)
+{
+    ReviewCardMergeSource plan;
+    const auto fail = [](const QString &error) {
+        ReviewCardMergeSource failed;
+        failed.error = error;
+        return failed;
+    };
+    const bool markdown = isMarkdownPath(path);
+    if (!markdown && !path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) return fail(QStringLiteral("Choose a LaTeX or Markdown source file."));
+    const QStringList cards = QStringList{keptId} + mergedIds;
+    if (mergedIds.isEmpty() || QSet<QString>(cards.cbegin(), cards.cend()).size() != cards.size())
+        return fail(QStringLiteral("Choose two or more different cards."));
+    for (const QString &id : cards) {
+        if (QUuid(id).isNull() || segmentIds.value(id).isEmpty()) return fail(QStringLiteral("Every card to merge must be linked to a source passage."));
+        // Complete pairs in their canonical place, as Thoughts writes them.
+        if (!readReviewSourceAnchor(path, source, id).error.isEmpty())
+            return fail(QStringLiteral("The markers of card %1 in %2 are incomplete, nested, or not on lines of their own. Fix them in the source, then merge the cards.").arg(id, path));
+    }
+    if (QString::fromUtf8(source).toUtf8() != source) return fail(QStringLiteral("The source is not valid UTF-8."));
+    // Every passage: its card and its marker lines (one-based).
+    const QRegularExpression marker(markdown
+        ? QStringLiteral(R"(^ {0,3}<!-- thoughts:v1:(start|end) review:([0-9A-Za-z-]+):answer:([0-9]+) -->\r?$)")
+        : QStringLiteral(R"(^\\ReviewCardMask(Start|End)\{([^}]+)\}\{([0-9]+)\}%$)"));
+    struct Passage { QString card, segment; int start = 0, end = 0; };
+    QList<Passage> passages;
+    QHash<QString, int> open;
+    QHash<QString, QSet<QString>> marked;
+    QSet<int> markerLines;
+    const auto lines = source.split('\n');
+    for (int i = 0; i < lines.size(); ++i) {
+        const auto match = marker.match(QString::fromUtf8(lines[i]));
+        if (!match.hasMatch() || !cards.contains(match.captured(2))) continue;
+        const QString key = match.captured(2) + QLatin1Char(':') + match.captured(3);
+        markerLines.insert(i + 1);
+        if (match.captured(1).compare(QLatin1String("start"), Qt::CaseInsensitive) == 0) {
+            open.insert(key, i + 1);
+            continue;
+        }
+        passages.append({match.captured(2), match.captured(3), open.take(key), i + 1});
+        marked[match.captured(2)].insert(match.captured(3));
+    }
+    for (const QString &id : cards) {
+        if (marked.value(id) != segmentIds.value(id))
+            return fail(QStringLiteral("Card %1 lists other passages than its markers in %2 hold. Sync, then merge the cards again.").arg(id, path));
+    }
+    // The merged cards' markers go first, one card at a time, as their deletions remove them.
+    plan.versions.append(source);
+    QString error;
+    for (const QString &id : mergedIds) {
+        const auto next = removeReviewCardMarkers(path, plan.versions.constLast(), id, segmentIds.value(id), &error);
+        if (!error.isEmpty()) return fail(error);
+        plan.versions.append(next);
+    }
+    // The text every passage is marked in again: without the kept card's markers too.
+    const QByteArray unmarked = removeReviewCardMarkers(path, plan.versions.constLast(), keptId, segmentIds.value(keptId), &error);
+    if (!error.isEmpty()) return fail(error);
+    QList<QByteArray> kept;
+    QList<int> lineMap(lines.size() + 1, 0);
+    for (int i = 0; i < lines.size(); ++i) {
+        if (markerLines.contains(i + 1)) continue;
+        kept.append(lines[i]);
+        lineMap[i + 1] = kept.size();
+    }
+    if (kept.join('\n') != unmarked)
+        return fail(QStringLiteral("The cards' markers in %1 are not on lines of their own. Fix them in the source, then merge the cards.").arg(path));
+    // Each passage's own lines, without the text between passages; passages that overlap become one.
+    struct Range { int first = 0, last = 0; QStringList cards; };
+    QList<Range> ranges;
+    for (const auto &passage : std::as_const(passages)) {
+        int first = 0, last = 0;
+        for (int line = passage.start + 1; line < passage.end; ++line) {
+            if (!lineMap[line]) continue;
+            if (!first) first = lineMap[line];
+            last = lineMap[line];
+        }
+        if (!first) return fail(QStringLiteral("A passage of card %1 is empty.").arg(passage.card));
+        ranges.append({first, last, {passage.card}});
+    }
+    std::stable_sort(ranges.begin(), ranges.end(), [](const Range &a, const Range &b) { return a.first < b.first; });
+    QList<Range> joined;
+    for (const auto &range : std::as_const(ranges)) {
+        if (!joined.isEmpty() && range.first <= joined.last().last) {
+            joined.last().last = std::max(joined.last().last, range.last);
+            for (const auto &card : range.cards) if (!joined.last().cards.contains(card)) joined.last().cards.append(card);
+            continue;
+        }
+        joined.append(range);
+    }
+    QList<QPair<int, int>> lineRanges;
+    for (const auto &range : std::as_const(joined)) lineRanges.append({range.first, range.last});
+    auto marking = markReviewSourceRanges(path, unmarked, lineRanges, keptId);
+    if (!marking.error.isEmpty()) return fail(QStringLiteral("The merged card's passages cannot be marked in %1: %2").arg(path, marking.error));
+    const auto segments = marking.anchor.value(QStringLiteral("segments")).toArray();
+    if (segments.size() != joined.size()) return fail(QStringLiteral("The merged card's passages cannot be marked in %1.").arg(path));
+    // The server's rule for the kept card: the source without its old markers equals the source
+    // without its new ones.
+    QSet<QString> newSegments;
+    for (const auto &value : segments) newSegments.insert(value.toObject().value(QStringLiteral("segment_id")).toString());
+    if (removeReviewCardMarkers(path, marking.replacement, keptId, newSegments, &error) != unmarked || !error.isEmpty())
+        return fail(QStringLiteral("The merged card's markers would change the text of %1.").arg(path));
+    plan.replacement = marking.replacement;
+    plan.anchor = marking.anchor;
+    for (const auto &range : std::as_const(joined)) plan.origins.append(range.cards);
+    return plan;
+}
+
+namespace {
+QString oneLineText(QString text)
+{
+    static const QRegularExpression whitespace(QStringLiteral("\\s+"));
+    return text.replace(whitespace, QStringLiteral(" ")).trimmed();
+}
+
+struct AnswerRegion { int page; QRectF rect; };
+
+// The card's answer regions in reading order: by page, then top to bottom, then left to right.
+QList<AnswerRegion> answerRegions(const QJsonArray &values)
+{
+    QList<AnswerRegion> regions;
+    for (const auto &value : values) {
+        const auto region = value.toObject();
+        const auto rect = region.value(QStringLiteral("rect")).toArray();
+        const int page = region.value(QStringLiteral("page")).toInt();
+        if (page < 1 || rect.size() != 4) continue;
+        regions.append({page, QRectF(QPointF(rect[0].toDouble(), rect[1].toDouble()), QPointF(rect[2].toDouble(), rect[3].toDouble())).normalized()});
+    }
+    std::stable_sort(regions.begin(), regions.end(), [](const AnswerRegion &a, const AnswerRegion &b) {
+        if (a.page != b.page) return a.page < b.page;
+        if (a.rect.top() != b.rect.top()) return a.rect.top() < b.rect.top();
+        return a.rect.left() < b.rect.left();
+    });
+    return regions;
+}
+
+// The text inside the answer regions, only from the PDF the card was made on: its regions mean
+// nothing on another build.
+QString pdfAnswerText(Poppler::Document *pdf, const ReviewCardAgentInput &card, const QList<AnswerRegion> &regions)
+{
+    if (!pdf || card.pdfSha256.isEmpty() || digest(read(card.pdfPath)) != card.pdfSha256.toLower()) return {};
+    const int pageCount = pdf->numPages();
+    QStringList texts;
+    for (const auto &region : regions) {
+        if (region.page > pageCount) continue;
+        std::unique_ptr<Poppler::Page> page(pdf->page(region.page - 1));
+        if (!page) continue;
+        const QSizeF size = page->pageSizeF();
+        const QRectF area(region.rect.left() * size.width(), region.rect.top() * size.height(),
+                          region.rect.width() * size.width(), region.rect.height() * size.height());
+        for (const auto &line : page->text(area).split(QLatin1Char('\n'))) {
+            const QString collapsed = oneLineText(line);
+            if (!collapsed.isEmpty()) texts.append(collapsed);
+        }
+    }
+    return texts.join(QLatin1Char('\n'));
+}
+
+std::unique_ptr<Poppler::Document> loadCardPdf(const QString &path)
+{
+    std::unique_ptr<Poppler::Document> pdf = QFileInfo(path).isFile() ? Poppler::Document::load(path) : nullptr;
+    if (pdf && pdf->isLocked()) pdf.reset();
+    return pdf;
+}
+}
+
+QList<ReviewCardSourcePassage> reviewCardSourcePassages(const QString &docsRoot, const QString &cardId, const QStringList &sourceFiles,
+                                                        QHash<QString, QString> *contentCache)
+{
+    const auto trimEnd = [](QString text) {
+        while (!text.isEmpty() && text.back().isSpace()) text.chop(1);
+        return text;
+    };
+    // The source text between the card's mask markers (TeX or Markdown), markers excluded, read
+    // from the local working copy. A marker may sit mid-line: only the text between the markers
+    // counts, and its lines are the lines that text occupies. Trailing whitespace is trimmed on
+    // every line, and blank lines directly inside the markers are dropped from range and text.
+    QList<ReviewCardSourcePassage> sources;
+    QStringList seenFiles;
+    for (const QString &file : sourceFiles) {
+        const QString path = file.isEmpty() ? QString() : QDir(docsRoot).filePath(file);
+        if (path.isEmpty() || cardId.isEmpty() || seenFiles.contains(QDir::cleanPath(path))) continue;
+        seenFiles.append(QDir::cleanPath(path));
+        QString content;
+        if (contentCache && contentCache->contains(path)) {
+            content = contentCache->value(path);
+        } else {
+            QFile source(path);
+            if (source.open(QIODevice::ReadOnly)) {
+                content = QString::fromUtf8(source.readAll());
+                content.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+            }
+            if (contentCache) contentCache->insert(path, content);
+        }
+        if (content.isEmpty() || !content.contains(cardId)) continue;
+        const QString id = QRegularExpression::escape(cardId);
+        // A TeX marker's trailing % (which keeps it out of the typeset text) belongs to the marker.
+        const QRegularExpression marker(QStringLiteral(
+            R"(\\ReviewCardMask(Start|End)\s*\{%1\}\s*\{([0-9]+)\}%?|<!--\s*thoughts:v1:(start|end)\s+review:%1:answer:([0-9]+)\s*-->)").arg(id));
+        QHash<QString, qsizetype> opened; // Segment -> offset just after its start marker.
+        QList<ReviewCardSourceSegment> segments;
+        auto matches = marker.globalMatch(content);
+        while (matches.hasNext()) {
+            const auto match = matches.next();
+            const bool tex = !match.captured(1).isEmpty();
+            const bool isStart = (tex ? match.captured(1) : match.captured(3)).compare(QLatin1String("start"), Qt::CaseInsensitive) == 0;
+            const QString segment = tex ? match.captured(2) : match.captured(4);
+            if (isStart) {
+                opened.insert(segment, match.capturedEnd());
+                continue;
+            }
+            if (!opened.contains(segment)) continue;
+            const qsizetype bodyStart = opened.take(segment);
+            const int firstLine = int(QStringView(content).left(bodyStart).count(QLatin1Char('\n'))) + 1;
+            QStringList body = content.mid(bodyStart, match.capturedStart() - bodyStart).split(QLatin1Char('\n'));
+            for (auto &line : body) line = trimEnd(line);
+            int first = 0, last = int(body.size()) - 1;
+            while (first <= last && body.at(first).isEmpty()) ++first;
+            while (last >= first && body.at(last).isEmpty()) --last;
+            if (first > last) continue; // An empty marker pair.
+            segments.append({firstLine + first, firstLine + last, body.mid(first, last - first + 1).join(QLatin1Char('\n'))});
+        }
+        std::sort(segments.begin(), segments.end(), [](const ReviewCardSourceSegment &a, const ReviewCardSourceSegment &b) { return a.first < b.first; });
+        if (!segments.isEmpty()) sources.append({path, segments});
+    }
+    return sources;
+}
+
+QString reviewCardPdfAnswerText(const ReviewCardAgentInput &card)
+{
+    const auto regions = answerRegions(card.regions);
+    if (regions.isEmpty() || card.pdfSha256.isEmpty()) return {};
+    const auto pdf = loadCardPdf(card.pdfPath);
+    return pdfAnswerText(pdf.get(), card, regions);
+}
+
+QJsonArray reviewCardAgentFeedback(const QString &docsRoot, const QJsonObject &cardRecord, const ReviewCardAgentInput &answer, const QList<QJsonObject> &records,
+                                   const QHash<QString, QJsonObject> &homeCards, bool includeDeleted, const std::function<QString()> &fallbackAnswerText)
+{
+    const QString cardId = cardRecord.value(QStringLiteral("card_id")).toString();
+    QList<QJsonObject> result;
+    for (const QJsonObject &record : records) {
+        if (!ReviewCardFeedback::isShared(record, cardId)) result.append(record);
+    }
+    // Shared feedback: the other cards' records of its document inside its answer.
+    const QString fileDocument = answer.pdfPath.isEmpty() ? QString()
+        : DocumentIdentityStore(docsRoot).byFilename(QFileInfo(answer.pdfPath).fileName()).value(QStringLiteral("document_id")).toString();
+    QVariantList regions;
+    for (const QJsonValue &region : answer.regions) regions.append(region.toObject().toVariantMap());
+    const QHash<QString, QString> states = ReviewCardFeedback::sharedStates(
+        cardId, ReviewCardFeedback::documentOf(cardRecord, {fileDocument}), homeCards, answer.pdfSha256, ReviewCardFeedback::regionsFromVariant(regions), records, [&] {
+            const QString text = reviewCardPdfAnswerText(answer);
+            return text.isEmpty() && fallbackAnswerText ? fallbackAnswerText() : text;
+        });
+    for (const QJsonObject &record : records) {
+        if (states.contains(record.value(QStringLiteral("feedback_id")).toString())) result.append(record);
+    }
+    return ReviewCardFeedback::agentArray(result, cardRecord, includeDeleted, states);
+}
+
+QHash<QString, QString> reviewCardPromptFields(const QString &docsRoot, const QJsonArray &projects, const ReviewCardAgentInput &card,
+                                               bool withAnswerText)
+{
+    const auto pdf = loadCardPdf(card.pdfPath);
+    const int pageCount = pdf ? pdf->numPages() : 0;
+    const auto regions = answerRegions(card.regions);
+    int firstPage = 0, lastPage = 0;
+    if (!regions.isEmpty()) {
+        firstPage = regions.first().page;
+        for (const auto &region : regions) lastPage = std::max(lastPage, region.page);
+    } else if (card.wholeDocument && pageCount > 0) {
+        firstPage = 1;
+        lastPage = pageCount;
+    } else if (card.page > 0) {
+        firstPage = lastPage = card.page;
+    }
+
+    auto fields = agentDocumentFields(docsRoot, projects, card.pdfPath, card.documentName);
+    if (pageCount > 0) fields.insert(QStringLiteral("pdf_pages"), QString::number(pageCount));
+    fields.insert(QStringLiteral("card_id"), oneLineText(card.cardId));
+    fields.insert(QStringLiteral("question"), oneLineText(card.question));
+    fields.insert(QStringLiteral("note"), oneLineText(card.note));
+    if (!card.answerFeedback.isEmpty()) fields.insert(QStringLiteral("answer_feedback"), card.answerFeedback);
+    if (firstPage > 0)
+        fields.insert(QStringLiteral("answer_pages"), firstPage == lastPage ? QString::number(firstPage)
+                                                                           : QStringLiteral("%1–%2").arg(firstPage).arg(lastPage));
+
+    const auto sources = reviewCardSourcePassages(docsRoot, card.cardId, card.sourceFiles);
+    QString answer;
+    if (!sources.isEmpty()) {
+        QStringList files, texts;
+        for (const auto &source : sources) {
+            QStringList ranges;
+            for (const auto &segment : source.segments) {
+                ranges.append(QStringLiteral("%1–%2").arg(segment.first).arg(segment.last));
+                texts.append(segment.text);
+            }
+            files.append(QStringLiteral("%1, lines %2").arg(source.path, ranges.join(QStringLiteral("; "))));
+        }
+        fields.insert(QStringLiteral("answer_source"), files.join(QStringLiteral("; ")));
+        answer = texts.join(QStringLiteral("\n\n"));
+    } else if (withAnswerText) {
+        answer = pdfAnswerText(pdf.get(), card, regions);
+    }
+    if (withAnswerText) fields.insert(QStringLiteral("answer_text"), answer);
+    return fields;
+}
+
+QString reviewCardAgentDescription(const QString &docsRoot, const QJsonArray &projects, const ReviewCardAgentInput &card,
+                                   const QString &templateText)
+{
+    const QString effective = templateText.trimmed().isEmpty() ? AgentPrompts::defaultTemplate(AgentPrompts::Kind::Agent) : templateText;
+    return AgentPrompts::render(effective, reviewCardPromptFields(docsRoot, projects, card,
+                                                                 AgentPrompts::usesPlaceholder(effective, QStringLiteral("answer_text"))));
+}
+}

@@ -1,0 +1,6 @@
+{
+ "exit": 1,
+ "requests": [],
+ "stderr": "\n[T] Source publication failed: network unavailable\n",
+ "stdout": "[T] Local source publication:\n[T]   THOUGHTS_TOKEN=<macOS Keychain> \n\n[T] Waiting for the server to accept m.pdf...\n[T] [source publication] network unavailable\n"
+}

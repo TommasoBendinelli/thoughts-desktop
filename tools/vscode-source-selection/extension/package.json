@@ -1,0 +1,12 @@
+{
+  "name": "source-selection",
+  "publisher": "thoughts",
+  "displayName": "Thoughts Source Selection",
+  "description": "Select the source passage opened from Thoughts.",
+  "version": "0.2.0",
+  "license": "GPL-2.0-or-later",
+  "engines": { "vscode": "^1.85.0" },
+  "extensionKind": ["ui"],
+  "activationEvents": ["onUri"],
+  "main": "./extension.js"
+}

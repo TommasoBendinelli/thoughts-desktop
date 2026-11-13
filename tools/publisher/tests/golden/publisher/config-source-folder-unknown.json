@@ -1,0 +1,33 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}",
+    "ValueError: Document references an unknown source folder"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: Document references an unknown source folder"
+   ],
+   "stdout": ""
+  }
+ ]
+}

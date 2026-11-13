@@ -1,0 +1,85 @@
+{
+ "files": {
+  "out.json": {
+   "content": "{\n  \"schema_version\": 3,\n  \"projects\": [\n    {\n      \"project\": \".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default\",\n      \"targets\": [\n        \"document_f857f6b7f1be5abf2352.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\",\n          \"role\": \"source\"\n        }\n      ]\n    },\n    {\n      \"project\": \".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents\",\n      \"targets\": [\n        \"document_074a121b6825b20182c6.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\",\n          \"role\": \"source\"\n        }\n      ]\n    }\n  ],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    },\n    {\n      \"path\": \".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+   "mode": "0o600"
+  }
+ },
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "Wrote 4 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/assets\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/generated\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/assets\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/generated\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\",\"schema_version\":1}"
+   ],
+   "stdout": "{\"inventories\": [{\"discovery_policy\": \"source-closure-v2\", \"entries\": [], \"managed_files\": [\".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\"], \"project\": \".thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default\", \"schema_version\": 3, \"sha256\": \"877b1cdcd499c5a6267b112bb9d8eb4134f5742f6284f63d861cb35a28b9a714\", \"target\": \"document_f857f6b7f1be5abf2352.pdf\", \"watch_directories\": [\"<ROOT>\", \"<ROOT>/docs/.thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default\", \"<ROOT>/docs/.thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex\", \"<ROOT>/docs/current_pdfs\"], \"watch_files\": [\"<ROOT>/docs/.thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/notes.md\", \"<ROOT>/docs/.thoughts/projects/19b910152f2fb2789301384ff779d6f9ce336b4c1bbb488db727b2c11ba51a0f/default/tex/docs_order_manifest.txt\", \"<ROOT>/docs/current_pdfs/.thoughts-source-index.json\", \"<ROOT>/out.json\"]}, {\"discovery_policy\": \"source-closure-v2\", \"entries\": [], \"managed_files\": [\".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\"], \"project\": \".thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents\", \"schema_version\": 3, \"sha256\": \"b900456c75d27d102f96345c21578d271695d5fdbff7fb2b8013623afc10ef76\", \"target\": \"document_074a121b6825b20182c6.pdf\", \"watch_directories\": [\"<ROOT>\", \"<ROOT>/docs/.thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents\", \"<ROOT>/docs/.thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex\", \"<ROOT>/docs/current_pdfs\"], \"watch_files\": [\"<ROOT>/docs/.thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/notes.md\", \"<ROOT>/docs/.thoughts/projects/a8929f4c97f47452cb46a4b37054fb177fd6060b3ef881f7a4b5c3cddb662713/documents/tex/docs_order_manifest.txt\", \"<ROOT>/docs/current_pdfs/.thoughts-source-index.json\", \"<ROOT>/out.json\"]}], \"schema_version\": 1}\n"
+  }
+ ]
+}

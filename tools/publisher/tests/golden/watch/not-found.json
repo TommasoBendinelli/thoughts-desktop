@@ -1,0 +1,12 @@
+{
+ "exit": 1,
+ "requests": [
+  [
+   "GET",
+   "/v1/builds/missing",
+   ""
+  ]
+ ],
+ "stderr": "[T] Build output is unavailable: {\"detail\": \"Build not found\"}\n",
+ "stdout": "[T] Build ID: missing\n[T] PDF: m.pdf\n"
+}

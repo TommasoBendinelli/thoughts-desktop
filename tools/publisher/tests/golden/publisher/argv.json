@@ -1,0 +1,638 @@
+{
+ "files": {
+  "o.json": {
+   "content": "{\n  \"schema_version\": 3,\n  \"projects\": []\n}\n",
+   "mode": "0o600"
+  }
+ },
+ "runs": [
+  {
+   "arguments": [],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --root, --manifest, --state, --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST\n                                        --state STATE --server SERVER\n                                        [--token TOKEN] [--target TARGET]\n                                        [--force-build]\n                                        [--scope-target SCOPE_TARGET]\n                                        [--project PROJECT] [--path PATH]\n                                        [--frozen-inputs FROZEN_INPUTS]\n                                        [--adopt-remote-base ADOPT_REMOTE_BASE]\n                                        [--bootstrap-state BOOTSTRAP_STATE]\n\noptions:\n  -h, --help            show this help message and exit\n  --root ROOT\n  --manifest MANIFEST\n  --state STATE\n  --server SERVER\n  --token TOKEN\n  --target TARGET\n  --force-build         request an explicit build even when the captured\n                        inputs match the current publication\n  --scope-target SCOPE_TARGET\n                        publish only sources used by this PDF without\n                        requesting a build\n  --project PROJECT\n  --path PATH\n  --frozen-inputs FROZEN_INPUTS\n                        publish verified content-addressed source/build-input\n                        bytes from a frozen bundle\n  --adopt-remote-base ADOPT_REMOTE_BASE\n                        explicitly record the current server base for one\n                        newly managed path before publishing\n  --bootstrap-state BOOTSTRAP_STATE\n"
+  },
+  {
+   "arguments": [
+    "--help"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST\n                                        --state STATE --server SERVER\n                                        [--token TOKEN] [--target TARGET]\n                                        [--force-build]\n                                        [--scope-target SCOPE_TARGET]\n                                        [--project PROJECT] [--path PATH]\n                                        [--frozen-inputs FROZEN_INPUTS]\n                                        [--adopt-remote-base ADOPT_REMOTE_BASE]\n                                        [--bootstrap-state BOOTSTRAP_STATE]\n\noptions:\n  -h, --help            show this help message and exit\n  --root ROOT\n  --manifest MANIFEST\n  --state STATE\n  --server SERVER\n  --token TOKEN\n  --target TARGET\n  --force-build         request an explicit build even when the captured\n                        inputs match the current publication\n  --scope-target SCOPE_TARGET\n                        publish only sources used by this PDF without\n                        requesting a build\n  --project PROJECT\n  --path PATH\n  --frozen-inputs FROZEN_INPUTS\n                        publish verified content-addressed source/build-input\n                        bytes from a frozen bundle\n  --adopt-remote-base ADOPT_REMOTE_BASE\n                        explicitly record the current server base for one\n                        newly managed path before publishing\n  --bootstrap-state BOOTSTRAP_STATE\n"
+  },
+  {
+   "arguments": [
+    "bogus"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --root, --manifest, --state, --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "Generate-Manifest"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --root, --manifest, --state, --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: the following arguments are required: --docs-root, --output"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT\n                                                  --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--help"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources refresh-project-manifest [-h]\n                                                         --docs-root DOCS_ROOT\n                                                         --manifest MANIFEST\n                                                         --project PROJECT\n                                                         --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --manifest MANIFEST\n  --project PROJECT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources migrate-manifest [-h] --docs-root DOCS_ROOT\n                                                 --manifest MANIFEST\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --manifest MANIFEST\n"
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources list-candidates [-h] --docs-root DOCS_ROOT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n"
+  },
+  {
+   "arguments": [
+    "inspect-build-inputs",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources inspect-build-inputs [-h] --root ROOT\n                                                     --manifest MANIFEST\n                                                     --target TARGET\n                                                     [--project PROJECT]\n\noptions:\n  -h, --help           show this help message and exit\n  --root ROOT\n  --manifest MANIFEST\n  --target TARGET\n  --project PROJECT\n"
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources inspect-library-build-inputs\n       [-h] --root ROOT --manifest MANIFEST\n\noptions:\n  -h, --help           show this help message and exit\n  --root ROOT\n  --manifest MANIFEST\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "x"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: the following arguments are required: --output"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--output"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument --output: expected one argument"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "-x",
+    "--output",
+    "o"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument --docs-root: expected one argument"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--d",
+    "x"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: ambiguous option: --d could match --docs-root, --desktop-progress-jsonl"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs",
+    "missing-dir",
+    "--out",
+    "o.json",
+    "--desk"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}"
+   ],
+   "stdout": "Wrote 0 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root=missing-dir",
+    "--output=o.json",
+    "--desktop-progress-jsonl=1"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument --desktop-progress-jsonl: ignored explicit argument '1'"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root=missing-dir",
+    "--output=o.json",
+    "--desktop-progress-jsonl="
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument --desktop-progress-jsonl: ignored explicit argument ''"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "a",
+    "--output",
+    "o.json",
+    "extra"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: extra"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "a",
+    "--output",
+    "o.json",
+    "--",
+    "x"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: -- x"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "--",
+    "--output",
+    "o.json"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument --docs-root: expected one argument"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-x",
+    "--docs-root",
+    "a",
+    "--output",
+    "o.json"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: -x"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-5",
+    "--docs-root",
+    "a",
+    "--output",
+    "o.json"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: -5"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "-5",
+    "--output",
+    "o.json"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "Wrote 0 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "-x y",
+    "--output",
+    "o.json"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "Wrote 0 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-hx"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT\n                                                  --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-h=1"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: argument -h/--help: ignored explicit argument '1'"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--he"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT\n                                                  --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root=a",
+    "--docs-root",
+    "b",
+    "--output",
+    "o.json",
+    "--bogus"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: --bogus"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--bogus"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources list-candidates [-h] --docs-root DOCS_ROOT",
+    "thoughts-publish-sources list-candidates: error: the following arguments are required: --docs-root"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "nowhere",
+    "--bogus"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: --bogus"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "nowhere",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: --desktop-progress-jsonl"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "nowhere",
+    "-",
+    "x y"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources [-h]",
+    "                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...",
+    "thoughts-publish-sources: error: unrecognized arguments: - x y"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    ""
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "[]\n"
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root="
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "[]\n"
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "x"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources migrate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                 --manifest MANIFEST",
+    "thoughts-publish-sources migrate-manifest: error: the following arguments are required: --manifest"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "x",
+    "--manifest",
+    "m",
+    "--output",
+    "o"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources refresh-project-manifest [-h]",
+    "                                                         --docs-root DOCS_ROOT",
+    "                                                         --manifest MANIFEST",
+    "                                                         --project PROJECT",
+    "                                                         --output OUTPUT",
+    "thoughts-publish-sources refresh-project-manifest: error: the following arguments are required: --project"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "--root",
+    "r"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --manifest, --state, --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "--p",
+    "x"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: ambiguous option: --p could match --project, --path"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "--root=r",
+    "--manifest",
+    "m",
+    "--state",
+    "s"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "once"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources publish [-h] --root ROOT --manifest MANIFEST",
+    "                                        --state STATE --server SERVER",
+    "                                        [--token TOKEN] [--target TARGET]",
+    "                                        [--force-build]",
+    "                                        [--scope-target SCOPE_TARGET]",
+    "                                        [--project PROJECT] [--path PATH]",
+    "                                        [--frozen-inputs FROZEN_INPUTS]",
+    "                                        [--adopt-remote-base ADOPT_REMOTE_BASE]",
+    "                                        [--bootstrap-state BOOTSTRAP_STATE]",
+    "thoughts-publish-sources publish: error: the following arguments are required: --root, --manifest, --state, --server"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--output",
+    "o.json",
+    "--docs-root",
+    "a",
+    "-h"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT\n                                                  --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "-h",
+    "--d"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT\n                                                  --output OUTPUT\n\noptions:\n  -h, --help            show this help message and exit\n  --docs-root DOCS_ROOT\n  --output OUTPUT\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--d",
+    "-h"
+   ],
+   "exit": 2,
+   "stderr": [
+    "usage: thoughts-publish-sources generate-manifest [-h] --docs-root DOCS_ROOT",
+    "                                                  --output OUTPUT",
+    "thoughts-publish-sources generate-manifest: error: ambiguous option: --d could match --docs-root, --desktop-progress-jsonl"
+   ],
+   "stdout": ""
+  }
+ ]
+}

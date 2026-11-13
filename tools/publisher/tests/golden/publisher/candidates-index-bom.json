@@ -1,0 +1,17 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 1,
+   "stderr": [
+    "json.decoder.JSONDecodeError: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"
+   ],
+   "stdout": ""
+  }
+ ]
+}

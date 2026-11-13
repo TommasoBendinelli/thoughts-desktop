@@ -1,0 +1,17 @@
+{
+ "exit": 0,
+ "requests": [
+  [
+   "GET",
+   "/v1/builds/b1",
+   ""
+  ],
+  [
+   "GET",
+   "/v1/builds/b1/output?offset=0",
+   ""
+  ]
+ ],
+ "stderr": "",
+ "stdout": "[T] Local source publication:\n[T]   THOUGHTS_TOKEN=<macOS Keychain> '/Users/x y/pub' --target m.pdf --root 'C:\\a' 'it'\"'\"'s'\n\n[T] Waiting for the server to accept m.pdf...\n[T] Build ID: b1\n[T] PDF: m.pdf\n[T] Server renderer command is not available.\n\n[T] [succeeded]\n[T] done\n[T] Build succeeded.\n"
+}

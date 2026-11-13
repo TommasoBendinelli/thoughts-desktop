@@ -1,0 +1,38 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json",
+    "--project",
+    "docs-a",
+    "--output",
+    "refreshed.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+   ],
+   "stdout": ""
+  }
+ ]
+}

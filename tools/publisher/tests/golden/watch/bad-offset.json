@@ -1,0 +1,17 @@
+{
+ "exit": 1,
+ "requests": [
+  [
+   "GET",
+   "/v1/builds/b1",
+   ""
+  ],
+  [
+   "GET",
+   "/v1/builds/b1/output?offset=0",
+   ""
+  ]
+ ],
+ "stderr": "ValueError: invalid literal for int() with base 10: 'x'\n",
+ "stdout": "[T] Build ID: b1\n[T] PDF: m.pdf\n[T] Server renderer command is not available.\n\n[T] [running]\n"
+}

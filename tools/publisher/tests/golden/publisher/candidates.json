@@ -1,0 +1,98 @@
+{
+ "files": {
+  "out.json": {
+   "content": "{\n  \"schema_version\": 3,\n  \"projects\": [\n    {\n      \"project\": \"docs-A2\",\n      \"targets\": [\n        \"A2_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-A2/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    },\n    {\n      \"project\": \"docs-b\",\n      \"targets\": [\n        \"b_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-b/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    },\n    {\n      \"project\": \"docs-c\",\n      \"targets\": [\n        \"c_main.pdf\",\n        \"c_second.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-c/tex/source/main.tex\",\n          \"role\": \"source\"\n        },\n        {\n          \"path\": \"docs-c/tex/source/second.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    },\n    {\n      \"project\": \"docs-registered\",\n      \"targets\": [\n        \"registered_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-registered/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    },\n    {\n      \"project\": \"docs-skipped\",\n      \"targets\": [\n        \"skipped_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-skipped/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    }\n  ],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+   "mode": "0o600"
+  }
+ },
+ "runs": [
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "[{\"project\": \"docs-A2\", \"target\": \"A2_main.pdf\"}, {\"project\": \"docs-b\", \"target\": \"b_main.pdf\"}, {\"project\": \"docs-c\", \"target\": \"c_main.pdf\"}, {\"project\": \"docs-c\", \"target\": \"c_second.pdf\"}]\n"
+  },
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-A2/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-A2/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-A2/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-A2/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-A2/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-b/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-b/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-b/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-b/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-b/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-c/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-c/tex/source/second.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-c/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-c/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-c/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-c/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-c/tex/source/second.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-c/tex/source/second.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-registered/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-registered/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-registered/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-registered/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-registered/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/markdown/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/markdown/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/markdown/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/tex/fragments\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/tex/source\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-skipped/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-skipped/tex/support\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-skipped/.ThoughtIgnore\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"docs-skipped/tex/source/main.tex\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"read_file\",\"path\":\"docs-skipped/tex/source/main.tex\",\"schema_version\":1}"
+   ],
+   "stdout": "Wrote 7 managed source paths.\n"
+  }
+ ]
+}

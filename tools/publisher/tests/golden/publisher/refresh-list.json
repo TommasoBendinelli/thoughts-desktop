@@ -1,0 +1,38 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json",
+    "--project",
+    "docs-a",
+    "--output",
+    "refreshed.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest has an unsupported schema"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest has an unsupported schema"
+   ],
+   "stdout": ""
+  }
+ ]
+}

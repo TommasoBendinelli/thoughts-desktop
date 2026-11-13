@@ -1,0 +1,40 @@
+{
+ "files": {
+  "out.json": {
+   "content": "{\n  \"schema_version\": 3,\n  \"projects\": [],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/df3c4b8b7f5a64fefc61c130490d787d3c0033a34e413e5a98ebc607e64ad038/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+   "mode": "0o600"
+  }
+ },
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}"
+   ],
+   "stdout": "Wrote 1 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"inspect_file\",\"path\":\"library/source-project-policy.json\",\"schema_version\":1}"
+   ],
+   "stdout": "{\"inventories\": [], \"schema_version\": 1}\n"
+  }
+ ]
+}

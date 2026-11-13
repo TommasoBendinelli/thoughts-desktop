@@ -1,0 +1,17 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: Library source-project policy has an unsupported schema"
+   ],
+   "stdout": ""
+  }
+ ]
+}

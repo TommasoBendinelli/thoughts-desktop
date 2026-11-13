@@ -1,0 +1,38 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json",
+    "--project",
+    "docs-a",
+    "--output",
+    "refreshed.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "json.decoder.JSONDecodeError: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "json.decoder.JSONDecodeError: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"
+   ],
+   "stdout": ""
+  }
+ ]
+}

@@ -1,0 +1,4 @@
+dist/
+.cache/
+*.vsix
+node_modules/

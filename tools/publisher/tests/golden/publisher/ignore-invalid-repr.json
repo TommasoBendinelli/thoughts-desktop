@@ -1,0 +1,22 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}",
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"docs-a\",\"schema_version\":1}",
+    "ValueError: invalid .ThoughtIgnore rule: \"'quote\\\\\""
+   ],
+   "stdout": ""
+  }
+ ]
+}

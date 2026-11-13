@@ -1,0 +1,6 @@
+{
+ "exit": 1,
+ "requests": [],
+ "stderr": "ValueError: could not read the build request: [Errno 2] No such file or directory: '<DIR>/nowhere/request.json'\n",
+ "stdout": ""
+}

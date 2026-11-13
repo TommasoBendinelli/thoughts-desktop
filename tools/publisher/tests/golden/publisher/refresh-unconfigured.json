@@ -1,0 +1,36 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json",
+    "--project",
+    "docs-plain",
+    "--output",
+    "refreshed.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source project is unavailable: docs-plain"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "manifest.json"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "{\"from_schema_version\": 3, \"managed_paths\": 0, \"migrated\": false, \"to_schema_version\": 3}\n"
+  }
+ ]
+}

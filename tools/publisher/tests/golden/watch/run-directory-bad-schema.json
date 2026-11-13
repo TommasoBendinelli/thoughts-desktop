@@ -1,0 +1,6 @@
+{
+ "exit": 1,
+ "requests": [],
+ "stderr": "ValueError: the build request has an unsupported schema\n",
+ "stdout": ""
+}

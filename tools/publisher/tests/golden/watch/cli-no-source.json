@@ -1,0 +1,6 @@
+{
+ "exit": 2,
+ "requests": [],
+ "stderr": "usage: thoughts-watch-build [-h] --server SERVER\n                            (--run-directory RUN_DIRECTORY |\n                            --build-id BUILD_ID) [--target TARGET]\n                            [--token TOKEN] [--poll-interval POLL_INTERVAL]\nthoughts-watch-build: error: one of the arguments --run-directory --build-id is required\n",
+ "stdout": ""
+}

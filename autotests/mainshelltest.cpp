@@ -1,0 +1,13380 @@
+/*
+    SPDX-FileCopyrightText: 2014 Albert Astals Cid <aacid@kde.org>
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+*/
+
+// clazy:excludeall=qstring-allocations
+
+#include "../part/documentfeedback.h"
+#include "../core/htmlattachment.h"
+#include "../part/feedbackversion.h"
+#include "../part/htmlattachmentreader.h"
+#include "../part/htmldocumentview.h"
+#include "../part/libraryprojectstore.h"
+#include "../part/agentconversations.h"
+#include <QDesktopServices>
+#include <QScrollArea>
+#include <QScrollBar>
+#include "../shell/readerdisplaytitlestore.h"
+#include "../part/sourceannotationindex.h"
+#include "../part/thoughtsserveraddress.h"
+#include <QContextMenuEvent>
+#include <KXMLGUIFactory>
+#include <QKeySequence>
+#include <QTest>
+#include <QCheckBox>
+#include <QRadioButton>
+#include <QGroupBox>
+#include <config-okular.h>
+
+#include <KActionCollection>
+#include <KActionMenu>
+#include <KConfigGroup>
+#include <KEditToolBar>
+#include <KLineEdit>
+#include <KLocalizedString>
+#include <KRecentFilesAction>
+#include <KSharedConfig>
+#include <KStandardAction>
+
+#if HAVE_DBUS
+#include <QDBusConnection>
+#include <QDBusConnectionInterface>
+#endif // HAVE_DBUS
+#include <QClipboard>
+#include <QComboBox>
+#include <QCryptographicHash>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
+#include <QTextBrowser>
+#include <QDir>
+#include <QDomDocument>
+#include <QFile>
+#include <QFileInfo>
+#include <QFileSystemWatcher>
+#include <QFileOpenEvent>
+#include <QFrame>
+#include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QLocalSocket>
+#include <QMenu>
+#include <QDateEdit>
+#include <QMenuBar>
+#include <QMouseEvent>
+#include <QPixmap>
+#include <QPlainTextEdit>
+#include <QPrintDialog>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QPushButton>
+#include <QSaveFile>
+#include <QScopeGuard>
+#include <QActionGroup>
+#include <QScreen>
+#include <QSettings>
+#include <QShortcut>
+#include <QSignalSpy>
+#include <poppler-qt6.h>
+#include <memory>
+#include <QSplitter>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QStandardPaths>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTreeWidget>
+#include <QTemporaryDir>
+#include <QTemporaryFile>
+#include <QTimeZone>
+#include <QTimer>
+#include <QThreadPool>
+#include <QToolBar>
+#include <QToolButton>
+#include <QUuid>
+#include <qwidget.h>
+
+#include "../core/annotations.h"
+#include "../core/action.h"
+#include "../core/document_p.h"
+#include "../part/fedorarepository.h"
+#include "../part/docscommentsynchronizer.h"
+#include "../part/findbar.h"
+#include "../part/part.h"
+#include "../part/reviewcardfeedback.h"
+#include "../part/agentconversations.h"
+#include "../part/pdfversions.h"
+#include "../part/pageview.h"
+#include "../part/reviewfeedbackoverlay.h"
+#include "../core/page.h"
+#include "../core/area.h"
+#include "../shell/reviewfeedbackpanel.h"
+#include "../part/presentationwidget.h"
+#include "../part/sidebar.h"
+#include "../settings.h"
+#include "../shell/activeparttoolbarcontroller.h"
+#include "../shell/buildterminallauncher.h"
+#include "../shell/commentsoverview.h"
+#include "../shell/documentsyncpresentation.h"
+#include "../shell/okular_main.h"
+#include "../shell/reviewoverview.h"
+#include "../shell/reviewdocumenttools.h"
+#include "../part/agentpromptsettings.h"
+#include "../part/projectconfiguration.h"
+#include "../part/thoughtsplatform.h"
+#include "../shell/readerchrome.h"
+#include "../shell/proposaldecisions.h"
+#include "../shell/agentnotes.h"
+#include "../shell/agentnoteswindow.h"
+#include "../shell/shell.h"
+#include "../shell/agentdocumentdescription.h"
+#include "../shell/shellutils.h"
+#include "../shell/thoughtscommandprotocol.h"
+#include "closedialoghelper.h"
+
+#include <sys/types.h>
+#ifndef Q_OS_WIN
+#include <unistd.h>
+#else
+#include <process.h>
+#endif
+
+namespace Okular
+{
+class PartTest
+{
+public:
+    Okular::Document *partDocument(Okular::Part *part) const
+    {
+        return part->m_document;
+    }
+    QWidget *presentationWidget(Okular::Part *part) const
+    {
+        return part->m_presentationWidget;
+    }
+    FindBar *findWidget(Okular::Part *part) const
+    {
+        return part->m_findBar;
+    }
+    bool searchOverlayVisible(Okular::Part *part) const
+    {
+        return part->m_sidebar->isTransientWidgetVisible();
+    }
+    QWidget *agentNotesPanel(Okular::Part *part) const
+    {
+        return part->m_agentNotesPanel;
+    }
+    void setPartUrl(Okular::Part *part, const QUrl &url) const
+    {
+        part->setUrl(url);
+    }
+    bool fedoraClientCreated(Okular::Part *part) const
+    {
+        return part->m_fedoraRepository->m_client != nullptr;
+    }
+    void setManualSyncState(FedoraRepository *repository, FedoraRepository::ManualSyncState state) const
+    {
+        repository->m_syncCoordinator.state = state;
+    }
+    void setManualSyncOperation(FedoraRepository *repository, const QString &operationId) const
+    {
+        repository->m_syncCoordinator.operationId = operationId;
+    }
+    PageView *pageView(Okular::Part *part) const
+    {
+        return part->m_pageView;
+    }
+    // What Sync does once it has rebuilt the open PDF.
+    bool reload(Okular::Part *part) const
+    {
+        return part->slotAttemptReload(true);
+    }
+};
+}
+
+class ClosePrintDialogHelper : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit ClosePrintDialogHelper(int expectedTab)
+        : foundDialog(false)
+        , m_expectedTab(expectedTab)
+    {
+    }
+    bool foundDialog;
+
+public Q_SLOTS:
+    void closePrintDialog();
+
+private:
+    int m_expectedTab;
+};
+
+class ToolBarStatusPaintObserver : public QObject
+{
+public:
+    ToolBarStatusPaintObserver(QToolBar *toolBar, QAction *statusAction)
+        : m_toolBar(toolBar)
+        , m_statusAction(statusAction)
+    {
+    }
+
+    bool paintedWithoutStatus = false;
+
+protected:
+    bool eventFilter(QObject *object, QEvent *event) override
+    {
+        if (object == m_toolBar && event->type() == QEvent::Paint && !m_toolBar->actions().contains(m_statusAction)) {
+            paintedWithoutStatus = true;
+        }
+        return QObject::eventFilter(object, event);
+    }
+
+private:
+    QPointer<QToolBar> m_toolBar;
+    QPointer<QAction> m_statusAction;
+};
+
+class BuildTargetProbe : public QObject
+{
+    Q_OBJECT
+
+public:
+    QString requestedTarget;
+    QString requestedTraceId;
+
+    Q_INVOKABLE void requestFedoraBuildForTarget(const QString &target, const QString &traceId)
+    {
+        requestedTarget = target;
+        requestedTraceId = traceId;
+    }
+};
+
+class SyncDispatchProbe : public KParts::ReadWritePart
+{
+    Q_OBJECT
+
+public:
+    struct TargetCall {
+        QString target;
+        bool publishSources = false;
+        QString traceId;
+    };
+
+    int conditionalFullSyncs = 0;
+    QList<TargetCall> targetCalls;
+    QJsonArray sidebarCards;
+
+    Q_INVOKABLE void setSidebarReviewCards(const QJsonArray &cards) { sidebarCards = cards; }
+
+    void setDocumentUrl(const QUrl &url)
+    {
+        setUrl(url);
+    }
+
+    Q_INVOKABLE void updateFromFedora(const QString &)
+    {
+        ++conditionalFullSyncs;
+    }
+
+    Q_INVOKABLE void updateDocumentFromFedora(const QString &target, bool publishSources, const QString &traceId)
+    {
+        targetCalls.append({target, publishSources, traceId});
+    }
+
+    Q_INVOKABLE QString localDocumentPath() const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap fedoraManualSyncState() const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap globalPendingChanges() const
+    {
+        return {};
+    }
+
+protected:
+    bool saveFile() override
+    {
+        return true;
+    }
+};
+
+// Stands in for the Part that owns the Fedora repository: it records the
+// explicit Delete the shell asks for and does what Part does to the source.
+class CommentDeleteProbe : public KParts::ReadWritePart
+{
+    Q_OBJECT
+
+public:
+    QJsonObject projections;
+    QString sourcePath;
+    bool removeMarker = true;
+    QList<QVariantList> deleteCalls;
+    QString docsRoot;
+    QList<QVariantList> markerRemovalCalls;
+    QList<QJsonObject> queuedComments;
+    bool acceptQueue = true;
+
+    Q_INVOKABLE QJsonObject effectiveFedoraProjections() const
+    {
+        return projections;
+    }
+
+    Q_INVOKABLE bool enqueueLogicalCommentMutation(const QVariantMap &payload)
+    {
+        const QJsonObject comment = QJsonObject::fromVariantMap(payload);
+        queuedComments.append(comment);
+        if (!acceptQueue) return false;
+        projections.insert(QStringLiteral("logical_comment\ncomments\n") + comment.value(QStringLiteral("comment_id")).toString(), comment);
+        return true;
+    }
+
+    // Part::resolveMissingCommentMarkers("remove") edits through the same helper.
+    Q_INVOKABLE QVariantMap resolveMissingCommentMarkers(const QString &action, const QVariantList &markers)
+    {
+        markerRemovalCalls.append(markers);
+        bool success = action == QLatin1String("remove") && !markers.isEmpty();
+        QVariantList results;
+        for (const QVariant &value : markers) {
+            const QVariantMap marker = value.toMap();
+            QString error;
+            const bool removed = Okular::DocsCommentSynchronizer::removeMissingCommentMarker(
+                QDir(docsRoot).filePath(marker.value(QStringLiteral("source_file")).toString()), marker.value(QStringLiteral("anchor_id")).toString(), &error);
+            success = success && removed;
+            results.append(QVariantMap{{QStringLiteral("success"), removed}, {QStringLiteral("message"), error}});
+        }
+        return {{QStringLiteral("success"), success}, {QStringLiteral("results"), results}};
+    }
+
+    Q_INVOKABLE QVariantMap deleteReviewAnnotations(const QVariantList &targets)
+    {
+        deleteCalls.append(targets);
+        for (const QVariant &target : targets) {
+            const QString id = target.toMap().value(QStringLiteral("annotationId")).toString();
+            const QString key = QStringLiteral("logical_comment\ncomments\n") + id;
+            QJsonObject comment = projections.value(key).toObject();
+            comment.insert(QStringLiteral("deleted"), true);
+            comment.insert(QStringLiteral("deletion_reason"), QStringLiteral("user_deleted"));
+            projections.insert(key, comment);
+            const QString anchor = comment.value(QStringLiteral("scope")).toObject().value(QStringLiteral("anchor_id")).toString(id);
+            QFile file(sourcePath);
+            if (!removeMarker || !file.open(QIODevice::ReadOnly)) continue;
+            QByteArray kept;
+            for (const QByteArray &line : file.readAll().split('\n')) {
+                if (!line.contains(anchor.toUtf8())) kept += line + '\n';
+            }
+            file.close();
+            kept.chop(1);
+            if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) file.write(kept);
+        }
+        return {{QStringLiteral("success"), true}, {QStringLiteral("changed"), true}};
+    }
+
+    Q_INVOKABLE QString localDocumentPath() const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap fedoraManualSyncState() const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap globalPendingChanges() const
+    {
+        return {};
+    }
+
+protected:
+    bool saveFile() override
+    {
+        return true;
+    }
+};
+
+class PdfStatusProbe : public KParts::ReadWritePart
+{
+    Q_OBJECT
+
+public:
+    void setDocumentUrl(const QUrl &url)
+    {
+        setUrl(url);
+    }
+
+    Q_INVOKABLE QString localDocumentPath() const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap documentSyncStatus(const QString &) const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap fedoraManualSyncState() const
+    {
+        return {{QStringLiteral("state"), 0}};
+    }
+
+    Q_INVOKABLE QVariantMap fedoraBuildActivity(const QString &) const
+    {
+        return {};
+    }
+
+    Q_INVOKABLE QVariantMap fedoraRenderStatus(const QString &) const
+    {
+        return {};
+    }
+
+protected:
+    bool saveFile() override
+    {
+        return true;
+    }
+};
+
+class MainShellTest : public QObject, public Okular::PartTest
+{
+    Q_OBJECT
+
+public:
+    static QTabWidget *tabWidget(Shell *s)
+    {
+        return s->m_tabWidget;
+    }
+
+private Q_SLOTS:
+    void initTestCase();
+    void cleanupTestCase();
+    void init();
+    void cleanup();
+
+    void testReviewSourceLinkStatusAndManualRepair();
+    void testShell_data();
+    void testShell();
+    void testFileRemembersPagePosition_data();
+    void testFileRemembersPagePosition();
+    void test2FilesError_data();
+    void test2FilesError();
+    void testMiddleButtonCloseUndo();
+    void testSessionRestore_data();
+    void testSessionRestore();
+    void testOpenInvalidFiles_data();
+    void testOpenInvalidFiles();
+    void testOpenCommentSourceFileWithoutLine();
+    void testOpenTheSameFileSeveralTimes();
+    void testCrossDocumentLinkNavigation_data();
+    void testCrossDocumentLinkNavigation();
+    void testExternalOpenUrlResolution();
+    void testReviewCardLinkNamesCard();
+    void testReviewCardLinkOpensLibraryOnCard();
+    void testOpenFromUrlValidation_data();
+    void testOpenFromUrlValidation();
+    void testOpenFromUrlAction();
+    void testApplicationUtilities();
+    void testUrlBackedPdfUsesCurrentDocumentLibraryAction();
+    void testFileOpenEvent_data();
+    void testFileOpenEvent();
+    void testReaderDisplayTitlesRefreshInactiveTabs();
+    void testDocumentTitleOpensTheTabMenu();
+    void testPencilButtonMenu();
+    void testCopyForAgentInTheFileMenu();
+    void testTabRevealInFinderAction();
+    void testTabCopyDocumentNameAction();
+    void testLibraryProjectNameForPdf();
+    void testAgentDocumentDescription();
+    void testTabCloseOtherTabsAction();
+    void testTabCloseOtherTabsCancelKeepsWindow();
+    void testClosingAnnotatedTabClearsSidebarModel();
+    void testCommentsOverviewStartup();
+    void testLibraryDocumentPageActivation();
+    void testOpenDocumentCommand();
+    void testDeleteCommentCommand();
+    void testTodoCommands();
+    void testDecideProposalCommand();
+    void testLinkConversationCommand();
+    void testReviewCardPdfWindowKeepsBrowserAvailable();
+    void testSidebarReviewCardsProjection();
+    void testDocumentStartupSkipsCommentsOverview();
+    void testClosingLastDocumentReturnsToOverview();
+    void testArchivedCommentHistoryRestoration();
+    void testCommentsOverviewSurvivesLastPdfWindow();
+    void testLinkedPdfRenderTargetAndTerminalScript();
+    void testBuildTerminalLauncher();
+    void testActiveBuildActionOpensOutputWithoutResubmitting();
+    void testPdfBuildStatusWidgetStates();
+    void testReadingToolbarStaysStillDuringSync();
+    void testVisibleMarkupLeftToSidebarFilters();
+    void testHistoryButtonsBesidePageNumber();
+    void testTargetBuildDispatch();
+    void testLastSuccessfulGlobalSyncUsesGlobalScope();
+    void testDocumentSyncSummaryDoesNotLoadHistory();
+    void testLegacyEmbeddedJournalMigrationIsIdempotent();
+    void testLogsStayResponsiveDuringTraceReplay();
+    void testSourceConflictStaysOfferedAfterLaterSyncs();
+    void testResolveSourceConflictCommand();
+    void testSourceFilesNeedingMergeListsEachFileAndWhy();
+    void testClosingShellWhileMergeEditorWaitsIsSilent();
+    void testSavedMergeCanBeSubmittedWithoutEditor();
+    void testBuildSourceDiffDialog();
+    void testManyJournalEventsDoNotGrowRunPayload();
+    void testAbsoluteDirectionalTransferProgressPersistence();
+    void testSyncCommandServiceSurvivesMultipleWindows();
+    void testSyncEndingWhileNoWindowListenedIsRecorded();
+    void testOverviewTerminalStateWhileModalLogOpen();
+    void testSyncDispatchRenderPolicies();
+    void testVisibleSyncButtonsUseGlobalScope_data();
+    void testVisibleSyncButtonsUseGlobalScope();
+    void testTargetSyncDispatchPolicies();
+    void testProjectAttachmentChangeStaysLocal();
+    void testLibraryRemovalCompletionStaysLocalUntilManualSync();
+    void testSyncBuildOutputTargetRouting();
+    void testEditableSourceConflictUsesNormalGitMarkers();
+    void testOverviewIgnoresLegacyBuildAllState();
+    void testLocalSourceFreshnessUsesPublishedHashes();
+    void testPdfSourceFreshnessWatcherSchedulesRefresh();
+    void testPdfLibraryRefreshCoalescing();
+    void testPdfStatusRejectsTransientReloadSnapshot();
+    void testReviewActionAvailable();
+    void testAbTestingActionOpensRatingPage();
+    void testAgentNotesActionOpensWindow();
+    void testAgentNotesSidebarEntry();
+    void testOpenAgentNotesForAgents();
+    void testReviewBrowseStartsAtLeft();
+    void testReviewBrowseShiftClickSelectsRange();
+    void testReviewBrowseColumnsResizeAndPersist();
+    void testReviewBrowseHeaderSorting();
+    void testReviewBrowseExportCards();
+    void testReviewBrowseMergesCards();
+    void testCardBrowserFiltersByType();
+    void testCardBrowserFiltersByCurrentTag();
+    void testReviewSkipHistoryDetails();
+    void testReviewHistoryShowsAnswerFeedbackAndVersions();
+    void testShellOpensEarlierPdfVersion();
+    void testUpdateHistoryAddsIntervalWithoutReview();
+    void testReviewRefreshCoalescesAndPreservesRows();
+    void testReviewCandidatesAreRetired();
+    void testReviewQuestionRemainsVisibleAfterReveal();
+    void testReviewNamesThePagesOfAMultiPageAnswer();
+    void testReviewProjectionRefreshPreservesWindows_data();
+    void testReviewProjectionRefreshPreservesWindows();
+    void testReviewSessionKeepsCardBeingReplaced();
+    void testReviewCardMenu();
+    void testReviewRetireCard();
+    void testReviewCardAgentConversations();
+    void testCardHistoryInSidebar();
+    void testReviewCopyForAgentNamesSharedFeedback();
+    void testReviewAnswerSurvivesPdfReload();
+    void testReviewPresentationWaitsForTheRebuiltPdfsPlaces();
+    void testReviewAnswerTagGroups();
+    void testReviewTagPickerShowsOnlySliders();
+    void testReviewTagSliderGroups();
+    void testReviewTagGroupsFoldByDefault();
+    void testReviewTagSections();
+    void testReviewContextNotes();
+    void testReviewTagsApplyCommand();
+    void testReviewBarStartsWithLastAnswerTags();
+    void testReviewInTwoSteps();
+    void testReviewAsksForARecallPrediction();
+    void testReviewPanelSurvivesClosingItsReaderTab();
+    void testReviewPanelFloatsOverANativeDocumentView();
+    void testReviewOfAnAttachmentCardShowsTheStoredAnswerWhenNotFound();
+    void testDeletedReviewCardsDoNotShowLocationWarnings();
+    void testUnsupportedCardLatexIsExplained();
+    void testReviewColdOpenDuringSync_data();
+    void testReviewColdOpenDuringSync();
+    void testReviewCountsWaitForSyncAndSourceScan_data();
+    void testReviewCountsWaitForSyncAndSourceScan();
+    void testReviewCanStartDuringSync();
+    void testReviewStartEnabledAfterSyncAndSourceScan();
+    void testReviewDocumentPayloadUsesOpenPdf();
+    void testShellMenuLabelRepair();
+    void testLegacyPdfLibraryActionMigration();
+    void testSinglePdfLibraryActionInToolbarEditor();
+    void testPdfStatusSurvivesToolbarRebuild();
+    void testPdfLibraryFilenameSanitizer();
+    void testDocumentLinkFallsBackToPublishedPdf();
+    void testToolbarCustomizationPersistsAcrossTabChanges();
+    void testTrackedCommentActivatesExistingTab();
+    void testDetachTabPreservesState();
+    // After the toolbar-customization tests: a preceding multi-window test
+    // makes those flaky (also on the base commit with testDetachTabPreservesState).
+    void testSidebarChooserFollowsSidebar();
+    void testSelectionToolsInToolbar();
+    void testReaderBarHoldsTitleAndTools();
+    void testDocumentTabsAreQuiet();
+    void testMoveTabToNewWindowAction();
+    void testTransferTabBetweenWindows();
+    void testSingleTabDragReusesWindow();
+    void testDragTabOutsideWindow();
+    void testDocumentTabsShareTheBarEvenly();
+    // Last: pages of HTML attachments in tabs of their own (a Library PDF of the test home).
+    void testHtmlAttachmentLinkOpensItsOwnTab();
+    void testHtmlAttachmentCardAndFeedbackOpenInItsTab();
+
+private:
+};
+
+QList<Shell *> getShells()
+{
+    QList<Shell *> shells;
+    const QList<KMainWindow *> mainWindows = KMainWindow::memberList();
+    for (KMainWindow *kmw : mainWindows) {
+        Shell *shell = qobject_cast<Shell *>(kmw);
+        if (shell) {
+            shells.append(shell);
+        }
+    }
+    return shells;
+}
+
+// A library-looking PDF path below the test home. The tests only label the
+// active document with it; the shell's state for it is set directly.
+static QString libraryPdfLabel()
+{
+    return QDir::home().filePath(QStringLiteral("docs/current_pdfs/concepts.pdf"));
+}
+
+Shell *findShell(Shell *ignore = nullptr)
+{
+    const QWidgetList wList = QApplication::topLevelWidgets();
+    for (QWidget *widget : wList) {
+        Shell *s = qobject_cast<Shell *>(widget);
+        if (s && s != ignore) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+void MainShellTest::initTestCase()
+{
+    QStandardPaths::setTestModeEnabled(true);
+    // Don't pollute people's okular settings
+    Okular::Settings::instance(QStringLiteral("mainshelltest"));
+
+    // Register in bus as okular
+#if HAVE_DBUS
+    QDBusConnectionInterface *bus = QDBusConnection::sessionBus().interface();
+    QVERIFY(bus->registerService(ShellUtils::currentProcessDbusName()) == QDBusConnectionInterface::ServiceRegistered);
+#endif
+    // Tell the presentationWidget and queryClose to not be annoying
+    KSharedConfigPtr c = KSharedConfig::openConfig(QStringLiteral("mainshelltest.kmessagebox"));
+    KConfigGroup cg = c->group(QStringLiteral("General"));
+    cg.writeEntry("presentationInfo", 4);
+    cg.writeEntry("ShowTabWarning", 4);
+}
+
+void MainShellTest::cleanupTestCase()
+{
+}
+
+void MainShellTest::init()
+{
+    // Default settings for every test
+    Okular::Settings::self()->setDefaults();
+    QSettings settings;
+    settings.remove(QStringLiteral("Review/AgentCommand"));
+    settings.remove(QStringLiteral("Review/AgentModel"));
+    settings.remove(QStringLiteral("Review/AgentReasoningEffort"));
+    settings.remove(QStringLiteral("Review/AgentMaxCandidates"));
+    settings.sync();
+
+    // Clean docdatas
+    const QList<QUrl> urls = {QUrl::fromUserInput(QStringLiteral("file://" KDESRCDIR "data/file1.pdf")),
+                              QUrl::fromUserInput(QStringLiteral("file://" KDESRCDIR "data/tocreload.pdf")),
+                              QUrl::fromUserInput(QStringLiteral("file://" KDESRCDIR "data/contents.epub"))};
+
+    for (const QUrl &url : urls) {
+        QFileInfo fileReadTest(url.toLocalFile());
+        const QString docDataPath = Okular::DocumentPrivate::docDataFileName(url, fileReadTest.size());
+        QFile::remove(docDataPath);
+    }
+}
+
+void MainShellTest::cleanup()
+{
+    QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));
+    if (Shell::s_commentsOverview) {
+        // The real app permits a slow catalogue worker to outlive its window.
+        // Tests must finish those workers before destroying Qt's global state.
+        for (QThreadPool *pool : Shell::s_commentsOverview->findChildren<QThreadPool *>()) {
+            QVERIFY(pool->waitForDone(10000));
+        }
+    }
+    delete Shell::s_commentsOverview.data();
+    QVERIFY(!Shell::s_commentsOverview);
+    Shell *s;
+    while ((s = findShell())) {
+        delete s;
+    }
+}
+
+void MainShellTest::testShell_data()
+{
+    QTest::addColumn<QStringList>("paths");
+    QTest::addColumn<QString>("serializedOptions");
+    QTest::addColumn<bool>("useTabs");
+    QTest::addColumn<QString>("externalProcessPath");
+    QTest::addColumn<uint>("expectedPage");
+    QTest::addColumn<bool>("expectPresentation");
+    QTest::addColumn<bool>("expectPrintDialog");
+    QTest::addColumn<bool>("unique");
+    QTest::addColumn<uint>("externalProcessExpectedPage");
+    QTest::addColumn<bool>("externalProcessExpectPresentation");
+    QTest::addColumn<bool>("externalProcessExpectPrintDialog");
+    QTest::addColumn<QString>("externalProcessExpectFind");
+
+    const QStringList contentsEpub = QStringList(QStringLiteral(KDESRCDIR "data/contents.epub"));
+    const QStringList file1 = QStringList(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    QStringList file1AndToc;
+    file1AndToc << QStringLiteral(KDESRCDIR "data/file1.pdf");
+    file1AndToc << QStringLiteral(KDESRCDIR "data/tocreload.pdf");
+    const QString tocReload = QStringLiteral(KDESRCDIR "data/tocreload.pdf");
+
+    const QString optionsPage2 = ShellUtils::serializeOptions(false, false, false, false, false, QStringLiteral("2"), QString(), QString());
+    const QString optionsPage2Presentation = ShellUtils::serializeOptions(true, false, false, false, false, QStringLiteral("2"), QString(), QString());
+    const QString optionsPrint = ShellUtils::serializeOptions(false, true, false, false, false, QString(), QString(), QString());
+    const QString optionsUnique = ShellUtils::serializeOptions(false, false, false, true, false, QString(), QString(), QString());
+    const QString optionsFind = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QStringLiteral("si:next-testing parameters!"), QString());
+
+    QTest::newRow("just show shell") << QStringList() << QString() << false << QString() << 0u << false << false << false << 0u << false << false << QString();
+    QTest::newRow("open file") << file1 << QString() << false << QString() << 0u << false << false << false << 0u << false << false << QString();
+    QTest::newRow("two files no tabs") << file1AndToc << QString() << false << QString() << 0u << false << false << false << 0u << false << false << QString();
+    QTest::newRow("two files with tabs") << file1AndToc << QString() << true << QString() << 0u << false << false << false << 0u << false << false << QString();
+    QTest::newRow("two files sequence no tabs") << file1 << QString() << false << tocReload << 0u << false << false << false << 0u << false << false << QString();
+#if HAVE_DBUS
+    QTest::newRow("two files sequence with tabs") << file1 << QString() << true << tocReload << 0u << false << false << false << 0u << false << false << QString();
+#endif // HAVE_DBUS
+    QTest::newRow("open file page number") << contentsEpub << optionsPage2 << false << QString() << 1u << false << false << false << 0u << false << false << QString();
+    QTest::newRow("open file page number and presentation") << contentsEpub << optionsPage2Presentation << false << QString() << 1u << true << false << false << 0u << false << false << QString();
+    QTest::newRow("open file find") << file1 << optionsFind << false << QString() << 0u << false << false << false << 0u << false << false << QStringLiteral("si:next-testing parameters!");
+    QTest::newRow("open file print") << file1 << optionsPrint << false << QString() << 0u << false << true << false << 0u << false << false << QString();
+#if HAVE_DBUS
+    QTest::newRow("open two files unique") << file1 << optionsUnique << false << tocReload << 0u << false << false << true << 0u << false << false << QString();
+    QTest::newRow("open two files unique tabs") << file1 << optionsUnique << true << tocReload << 0u << false << false << true << 0u << false << false << QString();
+    QTest::newRow("page number attach tabs") << file1 << QString() << true << contentsEpub[0] << 0u << false << false << false << 2u << false << false << QString();
+    QTest::newRow("presentation attach tabs") << file1 << QString() << true << contentsEpub[0] << 0u << false << false << false << 2u << true << false << QString();
+    QTest::newRow("print attach tabs") << file1 << QString() << true << contentsEpub[0] << 0u << false << true << false << 2u << false << true << QString();
+    QTest::newRow("page number attach unique") << file1 << optionsUnique << false << contentsEpub[0] << 0u << false << false << true << 3u << false << false << QString();
+    QTest::newRow("presentation attach unique") << file1 << optionsUnique << false << contentsEpub[0] << 0u << false << false << true << 2u << true << false << QString();
+    QTest::newRow("print attach unique") << file1 << optionsUnique << false << contentsEpub[0] << 0u << false << false << true << 2u << false << true << QString();
+    QTest::newRow("page number attach unique tabs") << file1 << optionsUnique << true << contentsEpub[0] << 0u << false << false << true << 3u << false << false << QString();
+    QTest::newRow("presentation attach unique tabs") << file1 << optionsUnique << true << contentsEpub[0] << 0u << false << false << true << 2u << true << false << QString();
+    QTest::newRow("print attach unique tabs") << file1 << optionsUnique << true << contentsEpub[0] << 0u << false << false << true << 2u << false << true << QString();
+#endif // HAVE_DBUS
+}
+
+void MainShellTest::testShell()
+{
+    QFETCH(QStringList, paths);
+    QFETCH(QString, serializedOptions);
+    QFETCH(bool, useTabs);
+    QFETCH(QString, externalProcessPath);
+    QFETCH(uint, expectedPage);
+    QFETCH(bool, expectPresentation);
+    QFETCH(bool, expectPrintDialog);
+    QFETCH(bool, unique);
+    QFETCH(uint, externalProcessExpectedPage);
+    QFETCH(bool, externalProcessExpectPresentation);
+    QFETCH(bool, externalProcessExpectPrintDialog);
+    QFETCH(QString, externalProcessExpectFind);
+
+    QScopedPointer<ClosePrintDialogHelper> helper;
+
+    Okular::Settings::self()->setShellOpenFileInTabs(useTabs);
+
+    if (expectPrintDialog || externalProcessExpectPrintDialog) {
+        const int expectedTab = externalProcessExpectPrintDialog && !unique ? 1 : 0;
+        helper.reset(new ClosePrintDialogHelper(expectedTab));
+        QTimer::singleShot(0, helper.data(), &ClosePrintDialogHelper::closePrintDialog);
+    }
+
+    Okular::Status status = Okular::main(paths, serializedOptions);
+    QCOMPARE(status, Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+
+    if (paths.count() == 1) {
+        QCOMPARE(s->m_tabs.count(), 1);
+        Okular::Part *part = s->findChild<Okular::Part *>();
+        QVERIFY(part);
+        QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+        QCOMPARE(partDocument(part)->currentPage(), expectedPage);
+        // Testing if the transient sidebar search is shown or hidden as expected
+        QCOMPARE(findWidget(part)->isHidden(), externalProcessExpectFind.isEmpty());
+        QCOMPARE(searchOverlayVisible(part), !externalProcessExpectFind.isEmpty());
+        QCOMPARE(findWidget(part)->findChild<KLineEdit *>()->text(), externalProcessExpectFind);
+        // Checking if the encryption/decryption worked
+        QCOMPARE(externalProcessExpectFind, ShellUtils::find(serializedOptions));
+
+    } else if (paths.count() == 2) {
+        if (useTabs) {
+            Shell *s = findShell();
+            QVERIFY(s);
+            QCOMPARE(s->m_tabs.count(), 2);
+            Okular::Part *part = dynamic_cast<Okular::Part *>(s->m_tabs[0].part);
+            Okular::Part *part2 = dynamic_cast<Okular::Part *>(s->m_tabs[1].part);
+            QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+            QCOMPARE(part2->url().url(), QStringLiteral("file://%1").arg(paths[1]));
+            QCOMPARE(partDocument(part)->currentPage(), expectedPage);
+            QCOMPARE(partDocument(part2)->currentPage(), expectedPage);
+        } else {
+            QSet<QString> openUrls;
+            Shell *s = findShell();
+            QVERIFY(s);
+            QCOMPARE(s->m_tabs.count(), 1);
+            Okular::Part *part = s->findChild<Okular::Part *>();
+            QVERIFY(part);
+            QCOMPARE(partDocument(part)->currentPage(), expectedPage);
+            openUrls << part->url().url();
+
+            Shell *s2 = findShell(s);
+            QVERIFY(s2);
+            QCOMPARE(s2->m_tabs.count(), 1);
+            Okular::Part *part2 = s2->findChild<Okular::Part *>();
+            QVERIFY(part2);
+            QCOMPARE(partDocument(part2)->currentPage(), expectedPage);
+            openUrls << part2->url().url();
+
+            for (const QString &path : std::as_const(paths)) {
+                QVERIFY(openUrls.contains(QStringLiteral("file://%1").arg(path)));
+            }
+        }
+    }
+
+    if (!externalProcessPath.isEmpty()) {
+        Okular::Part *part = s->findChild<Okular::Part *>();
+
+        QProcess p;
+        QStringList args;
+        args << externalProcessPath;
+        if (unique) {
+            args << QStringLiteral("-unique");
+        }
+        if (externalProcessExpectedPage != 0) {
+            args << QStringLiteral("-page") << QString::number(externalProcessExpectedPage + 1);
+        }
+        if (externalProcessExpectPresentation) {
+            args << QStringLiteral("-presentation");
+        }
+        if (externalProcessExpectPrintDialog) {
+            args << QStringLiteral("-print");
+        }
+        p.start(QStringLiteral(OKULAR_BINARY), args);
+        p.waitForStarted();
+        QCOMPARE(p.state(), QProcess::Running);
+
+        if (useTabs || unique) {
+            // It is attaching to us, so will eventually stop
+            QTRY_COMPARE_WITH_TIMEOUT(p.state(), QProcess::NotRunning, 20000);
+            QCOMPARE(p.exitStatus(), QProcess::NormalExit);
+            QCOMPARE(p.exitCode(), 0);
+
+            if (unique) {
+                // It is unique so part got "overwritten"
+                QCOMPARE(s->m_tabs.count(), 1);
+                QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(externalProcessPath));
+                QCOMPARE(partDocument(part)->currentPage(), externalProcessExpectedPage);
+            } else {
+                // It is attaching to us so a second tab is there
+                QCOMPARE(s->m_tabs.count(), 2);
+                Okular::Part *part2 = dynamic_cast<Okular::Part *>(s->m_tabs[1].part);
+                QCOMPARE(part2->url().url(), QStringLiteral("file://%1").arg(externalProcessPath));
+                QCOMPARE(partDocument(part2)->currentPage(), externalProcessExpectedPage);
+            }
+        } else {
+            QTest::qWait(750);
+
+            // It opened on a new process, so it is still running, we need to kill it
+            QCOMPARE(p.state(), QProcess::Running);
+            p.terminate();
+            p.waitForFinished();
+            QVERIFY(p.state() != QProcess::Running);
+            // It opened on a new process, so no change for us
+            QCOMPARE(s->m_tabs.count(), 1);
+            QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+            QCOMPARE(partDocument(part)->currentPage(), externalProcessExpectedPage);
+        }
+    }
+
+    if (expectPresentation) {
+        QCOMPARE(paths.count(), 1);
+        Okular::Part *part = s->findChild<Okular::Part *>();
+        QTRY_VERIFY(presentationWidget(part) != nullptr);
+    }
+
+    if (externalProcessExpectPresentation) {
+        Okular::Part *part;
+        if (unique) {
+            QCOMPARE(s->m_tabs.count(), 1);
+            part = dynamic_cast<Okular::Part *>(s->m_tabs[0].part);
+        } else {
+            QCOMPARE(s->m_tabs.count(), 2);
+            part = dynamic_cast<Okular::Part *>(s->m_tabs[1].part);
+        }
+
+        QTRY_VERIFY(presentationWidget(part) != nullptr);
+    }
+
+    if (helper) {
+        QVERIFY(helper->foundDialog);
+    }
+}
+
+void ClosePrintDialogHelper::closePrintDialog()
+{
+    Shell *s = findShell();
+    QPrintDialog *dialog = s->findChild<QPrintDialog *>();
+    if (!dialog) {
+        QTimer::singleShot(0, this, &ClosePrintDialogHelper::closePrintDialog);
+        return;
+    }
+    QVERIFY(dialog);
+    QCOMPARE(MainShellTest::tabWidget(s)->currentIndex(), m_expectedTab);
+    dialog->close();
+    foundDialog = true;
+}
+
+void MainShellTest::testFileRemembersPagePosition_data()
+{
+    QTest::addColumn<int>("mode");
+
+    QTest::newRow("normal") << 1;
+#if HAVE_DBUS
+    // A second process can only attach to this one over D-Bus.
+    QTest::newRow("unique") << 2;
+    QTest::newRow("tabs") << 3;
+#endif // HAVE_DBUS
+}
+
+void MainShellTest::testFileRemembersPagePosition()
+{
+    QFETCH(int, mode);
+
+    const QStringList paths = QStringList(QStringLiteral(KDESRCDIR "data/contents.epub"));
+    QString serializedOptions;
+    if (mode == 1 || mode == 3) {
+        serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    } else {
+        serializedOptions = ShellUtils::serializeOptions(false, false, false, true, false, QString(), QString(), QString());
+    }
+
+    Okular::Settings::self()->setShellOpenFileInTabs(mode == 3);
+
+    Okular::Status status = Okular::main(paths, serializedOptions);
+    QCOMPARE(status, Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    Okular::Part *part = s->findChild<Okular::Part *>();
+    QVERIFY(part);
+    QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+    QCOMPARE(partDocument(part)->currentPage(), 0u);
+    partDocument(part)->setViewportPage(3);
+    QCOMPARE(partDocument(part)->currentPage(), 3u);
+    s->closeUrl();
+    QCOMPARE(part->url().url(), QString());
+
+    if (mode == 1) {
+        delete s;
+        status = Okular::main(paths, serializedOptions);
+        QCOMPARE(status, Okular::Success);
+    } else {
+        QProcess p;
+        QStringList args;
+        args << paths[0];
+        if (mode == 2) {
+            args << QStringLiteral("-unique");
+        }
+        p.start(QStringLiteral(OKULAR_BINARY), args);
+        p.waitForStarted();
+        QCOMPARE(p.state(), QProcess::Running);
+
+        // It is attaching to us, so will eventually stop
+        QTRY_COMPARE_WITH_TIMEOUT((int)p.state(), (int)QProcess::NotRunning, 20000);
+        QCOMPARE((int)p.exitStatus(), (int)QProcess::NormalExit);
+        QCOMPARE(p.exitCode(), 0);
+    }
+    s = findShell();
+    QVERIFY(s);
+    part = s->findChild<Okular::Part *>();
+    QVERIFY(part);
+    QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+    QCOMPARE(partDocument(part)->currentPage(), 3u);
+}
+
+void MainShellTest::test2FilesError_data()
+{
+    QTest::addColumn<QString>("serializedOptions");
+
+    QTest::newRow("startInPresentation") << ShellUtils::serializeOptions(true, false, false, false, false, QString(), QString(), QString());
+    QTest::newRow("showPrintDialog") << ShellUtils::serializeOptions(false, true, false, false, false, QString(), QString(), QString());
+#if HAVE_DBUS
+    QTest::newRow("unique") << ShellUtils::serializeOptions(false, false, false, true, false, QString(), QString(), QString());
+    QTest::newRow("pageNumber") << ShellUtils::serializeOptions(false, false, false, false, false, QStringLiteral("3"), QString(), QString());
+#endif // HAVE_DBUS
+    QTest::newRow("find") << ShellUtils::serializeOptions(false, false, false, false, false, QString(), QStringLiteral("silly"), QString());
+}
+
+void MainShellTest::test2FilesError()
+{
+    QFETCH(QString, serializedOptions);
+
+    QStringList paths;
+    paths << QStringLiteral(KDESRCDIR "data/file1.pdf") << QStringLiteral(KDESRCDIR "data/tocreload.pdf");
+    Okular::Status status = Okular::main(paths, serializedOptions);
+    QCOMPARE(status, Okular::Error);
+
+    Shell *s = findShell();
+    QVERIFY(!s);
+}
+
+void MainShellTest::testSessionRestore_data()
+{
+    QTest::addColumn<QStringList>("paths");
+    QTest::addColumn<QString>("options");
+    QTest::addColumn<bool>("useTabsOpen");
+    QTest::addColumn<bool>("useTabsRestore");
+
+    QStringList oneDocPaths(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    QStringList twoDocPaths(oneDocPaths);
+    twoDocPaths << QStringLiteral(KDESRCDIR "data/formSamples.pdf");
+
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    QTest::newRow("1 doc, 1 window, tabs") << oneDocPaths << options << true << true;
+    QTest::newRow("2 docs, 1 window, tabs") << twoDocPaths << options << true << true;
+    QTest::newRow("2 docs, 2 windows, tabs") << twoDocPaths << options << false << true;
+    QTest::newRow("2 docs, 2 windows, no tabs") << twoDocPaths << options << false << false;
+    QTest::newRow("2 docs, 1 window, no tabs") << twoDocPaths << options << true << false;
+}
+
+void MainShellTest::testSessionRestore()
+{
+    QFETCH(QStringList, paths);
+    QFETCH(QString, options);
+    QFETCH(bool, useTabsOpen);
+    QFETCH(bool, useTabsRestore);
+
+    Okular::Settings::self()->setShellOpenFileInTabs(useTabsOpen);
+
+    Okular::Status status = Okular::main(paths, options);
+    QCOMPARE(status, Okular::Success);
+
+    // Gather some information about the state
+    // Verify that the correct number of windows/tabs were opened
+    QList<Shell *> shells = getShells();
+    QVERIFY(!shells.isEmpty());
+    int numDocs = 0;
+    for (Shell *shell : std::as_const(shells)) {
+        QVERIFY(QTest::qWaitForWindowExposed(shell));
+        numDocs += shell->m_tabs.size();
+    }
+
+    QCOMPARE(numDocs, paths.size());
+    QCOMPARE(shells.size(), useTabsOpen ? 1 : paths.size());
+    QTest::qWait(100);
+
+    // Simulate session shutdown. The actual shutdown path comes through
+    // QSessionManager XSMP handlers, then KApplication::commitData/saveState,
+    // then KMWSessionManager::commitData/saveState. Without simulating an X
+    // session manager, the best we can do here is to make a temporary Config
+    // and call KMainWindows save functions directly.
+    QTemporaryFile configFile;
+    QVERIFY(configFile.open());
+
+    int numWindows = 0;
+    { // Scope for config so that we can reconstruct from file
+        KConfig config(configFile.fileName(), KConfig::SimpleConfig);
+        for (Shell *shell : std::as_const(shells)) {
+            shell->savePropertiesInternal(&config, ++numWindows);
+            // Windows aren't necessarily closed on shutdown, but we'll use
+            // this as a way to trigger the destructor code, which is normally
+            // connected to the aboutToQuit signal
+            shell->close();
+        }
+    }
+
+    // Wait for shells to delete themselves. QTest::qWait doesn't do deferred
+    // deletions so we'll set up a full event loop to do that.
+    QEventLoop eventLoop;
+    QTimer::singleShot(100, &eventLoop, &QEventLoop::quit);
+    eventLoop.exec(QEventLoop::AllEvents);
+    // Sometimes the event loop is not enough, so try a bit more to get deferred delete happen
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    shells = getShells();
+    QCOMPARE(shells.size(), 0);
+
+    Okular::Settings::self()->setShellOpenFileInTabs(useTabsRestore);
+
+    // Simulate session restore. We can't call KMainWindow::restore() directly
+    // because it asks for info from the session manager, which doesn't know
+    // about our temporary config. But the logic here mostly mirrors restore().
+    KConfig config(configFile.fileName(), KConfig::SimpleConfig);
+    for (int i = 1; i <= numWindows; ++i) {
+        Shell *shell = new Shell;
+        shell->readPropertiesInternal(&config, i);
+        shell->show();
+    }
+
+    // Verify that the restore state is reasonable
+    shells = getShells();
+    QVERIFY(!shells.isEmpty());
+    numDocs = 0;
+    for (Shell *shell : std::as_const(shells)) {
+        QVERIFY(QTest::qWaitForWindowExposed(shell));
+        numDocs += shell->m_tabs.size();
+    }
+
+    QCOMPARE(numDocs, paths.size());
+    QCOMPARE(shells.size(), useTabsRestore ? numWindows : paths.size());
+}
+
+void MainShellTest::testOpenInvalidFiles_data()
+{
+    QTest::addColumn<QList<QUrl>>("files");
+    QTest::addColumn<QString>("options");
+
+    QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QUrl validFile1 = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/file1.pdf"), ShellUtils::qfileExistFunc(), QString());
+    QUrl validFile2 = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/file2.pdf"), ShellUtils::qfileExistFunc(), QString());
+    QUrl invalidFile = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/non-existing-doc.pdf"), ShellUtils::qfileExistFunc(), QString());
+
+    QList<QUrl> firstCase {invalidFile, validFile1, validFile2};
+    QList<QUrl> secondCase {validFile1, validFile2, invalidFile};
+
+    QTest::newRow("opening the invalid file first") << firstCase << options;
+    QTest::newRow("opening the valids file first") << secondCase << options;
+}
+
+void MainShellTest::testOpenInvalidFiles()
+{
+    QFETCH(QList<QUrl>, files);
+    QFETCH(QString, options);
+
+    /*
+     *  The purpose of this test is to verify that when we open an invalid file, no tab is created in the
+     * shell.
+     *
+     */
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    Okular::Status status = Okular::main(QStringList(), options);
+    QCOMPARE(status, Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+
+    /*
+     *  We need to make sure that the KrecentFilesAction is empty before starting, because we will also test that
+     * the file gets removed from the recent documents
+     *
+     */
+    shell->m_recent->clear();
+
+    QScopedPointer<TestingUtils::CloseDialogHelper> closeDialogHelper {new TestingUtils::CloseDialogHelper(QDialogButtonBox::StandardButton::Ok)};
+
+    for (const QUrl &file : files) {
+        shell->openUrl(file);
+    }
+
+    QList<QUrl> recentFiles = shell->m_recent->urls();
+
+    QVERIFY(shell->m_tabs.size() == 2);
+    // A failed open of the only document returns the window to the Overview
+    // and hides it, so check the tab bar relative to the window.
+    QVERIFY(shell->m_tabWidget->tabBar()->isVisibleTo(shell));
+
+    QVERIFY(!shell->m_tabWidget->tabIcon(0).isNull());
+    QVERIFY(!shell->m_tabWidget->tabIcon(1).isNull());
+
+    QVERIFY(recentFiles.size() == 2);
+}
+
+void MainShellTest::testOpenTheSameFileSeveralTimes()
+{
+    QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    Okular::Status status = Okular::main(QStringList(), options);
+    QCOMPARE(status, Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+
+    QUrl file1 = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/file1.pdf"), ShellUtils::qfileExistFunc(), QString());
+    QUrl file2 = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/file2.pdf"), ShellUtils::qfileExistFunc(), QString());
+    QUrl file3 = ShellUtils::urlFromArg(QStringLiteral(KDESRCDIR "data/formattest.pdf"), ShellUtils::qfileExistFunc(), QString());
+
+    shell->openUrl(file1);
+    shell->openUrl(file2);
+    shell->openUrl(file2);
+
+    QVERIFY(shell->m_tabs.size() == 2);
+
+    QVERIFY(shell->m_tabWidget->currentIndex() == 1);
+
+    Okular::Settings::self()->setSwitchToTabIfOpen(false);
+
+    shell->openUrl(file2);
+
+    QVERIFY(shell->m_tabs.size() == 3);
+
+    shell->openUrl(file3);
+    QVERIFY(shell->m_tabWidget->currentIndex() == 3);
+
+    QVERIFY(shell->m_tabs.size() == 4);
+
+    Okular::Settings::self()->setSwitchToTabIfOpen(true);
+}
+
+void MainShellTest::testCrossDocumentLinkNavigation_data()
+{
+    QTest::addColumn<bool>("alreadyOpen");
+    QTest::addColumn<bool>("namedDestination");
+    QTest::newRow("new-tab-page") << false << false;
+    QTest::newRow("existing-tab-page") << true << false;
+    QTest::newRow("new-tab-named") << false << true;
+    QTest::newRow("existing-tab-named") << true << true;
+}
+
+void MainShellTest::testCrossDocumentLinkNavigation()
+{
+    QFETCH(bool, alreadyOpen);
+    QFETCH(bool, namedDestination);
+    auto *shell = new Shell;
+    const QUrl sourceUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"));
+    const QUrl targetUrl = QUrl::fromLocalFile(namedDestination ? QStringLiteral(KDESRCDIR "data/tocreload.pdf") : QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    shell->openUrl(sourceUrl);
+    auto *source = qobject_cast<Okular::Part *>(shell->m_tabs[0].part);
+    QVERIFY(source);
+    Okular::PartTest access;
+    auto *sourceDocument = access.partDocument(source);
+    sourceDocument->setViewportPage(4);
+    sourceDocument->setViewportPage(9);
+    Okular::DocumentViewport sourcePosition(9);
+    sourcePosition.rePos.enabled = true;
+    sourcePosition.rePos.normalizedX = 0.5;
+    sourcePosition.rePos.normalizedY = 0.4;
+    sourceDocument->setViewport(sourcePosition);
+
+    if (alreadyOpen) {
+        shell->openUrl(targetUrl);
+        shell->setActiveTab(0);
+    }
+    QSignalSpy sourceReload(source, &KParts::ReadOnlyPart::completed);
+    // Cross-document links preserve the source even if ordinary file opens
+    // are configured to use separate windows rather than tabs.
+    Okular::Settings::self()->setShellOpenFileInTabs(false);
+    const Okular::GotoAction pageLink(QStringLiteral("file2.pdf"), Okular::DocumentViewport(1));
+    const Okular::GotoAction namedLink(QStringLiteral("tocreload.pdf"), QStringLiteral("section.1"));
+    sourceDocument->processAction(namedDestination ? &namedLink : &pageLink);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(source->url(), sourceUrl);
+    QCOMPARE(sourceDocument->viewport(), sourcePosition);
+    QCOMPARE(sourceReload.count(), 0);
+    auto *target = qobject_cast<Okular::Part *>(shell->m_tabs[1].part);
+    QVERIFY(target);
+    QCOMPARE(target->url(), targetUrl);
+    auto *targetDocument = access.partDocument(target);
+    const Okular::DocumentViewport expected = namedDestination
+        ? Okular::DocumentViewport(targetDocument->metaData(QStringLiteral("NamedViewport"), QStringLiteral("section.1")).toString())
+        : Okular::DocumentViewport(1);
+    QCOMPARE(targetDocument->viewport(), expected);
+    QSignalSpy targetReload(target, &KParts::ReadOnlyPart::completed);
+
+    auto *back = shell->m_activePartToolbar->action(QStringLiteral("go_document_back"));
+    auto *forward = shell->m_activePartToolbar->action(QStringLiteral("go_document_forward"));
+    QVERIFY(back->isEnabled());
+    back->trigger();
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(sourceDocument->viewport(), sourcePosition);
+    QVERIFY(forward->isEnabled());
+    forward->trigger();
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(targetDocument->viewport(), expected);
+    QCOMPARE(targetReload.count(), 0);
+
+    // Internal links, including jumps within the same page, still participate
+    // in the toolbar history before returning across the document link.
+    auto localPosition = expected;
+    localPosition.rePos.enabled = true;
+    localPosition.rePos.normalizedX = 0.5;
+    localPosition.rePos.normalizedY = 0.3;
+    const Okular::GotoAction localLink(QString(), localPosition);
+    targetDocument->processAction(&localLink);
+    back->trigger();
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(targetDocument->viewport(), expected);
+    back->trigger();
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(sourceDocument->viewport(), sourcePosition);
+
+    // A new navigation after Back discards the old forward route.
+    sourceDocument->setViewportPage(12);
+    QVERIFY(!forward->isEnabled());
+    sourceDocument->processAction(namedDestination ? &namedLink : &pageLink);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(targetReload.count(), 0);
+    back->trigger();
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(sourceDocument->currentPage(), 12u);
+    shell->closeTab(1);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QVERIFY(!forward->isEnabled());
+    QCOMPARE(sourceReload.count(), 0);
+}
+
+void MainShellTest::testFileOpenEvent_data()
+{
+    QTest::addColumn<bool>("useTabs");
+    QTest::addColumn<int>("expectedShells");
+    QTest::addColumn<int>("expectedTabs");
+
+    QTest::newRow("new-window") << false << 2 << 2;
+    QTest::newRow("new-tab") << true << 1 << 2;
+}
+
+void MainShellTest::testFileOpenEvent()
+{
+    QFETCH(bool, useTabs);
+    QFETCH(int, expectedShells);
+    QFETCH(int, expectedTabs);
+
+    Okular::Settings::self()->setShellOpenFileInTabs(useTabs);
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+
+    QCOMPARE(Okular::main({firstUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    QCOMPARE(getShells().size(), 1);
+
+    Okular::FileOpenEventHandler eventHandler;
+    qApp->installEventFilter(&eventHandler);
+    QFileOpenEvent event(secondUrl);
+    QVERIFY(QApplication::sendEvent(qApp, &event));
+    qApp->removeEventFilter(&eventHandler);
+
+    const QList<Shell *> shells = getShells();
+    QCOMPARE(shells.size(), expectedShells);
+
+    QSet<QUrl> openUrls;
+    int tabCount = 0;
+    for (Shell *shell : shells) {
+        tabCount += shell->m_tabs.size();
+        for (const Shell::TabState &tab : std::as_const(shell->m_tabs)) {
+            openUrls.insert(tab.part->url());
+        }
+    }
+
+    QCOMPARE(tabCount, expectedTabs);
+    QCOMPARE(openUrls, QSet<QUrl>({firstUrl, secondUrl}));
+}
+
+void MainShellTest::testReviewCardLinkNamesCard()
+{
+    const QString card = QStringLiteral("ca9f2b5a-ead0-4174-8d01-c68f536fefb2");
+    QCOMPARE(Okular::reviewCardIdFromUrl(QUrl(QStringLiteral("thoughts://review-card/") + card)), card);
+    QCOMPARE(Okular::reviewCardIdFromUrl(QUrl(QStringLiteral("thoughts://review-card/") + card.toUpper())), card);
+
+    const QStringList rejected = {
+        QStringLiteral("thoughts://review-card/not-a-card"),
+        QStringLiteral("thoughts://review-card/{") + card + QLatin1Char('}'),
+        QStringLiteral("thoughts://review-card/") + card + QStringLiteral("/extra"),
+        QStringLiteral("thoughts://review-card/") + card + QStringLiteral("?x=1"),
+        QStringLiteral("thoughts://review-card/") + card + QStringLiteral("#top"),
+        QStringLiteral("thoughts://current-pdfs/") + card,
+        QStringLiteral("https://review-card/") + card,
+        QStringLiteral("thoughts://review-card/"),
+    };
+    for (const QString &value : rejected) {
+        QVERIFY2(Okular::reviewCardIdFromUrl(QUrl(value)).isEmpty(), qPrintable(value));
+    }
+}
+
+void MainShellTest::testReviewCardLinkOpensLibraryOnCard()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+
+    Okular::FileOpenEventHandler handler;
+    qApp->installEventFilter(&handler);
+    const auto removeHandler = qScopeGuard([&handler] {
+        qApp->removeEventFilter(&handler);
+    });
+    const QString card = QStringLiteral("ca9f2b5a-ead0-4174-8d01-c68f536fefb2");
+
+    // A link that launches Thoughts arrives before its first window: it waits
+    // for that window instead of opening one of its own.
+    QFileOpenEvent event(QUrl(QStringLiteral("thoughts://review-card/") + card));
+    QCoreApplication::sendEvent(qApp, &event);
+    QTest::qWait(250);
+    QVERIFY(!findShell());
+    QVERIFY(!Shell::s_commentsOverview);
+
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main(QStringList(), options), Okular::Success);
+    QTRY_VERIFY(Shell::s_commentsOverview && Shell::s_commentsOverview->isVisible());
+    auto *tabs = Shell::s_commentsOverview->findChild<QTabWidget *>(QStringLiteral("thoughtsOverviewTabs"));
+    QVERIFY(tabs);
+    QCOMPARE(KLocalizedString::removeAcceleratorMarker(tabs->tabText(tabs->currentIndex())), QStringLiteral("Review"));
+    auto *table = Shell::s_commentsOverview->findChild<QTreeWidget *>(QStringLiteral("reviewBrowseTable"));
+    QVERIFY(table);
+    QCOMPARE(table->property("preferredCardId").toString(), card);
+    int shells = 0;
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+        shells += qobject_cast<Shell *>(widget) ? 1 : 0;
+    }
+    QCOMPARE(shells, 1);
+}
+
+void MainShellTest::testExternalOpenUrlResolution()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString currentPdfs = temporary.filePath(QStringLiteral("current_pdfs"));
+    QVERIFY(QDir().mkpath(currentPdfs));
+
+    const QString targetPath = QDir(currentPdfs).filePath(QStringLiteral("trajectory.pdf"));
+    QFile target(targetPath);
+    QVERIFY(target.open(QIODevice::WriteOnly));
+    target.write("%PDF-1.4\n");
+    target.close();
+
+    const QUrl expected = QUrl::fromLocalFile(QFileInfo(targetPath).canonicalFilePath());
+    QCOMPARE(Okular::resolvedExternalOpenUrl(QUrl(QStringLiteral("thoughts://current-pdfs/trajectory.pdf")), temporary.path()), expected);
+
+    const QUrl ordinary = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    QCOMPARE(Okular::resolvedExternalOpenUrl(ordinary, temporary.path()), ordinary);
+
+    const QStringList rejected = {
+        QStringLiteral("thoughts://other/trajectory.pdf"),
+        QStringLiteral("thoughts://current-pdfs/missing.pdf"),
+        QStringLiteral("thoughts://current-pdfs/nested/trajectory.pdf"),
+        QStringLiteral("thoughts://current-pdfs/%2e%2e/trajectory.pdf"),
+        QStringLiteral("thoughts://current-pdfs/trajectory.txt"),
+        QStringLiteral("thoughts://current-pdfs/trajectory.pdf?download=1"),
+        QStringLiteral("thoughts://current-pdfs/trajectory.pdf#page=2"),
+    };
+    for (const QString &value : rejected) {
+        QVERIFY2(Okular::resolvedExternalOpenUrl(QUrl(value), temporary.path()).isEmpty(), qPrintable(value));
+    }
+
+    const QString outsidePath = temporary.filePath(QStringLiteral("outside.pdf"));
+    QFile outside(outsidePath);
+    QVERIFY(outside.open(QIODevice::WriteOnly));
+    outside.write("%PDF-1.4\n");
+    outside.close();
+    const QString linkedPath = QDir(currentPdfs).filePath(QStringLiteral("linked.pdf"));
+    if (QFile::link(outsidePath, linkedPath)) {
+        QVERIFY(Okular::resolvedExternalOpenUrl(QUrl(QStringLiteral("thoughts://current-pdfs/linked.pdf")), temporary.path()).isEmpty());
+    }
+}
+
+void MainShellTest::testOpenFromUrlValidation_data()
+{
+    QTest::addColumn<QString>("input");
+    QTest::addColumn<QUrl>("expected");
+
+    QTest::newRow("http") << QStringLiteral("http://example.com/document.pdf") << QUrl(QStringLiteral("http://example.com/document.pdf"));
+    QTest::newRow("https") << QStringLiteral("https://example.com/document.pdf") << QUrl(QStringLiteral("https://example.com/document.pdf"));
+    QTest::newRow("outer whitespace") << QStringLiteral("  https://example.com/document.pdf  ") << QUrl(QStringLiteral("https://example.com/document.pdf"));
+    QTest::newRow("port") << QStringLiteral("https://localhost:8443/document.pdf") << QUrl(QStringLiteral("https://localhost:8443/document.pdf"));
+    QTest::newRow("query and fragment") << QStringLiteral("https://example.com/document.pdf?download=1#page=2") << QUrl(QStringLiteral("https://example.com/document.pdf?download=1#page=2"));
+    QTest::newRow("empty") << QString() << QUrl();
+    QTest::newRow("missing scheme") << QStringLiteral("example.com/document.pdf") << QUrl();
+    QTest::newRow("missing host") << QStringLiteral("https:///document.pdf") << QUrl();
+    QTest::newRow("malformed host") << QStringLiteral("https://exa mple.com/document.pdf") << QUrl();
+    QTest::newRow("ftp") << QStringLiteral("ftp://example.com/document.pdf") << QUrl();
+    QTest::newRow("local path") << QStringLiteral("/tmp/document.pdf") << QUrl();
+    QTest::newRow("local URL") << QStringLiteral("file:///tmp/document.pdf") << QUrl();
+}
+
+void MainShellTest::testOpenFromUrlValidation()
+{
+    QFETCH(QString, input);
+    QFETCH(QUrl, expected);
+
+    QCOMPARE(Shell::webDocumentUrl(input), expected);
+}
+
+#ifdef Q_OS_MACOS
+QStringList visibleNativeApplicationMenuItems();
+#endif
+
+void MainShellTest::testApplicationUtilities()
+{
+    // A customized menu from before Server/Logs must retain the new actions.
+    const QString configRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath(QStringLiteral("kxmlgui5/okular"));
+    QVERIFY(QDir().mkpath(configRoot));
+    QFile savedMenu(QDir(configRoot).filePath(QStringLiteral("shell.rc")));
+    const bool existed = savedMenu.exists();
+    QByteArray original;
+    if (existed) {
+        QVERIFY(savedMenu.open(QIODevice::ReadOnly));
+        original = savedMenu.readAll();
+        savedMenu.close();
+    }
+    const auto restoreMenu = qScopeGuard([&] {
+        savedMenu.remove();
+        if (existed && savedMenu.open(QIODevice::WriteOnly)) {
+            savedMenu.write(original);
+            savedMenu.close();
+        }
+    });
+    QFile bundledMenu(QStringLiteral(":/kxmlgui5/okular/shell.rc"));
+    QVERIFY(bundledMenu.open(QIODevice::ReadOnly));
+    QByteArray oldMenu = bundledMenu.readAll();
+    oldMenu.replace("   <Action name=\"thoughts_storage\" />\n", "");
+    oldMenu.replace("   <Action name=\"thoughts_logs\" />\n", "");
+    QVERIFY(savedMenu.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(savedMenu.write(oldMenu), oldMenu.size());
+    savedMenu.close();
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    auto *server = shell->actionCollection()->action(QStringLiteral("thoughts_storage"));
+    auto *logs = shell->actionCollection()->action(QStringLiteral("thoughts_logs"));
+    auto *developerLogs = shell->actionCollection()->action(QStringLiteral("thoughts_developer_logs"));
+    QVERIFY(developerLogs);
+    QVERIFY(server);
+    QCOMPARE(server->text(), QStringLiteral("Server…"));
+    QVERIFY(logs);
+#ifdef Q_OS_MACOS
+    QCOMPARE(server->menuRole(), QAction::ApplicationSpecificRole);
+    QCOMPARE(logs->menuRole(), QAction::ApplicationSpecificRole);
+    QCOMPARE(developerLogs->menuRole(), QAction::ApplicationSpecificRole);
+#endif
+    shell->setActiveTab(0);
+    shell->setActiveTab(0);
+    for (QAction *action : {server, logs, developerLogs}) {
+        bool inMenu = false;
+        for (QAction *menu : shell->menuBar()->actions()) {
+            inMenu = inMenu || (menu->menu() && menu->menu()->actions().contains(action));
+        }
+        QVERIFY(inMenu);
+    }
+    shell->show();
+    shell->showCommentsOverview();
+    auto *overview = shell->commentsOverview();
+#ifdef Q_OS_MACOS
+    if (QGuiApplication::platformName() == QStringLiteral("cocoa")) {
+        overview->show();
+        overview->raise();
+        overview->activateWindow();
+        QTRY_VERIFY(overview->isActiveWindow());
+        QTRY_VERIFY(visibleNativeApplicationMenuItems().contains(server->text()));
+        QTRY_VERIFY(visibleNativeApplicationMenuItems().contains(logs->text()));
+        const QStringList items = visibleNativeApplicationMenuItems();
+        qInfo() << "Native application menu with Library active:" << items;
+        QCOMPARE(items.count(server->text()), 1);
+        QCOMPARE(items.count(logs->text()), 1);
+        QCOMPARE(items.count(developerLogs->text()), 1);
+        QVERIFY(items.indexOf(logs->text()) > items.indexOf(server->text()));
+    }
+#endif
+    server->trigger();
+    auto *dialog = overview->findChild<QDialog *>(QStringLiteral("thoughtsOverviewFedoraDetailsDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->isVisible());
+    QCOMPARE(dialog->windowTitle(), QStringLiteral("Server"));
+    for (const QString &field : {QStringLiteral("Storage"), QStringLiteral("System"), QStringLiteral("Memory"), QStringLiteral("Services"), QStringLiteral("Builds"), QStringLiteral("Backup"), QStringLiteral("Integrity")}) {
+        QVERIFY(dialog->findChild<QLabel *>(QStringLiteral("thoughtsOverviewFedoraDetails") + field));
+    }
+    dialog->close();
+    logs->trigger();
+    auto *logsDialog = shell->findChild<QDialog *>(QStringLiteral("syncOperationsDialog"));
+    QVERIFY(logsDialog);
+    QTRY_VERIFY(logsDialog->isVisible());
+    QCOMPARE(logsDialog->windowModality(), Qt::NonModal);
+    QVERIFY(logsDialog->findChild<QListWidget *>(QStringLiteral("operationsList")));
+    logsDialog->reject();
+    developerLogs->trigger();
+    auto *developerDialog = shell->findChild<QDialog *>(QStringLiteral("developerLogsDialog"));
+    QVERIFY(developerDialog);
+    QVERIFY(developerDialog->isVisible());
+    QVERIFY(developerDialog->findChild<QPlainTextEdit *>(QStringLiteral("developerLogsText")));
+    developerDialog->close();
+    delete shell;
+}
+
+void MainShellTest::testOpenFromUrlAction()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+
+    QAction *const action = shell->actionCollection()->action(QStringLiteral("open_from_url"));
+    QVERIFY(action);
+    QCOMPARE(action->text(), QStringLiteral("Open from URL…"));
+    QCOMPARE(action->toolTip(), QStringLiteral("Open a document from an HTTP or HTTPS URL"));
+    QVERIFY(!action->icon().isNull());
+    QVERIFY(action->shortcuts().isEmpty());
+
+    QAction *const fileOpenAction = shell->actionCollection()->action(KStandardAction::name(KStandardAction::Open));
+    QVERIFY(fileOpenAction);
+    QMenu *fileMenu = nullptr;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *const menu = menuAction->menu();
+        if (menu && menu->actions().contains(action)) {
+            fileMenu = menu;
+            break;
+        }
+    }
+    QVERIFY(fileMenu);
+    const QList<QAction *> fileActions = fileMenu->actions();
+    QCOMPARE(fileActions.indexOf(action), fileActions.indexOf(fileOpenAction) + 1);
+
+    QToolBar *const mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    QCOMPARE(mainToolBar->actions().count(action), 0);
+    shell->setActiveTab(0);
+    shell->setActiveTab(0);
+    QCOMPARE(mainToolBar->actions().count(action), 0);
+
+    const int initialTabCount = shell->m_tabs.size();
+    const QUrl initialUrl = shell->m_tabs.constFirst().part->url();
+    bool invalidInputChecked = false;
+    QTimer::singleShot(0, shell, [&] {
+        auto *dialog = shell->findChild<QDialog *>(QStringLiteral("openFromUrlDialog"));
+        auto *urlEdit = dialog ? dialog->findChild<QLineEdit *>(QStringLiteral("openFromUrlEdit")) : nullptr;
+        auto *errorLabel = dialog ? dialog->findChild<QLabel *>(QStringLiteral("openFromUrlError")) : nullptr;
+        auto *buttons = dialog ? dialog->findChild<QDialogButtonBox *>(QStringLiteral("openFromUrlButtons")) : nullptr;
+        QPushButton *openButton = buttons ? buttons->button(QDialogButtonBox::Open) : nullptr;
+        if (dialog && urlEdit && errorLabel && openButton) {
+            const QString invalidUrl = QStringLiteral("file:///tmp/document.pdf");
+            urlEdit->setText(invalidUrl);
+            openButton->click();
+            invalidInputChecked = dialog->isVisible() && errorLabel->isVisible() && urlEdit->text() == invalidUrl;
+            dialog->reject();
+        }
+    });
+    action->trigger();
+    QVERIFY(invalidInputChecked);
+    QCOMPARE(shell->m_tabs.size(), initialTabCount);
+    QCOMPARE(shell->m_tabs.constFirst().part->url(), initialUrl);
+
+    bool cancelChecked = false;
+    QTimer::singleShot(0, shell, [&] {
+        if (auto *dialog = shell->findChild<QDialog *>(QStringLiteral("openFromUrlDialog"))) {
+            cancelChecked = true;
+            dialog->reject();
+        }
+    });
+    action->trigger();
+    QVERIFY(cancelChecked);
+    QCOMPARE(shell->m_tabs.size(), initialTabCount);
+    QCOMPARE(shell->m_tabs.constFirst().part->url(), initialUrl);
+}
+
+void MainShellTest::testUrlBackedPdfUsesCurrentDocumentLibraryAction()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+
+    const QUrl localUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    shell->openUrl(localUrl);
+    QTRY_COMPARE(shell->activePdfUrl(), localUrl);
+    QTRY_VERIFY(!shell->m_pdfLibraryRefreshRunning);
+
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part);
+    QVERIFY(part);
+    const QString backingPath = part->localDocumentPath();
+    QVERIFY(QFileInfo(backingPath).isReadable());
+
+    const QUrl remoteUrl(QStringLiteral("https://example.com/papers/url-backed.pdf?download=1"));
+    setPartUrl(part, remoteUrl);
+    shell->m_pdfLibraryStateUrl = remoteUrl;
+    shell->m_cachedPdfLibraryState = Shell::PdfLibraryState::NoDocument;
+    shell->m_pdfLibraryStateReady = true;
+
+    QCOMPARE(shell->activePdfSourcePath(), backingPath);
+    QCOMPARE(shell->activePdfSuggestedFilename(), QStringLiteral("url-backed.pdf"));
+    QCOMPARE(shell->activePdfLibraryState(), Shell::PdfLibraryState::OutsideLibrary);
+
+    shell->updatePdfLibraryAction();
+    QCOMPARE(shell->m_pdfLibraryAction->iconText(), QStringLiteral("Add to Library…"));
+    QCOMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("outside-library"));
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("Not in Library"));
+    QVERIFY(shell->m_pdfLibraryAction->isEnabled());
+}
+
+void MainShellTest::testDocumentTitleOpensTheTabMenu()
+{
+    // The toolbar's document title stands for the tab: right-clicking it opens the tab's menu
+    // (Copy for agent…), not the toolbar's Toolbar Settings.
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    shell->show();
+    QToolBar *mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    QLabel *title = shell->findChild<QLabel *>(QStringLiteral("readerDocumentTitle"));
+    QVERIFY(title);
+    QTRY_VERIFY(title->isVisible());
+    QStringList names;
+    QTimer::singleShot(0, shell, [&names] {
+        for (QWidget *widget : QApplication::topLevelWidgets()) {
+            auto *menu = qobject_cast<QMenu *>(widget);
+            if (!menu || !menu->isVisible()) continue;
+            names.append(menu->objectName());
+            for (const QAction *action : menu->actions()) names.append(action->objectName());
+            menu->close();
+        }
+    });
+    const QPoint global = title->mapToGlobal(title->rect().center());
+    QContextMenuEvent event(QContextMenuEvent::Mouse, mainToolBar->mapFromGlobal(global), global);
+    QApplication::sendEvent(mainToolBar, &event);
+    QVERIFY(names.contains(QStringLiteral("tabContextMenu")));
+    QVERIFY(names.contains(QStringLiteral("copyForAgentAction")));
+    shell->closeUrl();
+}
+
+void MainShellTest::testPencilButtonMenu()
+{
+    // Right-clicking the pencil's button opens its colours and eraser, not the toolbar's settings;
+    // a choice turns the pencil on. Elsewhere on the bar the toolbar's menu stays.
+    const QString savedColour = Okular::Settings::pencilColor();
+    const bool savedEraser = Okular::Settings::pencilEraser();
+    const auto restore = qScopeGuard([&] {
+        Okular::Settings::setPencilColor(savedColour);
+        Okular::Settings::setPencilEraser(savedEraser);
+        Okular::Settings::self()->save();
+    });
+    Okular::Settings::setPencilColor(QString());
+    Okular::Settings::setPencilEraser(false);
+    Okular::Settings::self()->save();
+
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QToolBar *mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    const auto buttonOf = [mainToolBar](const QString &name) -> QToolButton * {
+        for (QAction *action : mainToolBar->actions()) {
+            if (action->objectName() == name) return qobject_cast<QToolButton *>(mainToolBar->widgetForAction(action));
+        }
+        return nullptr;
+    };
+    QTRY_VERIFY(buttonOf(QStringLiteral("mouse_draw")) && buttonOf(QStringLiteral("mouse_draw"))->isVisible());
+    // The file's tab, also when an earlier test left others open.
+    auto *part = dynamic_cast<Okular::Part *>(shell->m_tabs[shell->m_tabWidget->currentIndex()].part);
+    QVERIFY(part);
+    QAction *pencil = part->actionCollection()->action(QStringLiteral("mouse_draw"));
+    QVERIFY(pencil && !pencil->isChecked());
+
+    // The menu that opens on a right-click at @p widget, and @p choose chosen in it.
+    const auto rightClick = [shell](QWidget *widget, const QString &choose) {
+        QStringList names;
+        QTimer::singleShot(0, shell, [&names, choose] {
+            for (QWidget *top : QApplication::topLevelWidgets()) {
+                auto *menu = qobject_cast<QMenu *>(top);
+                if (!menu || !menu->isVisible()) continue;
+                names.append(menu->objectName());
+                QAction *chosen = nullptr;
+                for (QAction *action : menu->actions()) {
+                    names.append(action->objectName());
+                    if (!choose.isEmpty() && action->objectName() == choose) chosen = action;
+                }
+                menu->close();
+                if (chosen) chosen->trigger();
+            }
+        });
+        const QPoint local = widget->rect().center();
+        QContextMenuEvent event(QContextMenuEvent::Mouse, local, widget->mapToGlobal(local));
+        QApplication::sendEvent(widget, &event);
+        return names;
+    };
+
+    // The bar may be rebuilt meanwhile: always its current button.
+    QStringList names = rightClick(buttonOf(QStringLiteral("mouse_draw")), QStringLiteral("pencilColour_red"));
+    QVERIFY(!names.isEmpty());
+    QCOMPARE(names.constFirst(), QStringLiteral("pencilMenu"));
+    for (const char *entry : {"pencilColour_blue", "pencilColour_black", "pencilColour_red", "pencilColour_green", "pencilColour_orange", "pencilEraser"}) {
+        QVERIFY2(names.contains(QLatin1String(entry)), entry);
+    }
+    QVERIFY(pencil->isChecked());
+    QCOMPARE(Okular::Settings::pencilColor(), QStringLiteral("#d32f2f"));
+    QCOMPARE(buttonOf(QStringLiteral("mouse_draw"))->defaultAction()->toolTip(), QStringLiteral("Pencil"));
+
+    QTRY_VERIFY(buttonOf(QStringLiteral("mouse_draw")) && buttonOf(QStringLiteral("mouse_draw"))->isVisible());
+    names = rightClick(buttonOf(QStringLiteral("mouse_draw")), QStringLiteral("pencilEraser"));
+    QVERIFY(!names.isEmpty());
+    QCOMPARE(names.constFirst(), QStringLiteral("pencilMenu"));
+    QVERIFY(pencil->isChecked());
+    QVERIFY(Okular::Settings::pencilEraser());
+    // The button says it erases now.
+    QCOMPARE(buttonOf(QStringLiteral("mouse_draw"))->defaultAction()->data().toString(), QStringLiteral("eraser"));
+    QCOMPARE(buttonOf(QStringLiteral("mouse_draw"))->defaultAction()->toolTip(), QStringLiteral("Eraser"));
+
+    // Another button keeps the toolbar's own menu.
+    QToolButton *other = buttonOf(QStringLiteral("mouse_textselect"));
+    QVERIFY(other);
+    names = rightClick(other, QString());
+    QVERIFY(!names.isEmpty());
+    QVERIFY(!names.contains(QStringLiteral("pencilMenu")));
+    QVERIFY(!names.contains(QStringLiteral("pencilEraser")));
+
+    pencil->trigger();
+    QVERIFY(!pencil->isChecked());
+    shell->closeUrl();
+}
+
+void MainShellTest::testCopyForAgentInTheFileMenu()
+{
+    // File > Copy for Agent (⌘⌥C) copies what the tab menu's Copy for agent copies, and a menu
+    // layout saved before it existed (v42) gains it after the review entry, and the Text tool after
+    // the pencil (v44).
+    const QString configRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath(QStringLiteral("kxmlgui5/okular"));
+    QVERIFY(QDir().mkpath(configRoot));
+    QFile savedMenu(QDir(configRoot).filePath(QStringLiteral("shell.rc")));
+    const bool existed = savedMenu.exists();
+    QByteArray original;
+    if (existed) {
+        QVERIFY(savedMenu.open(QIODevice::ReadOnly));
+        original = savedMenu.readAll();
+        savedMenu.close();
+    }
+    KConfigGroup toolbarState = KSharedConfig::openConfig()->group(QStringLiteral("ThoughtsToolbar"));
+    const int originalVersion = toolbarState.readEntry(QStringLiteral("LayoutVersion"), 0);
+    const auto restore = qScopeGuard([&] {
+        savedMenu.remove();
+        if (existed && savedMenu.open(QIODevice::WriteOnly)) {
+            savedMenu.write(original);
+            savedMenu.close();
+        }
+        toolbarState.writeEntry(QStringLiteral("LayoutVersion"), originalVersion);
+        toolbarState.sync();
+    });
+    QFile bundledMenu(QStringLiteral(":/kxmlgui5/okular/shell.rc"));
+    QVERIFY(bundledMenu.open(QIODevice::ReadOnly));
+    QByteArray oldMenu = bundledMenu.readAll();
+    QVERIFY(oldMenu.contains("copy_for_agent"));
+    oldMenu.replace("   <Action name=\"copy_for_agent\" append=\"open_merge\" />\n", "");
+    QVERIFY(oldMenu.contains("<Action name=\"mouse_text_box\"/>"));
+    oldMenu.replace("  <Action name=\"mouse_text_box\"/>\n", "");
+    QVERIFY(oldMenu.contains("<Action name=\"agent_notes\"/>"));
+    oldMenu.replace("  <Action name=\"agent_notes\"/>\n", "");
+    oldMenu.replace("   <Action name=\"agent_notes\" append=\"open_merge\" />\n", "");
+    QVERIFY(oldMenu.contains("<gui version=\"45\""));
+    oldMenu.replace("<gui version=\"45\"", "<gui version=\"42\"");
+    QVERIFY(!oldMenu.contains("copy_for_agent"));
+    QVERIFY(!oldMenu.contains("mouse_text_box"));
+    QVERIFY(!oldMenu.contains("agent_notes"));
+    QVERIFY(savedMenu.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(savedMenu.write(oldMenu), oldMenu.size());
+    savedMenu.close();
+    toolbarState.writeEntry(QStringLiteral("LayoutVersion"), 42);
+    toolbarState.sync();
+
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    // The saved layout now lists it, after the review entry.
+    QVERIFY(savedMenu.open(QIODevice::ReadOnly));
+    const QByteArray migrated = savedMenu.readAll();
+    savedMenu.close();
+    QVERIFY(migrated.contains("name=\"copy_for_agent\""));
+    QVERIFY(migrated.indexOf("copy_for_agent") > migrated.indexOf("review_overview"));
+    QVERIFY(migrated.contains("version=\"45\""));
+    QCOMPARE(migrated.count("name=\"mouse_text_box\""), 1);
+    QVERIFY(migrated.indexOf("mouse_text_box") > migrated.indexOf("mouse_draw"));
+    QVERIFY(migrated.indexOf("mouse_text_box") < migrated.indexOf("document_title"));
+    // v45: Agent Notes after Review, in the File menu and on the toolbar.
+    QCOMPARE(migrated.count("name=\"agent_notes\""), 2);
+    const qsizetype toolbarStart = migrated.indexOf("<ToolBar");
+    QVERIFY(toolbarStart > 0);
+    QVERIFY(migrated.indexOf("agent_notes") > migrated.indexOf("review_overview"));
+    QVERIFY(migrated.indexOf("agent_notes") < toolbarStart);
+    QVERIFY(migrated.indexOf("agent_notes", toolbarStart) > migrated.indexOf("review_overview", toolbarStart));
+    QVERIFY(migrated.indexOf("agent_notes", toolbarStart) < migrated.indexOf("ab_testing", toolbarStart));
+    QAction *fileAgentNotes = shell->actionCollection()->action(QStringLiteral("agent_notes"));
+    QVERIFY(fileAgentNotes);
+    QCOMPARE(fileAgentNotes->text(), QStringLiteral("Agent Notes"));
+    QCOMPARE(fileAgentNotes->shortcut(), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N));
+    QAction *fileCopy = shell->actionCollection()->action(QStringLiteral("copy_for_agent"));
+    QVERIFY(fileCopy);
+    QCOMPARE(fileCopy->text(), QStringLiteral("Copy for Agent"));
+    QCOMPARE(fileCopy->shortcut(), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_C));
+    auto *fileMenu = qobject_cast<QMenu *>(shell->factory()->container(QStringLiteral("file"), shell));
+    QVERIFY(fileMenu);
+    QVERIFY(fileMenu->actions().contains(fileCopy));
+    QVERIFY(fileMenu->actions().contains(fileAgentNotes));
+    QCOMPARE(fileMenu->actions().indexOf(fileAgentNotes), fileMenu->actions().indexOf(shell->actionCollection()->action(QStringLiteral("review_overview"))) + 1);
+
+    // The same text as the tab menu's Copy for agent.
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, shell->m_tabWidget->currentIndex());
+    QAction *tabCopy = menu.findChild<QAction *>(QStringLiteral("copyForAgentAction"));
+    if (!tabCopy) {
+        for (QAction *action : menu.actions())
+            if (action->objectName() == QStringLiteral("copyForAgentAction")) tabCopy = action;
+    }
+    QVERIFY(tabCopy);
+    QApplication::clipboard()->clear();
+    tabCopy->trigger();
+    const QString fromTab = QApplication::clipboard()->text();
+    QVERIFY(fromTab.startsWith(QStringLiteral("Thoughts document: \"file1.pdf\"")));
+    QApplication::clipboard()->clear();
+    fileCopy->trigger();
+    QCOMPARE(QApplication::clipboard()->text(), fromTab);
+    shell->closeUrl();
+}
+
+void MainShellTest::testReaderDisplayTitlesRefreshInactiveTabs()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QTemporaryDir root;
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    auto manifest = Thoughts::ProjectConfiguration::empty(root.path(), QStringLiteral("models"), QStringLiteral("Models"));
+    manifest.insert(QStringLiteral("documents"), QJsonArray{QJsonObject{{QStringLiteral("document_id"), id},
+        {QStringLiteral("format"), QStringLiteral("pdf")}, {QStringLiteral("included"), true},
+        {QStringLiteral("source"), QJsonObject{{QStringLiteral("folder_id"), manifest.value(QStringLiteral("default_folder_id"))},
+                                               {QStringLiteral("path"), QStringLiteral("paper.pdf")}}}}});
+    manifest.insert(QStringLiteral("document_names"), QJsonObject{{id, QStringLiteral("OLMo 3")}});
+    const auto path = Thoughts::ProjectConfiguration::path(root.path(), QStringLiteral("models"));
+    QVERIFY(Thoughts::ProjectConfiguration::save(path, manifest).isEmpty());
+    delete shell->m_readerDisplayTitles;
+    shell->m_readerDisplayTitles = new Thoughts::ReaderDisplayTitleStore(root.path(), shell, [shell] { shell->refreshReaderTabTitles(); });
+    // KDE's accelerator manager inserts '&' mnemonics into the tab labels.
+    const auto tabTitle = [shell](int index) { return KLocalizedString::removeAcceleratorMarker(shell->m_tabWidget->tabText(index)); };
+    auto *firstPart = shell->m_tabs[0].part;
+    shell->selectReaderTitle(firstPart, id, QStringLiteral("Initial title"));
+    shell->setActiveTab(1);
+    QTRY_COMPARE(tabTitle(0), QStringLiteral("OLMo 3"));
+    manifest.insert(QStringLiteral("document_names"), QJsonObject{{id, QStringLiteral("OLMo 3.1")}});
+    QVERIFY(Thoughts::ProjectConfiguration::save(path, manifest).isEmpty());
+    QTRY_COMPARE(tabTitle(0), QStringLiteral("OLMo 3.1"));
+    QCOMPARE(shell->m_tabs[0].part, firstPart);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 0);
+    QCOMPARE(menu.actions().at(1)->data().toString(), QStringLiteral("OLMo 3.1"));
+    shell->setActiveTab(0);
+    shell->setCaption(QStringLiteral("A PDF metadata title"));
+    QCOMPARE(tabTitle(0), QStringLiteral("OLMo 3.1"));
+    QCOMPARE(shell->m_tabs.size(), 2);
+}
+
+void MainShellTest::testTabRevealInFinderAction()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+
+    shell->setActiveTab(0);
+    // An empty Library: the test PDFs belong to no project.
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 1);
+
+    QCOMPARE(menu.actions().size(), 9);
+    QCOMPARE(menu.actions().at(8)->objectName(), QStringLiteral("documentViewTabAction"));
+    QCOMPARE(menu.actions().at(8)->text(), QStringLiteral("Show as HTML"));
+    QAction *revealInFinderAction = menu.actions().constFirst();
+    QCOMPARE(revealInFinderAction->objectName(), QStringLiteral("revealInFinderAction"));
+    QCOMPARE(revealInFinderAction->text(), QStringLiteral("Reveal in Finder"));
+    QVERIFY(revealInFinderAction->isEnabled());
+    QCOMPARE(revealInFinderAction->data().toUrl(), secondUrl);
+    QAction *copyDocumentNameAction = menu.actions().at(1);
+    QCOMPARE(copyDocumentNameAction->objectName(), QStringLiteral("copyDocumentNameAction"));
+    QCOMPARE(copyDocumentNameAction->text(), QStringLiteral("Copy document name"));
+    QVERIFY(copyDocumentNameAction->isEnabled());
+    QCOMPARE(copyDocumentNameAction->data().toString(), QStringLiteral("file2.pdf"));
+    QAction *copyProjectNameAction = menu.actions().at(2);
+    QCOMPARE(copyProjectNameAction->objectName(), QStringLiteral("copyProjectNameAction"));
+    QCOMPARE(copyProjectNameAction->text(), QStringLiteral("Copy project name"));
+    QVERIFY(!copyProjectNameAction->isEnabled());
+    QAction *copyForAgentAction = menu.actions().at(3);
+    QCOMPARE(copyForAgentAction->objectName(), QStringLiteral("copyForAgentAction"));
+    QCOMPARE(copyForAgentAction->text(), QStringLiteral("Copy for agent"));
+    QVERIFY(copyForAgentAction->isEnabled());
+    // Whole-document review cards are gone: a document note in a card's Tags window replaces them.
+    QVERIFY(!menu.findChild<QAction *>(QStringLiteral("wholeDocumentReviewCardAction")));
+    QVERIFY(menu.actions().at(4)->isSeparator());
+    QAction *moveTabToNewWindowAction = menu.actions().at(5);
+    QCOMPARE(moveTabToNewWindowAction->objectName(), QStringLiteral("moveTabToNewWindowAction"));
+    QCOMPARE(moveTabToNewWindowAction->text(), QStringLiteral("Move Tab to New Window"));
+    QVERIFY(moveTabToNewWindowAction->isEnabled());
+    QAction *closeOtherTabsAction = menu.actions().at(6);
+    QCOMPARE(closeOtherTabsAction->objectName(), QStringLiteral("closeOtherTabsAction"));
+    QCOMPARE(closeOtherTabsAction->text(), QStringLiteral("Close Other Tabs"));
+    QVERIFY(closeOtherTabsAction->isEnabled());
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    // Outside every project the agent text names the document and its PDF only.
+    copyForAgentAction->trigger();
+    const QString agentText = QApplication::clipboard()->text();
+    // No page on screen: the text names the document and its PDF only.
+    QVERIFY2(QRegularExpression(QStringLiteral("^Thoughts document: \"file2\\.pdf\"\nBuilt PDF: ") + QRegularExpression::escape(secondUrl.toLocalFile())
+                                + QStringLiteral("\n"))
+                 .match(agentText).hasMatch(),
+             qPrintable(agentText));
+    QVERIFY(!agentText.contains(QStringLiteral("Project:")));
+
+    // A PDF imported from a link also offers that link.
+    const QUrl link(QStringLiteral("https://arxiv.org/abs/2401.12345"));
+    QVERIFY(Thoughts::LibraryProjectStore::recordSourceLink(library.path(), QStringLiteral("file2.pdf"), link));
+    QMenu linkedMenu;
+    shell->addTabContextMenuActions(&linkedMenu, 1);
+    QCOMPARE(linkedMenu.actions().size(), 10);
+    QAction *copyLinkAction = linkedMenu.actions().at(3);
+    QCOMPARE(copyLinkAction->objectName(), QStringLiteral("copyLinkAction"));
+    QCOMPARE(copyLinkAction->text(), QStringLiteral("Copy link"));
+    QCOMPARE(copyLinkAction->data().toUrl(), link);
+    copyLinkAction->trigger();
+    QCOMPARE(QApplication::clipboard()->text(), link.toString());
+    QMenu unlinkedMenu;
+    shell->addTabContextMenuActions(&unlinkedMenu, 0);
+    QVERIFY(!unlinkedMenu.findChild<QAction *>(QStringLiteral("copyLinkAction")));
+}
+
+void MainShellTest::testTabCopyDocumentNameAction()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->setActiveTab(0);
+
+    // A narrow tab bar elides the painted label but the full document name must
+    // still be available to the context menu action and the clipboard.
+    const QString fullDocumentName = QStringLiteral("course-notes-with-a-truncated-tab-label");
+    shell->m_tabWidget->setTabText(1, fullDocumentName);
+    QVERIFY(shell->m_tabWidget->tabText(1) == fullDocumentName);
+
+    QApplication::clipboard()->setText(QStringLiteral("sentinel"));
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 1);
+    QAction *copyDocumentNameAction = menu.actions().at(1);
+    QCOMPARE(copyDocumentNameAction->objectName(), QStringLiteral("copyDocumentNameAction"));
+    QCOMPARE(copyDocumentNameAction->data().toString(), fullDocumentName);
+    copyDocumentNameAction->trigger();
+
+    QCOMPARE(QApplication::clipboard()->text(), fullDocumentName);
+
+    // The modification marker is not part of the document name.
+    shell->m_tabWidget->setTabText(1, fullDocumentName + QStringLiteral(" *"));
+    QMenu modifiedMenu;
+    shell->addTabContextMenuActions(&modifiedMenu, 1);
+    QCOMPARE(modifiedMenu.actions().at(1)->data().toString(), fullDocumentName);
+
+    // Neither is the mnemonic KDE's accelerator manager adds to tab labels.
+    shell->m_tabWidget->setTabText(1, QStringLiteral("&") + fullDocumentName);
+    QMenu mnemonicMenu;
+    shell->addTabContextMenuActions(&mnemonicMenu, 1);
+    QCOMPARE(mnemonicMenu.actions().at(1)->data().toString(), fullDocumentName);
+}
+
+void MainShellTest::testAgentDocumentDescription()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString projectId = QStringLiteral("new:applications");
+    const QString configuration = Thoughts::ProjectConfiguration::path(root.path(), projectId);
+    QVERIFY(Thoughts::ProjectConfiguration::save(configuration, Thoughts::ProjectConfiguration::empty(root.path(), projectId, QStringLiteral("Applications"))).isEmpty());
+    const QString owner = QDir(root.path()).relativeFilePath(QFileInfo(configuration).absolutePath());
+    QJsonObject sourceDocument;
+    sourceDocument.insert(QStringLiteral("filename"), QStringLiteral("document_abc.pdf"));
+    sourceDocument.insert(QStringLiteral("document_id"), QStringLiteral("7995b5d7-ab6e-4d53-9c3c-0e8c1c3f2a10"));
+    sourceDocument.insert(QStringLiteral("source_file"), QString(owner + QStringLiteral("/AlexExampleReport_2026.tex")));
+    QJsonObject applications;
+    applications.insert(QStringLiteral("id"), projectId);
+    applications.insert(QStringLiteral("name"), QStringLiteral("Applications"));
+    applications.insert(QStringLiteral("documents"), QJsonArray {sourceDocument});
+    const QJsonArray projects {applications};
+    const QString pdf = QDir(root.path()).filePath(QStringLiteral("current_pdfs/document_abc.pdf"));
+    QCOMPARE(Thoughts::agentDocumentDescription(root.path(), projects, pdf, QStringLiteral("Alex Example Report 2026"),
+                                                QStringLiteral("  Lead and mentor\n teams of  engineers ")),
+             QStringLiteral("Thoughts document: \"Alex Example Report 2026\"\n"
+                            "Project: Applications\n"
+                            "Source: %1  (LaTeX)\n"
+                            "To change the text, create proposals with the Thoughts create_proposals tool (several edits at once) or "
+                            "`thoughtsctl create-proposals`; don't edit the source directly unless asked, and never edit the PDF.\n"
+                            "Built PDF: %2\n"
+                            "Project file: %3\n"
+                            "Document ID: 7995b5d7-ab6e-4d53-9c3c-0e8c1c3f2a10\n"
+                            "Selected text: \"Lead and mentor teams of engineers\"\n")
+                 .arg(QDir(root.path()).filePath(owner + QStringLiteral("/AlexExampleReport_2026.tex")), pdf, configuration));
+    // No selection, no source (an imported PDF): those lines are left out.
+    QJsonObject importedDocument;
+    importedDocument.insert(QStringLiteral("filename"), QStringLiteral("paper.pdf"));
+    importedDocument.insert(QStringLiteral("document_id"), QStringLiteral("1fd11935-ae0e-4960-a8bd-27c39f1b7ace"));
+    QJsonObject importedProject;
+    importedProject.insert(QStringLiteral("id"), projectId);
+    importedProject.insert(QStringLiteral("name"), QStringLiteral("Applications"));
+    importedProject.insert(QStringLiteral("documents"), QJsonArray {importedDocument});
+    const QJsonArray imported {importedProject};
+    const QString paper = QDir(root.path()).filePath(QStringLiteral("current_pdfs/paper.pdf"));
+    QCOMPARE(Thoughts::agentDocumentDescription(root.path(), imported, paper, QStringLiteral("Paper"), QString()),
+             QStringLiteral("Thoughts document: \"Paper\"\nProject: Applications\nBuilt PDF: %1\n"
+                            "Project file: %2\nDocument ID: 1fd11935-ae0e-4960-a8bd-27c39f1b7ace\n").arg(paper, configuration));
+}
+
+void MainShellTest::testLibraryProjectNameForPdf()
+{
+    const QJsonArray projects {
+        QJsonObject {{QStringLiteral("name"), QStringLiteral("Models")},
+                     {QStringLiteral("documents"), QJsonArray {QJsonObject {{QStringLiteral("filename"), QStringLiteral("model.pdf")}}}}},
+        QJsonObject {{QStringLiteral("name"), QStringLiteral(" Benchmarks ")},
+                     {QStringLiteral("documents"), QJsonArray {
+                         QJsonObject {{QStringLiteral("filename"), QStringLiteral("PointArena_f2b79d4f.pdf")},
+                                      {QStringLiteral("name"), QStringLiteral("PointArena: Probing Multimodal Grounding")}},
+                         QJsonObject {{QStringLiteral("filename"), QStringLiteral("built.pdf")}, {QStringLiteral("attachment_filename"), QStringLiteral("export.pdf")}}}}}};
+    QCOMPARE(Thoughts::LibraryProjectStore::projectNameForPdf(projects, QStringLiteral("PointArena_f2b79d4f.pdf")), QStringLiteral("Benchmarks"));
+    QCOMPARE(Thoughts::LibraryProjectStore::projectNameForPdf(projects, QStringLiteral("model.pdf")), QStringLiteral("Models"));
+    QCOMPARE(Thoughts::LibraryProjectStore::projectNameForPdf(projects, QStringLiteral("export.pdf")), QStringLiteral("Benchmarks"));
+    QVERIFY(Thoughts::LibraryProjectStore::projectNameForPdf(projects, QStringLiteral("unknown.pdf")).isEmpty());
+    QVERIFY(Thoughts::LibraryProjectStore::projectNameForPdf(projects, QString()).isEmpty());
+}
+
+void MainShellTest::testTabCloseOtherTabsAction()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl retainedUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QUrl thirdUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/formattest.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), retainedUrl.toLocalFile(), thirdUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 3);
+    shell->setActiveTab(0);
+    KParts::ReadWritePart *const retainedPart = shell->m_tabs.at(1).part;
+
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 1);
+    // By name: the menu grows, and a shifted index once opened a modal dialog that hung the test.
+    QAction *closeOtherTabsAction = menu.findChild<QAction *>(QStringLiteral("closeOtherTabsAction"));
+    QVERIFY(closeOtherTabsAction);
+    closeOtherTabsAction->trigger();
+
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QCOMPARE(shell->m_tabs.constFirst().part, retainedPart);
+    QCOMPARE(shell->m_tabs.constFirst().part->url(), retainedUrl);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(shell->m_closedTabUrls, QList<QUrl>({thirdUrl, firstUrl}));
+    QVERIFY(shell->m_undoCloseTab->isEnabled());
+
+    shell->undoCloseTab();
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(shell->m_tabs.at(0).part, retainedPart);
+    QCOMPARE(shell->m_tabs.at(1).part->url(), firstUrl);
+    QCOMPARE(shell->m_closedTabUrls, QList<QUrl>({thirdUrl}));
+
+    QMenu singleTabMenu;
+    shell->closeTab(1);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    shell->addTabContextMenuActions(&singleTabMenu, 0);
+    QAction *singleCloseOthers = singleTabMenu.findChild<QAction *>(QStringLiteral("closeOtherTabsAction"));
+    QVERIFY(singleCloseOthers);
+    QVERIFY(!singleCloseOthers->isEnabled());
+}
+
+void MainShellTest::testTabCloseOtherTabsCancelKeepsWindow()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl retainedUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QUrl thirdUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/formattest.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), retainedUrl.toLocalFile(), thirdUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 3);
+    shell->setActiveTab(2);
+    auto *modifiedPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(modifiedPart);
+    modifiedPart->setModified(true);
+
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 1);
+    {
+        // Discard/Cancel prompt: Cancel is the secondary (No) button.
+        TestingUtils::CloseDialogHelper closeDialog(modifiedPart, QDialogButtonBox::No);
+        QAction *closeOtherTabsAction = menu.findChild<QAction *>(QStringLiteral("closeOtherTabsAction"));
+        QVERIFY(closeOtherTabsAction);
+        closeOtherTabsAction->trigger();
+    }
+
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 2);
+    QCOMPARE(shell->m_tabs.at(0).part->url(), firstUrl);
+    QCOMPARE(shell->m_tabs.at(1).part->url(), retainedUrl);
+    QCOMPARE(shell->m_tabs.at(2).part->url(), thirdUrl);
+    QVERIFY(shell->m_closedTabUrls.isEmpty());
+    modifiedPart->setModified(false);
+}
+
+void MainShellTest::testClosingAnnotatedTabClearsSidebarModel()
+{
+    const QUrl annotatedUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl retainedUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({annotatedUrl.toLocalFile(), retainedUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->setActiveTab(0);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    auto *annotatedPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(annotatedPart);
+    auto *annotation = new Okular::TextAnnotation();
+    annotation->setUniqueName(QStringLiteral("tab-close-sidebar-comment"));
+    annotation->setBoundingRectangle(Okular::NormalizedRect(0.1, 0.1, 0.15, 0.15));
+    annotation->setContents(QStringLiteral("Tab close sidebar lifecycle comment"));
+    partDocument(annotatedPart)->addPageAnnotation(0, annotation);
+
+    QAbstractItemModel *closingModel = annotatedPart->annotationsModel();
+    QVERIFY(closingModel);
+    QTRY_VERIFY(closingModel->rowCount() > 0);
+
+    QVERIFY(shell->closeTabInternal(0, false));
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QCOMPARE(shell->m_tabs.constFirst().part->url(), retainedUrl);
+    QCOMPARE(closingModel->rowCount(), 0);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+}
+
+void MainShellTest::testTrackedCommentActivatesExistingTab()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QUrl thirdUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/formattest.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->setActiveTab(0);
+    auto *firstPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(firstPart);
+    auto *secondPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(1).part);
+    QVERIFY(secondPart);
+    QAction *overviewAction = firstPart->actionCollection()->action(QStringLiteral("comments_overview"));
+    QVERIFY(overviewAction);
+    QAction *historyBackAction = firstPart->actionCollection()->action(QStringLiteral("go_document_back"));
+    QAction *historyBackProxy = shell->m_activePartToolbar->action(QStringLiteral("go_document_back"));
+    QAction *historyForwardAction = firstPart->actionCollection()->action(QStringLiteral("go_document_forward"));
+    QAction *historyForwardProxy = shell->m_activePartToolbar->action(QStringLiteral("go_document_forward"));
+    QVERIFY(historyBackAction);
+    QVERIFY(historyBackProxy);
+    QVERIFY(historyForwardAction);
+    QVERIFY(historyForwardProxy);
+    QAction *secondOverviewAction = secondPart->actionCollection()->action(QStringLiteral("comments_overview"));
+    QVERIFY(secondOverviewAction);
+    QAction *logsAction = firstPart->actionCollection()->action(QStringLiteral("sync_operations"));
+    QVERIFY(logsAction);
+    QCOMPARE(logsAction->text(), QStringLiteral("Logs…"));
+    QAction *reviewAction = shell->actionCollection()->action(QStringLiteral("review_overview"));
+    QVERIFY(reviewAction);
+    QAction *renderAction = shell->actionCollection()->action(QStringLiteral("render_linked_pdf"));
+    QAction *statusAction = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QVERIFY(renderAction);
+    QVERIFY(statusAction);
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("track_pdf")));
+    QCOMPARE(overviewAction->text(), QStringLiteral("Thoughts Overview…"));
+    QCOMPARE(overviewAction->iconText(), QStringLiteral("Overview"));
+    QCOMPARE(reviewAction->text(), QStringLiteral("Review"));
+    QCOMPARE(renderAction->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(renderAction->iconText(), QStringLiteral("Syncing…"));
+    QCOMPARE(renderAction->data().toString(), QStringLiteral("checking-library-pdf"));
+    QVERIFY(renderAction->isVisible());
+    QVERIFY(!renderAction->isEnabled());
+    QTRY_COMPARE(renderAction->iconText(), QStringLiteral("Add to Library…"));
+    QTRY_COMPARE(renderAction->data().toString(), QStringLiteral("outside-library"));
+    QTRY_VERIFY(renderAction->isEnabled());
+    QVERIFY(!overviewAction->icon().isNull());
+    QVERIFY(!reviewAction->icon().isNull());
+    QVERIFY(!renderAction->icon().isNull());
+    QVERIFY(!firstPart->getSideContainer()->findChild<QToolButton *>(QStringLiteral("allCommentsButton")));
+    QToolBar *mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    QCOMPARE(mainToolBar->actions().count(historyBackAction), 0);
+    QCOMPARE(mainToolBar->actions().count(historyBackProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(historyForwardAction), 0);
+    QCOMPARE(mainToolBar->actions().count(historyForwardProxy), 1);
+    // The Sidebar chooser hides the sidebar: no toggle icon on the toolbar.
+    QAction *showSidebarProxy = shell->m_activePartToolbar->action(QStringLiteral("show_leftpanel"));
+    QVERIFY(!showSidebarProxy || !mainToolBar->actions().contains(showSidebarProxy));
+    // The history arrows sit either side of the page number.
+    const int pageNumberIndex = mainToolBar->actions().indexOf(historyBackProxy) + 1;
+    QVERIFY(pageNumberIndex > 0);
+    QCOMPARE(mainToolBar->actions().at(pageNumberIndex)->objectName(), QStringLiteral("page_number"));
+    QCOMPARE(mainToolBar->actions().indexOf(historyForwardProxy), pageNumberIndex + 1);
+    QCOMPARE(mainToolBar->actions().count(renderAction), 0);
+    QCOMPARE(mainToolBar->actions().count(statusAction), 1);
+    auto *libraryButton = qobject_cast<QToolButton *>(mainToolBar->widgetForAction(statusAction));
+    QVERIFY(libraryButton);
+    QCOMPARE(libraryButton->text(), shell->m_pdfBuildStatusText);
+    QCOMPARE(libraryButton->popupMode(), QToolButton::DelayedPopup);
+    QMenu *fileMenu = nullptr;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *const menu = menuAction->menu();
+        if (menu && menu->actions().contains(renderAction)) {
+            fileMenu = menu;
+            break;
+        }
+    }
+    QVERIFY(fileMenu);
+    QCOMPARE(fileMenu->actions().count(renderAction), 1);
+    QAction *fileSyncAction = firstPart->actionCollection()->action(QStringLiteral("update_from_fedora"));
+    QVERIFY(fileSyncAction);
+    const int fileSyncIndex = fileMenu->actions().indexOf(fileSyncAction);
+    const int overviewIndex = fileMenu->actions().indexOf(overviewAction);
+    const int logsIndex = fileMenu->actions().indexOf(logsAction);
+    const int manageIndex = fileMenu->actions().indexOf(renderAction);
+    QVERIFY(fileSyncIndex >= 0);
+    QVERIFY(fileSyncIndex < overviewIndex);
+    QVERIFY(overviewIndex < logsIndex);
+    QVERIFY(logsIndex < manageIndex);
+    QAction *mouseModeAction = firstPart->actionCollection()->action(QStringLiteral("mouse_selecttools"));
+    QAction *areaSelectionAction = firstPart->actionCollection()->action(QStringLiteral("mouse_select"));
+    QAction *textSelectionAction = firstPart->actionCollection()->action(QStringLiteral("mouse_textselect"));
+    QAction *tableSelectionAction = firstPart->actionCollection()->action(QStringLiteral("mouse_tableselect"));
+    QVERIFY(mouseModeAction);
+    QVERIFY(areaSelectionAction);
+    QVERIFY(textSelectionAction);
+    QVERIFY(tableSelectionAction);
+    QVERIFY(!mouseModeAction->isVisible());
+    QVERIFY(!mainToolBar->actions().contains(mouseModeAction));
+    QMenu *toolsMenu = nullptr;
+    QAction *magnifierAction = firstPart->actionCollection()->action(QStringLiteral("mouse_magnifier"));
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *menu = menuAction->menu();
+        if (menu && menu->actions().contains(magnifierAction)) {
+            toolsMenu = menu;
+            break;
+        }
+    }
+    QVERIFY(toolsMenu);
+    QVERIFY(!toolsMenu->actions().contains(areaSelectionAction));
+    QVERIFY(!toolsMenu->actions().contains(textSelectionAction));
+    QVERIFY(!toolsMenu->actions().contains(tableSelectionAction));
+    QAction *undoAction = firstPart->actionCollection()->action(QStringLiteral("edit_undo"));
+    QAction *redoAction = firstPart->actionCollection()->action(QStringLiteral("edit_redo"));
+    QAction *overviewProxy = shell->m_activePartToolbar->action(QStringLiteral("comments_overview"));
+    QAction *undoProxy = shell->m_activePartToolbar->action(QStringLiteral("edit_undo"));
+    QAction *redoProxy = shell->m_activePartToolbar->action(QStringLiteral("edit_redo"));
+    QVERIFY(undoAction);
+    QVERIFY(redoAction);
+    QVERIFY(overviewProxy);
+    QVERIFY(undoProxy);
+    QVERIFY(redoProxy);
+
+    QDomDocument customizedToolbar = shell->domDocument();
+    QDomElement mainToolBarElement;
+    const QDomNodeList toolBars = customizedToolbar.elementsByTagName(QStringLiteral("ToolBar"));
+    for (int i = 0; i < toolBars.size(); ++i) {
+        const QDomElement candidate = toolBars.at(i).toElement();
+        if (candidate.attribute(QStringLiteral("name")) == QLatin1StringView("mainToolBar")) {
+            mainToolBarElement = candidate;
+            break;
+        }
+    }
+    QVERIFY(!mainToolBarElement.isNull());
+    bool hasHamburger = false;
+    for (QDomNode node = mainToolBarElement.firstChild(); !node.isNull(); node = node.nextSibling()) {
+        const QDomElement element = node.toElement();
+        if (element.tagName().compare(QLatin1StringView("Action"), Qt::CaseInsensitive) == 0 && element.attribute(QStringLiteral("name")) == QLatin1StringView("hamburger_menu")) {
+            hasHamburger = true;
+            break;
+        }
+    }
+    const QStringList addedActions = hasHamburger
+        ? QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("ab_testing"), QStringLiteral("edit_undo"), QStringLiteral("edit_redo")}
+        : QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("ab_testing"), QStringLiteral("hamburger_menu"), QStringLiteral("edit_undo"),
+                       QStringLiteral("edit_redo")};
+    for (const QString &name : addedActions) {
+        QDomElement actionElement = customizedToolbar.createElement(QStringLiteral("Action"));
+        actionElement.setAttribute(QStringLiteral("name"), name);
+        mainToolBarElement.appendChild(actionElement);
+    }
+    shell->setDOMDocument(customizedToolbar);
+    shell->materializeMainToolBar();
+    QVERIFY(mainToolBar->widgetForAction(overviewProxy));
+    QVERIFY(mainToolBar->widgetForAction(undoProxy));
+    QVERIFY(mainToolBar->widgetForAction(redoProxy));
+    shell->setActiveTab(1);
+    QCOMPARE(mainToolBar->actions().count(overviewAction), 0);
+    QCOMPARE(mainToolBar->actions().count(secondOverviewAction), 0);
+    QCOMPARE(mainToolBar->actions().count(overviewProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(undoProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(redoProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(reviewAction), 1);
+    shell->setActiveTab(0);
+    shell->setActiveTab(1);
+    shell->setActiveTab(0);
+    QCOMPARE(mainToolBar->actions().count(overviewAction), 0);
+    QCOMPARE(mainToolBar->actions().count(secondOverviewAction), 0);
+    QCOMPARE(mainToolBar->actions().count(overviewProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(undoProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(redoProxy), 1);
+    QCOMPARE(mainToolBar->actions().count(reviewAction), 1);
+    QAction *hamburgerAction = firstPart->actionCollection()->action(QStringLiteral("hamburger_menu"));
+    QAction *hamburgerProxy = shell->m_activePartToolbar->action(QStringLiteral("hamburger_menu"));
+    QVERIFY(hamburgerAction);
+    QVERIFY(hamburgerProxy);
+    const QList<QAction *> toolbarActions = mainToolBar->actions();
+    QAction *pageNumberAction = firstPart->actionCollection()->action(QStringLiteral("page_number"));
+    QAction *sidebarDisplayAction = firstPart->actionCollection()->action(QStringLiteral("sidebar_display"));
+    QAction *viewModeAction = firstPart->actionCollection()->action(QStringLiteral("view_render_mode"));
+    QVERIFY(pageNumberAction);
+    QVERIFY(sidebarDisplayAction);
+    QVERIFY(viewModeAction);
+    QVERIFY(toolbarActions.contains(pageNumberAction));
+    QVERIFY(toolbarActions.contains(sidebarDisplayAction));
+    QVERIFY(pageNumberAction->isVisible());
+    QVERIFY(sidebarDisplayAction->isVisible());
+    QVERIFY(mainToolBar->widgetForAction(sidebarDisplayAction));
+    // The page layouts left the toolbar; they stay in the menu bar's View menu.
+    QVERIFY(!toolbarActions.contains(viewModeAction));
+    QMenu *viewMenu = nullptr;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        if (menuAction->menu() && menuAction->menu()->actions().contains(viewModeAction)) {
+            viewMenu = menuAction->menu();
+            break;
+        }
+    }
+    QVERIFY(viewMenu);
+    for (const char *layout : {"view_render_mode_single", "view_render_mode_facing", "view_render_mode_facing_center_first", "view_render_mode_overview"}) {
+        QVERIFY2(viewModeAction->menu()->actions().contains(firstPart->actionCollection()->action(QLatin1String(layout))), layout);
+    }
+    QAction *browseAction = shell->m_activePartToolbar->action(QStringLiteral("mouse_drag"));
+    QVERIFY(browseAction);
+    QVERIFY(!toolbarActions.contains(browseAction));
+    QVERIFY(!toolbarActions.contains(shell->m_activePartToolbar->action(QStringLiteral("annotation_favorites"))));
+    QCOMPARE(toolbarActions.indexOf(pageNumberAction) < toolbarActions.indexOf(statusAction), true);
+    QCOMPARE(toolbarActions.indexOf(overviewProxy), toolbarActions.indexOf(statusAction) + 1);
+    QCOMPARE(toolbarActions.indexOf(reviewAction), toolbarActions.indexOf(overviewProxy) + 1);
+    QAction *abTestingAction = shell->actionCollection()->action(QStringLiteral("ab_testing"));
+    QVERIFY(abTestingAction);
+    QAction *agentNotesAction = shell->actionCollection()->action(QStringLiteral("agent_notes"));
+    QVERIFY(agentNotesAction);
+    QCOMPARE(toolbarActions.indexOf(agentNotesAction), toolbarActions.indexOf(reviewAction) + 1);
+    QCOMPARE(toolbarActions.indexOf(abTestingAction), toolbarActions.indexOf(agentNotesAction) + 1);
+    QVERIFY(!shell->m_activePartToolbar->action(QStringLiteral("publish_sources")));
+    QCOMPARE(toolbarActions.indexOf(hamburgerAction), toolbarActions.indexOf(abTestingAction) + 1);
+    // Rematerializing the toolbar replaces its buttons, so look them up on use.
+    const auto button = [mainToolBar](QAction *action) { return qobject_cast<QToolButton *>(mainToolBar->widgetForAction(action)); };
+    const auto visibleInToolBar = [&](QAction *action) {
+        QToolButton *toolButton = button(action);
+        return toolButton && toolButton->isVisibleTo(shell) && mainToolBar->contentsRect().contains(toolButton->geometry());
+    };
+    QVERIFY(button(overviewProxy));
+    QVERIFY(button(reviewAction));
+    QVERIFY(button(statusAction));
+    QCOMPARE(button(overviewProxy)->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QCOMPARE(button(reviewAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QCOMPARE(button(abTestingAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QCOMPARE(button(agentNotesAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QVERIFY(!agentNotesAction->icon().isNull());
+    QCOMPARE(button(statusAction)->toolButtonStyle(), Qt::ToolButtonTextBesideIcon);
+    QWidget *pageNumberWidget = mainToolBar->widgetForAction(pageNumberAction);
+    QVERIFY(pageNumberWidget);
+    auto *partPageNumberAction = qobject_cast<QWidgetAction *>(pageNumberAction);
+    QVERIFY(partPageNumberAction);
+    QWidget *partPageNumberWidget = partPageNumberAction->defaultWidget();
+    QVERIFY(partPageNumberWidget);
+    QVERIFY(pageNumberWidget == partPageNumberWidget || pageNumberWidget->isAncestorOf(partPageNumberWidget));
+    const auto pageNumberCenterOffset = [&] {
+        QWidget *host = mainToolBar->widgetForAction(pageNumberAction);
+        return host ? qAbs(mainToolBar->contentsRect().center().x() - host->geometry().center().x()) : INT_MAX;
+    };
+    shell->show();
+    for (int shellWidth : {1700, 1900}) {
+        shell->resize(shellWidth, 800);
+        QTRY_VERIFY(visibleInToolBar(overviewProxy));
+        QTRY_VERIFY(visibleInToolBar(reviewAction));
+        QTRY_VERIFY(visibleInToolBar(statusAction));
+        QTRY_VERIFY(partPageNumberWidget->isVisibleTo(shell));
+        QTRY_VERIFY2(pageNumberCenterOffset() <= 2, qPrintable(QStringLiteral("width %1: page number is %2 px off centre").arg(shellWidth).arg(pageNumberCenterOffset())));
+    }
+    QVERIFY(!mainToolBar->actions().contains(undoAction));
+    QVERIFY(!mainToolBar->actions().contains(redoAction));
+    QVERIFY(mainToolBar->widgetForAction(undoProxy));
+    QVERIFY(mainToolBar->widgetForAction(redoProxy));
+
+    QVERIFY(QMetaObject::invokeMethod(firstPart, "slotUpdateHamburgerMenu", Qt::DirectConnection));
+    QMenu *overflowMenu = hamburgerAction->menu();
+    QVERIFY(overflowMenu);
+    QCOMPARE(overflowMenu->actions().count(undoAction), 1);
+    QCOMPARE(overflowMenu->actions().count(redoAction), 1);
+    QCOMPARE(overflowMenu->actions().count(areaSelectionAction), 0);
+    QCOMPARE(overflowMenu->actions().count(textSelectionAction), 0);
+    QCOMPARE(overflowMenu->actions().count(tableSelectionAction), 0);
+
+    QTRY_VERIFY(visibleInToolBar(reviewAction));
+    QTest::mouseClick(button(reviewAction), Qt::LeftButton);
+    QTRY_VERIFY(shell->m_reviewOverview);
+    QTRY_VERIFY(shell->m_reviewOverview->isVisible());
+    shell->m_reviewOverview->hide();
+
+    QTRY_VERIFY(visibleInToolBar(overviewProxy));
+    QTest::mouseClick(button(overviewProxy), Qt::LeftButton);
+    QTRY_VERIFY(Shell::s_commentsOverview);
+    QTRY_VERIFY(Shell::s_commentsOverview->isVisible());
+    auto *overviewTabs = Shell::s_commentsOverview->findChild<QTabWidget *>(QStringLiteral("thoughtsOverviewTabs"));
+    QVERIFY(overviewTabs);
+    const auto overviewTabTitle = [overviewTabs](int index) { return KLocalizedString::removeAcceleratorMarker(overviewTabs->tabText(index)); };
+    QCOMPARE(overviewTabTitle(0), QStringLiteral("Projects"));
+    QCOMPARE(overviewTabTitle(1), QStringLiteral("To-dos"));
+    QCOMPARE(overviewTabTitle(2), QStringLiteral("Diary"));
+    QCOMPARE(overviewTabTitle(3), QStringLiteral("Annotations"));
+    QCOMPARE(overviewTabTitle(4), QStringLiteral("Review"));
+    QCOMPARE(overviewTabs->currentIndex(), 0);
+
+    Q_EMIT Shell::s_commentsOverview->documentActivated(secondUrl.toLocalFile());
+    QTRY_COMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    Q_EMIT Shell::s_commentsOverview->documentActivated(thirdUrl.toLocalFile());
+    QTRY_COMPARE(shell->m_tabWidget->currentIndex(), 2);
+    QCOMPARE(shell->m_tabs.size(), 3);
+
+    auto *annotation = new Okular::TextAnnotation();
+    annotation->setUniqueName(QStringLiteral("shell-dashboard-comment"));
+    annotation->setBoundingRectangle(Okular::NormalizedRect(0.1, 0.1, 0.15, 0.15));
+    annotation->setContents(QStringLiteral("Shell dashboard comment"));
+    partDocument(firstPart)->addPageAnnotation(0, annotation);
+
+    shell->setActiveTab(1);
+    shell->openTrackedComment(firstUrl.toLocalFile(), QStringLiteral("shell-dashboard-comment"), 1);
+
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(partDocument(firstPart)->currentPage(), 0u);
+    QTRY_COMPARE(firstPart->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow")).size(), 1);
+    for (QFrame *window : firstPart->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow"))) {
+        window->close();
+    }
+    QTRY_COMPARE(firstPart->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow")).size(), 0);
+
+    QTimer::singleShot(100, firstPart, [this, firstPart] {
+        auto *delayed = new Okular::TextAnnotation();
+        delayed->setUniqueName(QStringLiteral("shell-delayed-projection-comment"));
+        delayed->setBoundingRectangle(Okular::NormalizedRect(0.2, 0.2, 0.25, 0.25));
+        delayed->setContents(QStringLiteral("Delayed projection comment"));
+        partDocument(firstPart)->addPageAnnotation(0, delayed);
+    });
+    shell->openTrackedComment(firstUrl.toLocalFile(), QStringLiteral("shell-delayed-projection-comment"), 1);
+    QTRY_COMPARE(firstPart->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow")).size(), 1);
+}
+
+void MainShellTest::testShellMenuLabelRepair()
+{
+    QDomDocument document;
+    QVERIFY(
+        document.setContent(QByteArrayLiteral("<gui version=\"23\" custom=\"preserved\">"
+                                              " <MenuBar>"
+                                              "  <Menu name=\"file\" custom=\"file-attribute\"><Action name=\"open_from_url\"/></Menu>"
+                                              "  <Menu name=\"edit\"><text>&amp;Edit</text></Menu>"
+                                              "  <Menu name=\"settings\"><DefineGroup name=\"configure_merge\"/></Menu>"
+                                              "  <Menu name=\"help\"><text>Wrong label</text><Action name=\"help_about_app\"/></Menu>"
+                                              " </MenuBar>"
+                                              " <ToolBar name=\"mainToolBar\" custom=\"toolbar-attribute\"><Action name=\"comments_overview\"/></ToolBar>"
+                                              "</gui>")));
+
+    QVERIFY(Shell::repairShellMenuLabels(document));
+    QCOMPARE(document.documentElement().attribute(QStringLiteral("custom")), QStringLiteral("preserved"));
+    QHash<QString, QString> labels;
+    const QDomNodeList menus = document.elementsByTagName(QStringLiteral("Menu"));
+    for (int index = 0; index < menus.size(); ++index) {
+        const QDomElement menu = menus.at(index).toElement();
+        labels.insert(menu.attribute(QStringLiteral("name")), menu.firstChildElement(QStringLiteral("text")).text());
+    }
+    QCOMPARE(labels.value(QStringLiteral("file")), QStringLiteral("&File"));
+    QCOMPARE(labels.value(QStringLiteral("edit")), QStringLiteral("&Edit"));
+    QCOMPARE(labels.value(QStringLiteral("settings")), QStringLiteral("&Settings"));
+    QCOMPARE(labels.value(QStringLiteral("help")), QStringLiteral("&Help"));
+    QCOMPARE(menus.at(0).toElement().attribute(QStringLiteral("custom")), QStringLiteral("file-attribute"));
+    QCOMPARE(document.elementsByTagName(QStringLiteral("ToolBar")).at(0).toElement().attribute(QStringLiteral("custom")), QStringLiteral("toolbar-attribute"));
+    QCOMPARE(document.elementsByTagName(QStringLiteral("Action")).size(), 3);
+
+    const QByteArray repaired = document.toByteArray(1);
+    QVERIFY(!Shell::repairShellMenuLabels(document));
+    QCOMPARE(document.toByteArray(1), repaired);
+}
+
+void MainShellTest::testLegacyPdfLibraryActionMigration()
+{
+    QDomDocument document;
+    QVERIFY(
+        document.setContent(QByteArrayLiteral("<gui version=\"23\" custom=\"preserved\">"
+                                              " <MenuBar><Menu name=\"file\" custom=\"menu-attribute\">"
+                                              "  <Action name=\"open_from_url\"/>"
+                                              "  <Action name=\"track_pdf\" append=\"open_merge\"/>"
+                                              "  <Separator name=\"file_separator\"/>"
+                                              "  <Action name=\"review_overview\"/>"
+                                              " </Menu></MenuBar>"
+                                              " <ToolBar name=\"mainToolBar\" noMerge=\"1\">"
+                                              "  <Action name=\"review_overview\"/>"
+                                              "  <Action name=\"render_linked_pdf\" custom=\"current\"/>"
+                                              "  <Spacer name=\"center\"/>"
+                                              "  <Action name=\"track_pdf\" custom=\"legacy\"/>"
+                                              "  <Action name=\"hamburger_menu\"/>"
+                                              " </ToolBar>"
+                                              " <ActionProperties scheme=\"Default\">"
+                                              "  <Action name=\"track_pdf\" shortcut=\"Ctrl+L\"/>"
+                                              " </ActionProperties>"
+                                              "</gui>")));
+
+    QVERIFY(Shell::migrateLegacyPdfLibraryActions(document));
+    QCOMPARE(document.documentElement().attribute(QStringLiteral("custom")), QStringLiteral("preserved"));
+
+    int legacyCount = 0;
+    int currentCount = 0;
+    const QDomNodeList actions = document.elementsByTagName(QStringLiteral("Action"));
+    for (int index = 0; index < actions.size(); ++index) {
+        const QString name = actions.at(index).toElement().attribute(QStringLiteral("name"));
+        legacyCount += name == QLatin1StringView("track_pdf");
+        currentCount += name == QLatin1StringView("render_linked_pdf");
+    }
+    QCOMPARE(legacyCount, 0);
+    QCOMPARE(currentCount, 3);
+
+    auto directChildren = [](const QDomElement &parent) {
+        QStringList result;
+        for (QDomNode node = parent.firstChild(); !node.isNull(); node = node.nextSibling()) {
+            const QDomElement element = node.toElement();
+            if (!element.isNull()) {
+                result.append(element.tagName() + QLatin1Char(':') + element.attribute(QStringLiteral("name")));
+            }
+        }
+        return result;
+    };
+    const QDomElement fileMenu = document.elementsByTagName(QStringLiteral("Menu")).at(0).toElement();
+    QCOMPARE(fileMenu.attribute(QStringLiteral("custom")), QStringLiteral("menu-attribute"));
+    QCOMPARE(directChildren(fileMenu), QStringList({QStringLiteral("Action:open_from_url"), QStringLiteral("Action:render_linked_pdf"), QStringLiteral("Separator:file_separator"), QStringLiteral("Action:review_overview")}));
+    QDomElement migratedMenuAction = fileMenu.firstChildElement(QStringLiteral("Action"));
+    migratedMenuAction = migratedMenuAction.nextSiblingElement(QStringLiteral("Action"));
+    QCOMPARE(migratedMenuAction.attribute(QStringLiteral("append")), QStringLiteral("open_merge"));
+
+    const QDomElement toolbar = document.elementsByTagName(QStringLiteral("ToolBar")).at(0).toElement();
+    QCOMPARE(directChildren(toolbar), QStringList({QStringLiteral("Action:review_overview"), QStringLiteral("Action:render_linked_pdf"), QStringLiteral("Spacer:center"), QStringLiteral("Action:hamburger_menu")}));
+    QDomElement retainedToolbarAction = toolbar.firstChildElement(QStringLiteral("Action"));
+    retainedToolbarAction = retainedToolbarAction.nextSiblingElement(QStringLiteral("Action"));
+    QCOMPARE(retainedToolbarAction.attribute(QStringLiteral("custom")), QStringLiteral("current"));
+
+    const QDomElement properties = document.elementsByTagName(QStringLiteral("ActionProperties")).at(0).toElement();
+    QCOMPARE(properties.firstChildElement(QStringLiteral("Action")).attribute(QStringLiteral("shortcut")), QStringLiteral("Ctrl+L"));
+
+    const QByteArray migrated = document.toByteArray(1);
+    QVERIFY(!Shell::migrateLegacyPdfLibraryActions(document));
+    QCOMPARE(document.toByteArray(1), migrated);
+}
+
+void MainShellTest::testSinglePdfLibraryActionInToolbarEditor()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QAction *const action = shell->actionCollection()->action(QStringLiteral("render_linked_pdf"));
+    QAction *const statusAction = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QVERIFY(action);
+    QVERIFY(statusAction);
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("track_pdf")));
+    QCOMPARE(action->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(action->iconText(), QStringLiteral("Add to Library…"));
+
+    QToolBar *const mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    shell->resize(1700, 800);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    shell->syncPdfLibraryStatusToolButton();
+    QCOMPARE(mainToolBar->actions().count(action), 0);
+    QCOMPARE(mainToolBar->actions().count(statusAction), 1);
+    QCOMPARE(statusAction->text(), QStringLiteral("Sync"));
+    QVERIFY(shell->m_pdfBuildStatusButton);
+    QVERIFY(shell->m_pdfBuildStatusButton->actions().contains(statusAction));
+    QCOMPARE(shell->m_pdfBuildStatusButton->toolButtonStyle(), Qt::ToolButtonTextBesideIcon);
+    QCOMPARE(shell->m_pdfBuildStatusButton->popupMode(), QToolButton::DelayedPopup);
+    QVERIFY(!statusAction->menu());
+    QVERIFY(!shell->m_pdfBuildStatusButton->menu());
+    QCOMPARE(statusAction->iconText(), QStringLiteral("Sync"));
+    QCOMPARE(shell->m_pdfBuildStatusButton->text(), shell->m_pdfBuildStatusText);
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton->isVisibleTo(mainToolBar));
+    QTRY_VERIFY(!shell->m_pdfBuildStatusButton->visibleRegion().isEmpty());
+    QVERIFY(shell->m_pdfPrimaryMenuAction);
+    QVERIFY(shell->m_pdfLastBuiltMenuAction);
+    QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfStatusMenuAction));
+    QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfStatusDetailMenuAction));
+    QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfPrimaryMenuAction));
+    QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfLastBuiltMenuAction));
+    for (QAction *menuAction : shell->m_pdfLibraryMenu->actions()) {
+        QVERIFY(!menuAction->text().startsWith(QStringLiteral("Status:")));
+    }
+    QVERIFY(!shell->m_pdfLibraryMenu->isVisible());
+    QSignalSpy statusMenuShown(shell->m_pdfLibraryMenu, &QMenu::aboutToShow);
+    QTimer::singleShot(100, shell->m_pdfLibraryMenu, &QMenu::close);
+    shell->actionCollection()->action(QStringLiteral("pdf_sync_details"))->trigger();
+    QCOMPARE(statusMenuShown.count(), 1);
+    shell->m_pdfLibraryMenu->close();
+
+    auto editorItemCount = [](KEditToolBar *editor, const QString &text) {
+        int count = 0;
+        for (QListWidget *list : editor->findChildren<QListWidget *>()) {
+            for (int row = 0; row < list->count(); ++row) {
+                count += list->item(row)->text() == text;
+            }
+        }
+        return count;
+    };
+
+    shell->configureToolbars();
+    QTRY_VERIFY(shell->findChild<KEditToolBar *>());
+    QPointer<KEditToolBar> editor = shell->findChild<KEditToolBar *>();
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Add PDF to Library…")), 0);
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Sync")), 2);
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Manage Current PDF")), 1);
+    editor->reject();
+    QTRY_VERIFY(!editor);
+
+    const QDomDocument originalDocument = shell->domDocument();
+    QDomDocument availableDocument = originalDocument.cloneNode(true).toDocument();
+    const QDomNodeList toolbars = availableDocument.elementsByTagName(QStringLiteral("ToolBar"));
+    bool removed = false;
+    for (int index = 0; index < toolbars.size() && !removed; ++index) {
+        QDomElement toolbar = toolbars.at(index).toElement();
+        if (toolbar.attribute(QStringLiteral("name")) != QLatin1StringView("mainToolBar")) {
+            continue;
+        }
+        for (QDomNode node = toolbar.firstChild(); !node.isNull(); node = node.nextSibling()) {
+            const QDomElement element = node.toElement();
+            if (element.tagName() == QLatin1StringView("Action") && element.attribute(QStringLiteral("name")) == QLatin1StringView("pdf_library_status")) {
+                toolbar.removeChild(node);
+                removed = true;
+                break;
+            }
+        }
+    }
+    QVERIFY(removed);
+    shell->setDOMDocument(availableDocument);
+    shell->materializeMainToolBar();
+    QCOMPARE(mainToolBar->actions().count(statusAction), 0);
+    QVERIFY(!mainToolBar->widgetForAction(statusAction));
+    QVERIFY(!shell->m_pdfBuildStatusButton);
+
+    shell->m_pdfLibraryAction->setData(QStringLiteral("no-document"));
+    shell->updatePdfLibraryWidget(false);
+    QTest::qWait(150);
+    QCOMPARE(mainToolBar->actions().count(statusAction), 0);
+    QVERIFY(!mainToolBar->widgetForAction(statusAction));
+    QVERIFY(!shell->m_pdfBuildStatusButton);
+
+    shell->configureToolbars();
+    QTRY_VERIFY(shell->findChild<KEditToolBar *>());
+    editor = shell->findChild<KEditToolBar *>();
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Manage Current PDF")), 1);
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Add PDF to Library…")), 0);
+    QCOMPARE(editorItemCount(editor, QStringLiteral("Sync")), 2);
+    editor->reject();
+    QTRY_VERIFY(!editor);
+
+    shell->setDOMDocument(originalDocument);
+    shell->materializeMainToolBar();
+    QCOMPARE(mainToolBar->actions().count(statusAction), 1);
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+    QVERIFY(shell->m_pdfBuildStatusButton->actions().contains(statusAction));
+    QCOMPARE(shell->m_pdfBuildStatusButton->text(), shell->m_pdfBuildStatusText);
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("No PDF"));
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton->isVisibleTo(mainToolBar));
+    QTRY_VERIFY(!shell->m_pdfBuildStatusButton->visibleRegion().isEmpty());
+}
+
+void MainShellTest::testPdfStatusSurvivesToolbarRebuild()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->resize(1700, 800);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    QToolBar *const mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QAction *const statusAction = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QVERIFY(mainToolBar);
+    QVERIFY(statusAction);
+    QTRY_COMPARE(mainToolBar->actions().count(statusAction), 1);
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+
+    ToolBarStatusPaintObserver paintObserver(mainToolBar, statusAction);
+    mainToolBar->installEventFilter(&paintObserver);
+
+    const QUrl pdfUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QVERIFY(shell->openDocument(pdfUrl, serializedOptions));
+    QTRY_COMPARE(shell->m_tabs.constFirst().part->url(), pdfUrl);
+    QTest::qWait(250);
+    QVERIFY(!paintObserver.paintedWithoutStatus);
+    QCOMPARE(mainToolBar->actions().count(statusAction), 1);
+
+    // KXMLGUI may temporarily remove shell actions while merging a new Part.
+    // That incomplete layout must remain unpainted until normalization restores it.
+    mainToolBar->removeAction(statusAction);
+    QVERIFY(!mainToolBar->updatesEnabled());
+    mainToolBar->update();
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    QVERIFY(!paintObserver.paintedWithoutStatus);
+    QTRY_COMPARE(mainToolBar->actions().count(statusAction), 1);
+    QTRY_VERIFY(mainToolBar->updatesEnabled());
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton->isVisibleTo(mainToolBar));
+    QTRY_VERIFY(!shell->m_pdfBuildStatusButton->visibleRegion().isEmpty());
+    QVERIFY(!paintObserver.paintedWithoutStatus);
+}
+
+void MainShellTest::testToolbarCustomizationPersistsAcrossTabChanges()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->setActiveTab(0);
+
+    auto *firstPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    auto *secondPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(1).part);
+    QVERIFY(firstPart);
+    QVERIFY(secondPart);
+    QToolBar *mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(mainToolBar);
+    shell->resize(1700, 800);
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    QDomDocument customizedToolbar = shell->domDocument();
+    QDomElement mainToolBarElement;
+    const QDomNodeList toolBars = customizedToolbar.elementsByTagName(QStringLiteral("ToolBar"));
+    for (int i = 0; i < toolBars.size(); ++i) {
+        const QDomElement candidate = toolBars.at(i).toElement();
+        if (candidate.attribute(QStringLiteral("name")) == QLatin1StringView("mainToolBar")) {
+            mainToolBarElement = candidate;
+            break;
+        }
+    }
+    QVERIFY(!mainToolBarElement.isNull());
+    for (QDomNode node = mainToolBarElement.firstChild(); !node.isNull();) {
+        const QDomNode next = node.nextSibling();
+        const QString tagName = node.toElement().tagName();
+        if (tagName.compare(QLatin1StringView("Action"), Qt::CaseInsensitive) == 0 || tagName.compare(QLatin1StringView("Separator"), Qt::CaseInsensitive) == 0 || tagName.compare(QLatin1StringView("Spacer"), Qt::CaseInsensitive) == 0) {
+            mainToolBarElement.removeChild(node);
+        }
+        node = next;
+    }
+    auto appendAction = [&customizedToolbar, &mainToolBarElement](const QString &name) {
+        QDomElement actionElement = customizedToolbar.createElement(QStringLiteral("Action"));
+        actionElement.setAttribute(QStringLiteral("name"), name);
+        mainToolBarElement.appendChild(actionElement);
+    };
+    appendAction(QStringLiteral("review_overview"));
+    appendAction(QStringLiteral("view_render_mode"));
+    QDomElement spacerElement = customizedToolbar.createElement(QStringLiteral("Spacer"));
+    spacerElement.setAttribute(QStringLiteral("name"), QStringLiteral("custom_spacer"));
+    mainToolBarElement.appendChild(spacerElement);
+    appendAction(QStringLiteral("comments_overview"));
+    appendAction(QStringLiteral("render_linked_pdf"));
+
+    shell->setDOMDocument(customizedToolbar);
+    shell->materializeMainToolBar();
+
+    QAction *reviewAction = shell->actionCollection()->action(QStringLiteral("review_overview"));
+    QAction *commentsAction = shell->m_activePartToolbar->action(QStringLiteral("comments_overview"));
+    QAction *firstPartCommentsAction = firstPart->actionCollection()->action(QStringLiteral("comments_overview"));
+    QAction *secondPartCommentsAction = secondPart->actionCollection()->action(QStringLiteral("comments_overview"));
+    QAction *libraryAction = shell->actionCollection()->action(QStringLiteral("render_linked_pdf"));
+    QAction *statusAction = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QAction *hamburgerAction = shell->m_activePartToolbar->action(QStringLiteral("hamburger_menu"));
+    QAction *firstHamburgerAction = firstPart->actionCollection()->action(QStringLiteral("hamburger_menu"));
+    QAction *firstViewModeAction = firstPart->actionCollection()->action(QStringLiteral("view_render_mode"));
+    QAction *secondViewModeAction = secondPart->actionCollection()->action(QStringLiteral("view_render_mode"));
+    QAction *firstPageNumberAction = firstPart->actionCollection()->action(QStringLiteral("page_number"));
+    QVERIFY(reviewAction);
+    QVERIFY(commentsAction);
+    QVERIFY(firstPartCommentsAction);
+    QVERIFY(secondPartCommentsAction);
+    QVERIFY(libraryAction);
+    QVERIFY(statusAction);
+    QVERIFY(hamburgerAction);
+    QVERIFY(firstHamburgerAction);
+    QVERIFY(firstViewModeAction);
+    QVERIFY(secondViewModeAction);
+    QVERIFY(firstPageNumberAction);
+
+    auto verifyCustomizedToolbar = [&](QAction *viewModeAction, QAction *inactiveViewModeAction) {
+        const QList<QAction *> actions = mainToolBar->actions();
+        QCOMPARE(actions.size(), 5);
+        QCOMPARE(actions.at(0), reviewAction);
+        QCOMPARE(actions.at(1), viewModeAction);
+        QCOMPARE(actions.at(2)->objectName(), QStringLiteral("custom_spacer"));
+        QCOMPARE(actions.at(3), commentsAction);
+        QCOMPARE(actions.at(4), libraryAction);
+        QVERIFY(mainToolBar->widgetForAction(viewModeAction));
+        QVERIFY(!actions.contains(inactiveViewModeAction));
+        QVERIFY(!actions.contains(hamburgerAction));
+        QVERIFY(!actions.contains(firstHamburgerAction));
+        QVERIFY(!actions.contains(firstPageNumberAction));
+        QVERIFY(!actions.contains(statusAction));
+        QVERIFY(!mainToolBar->widgetForAction(statusAction));
+        QVERIFY(!shell->m_pdfBuildStatusButton);
+
+        for (QAction *iconAction : {reviewAction, commentsAction, libraryAction}) {
+            auto *button = qobject_cast<QToolButton *>(mainToolBar->widgetForAction(iconAction));
+            QVERIFY(button);
+            QCOMPARE(button->toolButtonStyle(), Qt::ToolButtonIconOnly);
+        }
+    };
+
+    auto verifyLateOverviewIsNormalized = [&](QAction *partCommentsAction, QAction *viewModeAction, QAction *inactiveViewModeAction) {
+        mainToolBar->addAction(partCommentsAction);
+        QVERIFY(mainToolBar->actions().contains(partCommentsAction));
+        QTRY_VERIFY(!mainToolBar->actions().contains(partCommentsAction));
+        QCOMPARE(mainToolBar->actions().count(commentsAction), 1);
+        verifyCustomizedToolbar(viewModeAction, inactiveViewModeAction);
+    };
+
+    verifyCustomizedToolbar(firstViewModeAction, secondViewModeAction);
+    verifyLateOverviewIsNormalized(firstPartCommentsAction, firstViewModeAction, secondViewModeAction);
+    shell->m_pdfLibraryAction->setData(QStringLiteral("no-document"));
+    shell->updatePdfLibraryWidget(false);
+    QTest::qWait(150);
+    verifyCustomizedToolbar(firstViewModeAction, secondViewModeAction);
+    shell->setActiveTab(1);
+    QTest::qWait(150);
+    verifyCustomizedToolbar(secondViewModeAction, firstViewModeAction);
+    verifyLateOverviewIsNormalized(secondPartCommentsAction, secondViewModeAction, firstViewModeAction);
+    shell->setActiveTab(0);
+    QTest::qWait(150);
+    verifyCustomizedToolbar(firstViewModeAction, secondViewModeAction);
+    verifyLateOverviewIsNormalized(firstPartCommentsAction, firstViewModeAction, secondViewModeAction);
+
+    QDomDocument statusToolbar = customizedToolbar.cloneNode(true).toDocument();
+    QDomElement statusMainToolBar;
+    const QDomNodeList statusToolBars = statusToolbar.elementsByTagName(QStringLiteral("ToolBar"));
+    for (int i = 0; i < statusToolBars.size(); ++i) {
+        const QDomElement candidate = statusToolBars.at(i).toElement();
+        if (candidate.attribute(QStringLiteral("name")) == QLatin1StringView("mainToolBar")) {
+            statusMainToolBar = candidate;
+            break;
+        }
+    }
+    QVERIFY(!statusMainToolBar.isNull());
+    QDomElement statusElement = statusToolbar.createElement(QStringLiteral("Action"));
+    statusElement.setAttribute(QStringLiteral("name"), QStringLiteral("pdf_library_status"));
+    statusMainToolBar.insertBefore(statusElement, statusMainToolBar.firstChild());
+    shell->setDOMDocument(statusToolbar);
+    shell->materializeMainToolBar();
+
+    auto verifyStatusToolbar = [&](QAction *viewModeAction, QAction *inactiveViewModeAction) {
+        const QList<QAction *> actions = mainToolBar->actions();
+        QCOMPARE(actions.size(), 6);
+        QCOMPARE(actions.count(statusAction), 1);
+        QCOMPARE(actions.at(0), statusAction);
+        QCOMPARE(actions.at(1), reviewAction);
+        QCOMPARE(actions.at(2), viewModeAction);
+        QCOMPARE(actions.at(3)->objectName(), QStringLiteral("custom_spacer"));
+        QCOMPARE(actions.at(4), commentsAction);
+        QCOMPARE(actions.at(5), libraryAction);
+        QVERIFY(!actions.contains(inactiveViewModeAction));
+        QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+        QVERIFY(shell->m_pdfBuildStatusButton->actions().contains(statusAction));
+        QCOMPARE(statusAction->iconText(), QStringLiteral("Sync"));
+        QCOMPARE(shell->m_pdfBuildStatusButton->text(), shell->m_pdfBuildStatusText);
+        QTRY_VERIFY(shell->m_pdfBuildStatusButton->isVisibleTo(mainToolBar));
+        QTRY_VERIFY(!shell->m_pdfBuildStatusButton->visibleRegion().isEmpty());
+    };
+
+    verifyStatusToolbar(firstViewModeAction, secondViewModeAction);
+    shell->setActiveTab(1);
+    QTest::qWait(150);
+    verifyStatusToolbar(secondViewModeAction, firstViewModeAction);
+    shell->setActiveTab(0);
+    QTest::qWait(150);
+    verifyStatusToolbar(firstViewModeAction, secondViewModeAction);
+
+    QDomDocument emptyToolbar = customizedToolbar;
+    QDomElement emptyMainToolBar;
+    const QDomNodeList emptyToolBars = emptyToolbar.elementsByTagName(QStringLiteral("ToolBar"));
+    for (int i = 0; i < emptyToolBars.size(); ++i) {
+        const QDomElement candidate = emptyToolBars.at(i).toElement();
+        if (candidate.attribute(QStringLiteral("name")) == QLatin1StringView("mainToolBar")) {
+            emptyMainToolBar = candidate;
+            break;
+        }
+    }
+    QVERIFY(!emptyMainToolBar.isNull());
+    for (QDomNode node = emptyMainToolBar.firstChild(); !node.isNull();) {
+        const QDomNode next = node.nextSibling();
+        const QString tagName = node.toElement().tagName();
+        if (tagName.compare(QLatin1StringView("Action"), Qt::CaseInsensitive) == 0 || tagName.compare(QLatin1StringView("Separator"), Qt::CaseInsensitive) == 0 || tagName.compare(QLatin1StringView("Spacer"), Qt::CaseInsensitive) == 0) {
+            emptyMainToolBar.removeChild(node);
+        }
+        node = next;
+    }
+    shell->setDOMDocument(emptyToolbar);
+    shell->materializeMainToolBar();
+    QCOMPARE(mainToolBar->actions().size(), 0);
+    QVERIFY(!shell->m_pdfBuildStatusButton);
+    mainToolBar->addAction(firstPartCommentsAction);
+    QVERIFY(mainToolBar->actions().contains(firstPartCommentsAction));
+    QTRY_COMPARE(mainToolBar->actions().size(), 0);
+    QVERIFY(!mainToolBar->actions().contains(firstPartCommentsAction));
+    QVERIFY(!mainToolBar->actions().contains(commentsAction));
+    shell->updatePdfLibraryWidget(false);
+    QTest::qWait(150);
+    QCOMPARE(mainToolBar->actions().size(), 0);
+    QVERIFY(!shell->m_pdfBuildStatusButton);
+    shell->setActiveTab(1);
+    QTest::qWait(150);
+    QCOMPARE(mainToolBar->actions().size(), 0);
+    QVERIFY(!shell->m_pdfBuildStatusButton);
+}
+
+void MainShellTest::testLibraryDocumentPageActivation()
+{
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    auto *shell = new Shell(options);
+    QVERIFY(shell->isValid());
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    shell->showCommentsOverview();
+    QTRY_VERIFY(Shell::s_commentsOverview);
+    const QString pdf = QStringLiteral(KDESRCDIR "data/simple-multipage.pdf");
+    Q_EMIT Shell::s_commentsOverview->documentPageActivated(pdf, 2);
+    QTRY_VERIFY(shell->isVisible());
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part);
+    QVERIFY(part);
+    QTRY_COMPARE(partDocument(part)->currentPage(), 1u);
+    Q_EMIT Shell::s_commentsOverview->documentPageActivated(pdf, 1);
+    QTRY_COMPARE(partDocument(part)->currentPage(), 0u);
+    QCOMPARE(part->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow")).size(), 0);
+}
+
+void MainShellTest::testOpenDocumentCommand()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->show();
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdf = temporary.filePath(QStringLiteral("stable.pdf"));
+    QVERIFY(QFile::link(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), pdf));
+    QJsonObject request{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("open")},
+                        {QStringLiteral("document"), pdf}, {QStringLiteral("page"), 2}};
+    QJsonObject result = shell->handleSyncCommandRequest(request);
+    QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("opened"));
+    QCOMPARE(result.value(QStringLiteral("document")).toString(), pdf);
+    QCOMPARE(result.value(QStringLiteral("page")).toInt(), 2);
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part);
+    QVERIFY(part);
+    QCOMPARE(partDocument(part)->currentPage(), 1u);
+    const int tabs = shell->m_tabs.size();
+    request.insert(QStringLiteral("page"), 1);
+    result = shell->handleSyncCommandRequest(request);
+    QCOMPARE(result.value(QStringLiteral("page")).toInt(), 1);
+    QCOMPARE(partDocument(part)->currentPage(), 0u);
+    QCOMPARE(shell->m_tabs.size(), tabs);
+    for (const QJsonValue &invalid : {QJsonValue(0), QJsonValue(-1), QJsonValue(1.5), QJsonValue(QStringLiteral("2")), QJsonValue(99999), QJsonValue()}) {
+        request.insert(QStringLiteral("page"), invalid);
+        QVERIFY(!shell->handleSyncCommandRequest(request).value(QStringLiteral("accepted")).toBool());
+        QCOMPARE(partDocument(part)->currentPage(), 0u);
+    }
+    request.insert(QStringLiteral("page"), 1);
+    for (const QString &invalid : {QString(), QStringLiteral("../escape.pdf"), QStringLiteral("https://example.com/file.pdf"), QStringLiteral("/nonexistent/file.pdf")}) {
+        request.insert(QStringLiteral("document"), invalid);
+        QVERIFY(!shell->handleSyncCommandRequest(request).value(QStringLiteral("accepted")).toBool());
+    }
+}
+
+// `thoughtsctl link-conversation`: an agent conversation is linked to the Project of a
+// project name, a source or a Library document (spec section 5.4).
+void MainShellTest::testLinkConversationCommand()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(QFileInfo(library.path()).canonicalFilePath());
+    const auto addProject = [&root](const QString &id, const QString &name, const QStringList &folders) {
+        QJsonObject project = Thoughts::ProjectConfiguration::empty(root.path(), id, name);
+        QJsonArray sourceFolders = project.value(QStringLiteral("source_folders")).toArray();
+        for (const QString &folder : folders)
+            sourceFolders.append(QJsonObject{{QStringLiteral("folder_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}, {QStringLiteral("path"), folder},
+                                             {QStringLiteral("document_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}});
+        project.insert(QStringLiteral("source_folders"), sourceFolders);
+        return Thoughts::ProjectConfiguration::save(Thoughts::ProjectConfiguration::path(root.path(), id), project).isEmpty();
+    };
+    QVERIFY(addProject(QStringLiteral("one"), QStringLiteral("One"), {QStringLiteral("docs-one"), QStringLiteral("docs-shared")}));
+    QVERIFY(addProject(QStringLiteral("two"), QStringLiteral("Two"), {QStringLiteral("docs-shared")}));
+    for (const QString &path : {QStringLiteral("docs-one/tex/a.tex"), QStringLiteral("docs-shared/b.md")}) {
+        QVERIFY(root.mkpath(QFileInfo(root.filePath(path)).path()));
+        QFile file(root.filePath(path));
+        QVERIFY(file.open(QIODevice::WriteOnly) && file.write("x") == 1);
+    }
+    const auto projects = Thoughts::LibraryProjectStore(root.path()).projects(false);
+    QCOMPARE(projects.size(), 2);
+    QString oneId;
+    for (const auto &value : projects)
+        if (value.toObject().value(QStringLiteral("name")).toString() == QLatin1String("One")) oneId = value.toObject().value(QStringLiteral("id")).toString();
+    QVERIFY(!oneId.isEmpty());
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const QString conversationId = QStringLiteral("5ef4cd0f-6a8a-5b7a-ac7b-1e9f51cd3139");
+    const QJsonObject base{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("link-conversation")},
+                           {QStringLiteral("agent"), QStringLiteral("claude")}, {QStringLiteral("conversation_id"), conversationId},
+                           {QStringLiteral("conversation_url"), QStringLiteral("https://claude.ai/code/session_01ExampleSessionBcdeFghi")},
+                           {QStringLiteral("title"), QStringLiteral("Search on mobile")}, {QStringLiteral("title_source"), QStringLiteral("app")},
+                           {QStringLiteral("session_name"), QStringLiteral("alex-94")}, {QStringLiteral("linked_by"), QStringLiteral("tool")},
+                           {QStringLiteral("tool"), QStringLiteral("create_proposal")}};
+    const auto link = [&](const QString &key, const QString &value) {
+        QJsonObject request = base;
+        request.insert(key, value);
+        return shell->handleSyncCommandRequest(request);
+    };
+
+    QJsonObject result = link(QStringLiteral("source"), root.filePath(QStringLiteral("docs-one/tex/a.tex")));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("project_id")).toString(), oneId);
+    QCOMPARE(result.value(QStringLiteral("project_name")).toString(), QStringLiteral("One"));
+    QCOMPARE(result.value(QStringLiteral("link_id")).toString(), Thoughts::AgentConversations::linkId(oneId, QStringLiteral("claude"), conversationId));
+    QCOMPARE(result.value(QStringLiteral("written")).toBool(), true);
+    QCOMPARE(result.value(QStringLiteral("title")).toString(), QStringLiteral("Search on mobile"));
+    // The queued record is visible at once.
+    const QJsonObject stored = shell->effectiveFedoraProjections().value(Thoughts::AgentConversations::projectionKey(result.value(QStringLiteral("link_id")).toString())).toObject();
+    QCOMPARE(stored.value(QStringLiteral("project_id")).toString(), oneId);
+    QCOMPARE(stored.value(QStringLiteral("last_tool")).toString(), QStringLiteral("create_proposal"));
+
+    // The same Project by name or a relative source: nothing new to write within 10 minutes.
+    result = link(QStringLiteral("project"), QStringLiteral("one"));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("project_id")).toString(), oneId);
+    QCOMPARE(result.value(QStringLiteral("written")).toBool(), false);
+    result = link(QStringLiteral("source"), QStringLiteral("docs-one/tex/a.tex"));
+    QCOMPARE(result.value(QStringLiteral("project_id")).toString(), oneId);
+
+    QCOMPARE(link(QStringLiteral("source"), QStringLiteral("docs-shared/b.md")).value(QStringLiteral("error_code")).toString(), QStringLiteral("ambiguous_project"));
+    QCOMPARE(link(QStringLiteral("source"), QStringLiteral("/etc/hosts")).value(QStringLiteral("error_code")).toString(), QStringLiteral("not_in_library"));
+    QCOMPARE(link(QStringLiteral("document"), QStringLiteral("unknown.pdf")).value(QStringLiteral("error_code")).toString(), QStringLiteral("not_in_library"));
+    QCOMPARE(link(QStringLiteral("project"), QStringLiteral("Three")).value(QStringLiteral("error_code")).toString(), QStringLiteral("project_not_found"));
+    // A card this Mac does not know (card-agent-conversations spec section 3.3).
+    QCOMPARE(link(QStringLiteral("review_card_id"), QStringLiteral("0fc5768d-a56c-53d0-9f37-7af64c3cf8a9")).value(QStringLiteral("error_code")).toString(),
+             QStringLiteral("card_not_found"));
+    // The Project-only answer says no card was linked.
+    result = link(QStringLiteral("project"), QStringLiteral("One"));
+    QVERIFY(result.value(QStringLiteral("review_card_id")).isNull());
+    QCOMPARE(result.value(QStringLiteral("card_written")).toBool(true), false);
+    QJsonObject invalid = base;
+    invalid.insert(QStringLiteral("project"), QStringLiteral("One"));
+    invalid.insert(QStringLiteral("card_linked_by"), QStringLiteral("backfill"));
+    QCOMPARE(shell->handleSyncCommandRequest(invalid).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+    invalid = base;
+    invalid.insert(QStringLiteral("project"), QStringLiteral("One"));
+    invalid.insert(QStringLiteral("source"), QStringLiteral("docs-one/tex/a.tex"));
+    QCOMPARE(shell->handleSyncCommandRequest(invalid).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+    invalid = base;
+    invalid.insert(QStringLiteral("project"), QStringLiteral("One"));
+    invalid.insert(QStringLiteral("conversation_url"), QString(QStringLiteral("codex://threads/") + conversationId));
+    QCOMPARE(shell->handleSyncCommandRequest(invalid).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+    invalid.insert(QStringLiteral("conversation_url"), QString());
+    invalid.insert(QStringLiteral("linked_by"), QStringLiteral("backfill"));
+    QCOMPARE(shell->handleSyncCommandRequest(invalid).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+}
+
+// `thoughtsctl decide-proposal` (protocol/agent-proposals.md §10.7.3): the app
+// decides one whole proposal through its own path and records the claim.
+void MainShellTest::testDecideProposalCommand()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(QFileInfo(library.path()).canonicalFilePath());
+    // A Project connects docs-one, so Sync manages its tex/source/ files.
+    {
+        QJsonObject project = Thoughts::ProjectConfiguration::empty(root.path(), QStringLiteral("one"), QStringLiteral("One"));
+        QJsonArray folders = project.value(QStringLiteral("source_folders")).toArray();
+        folders.append(QJsonObject{{QStringLiteral("folder_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}, {QStringLiteral("path"), QStringLiteral("docs-one")},
+                                   {QStringLiteral("document_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}});
+        project.insert(QStringLiteral("source_folders"), folders);
+        QVERIFY(Thoughts::ProjectConfiguration::save(Thoughts::ProjectConfiguration::path(root.path(), QStringLiteral("one")), project).isEmpty());
+    }
+    QVERIFY(root.mkpath(QStringLiteral("docs-one/tex/source")));
+    QVERIFY(root.mkpath(QStringLiteral("docs-one/tex/generated")));
+    const QString sourcePath = root.filePath(QStringLiteral("docs-one/tex/source/a.tex"));
+    const QByteArray wrapper("\\agentProposedEdit[created=2026-10-10T12:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]{agent-1}{Clarify.\n}{Old line.\n}{New line.\n}");
+    const QByteArray text = "Intro.\n" + wrapper + "Outro.\n";
+    {
+        QFile file(sourcePath);
+        QVERIFY(file.open(QIODevice::WriteOnly) && file.write(text) == text.size());
+    }
+    const auto sha = [](const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); };
+    const QString database = Thoughts::ProposalDecisions::databasePath(root.path());
+    QVERIFY(!database.isEmpty());
+    QVERIFY(database.startsWith(QDir::homePath())); // the private test home
+    // Never the account's real data folder, whatever HOME and test mode say.
+    const QString account = Thoughts::Platform::accountHomeDirectory();
+    QVERIFY2(account.isEmpty() || !database.startsWith(account + QStringLiteral("/Library/")), qPrintable(database));
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QJsonObject request{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("decide-proposal")},
+                        {QStringLiteral("request_id"), QStringLiteral("3f1d7a52-6c1e-4b9a-8d2f-0a1b2c3d4e5f")}, {QStringLiteral("source"), sourcePath},
+                        {QStringLiteral("expected_source_sha256"), sha(text)}, {QStringLiteral("proposal_id"), QStringLiteral("agent-1")},
+                        {QStringLiteral("wrapper_sha256"), sha(wrapper)}, {QStringLiteral("action"), QStringLiteral("reject")}, {QStringLiteral("origin"), QStringLiteral("vscode")}};
+    QJsonObject partial = request;
+    partial.insert(QStringLiteral("action"), QStringLiteral("partial"));
+    QCOMPARE(shell->handleSyncCommandRequest(partial).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+    const QJsonObject result = shell->handleSyncCommandRequest(request);
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("rejected"));
+    QCOMPARE(result.value(QStringLiteral("claim")).toString(), QStringLiteral("recorded"));
+    QFile source(sourcePath);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QCOMPARE(source.readAll(), QByteArray("Intro.\nOld line.\nOutro.\n"));
+    const QList<QJsonObject> claims = Thoughts::ProposalDecisions::storedClaims(database);
+    QCOMPARE(claims.size(), 1);
+    QCOMPARE(claims.first().value(QStringLiteral("action")).toString(), QStringLiteral("reject"));
+    QCOMPARE(claims.first().value(QStringLiteral("origin")).toString(), QStringLiteral("vscode"));
+    QCOMPARE(claims.first().value(QStringLiteral("source_file")).toString(), QStringLiteral("docs-one/tex/source/a.tex"));
+    QVERIFY(shell->handleSyncCommandRequest(request).value(QStringLiteral("replayed")).toBool());
+
+    // A generated file is decided too, but Sync never uploads it: no claim.
+    const QString generatedPath = root.filePath(QStringLiteral("docs-one/tex/generated/table.tex"));
+    {
+        QFile file(generatedPath);
+        QVERIFY(file.open(QIODevice::WriteOnly) && file.write(text) == text.size());
+    }
+    QJsonObject generated = request;
+    generated.insert(QStringLiteral("request_id"), QStringLiteral("5b2e8c41-7d3f-4a6b-9c1e-2f3a4b5c6d7e"));
+    generated.insert(QStringLiteral("source"), generatedPath);
+    generated.insert(QStringLiteral("action"), QStringLiteral("accept"));
+    const QJsonObject unmanaged = shell->handleSyncCommandRequest(generated);
+    QVERIFY2(unmanaged.value(QStringLiteral("accepted")).toBool(), QJsonDocument(unmanaged).toJson().constData());
+    QCOMPARE(unmanaged.value(QStringLiteral("claim")).toString(), QStringLiteral("not_applicable"));
+    QFile decided(generatedPath);
+    QVERIFY(decided.open(QIODevice::ReadOnly));
+    QCOMPARE(decided.readAll(), QByteArray("Intro.\nNew line.\nOutro.\n"));
+    QCOMPARE(Thoughts::ProposalDecisions::storedClaims(database).size(), 1);
+}
+
+void MainShellTest::testTodoCommands()
+{
+    CommentDeleteProbe probe;
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    shell->m_tabs[activeTab].part = &probe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+    const auto command = [&](const QString &name, QJsonObject request = {}) {
+        request.insert(QStringLiteral("schema_version"), 1);
+        request.insert(QStringLiteral("command"), name);
+        return shell->handleSyncCommandRequest(request);
+    };
+
+    // No synced state at all is an error, not an empty list.
+    QCOMPARE(command(QStringLiteral("list-todos")).value(QStringLiteral("error_code")).toString(), QStringLiteral("not_configured"));
+
+    const QString requestId = QStringLiteral("0b0b0b0b-0000-4000-8000-000000000002");
+    const QJsonObject add {{QStringLiteral("request_id"), requestId}, {QStringLiteral("text"), QStringLiteral("Call the bank")}, {QStringLiteral("due_date"), QStringLiteral("2099-01-02")}};
+    QJsonObject result = command(QStringLiteral("add-todo"), add);
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(probe.queuedComments.size(), 1);
+    const QJsonObject queued = probe.queuedComments.constFirst();
+    const QString id = QStringLiteral("thoughts-") + requestId;
+    QCOMPARE(queued.value(QStringLiteral("comment_id")).toString(), id);
+    QCOMPARE(queued.value(QStringLiteral("contents")).toString(), QStringLiteral("Call the bank"));
+    QCOMPARE(queued.value(QStringLiteral("origin_id")).toString(), Thoughts::Platform::desktopOriginId());
+    QCOMPARE(queued.value(QStringLiteral("scope")).toObject().value(QStringLiteral("state")).toString(), QStringLiteral("standalone"));
+    QVERIFY(queued.value(QStringLiteral("origin")).isNull());
+    QCOMPARE(queued.value(QStringLiteral("calendar_zone_id")).toString(), QString::fromUtf8(QTimeZone::systemTimeZoneId()));
+
+    // A retry queues nothing; a listing shows it with the revision edit-todo asks for.
+    QVERIFY(command(QStringLiteral("add-todo"), add).value(QStringLiteral("replayed")).toBool());
+    QCOMPARE(probe.queuedComments.size(), 1);
+    result = command(QStringLiteral("list-todos"));
+    QCOMPARE(result.value(QStringLiteral("todos")).toArray().size(), 1);
+    const QJsonObject listed = result.value(QStringLiteral("todos")).toArray().first().toObject();
+    QCOMPARE(listed.value(QStringLiteral("todo_id")).toString(), id);
+
+    const QJsonObject edit {{QStringLiteral("todo_id"), id}, {QStringLiteral("expected_revision"), listed.value(QStringLiteral("revision"))}, {QStringLiteral("text"), QStringLiteral("Call the bank today")}};
+    result = command(QStringLiteral("edit-todo"), edit);
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(probe.queuedComments.size(), 2);
+    QCOMPARE(probe.queuedComments.constLast().value(QStringLiteral("revision")).toInt(), 2);
+    QCOMPARE(probe.queuedComments.constLast().value(QStringLiteral("contents")).toString(), QStringLiteral("Call the bank today"));
+
+    // The same edit again changes nothing; another change from that old copy is refused.
+    QCOMPARE(command(QStringLiteral("edit-todo"), edit).value(QStringLiteral("state")).toString(), QStringLiteral("unchanged"));
+    QJsonObject stale = edit;
+    stale.insert(QStringLiteral("text"), QStringLiteral("Something else"));
+    QCOMPARE(command(QStringLiteral("edit-todo"), stale).value(QStringLiteral("error_code")).toString(), QStringLiteral("todo_changed"));
+    QCOMPARE(probe.queuedComments.size(), 2);
+
+    // A full queue says so instead of reporting a to-do that does not exist.
+    probe.acceptQueue = false;
+    QJsonObject second = add;
+    second.insert(QStringLiteral("request_id"), QStringLiteral("0b0b0b0b-0000-4000-8000-000000000003"));
+    result = command(QStringLiteral("add-todo"), second);
+    QVERIFY(!result.value(QStringLiteral("accepted")).toBool());
+    QCOMPARE(result.value(QStringLiteral("error_code")).toString(), QStringLiteral("queue_failed"));
+}
+
+void MainShellTest::testDeleteCommentCommand()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(library.path());
+    QVERIFY(root.mkpath(QStringLiteral("docs-one/src")));
+    const QString relative = QStringLiteral("docs-one/src/note.tex");
+    const QString sourcePath = root.filePath(relative);
+    const QString markdownRelative = QStringLiteral("docs-one/src/notes.md");
+    const QString markdownPath = root.filePath(markdownRelative);
+    const auto write = [](const QString &path, const QByteArray &bytes) {
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(bytes) == bytes.size();
+    };
+    const auto read = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+    const auto sha = [](const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); };
+
+    const QString id = QStringLiteral("2b0d6c36-3c4e-4f3e-9a51-2f7c8e1d0a11");
+    const QString highlighted = QStringLiteral("8f1e0a52-7d6b-4c1a-b0c4-6f0e2d9a3b77");
+    const QString elsewhere = QStringLiteral("c7a9e3f1-5b2d-4e8a-9c6f-1d3b5a7e9f02");
+    const QString deletedId = QStringLiteral("e4d2c1b0-a9f8-4e7d-8c6b-5a4f3e2d1c0b");
+    const QString anchorOnly = QStringLiteral("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d");
+    const QString markdownId = QStringLiteral("5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9");
+    const QByteArray tex = QStringLiteral("Intro.\n\\CommentAnchor{%1}{Tighten this}{}%\nBody.\n"
+                                          "\\CommentHighlight{%2}{Second thought}{highlighted words}%\n"
+                                          "% \\CommentAnchor{%3}{Commented out}{}%\n"
+                                          "\\CommentAnchor{%3}{Moved here}{}%\n"
+                                          "\\CommentAnchor{%4}{Already deleted}{}%\n"
+                                          "\\CommentAnchor{%5}{Anchor ID}{}%\nEnd.\n")
+                             .arg(id, highlighted, elsewhere, deletedId, anchorOnly).toUtf8();
+    QVERIFY(write(sourcePath, tex));
+    const QByteArray markdown = QStringLiteral("# Notes\n\n<!-- thoughts:v1:meta {\"key\":\"comment:%1:0\",\"contents\":\"Markdown note\"} -->\n"
+                                               "<!-- thoughts:v1:point comment:%1:0 -->\nText.\n\n```\n<!-- thoughts:v1:meta {\"key\":\"comment:%1:0\"} -->\n```\n")
+                                      .arg(markdownId).toUtf8();
+    QVERIFY(write(markdownPath, markdown));
+
+    const QString prefix = QStringLiteral("logical_comment\ncomments\n");
+    const auto comment = [&](const QString &commentId, const QString &file, const QString &contents, const QJsonObject &extra = {}) {
+        QJsonObject payload{{QStringLiteral("schema_version"), 1}, {QStringLiteral("comment_id"), commentId}, {QStringLiteral("thread_root_id"), commentId},
+                            {QStringLiteral("revision"), 2}, {QStringLiteral("contents"), contents}, {QStringLiteral("deleted"), false},
+                            {QStringLiteral("scope"), QJsonObject{{QStringLiteral("state"), QStringLiteral("source_linked")}, {QStringLiteral("anchor_id"), commentId},
+                                                                  {QStringLiteral("source_file"), file}, {QStringLiteral("source_line"), 2}}}};
+        for (auto it = extra.begin(); it != extra.end(); ++it) payload.insert(it.key(), it.value());
+        return payload;
+    };
+    CommentDeleteProbe probe;
+    probe.sourcePath = sourcePath;
+    probe.docsRoot = library.path();
+    probe.projections = {
+        {prefix + id, comment(id, relative, QStringLiteral("Tighten this"))},
+        {prefix + highlighted, comment(highlighted, relative, QStringLiteral("Second thought"))},
+        {prefix + elsewhere, comment(elsewhere, QStringLiteral("docs-one/src/other.tex"), QStringLiteral("Moved here"))},
+        // Deleted through another project's copy of this section.
+        {prefix + deletedId, comment(deletedId, QStringLiteral("docs-two/src/note.tex"), QStringLiteral("Already deleted"),
+            {{QStringLiteral("deleted"), true}, {QStringLiteral("deletion_reason"), QStringLiteral("user_deleted")}})},
+        {prefix + QStringLiteral("comment-behind-anchor"), comment(QStringLiteral("comment-behind-anchor"), relative, QStringLiteral("Anchor ID"),
+            {{QStringLiteral("scope"), QJsonObject{{QStringLiteral("state"), QStringLiteral("source_linked")}, {QStringLiteral("anchor_id"), anchorOnly},
+                                                  {QStringLiteral("source_file"), relative}}}})},
+        {prefix + markdownId, comment(markdownId, markdownRelative, QStringLiteral("Markdown note"))},
+    };
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    shell->m_tabs[activeTab].part = &probe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+
+    const auto request = [&](const QString &commentId, const QString &source, const QString &hash) {
+        QJsonObject value{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("delete-comment")}, {QStringLiteral("comment_id"), commentId}};
+        if (!source.isNull()) value.insert(QStringLiteral("source"), source);
+        if (!hash.isNull()) value.insert(QStringLiteral("expected_source_sha256"), hash);
+        return value;
+    };
+    const auto refused = [&](const QJsonObject &value, const QString &code, const QString &message = QString()) {
+        const QJsonObject result = shell->handleSyncCommandRequest(value);
+        const bool matches = !result.value(QStringLiteral("accepted")).toBool() && result.value(QStringLiteral("error_code")).toString() == code
+            && (message.isEmpty() || result.value(QStringLiteral("message")).toString().contains(message));
+        if (!matches) qWarning().noquote() << QJsonDocument(result).toJson(QJsonDocument::Compact);
+        return matches && probe.deleteCalls.isEmpty();
+    };
+
+    // Malformed requests and stale or foreign sources are refused before anything is deleted.
+    QJsonObject unexpected = request(id, sourcePath, sha(tex));
+    unexpected.insert(QStringLiteral("force"), true);
+    QVERIFY(refused(unexpected, QStringLiteral("invalid_request"), QStringLiteral("Unexpected field: force")));
+    QVERIFY(refused(request(QString(), sourcePath, sha(tex)), QStringLiteral("invalid_request")));
+    QVERIFY(refused(request(QStringLiteral("a}b"), sourcePath, sha(tex)), QStringLiteral("invalid_request")));
+    QVERIFY(refused(request(QStringLiteral("0b0b0b0b-0000-4000-8000-000000000000"), sourcePath, sha(tex)), QStringLiteral("comment_unavailable"), QStringLiteral("no comment")));
+    QVERIFY(refused(request(deletedId, QString(), QString()), QStringLiteral("comment_unavailable"), QStringLiteral("already deleted")));
+    QVERIFY(refused(request(deletedId, sourcePath, sha("stale")), QStringLiteral("source_conflict"), QStringLiteral("source changed")));
+    QVERIFY(refused(request(id, sourcePath, sha("stale")), QStringLiteral("source_conflict"), QStringLiteral("source changed")));
+    QVERIFY(refused(request(id, sourcePath, QString()), QStringLiteral("invalid_source")));
+    QVERIFY(refused(request(id, QString(), sha(tex)), QStringLiteral("invalid_source")));
+    QVERIFY(refused(request(id, sourcePath, sha(tex).toUpper()), QStringLiteral("invalid_source")));
+    QTemporaryDir outside;
+    QVERIFY(write(outside.filePath(QStringLiteral("note.tex")), tex));
+    QVERIFY(refused(request(id, outside.filePath(QStringLiteral("note.tex")), sha(tex)), QStringLiteral("invalid_source")));
+    QVERIFY(refused(request(id, root.filePath(QStringLiteral("../") + QFileInfo(outside.path()).fileName() + QStringLiteral("/note.tex")), sha(tex)), QStringLiteral("invalid_source")));
+    QVERIFY(refused(request(markdownId, sourcePath, sha(tex)), QStringLiteral("invalid_source"), QStringLiteral("does not contain")));
+    // The commented-out copy is ignored; the live marker is in a file other than the linked one.
+    QVERIFY(refused(request(elsewhere, sourcePath, sha(tex)), QStringLiteral("source_conflict"), QStringLiteral("docs-one/src/other.tex")));
+    const QByteArray doubled = tex + QStringLiteral("\\CommentAnchor{%1}{Copy}{}%\n").arg(id).toUtf8();
+    QVERIFY(write(sourcePath, doubled));
+    QVERIFY(refused(request(id, sourcePath, sha(doubled)), QStringLiteral("invalid_source"), QStringLiteral("2 times")));
+    QVERIFY(write(sourcePath, tex));
+    QCOMPARE(read(sourcePath), tex);
+
+    // A current source deletes the comment through the comment UI's explicit Delete.
+    QJsonObject result = shell->handleSyncCommandRequest(request(id, relative, sha(tex)));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("deleted"));
+    QCOMPARE(result.value(QStringLiteral("comment_id")).toString(), id);
+    QCOMPARE(result.value(QStringLiteral("contents")).toString(), QStringLiteral("Tighten this"));
+    QCOMPARE(result.value(QStringLiteral("deletion_reason")).toString(), QStringLiteral("user_deleted"));
+    QCOMPARE(result.value(QStringLiteral("source")).toString(), relative);
+    QCOMPARE(result.value(QStringLiteral("marker_removal")).toString(), QStringLiteral("complete"));
+    QVERIFY(!read(sourcePath).contains(id.toUtf8()));
+    QCOMPARE(result.value(QStringLiteral("source_sha256")).toString(), sha(read(sourcePath)));
+    QCOMPARE(Thoughts::syncCommandExitCode(result), 0);
+    QCOMPARE(probe.deleteCalls.size(), 1);
+    const QVariantList expectedTargets{QVariantMap{{QStringLiteral("annotationId"), id}, {QStringLiteral("page"), 0}}};
+    QCOMPARE(probe.deleteCalls.constFirst(), expectedTargets);
+    // Repeating it finds the comment deleted and its marker gone.
+    probe.deleteCalls.clear();
+    QVERIFY(refused(request(id, QString(), QString()), QStringLiteral("comment_unavailable"), QStringLiteral("already deleted")));
+    QVERIFY(refused(request(id, relative, sha(read(sourcePath))), QStringLiteral("invalid_source"), QStringLiteral("does not contain")));
+    QVERIFY(probe.markerRemovalCalls.isEmpty());
+
+    // A comment already deleted through another copy of its marker: this leftover
+    // marker is removed (even though the comment was linked to the other copy).
+    const QByteArray beforeLeftover = read(sourcePath);
+    QVERIFY(beforeLeftover.contains(deletedId.toUtf8()));
+    result = shell->handleSyncCommandRequest(request(deletedId, relative, sha(beforeLeftover)));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QVERIFY(result.value(QStringLiteral("already_deleted")).toBool());
+    QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("deleted"));
+    QCOMPARE(result.value(QStringLiteral("comment_id")).toString(), deletedId);
+    QCOMPARE(result.value(QStringLiteral("deletion_reason")).toString(), QStringLiteral("user_deleted"));
+    QCOMPARE(result.value(QStringLiteral("source")).toString(), relative);
+    QCOMPARE(result.value(QStringLiteral("marker_removal")).toString(), QStringLiteral("complete"));
+    QCOMPARE(Thoughts::syncCommandExitCode(result), 0);
+    QVERIFY(probe.deleteCalls.isEmpty()); // Nothing is deleted again.
+    QCOMPARE(probe.markerRemovalCalls.size(), 1);
+    QCOMPARE(probe.markerRemovalCalls.constFirst(), (QVariantList{QVariantMap{{QStringLiteral("anchor_id"), deletedId}, {QStringLiteral("source_file"), relative}}}));
+    const QByteArray afterLeftover = read(sourcePath);
+    QCOMPARE(result.value(QStringLiteral("source_sha256")).toString(), sha(afterLeftover));
+    QVERIFY(!afterLeftover.contains(deletedId.toUtf8()));
+    QVERIFY(!afterLeftover.contains("Already deleted"));
+    // Only the marker's line went.
+    QByteArray expectedLeftover = beforeLeftover;
+    expectedLeftover.replace(QStringLiteral("\\CommentAnchor{%1}{Already deleted}{}%\n").arg(deletedId).toUtf8(), QByteArray());
+    QCOMPARE(afterLeftover, expectedLeftover);
+    probe.markerRemovalCalls.clear();
+
+    // The UI's Delete reaches the Part through the same call.
+    shell->deleteTrackedComments({{QString(), highlighted, 0}});
+    QCOMPARE(probe.deleteCalls.size(), 1);
+    QCOMPARE(probe.deleteCalls.constFirst(), QVariantList{QVariantMap({{QStringLiteral("annotationId"), highlighted}, {QStringLiteral("page"), 0}})});
+    probe.deleteCalls.clear();
+
+    // A marker under its own anchor ID resolves to its comment; a marker left behind is reported.
+    probe.removeMarker = false;
+    QByteArray current = read(sourcePath);
+    result = shell->handleSyncCommandRequest(request(anchorOnly, sourcePath, sha(current)));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("comment_id")).toString(), QStringLiteral("comment-behind-anchor"));
+    QCOMPARE(result.value(QStringLiteral("marker_removal")).toString(), QStringLiteral("pending"));
+    QCOMPARE(probe.deleteCalls.constFirst().constFirst().toMap().value(QStringLiteral("annotationId")).toString(), QStringLiteral("comment-behind-anchor"));
+    probe.deleteCalls.clear();
+
+    // Markdown counts only the live metadata line, not the fenced example.
+    probe.removeMarker = true;
+    probe.sourcePath = markdownPath;
+    result = shell->handleSyncCommandRequest(request(markdownId, markdownPath, sha(markdown)));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("source")).toString(), markdownRelative);
+    QCOMPARE(probe.deleteCalls.size(), 1);
+}
+
+void MainShellTest::testSidebarReviewCardsProjection()
+{
+    Shell shell;
+    SyncDispatchProbe part;
+    part.setDocumentUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf")));
+    const QString id = QStringLiteral("02db2cd5-b7b9-4b90-a655-fc1c761303a4");
+    const QString key = QStringLiteral("review_card\ncards\n") + id;
+    QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage")},
+                        {QStringLiteral("question"), QStringLiteral("What is shown on these pages?")},
+                        {QStringLiteral("regions"), QJsonArray()}};
+    QJsonObject card{{QStringLiteral("card_id"), id}, {QStringLiteral("schema_version"), 4},
+                     {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("primary"), primary}};
+    QJsonObject projections{{key, card}};
+    shell.refreshSidebarReviewCards(&part, projections);
+    QCOMPARE(part.sidebarCards.size(), 1);
+    // The card's record with its schedule, read from the same cards (one ReviewStore, one read).
+    QJsonObject passed = part.sidebarCards.first().toObject();
+    QJsonObject schedule = passed.take(QStringLiteral("sidebar_schedule")).toObject();
+    QCOMPARE(passed, card); // Unlocated cards remain visible.
+    QCOMPARE(schedule.value(QStringLiteral("state")).toString(), QStringLiteral("new"));
+    QCOMPARE(schedule.value(QStringLiteral("due_from")).toString(), QStringLiteral("1970-01-01T00:00:00.000Z")); // Due since ever.
+    QCOMPARE(schedule.value(QStringLiteral("reviews")).toInt(), 0);
+    QVERIFY(!schedule.value(QStringLiteral("answered")).toBool());
+
+    // Answered: its due date, interval, counts and last tags, labelled as the Review tab labels them.
+    const QString answerId = QStringLiteral("8b0f3c55-0a51-4f73-9d3c-6a3c2f1e0b11");
+    const QString answerKey = QStringLiteral("review_event\nevents\n") + answerId;
+    projections.insert(answerKey, QJsonObject{{QStringLiteral("event_id"), answerId}, {QStringLiteral("card_id"), id},
+                                            {QStringLiteral("rating"), QStringLiteral("custom_interval")},
+                                            {QStringLiteral("review_tags"), QJsonArray{QStringLiteral("correct"), QStringLiteral("my tag")}},
+                                            {QStringLiteral("reviewed_at"), QStringLiteral("2026-09-01T10:00:00Z")},
+                                            {QStringLiteral("scheduled_due_at"), QStringLiteral("2026-09-15T10:00:00Z")}});
+    shell.refreshSidebarReviewCards(&part, projections);
+    QCOMPARE(part.sidebarCards.size(), 1);
+    schedule = part.sidebarCards.first().toObject().value(QStringLiteral("sidebar_schedule")).toObject();
+    QCOMPARE(schedule.value(QStringLiteral("state")).toString(), QStringLiteral("review"));
+    QCOMPARE(schedule.value(QStringLiteral("due_at")).toString(), QStringLiteral("2026-09-15T10:00:00.000Z"));
+    QCOMPARE(schedule.value(QStringLiteral("due_from")).toString(), QStringLiteral("2026-09-15T10:00:00.000Z"));
+    QCOMPARE(schedule.value(QStringLiteral("last_reviewed_at")).toString(), QStringLiteral("2026-09-01T10:00:00.000Z"));
+    QCOMPARE(schedule.value(QStringLiteral("reviews")).toInt(), 1);
+    QCOMPARE(schedule.value(QStringLiteral("lapses")).toInt(), 0);
+    QCOMPARE(schedule.value(QStringLiteral("interval")).toString(), QStringLiteral("2 weeks"));
+    QVERIFY(schedule.value(QStringLiteral("repeats")).toBool());
+    QCOMPARE(schedule.value(QStringLiteral("tags")).toArray(), (QJsonArray{QStringLiteral("Correct"), QStringLiteral("my tag")}));
+    QVERIFY(schedule.value(QStringLiteral("answered")).toBool());
+    // Waiting for a location: the queue does not take it, so it has no due_from.
+    QJsonObject repairing = card;
+    repairing.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("running")}});
+    projections.insert(key, repairing);
+    shell.refreshSidebarReviewCards(&part, projections);
+    schedule = part.sidebarCards.first().toObject().value(QStringLiteral("sidebar_schedule")).toObject();
+    QCOMPARE(schedule.value(QStringLiteral("state")).toString(), QStringLiteral("unavailable"));
+    QVERIFY(!schedule.contains(QStringLiteral("due_from")));
+    QCOMPARE(schedule.value(QStringLiteral("due_at")).toString(), QStringLiteral("2026-09-15T10:00:00.000Z"));
+    projections.insert(key, card);
+    projections.remove(answerKey);
+
+    const QString eventId = QStringLiteral("2f65a7de-21c8-440c-a7a8-bbccf1f323a8");
+    const QString eventKey = QStringLiteral("review_event\nevents\n") + eventId;
+    projections.insert(eventKey, QJsonObject{{QStringLiteral("event_id"), eventId}, {QStringLiteral("card_id"), id},
+                                           {QStringLiteral("rating"), QStringLiteral("delete")}, {QStringLiteral("reviewed_at"), QStringLiteral("2026-09-09T15:00:00Z")}});
+    shell.refreshSidebarReviewCards(&part, projections);
+    QVERIFY(part.sidebarCards.isEmpty());
+    projections.remove(eventKey);
+    primary.insert(QStringLiteral("pdf_stem"), QStringLiteral("another-document"));
+    card.insert(QStringLiteral("primary"), primary);
+    projections.insert(key, card);
+    shell.refreshSidebarReviewCards(&part, projections);
+    QVERIFY(part.sidebarCards.isEmpty());
+}
+
+void MainShellTest::testCommentsOverviewStartup()
+{
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    auto *firstShell = new Shell(serializedOptions);
+    auto *secondShell = new Shell(serializedOptions);
+    QVERIFY(firstShell->isValid());
+    QVERIFY(secondShell->isValid());
+    firstShell->show();
+    secondShell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(firstShell));
+    QVERIFY(QTest::qWaitForWindowExposed(secondShell));
+    auto *firstPart = qobject_cast<Okular::Part *>(firstShell->m_tabs.constFirst().part);
+    auto *secondPart = qobject_cast<Okular::Part *>(secondShell->m_tabs.constFirst().part);
+    QVERIFY(firstPart);
+    QVERIFY(secondPart);
+    QVERIFY(!fedoraClientCreated(firstPart));
+    QVERIFY(!fedoraClientCreated(secondPart));
+
+    Shell::showCommentsOverviewOnStartup();
+
+    QTRY_VERIFY(Shell::s_commentsOverview);
+    QTRY_VERIFY(Shell::s_commentsOverview->isVisible());
+    QVERIFY(!Shell::s_commentsOverview->parentWidget());
+    QVERIFY(!fedoraClientCreated(firstPart));
+    QVERIFY(!fedoraClientCreated(secondPart));
+    QVERIFY(!Shell::s_commentsOverview->testAttribute(Qt::WA_ShowWithoutActivating));
+    QVERIFY(!firstShell->isVisible());
+    QVERIFY(!secondShell->isVisible());
+    Shell *overviewShell = Shell::s_commentsOverviewShell;
+    QVERIFY(overviewShell == firstShell || overviewShell == secondShell);
+    QVERIFY(!overviewShell->actionCollection()->action(QStringLiteral("track_pdf")));
+    QAction *pdfLibraryAction = overviewShell->actionCollection()->action(QStringLiteral("render_linked_pdf"));
+    QVERIFY(pdfLibraryAction);
+    QCOMPARE(pdfLibraryAction->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(pdfLibraryAction->iconText(), QStringLiteral("Add to Library…"));
+    QVERIFY(!pdfLibraryAction->icon().isNull());
+    QVERIFY(pdfLibraryAction->isVisible());
+    auto *trackPdfButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewTrackPdf"));
+    QVERIFY(trackPdfButton);
+    // The Overview's library header button creates a project.
+    QCOMPARE(trackPdfButton->text(), QStringLiteral("Add project…"));
+
+    QTemporaryDir libraryRoot;
+    QVERIFY(libraryRoot.isValid());
+    QVERIFY(QDir().mkpath(libraryRoot.filePath(QStringLiteral("current_pdfs"))));
+    const QString externalPath = libraryRoot.filePath(QStringLiteral("external.pdf"));
+    const QString libraryPath = libraryRoot.filePath(QStringLiteral("current_pdfs/unlinked.pdf"));
+    for (const QString &path : {externalPath, libraryPath}) {
+        QFile pdf(path);
+        QVERIFY(pdf.open(QIODevice::WriteOnly));
+        QCOMPARE(pdf.write("%PDF-1.7\n"), 9);
+    }
+    QVERIFY(Shell::isExternalPdfForLibrary(libraryRoot.path(), QUrl::fromLocalFile(externalPath)));
+    QVERIFY(!Shell::isExternalPdfForLibrary(libraryRoot.path(), QUrl::fromLocalFile(libraryPath)));
+    QVERIFY(!Shell::isExternalPdfForLibrary(libraryRoot.path(), QUrl(QStringLiteral("https://example.com/document.pdf"))));
+
+    overviewShell->showCommentsOverview();
+    QVERIFY(!Shell::s_commentsOverview->testAttribute(Qt::WA_ShowWithoutActivating));
+}
+
+void MainShellTest::testReviewCardPdfWindowKeepsBrowserAvailable()
+{
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    auto *shell = new Shell(serializedOptions);
+    QVERIFY(shell->isValid());
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    Shell::showCommentsOverviewOnStartup();
+    QTRY_VERIFY(Shell::s_commentsOverview);
+    QTRY_VERIFY(Shell::s_commentsOverview->isVisible());
+    QVERIFY(!shell->isVisible());
+
+    shell->showReviewCardPdfWindow(true);
+
+    QTRY_VERIFY(shell->isVisible());
+    QVERIFY(Shell::s_commentsOverview->isVisible());
+}
+
+void MainShellTest::testDocumentStartupSkipsCommentsOverview()
+{
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    const QUrl pdfUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    auto *shell = new Shell(serializedOptions);
+    QVERIFY(shell->isValid());
+    QVERIFY(shell->openDocument(pdfUrl, serializedOptions));
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    Shell::showCommentsOverviewOnStartup();
+
+    QVERIFY(!Shell::s_commentsOverview);
+    QVERIFY(shell->isVisible());
+    QVERIFY(shell->hasOpenDocument());
+}
+
+void MainShellTest::testClosingLastDocumentReturnsToOverview()
+{
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    const QUrl pdfUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    auto *shell = new Shell(serializedOptions);
+    QVERIFY(shell->isValid());
+    QVERIFY(shell->openDocument(pdfUrl, serializedOptions));
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QVERIFY(shell->hasOpenDocument());
+
+    QVERIFY(shell->closeTabInternal(0, false));
+
+    QTRY_VERIFY(Shell::s_commentsOverview);
+    QTRY_VERIFY(Shell::s_commentsOverview->isVisible());
+    QVERIFY(!Shell::s_commentsOverview->testAttribute(Qt::WA_ShowWithoutActivating));
+    QVERIFY(!shell->isVisible());
+    QVERIFY(!shell->hasOpenDocument());
+
+    Q_EMIT Shell::s_commentsOverview->documentActivated(pdfUrl.toLocalFile());
+
+    QTRY_VERIFY(shell->isVisible());
+    QTRY_VERIFY(!Shell::s_commentsOverview->isVisible());
+    QVERIFY(shell->hasOpenDocument());
+}
+
+void MainShellTest::testArchivedCommentHistoryRestoration()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString commentsRoot = temporary.filePath(QStringLiteral("comments"));
+    const QString olderRoot = commentsRoot + QStringLiteral("/.archive/paper/20260810T080000000Z");
+    const QString newerRoot = commentsRoot + QStringLiteral("/.archive/paper/20260811T080000000Z");
+    QVERIFY(QDir().mkpath(olderRoot));
+    QVERIFY(QDir().mkpath(newerRoot));
+
+    const QByteArray older = QByteArrayLiteral("older history\n");
+    const QByteArray newer = QByteArrayLiteral("newer history\n");
+    const auto write = [](const QString &path, const QByteArray &contents) {
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(contents) == contents.size();
+    };
+    QVERIFY(write(QDir(olderRoot).filePath(QStringLiteral("paper_comments.jsonl")), older));
+    QVERIFY(write(QDir(newerRoot).filePath(QStringLiteral("paper_comments.jsonl")), newer));
+    QVERIFY(write(QDir(newerRoot).filePath(QStringLiteral("manifest.json")), QByteArrayLiteral("{}\n")));
+
+    const QString archivedSidecar = Shell::newestArchivedSidecar(temporary.path(), QStringLiteral("paper"));
+    QCOMPARE(archivedSidecar, QDir(newerRoot).filePath(QStringLiteral("paper_comments.jsonl")));
+    const QString destination = commentsRoot + QStringLiteral("/paper_comments.jsonl");
+    QString error;
+    QVERIFY2(Shell::restoreArchivedSidecar(archivedSidecar, destination, &error), qPrintable(error));
+
+    QFile restored(destination);
+    QVERIFY(restored.open(QIODevice::ReadOnly));
+    QCOMPARE(restored.readAll(), newer);
+    QVERIFY(QFileInfo::exists(QDir(olderRoot).filePath(QStringLiteral("paper_comments.jsonl"))));
+    QVERIFY(!QFileInfo::exists(newerRoot));
+}
+
+void MainShellTest::testCommentsOverviewSurvivesLastPdfWindow()
+{
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    const QUrl pdfUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    auto *shell = new Shell(serializedOptions);
+    QVERIFY(shell->isValid());
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    shell->showCommentsOverview();
+
+    QPointer<Shell> closedShell(shell);
+    QPointer<Thoughts::CommentsOverview> overview(Shell::s_commentsOverview);
+    QVERIFY(overview);
+    QVERIFY(overview->isVisible());
+    QVERIFY(!overview->parentWidget());
+
+    QSignalSpy lastWindowClosedSpy(qApp, &QGuiApplication::lastWindowClosed);
+    shell->close();
+    QTRY_VERIFY(closedShell.isNull());
+    QCOMPARE(lastWindowClosedSpy.size(), 0);
+    QVERIFY(overview);
+    QVERIFY(overview->isVisible());
+    QVERIFY(getShells().isEmpty());
+
+    Shell *workerShell = Shell::shellForCommentsOverview();
+    QVERIFY(workerShell);
+    QVERIFY(workerShell->isValid());
+    QVERIFY(!workerShell->isVisible());
+    QVERIFY(workerShell->openDocument(pdfUrl, serializedOptions));
+    auto *part = qobject_cast<Okular::Part *>(workerShell->m_tabs.constFirst().part);
+    QVERIFY(part);
+
+    auto *annotation = new Okular::TextAnnotation();
+    annotation->setUniqueName(QStringLiteral("overview-lifecycle-comment"));
+    annotation->setBoundingRectangle(Okular::NormalizedRect(0.1, 0.1, 0.15, 0.15));
+    annotation->setContents(QStringLiteral("Overview lifecycle comment"));
+    partDocument(part)->addPageAnnotation(0, annotation);
+
+    Q_EMIT overview->commentActivated(pdfUrl.toLocalFile(), QStringLiteral("overview-lifecycle-comment"), 1);
+    QTRY_VERIFY(workerShell->isVisible());
+    QCOMPARE(partDocument(part)->currentPage(), 0u);
+    QTRY_COMPARE(part->widget()->findChildren<QFrame *>(QStringLiteral("AnnotWindow")).size(), 1);
+
+    // A comment on a passage opens the same way. The shell names these methods as text, so a
+    // mistake would only show at run time, by nothing happening.
+    workerShell->hide();
+    Q_EMIT overview->documentFeedbackActivated(pdfUrl.toLocalFile(), QStringLiteral("not-in-this-document"));
+    QTRY_VERIFY(workerShell->isVisible());
+    bool answer = true;
+    QVERIFY(QMetaObject::invokeMethod(part, "openDocumentFeedback", Qt::DirectConnection, Q_RETURN_ARG(bool, answer), Q_ARG(QString, QStringLiteral("not-in-this-document"))));
+    QVERIFY(!answer);
+    answer = true;
+    QVERIFY(QMetaObject::invokeMethod(part, "enqueueDocumentFeedbackRecord", Qt::DirectConnection, Q_RETURN_ARG(bool, answer), Q_ARG(QVariantMap, QVariantMap())));
+    QVERIFY(!answer);
+}
+
+void MainShellTest::testLinkedPdfRenderTargetAndTerminalScript()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QDir root(temporary.path());
+    QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("current_pdfs"))));
+    QVERIFY(QDir().mkpath(root.filePath(QStringLiteral("comments/.layout"))));
+
+    const QString pdfPath = root.filePath(QStringLiteral("current_pdfs/linked.pdf"));
+    const QString unlinkedPdfPath = root.filePath(QStringLiteral("current_pdfs/unlinked.pdf"));
+    const QString malformedPdfPath = root.filePath(QStringLiteral("current_pdfs/malformed.pdf"));
+    const QString externalPdfPath = root.filePath(QStringLiteral("outside.pdf"));
+    for (const QString &path : {pdfPath, unlinkedPdfPath, malformedPdfPath, externalPdfPath}) {
+        QFile pdf(path);
+        QVERIFY(pdf.open(QIODevice::WriteOnly));
+        QCOMPARE(pdf.write("placeholder"), 11);
+    }
+
+    QFile layout(root.filePath(QStringLiteral("comments/.layout/linked.json")));
+    QVERIFY(layout.open(QIODevice::WriteOnly));
+    layout.write(QJsonDocument(QJsonObject {{QStringLiteral("version"), 1}, {QStringLiteral("sources"), QJsonArray {QJsonObject {}}}}).toJson());
+    layout.close();
+    QFile malformedLayout(root.filePath(QStringLiteral("comments/.layout/malformed.json")));
+    QVERIFY(malformedLayout.open(QIODevice::WriteOnly));
+    QCOMPARE(malformedLayout.write("not-json"), 8);
+    malformedLayout.close();
+
+    QFile libraryIndex(root.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+    QVERIFY(libraryIndex.open(QIODevice::WriteOnly));
+    libraryIndex.write(
+        QJsonDocument(QJsonObject {
+                          {QStringLiteral("schema_version"), 1},
+                          {QStringLiteral("library_revision"), QString(64, QLatin1Char('d'))},
+                          {QStringLiteral("source_index_sha256"), QString(64, QLatin1Char('e'))},
+                          {QStringLiteral("pdfs"),
+                           QJsonArray {
+                               QJsonObject {{QStringLiteral("filename"), QStringLiteral("linked.pdf")}, {QStringLiteral("kind"), QStringLiteral("source_linked")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}},
+                               QJsonObject {{QStringLiteral("filename"), QStringLiteral("unlinked.pdf")}, {QStringLiteral("kind"), QStringLiteral("unlinked")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('b'))}},
+                               QJsonObject {{QStringLiteral("filename"), QStringLiteral("malformed.pdf")}, {QStringLiteral("kind"), QStringLiteral("source_linked")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('c'))}},
+                           }},
+                      })
+            .toJson());
+    libraryIndex.close();
+
+    QFile sourceIndex(root.filePath(QStringLiteral("current_pdfs/.thoughts-source-index.json")));
+    QVERIFY(sourceIndex.open(QIODevice::WriteOnly));
+    sourceIndex.write(
+        QJsonDocument(QJsonObject {
+                          {QStringLiteral("schema_version"), 1},
+                          {QStringLiteral("pdfs"),
+                           QJsonArray {QJsonObject {{QStringLiteral("filename"), QStringLiteral("linked.pdf")}, {QStringLiteral("project"), QStringLiteral("docs-linked")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}}}},
+                      })
+            .toJson());
+    sourceIndex.close();
+
+    QFile generation(root.filePath(QStringLiteral("current_pdfs/.thoughts-generation.json")));
+    QVERIFY(generation.open(QIODevice::WriteOnly));
+    generation.write(QJsonDocument(QJsonObject {
+                                       {QStringLiteral("schema_version"), 1},
+                                       {QStringLiteral("library_revision"), QString(64, QLatin1Char('d'))},
+                                       {QStringLiteral("source_index_sha256"), QString(64, QLatin1Char('e'))},
+                                       {QStringLiteral("publications"),
+                                        QJsonArray {
+                                            QJsonObject {{QStringLiteral("filename"), QStringLiteral("linked.pdf")}, {QStringLiteral("sha256"), QString(64, QLatin1Char('a'))}},
+                                            QJsonObject {{QStringLiteral("filename"), QStringLiteral("unlinked.pdf")}, {QStringLiteral("sha256"), QString(64, QLatin1Char('b'))}},
+                                            QJsonObject {{QStringLiteral("filename"), QStringLiteral("malformed.pdf")}, {QStringLiteral("sha256"), QString(64, QLatin1Char('c'))}},
+                                        }},
+                                   })
+                         .toJson());
+    generation.close();
+
+    QCOMPARE(Shell::linkedPdfRenderTarget(root.absolutePath(), QUrl::fromLocalFile(pdfPath)), QStringLiteral("current_pdfs/linked.pdf"));
+    QVERIFY(Shell::linkedPdfRenderTarget(root.absolutePath(), QUrl::fromLocalFile(externalPdfPath)).isEmpty());
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl::fromLocalFile(pdfPath)), Shell::PdfLibraryState::SourceLinked);
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl::fromLocalFile(unlinkedPdfPath)), Shell::PdfLibraryState::UnlinkedLibrary);
+    QCOMPARE(Shell::libraryPdfSha256(root.absolutePath(), QUrl::fromLocalFile(unlinkedPdfPath)), QString(64, QLatin1Char('b')));
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl::fromLocalFile(malformedPdfPath)), Shell::PdfLibraryState::SourceLinkedMissingLayout);
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl::fromLocalFile(externalPdfPath)), Shell::PdfLibraryState::OutsideLibrary);
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl::fromLocalFile(root.filePath(QStringLiteral("missing.pdf")))), Shell::PdfLibraryState::NoDocument);
+    QCOMPARE(Shell::pdfLibraryState(root.absolutePath(), QUrl(QStringLiteral("https://example.com/document.pdf"))), Shell::PdfLibraryState::NoDocument);
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QAction *action = shell->actionCollection()->action(QStringLiteral("render_linked_pdf"));
+    QVERIFY(action);
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("track_pdf")));
+    QCOMPARE(action->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(action->iconText(), QStringLiteral("Add to Library…"));
+    QVERIFY(action->isVisible());
+    QVERIFY(action->isEnabled());
+
+    shell->m_pendingLibraryImportId = QStringLiteral("pending-import");
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(action->iconText(), QStringLiteral("Adding PDF…"));
+    QCOMPARE(action->data().toString(), QStringLiteral("adding-library-pdf"));
+    QVERIFY(!action->isEnabled());
+
+    shell->m_pendingLibraryImportId.clear();
+    shell->m_pendingLibraryRemovalId = QStringLiteral("pending-removal");
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->text(), QStringLiteral("Manage Current PDF"));
+    QCOMPARE(action->iconText(), QStringLiteral("Removing PDF…"));
+    QCOMPARE(action->data().toString(), QStringLiteral("removing-library-pdf"));
+    QVERIFY(!action->isEnabled());
+
+    shell->m_pendingLibraryRemovalId.clear();
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->iconText(), QStringLiteral("Add to Library…"));
+    QVERIFY(action->isEnabled());
+
+    shell->m_pendingSourceProject = QStringLiteral("docs-new");
+    shell->m_pendingSourceTarget = QStringLiteral("new.pdf");
+    shell->m_cachedFedoraRenderTarget = QStringLiteral("new.pdf");
+    shell->m_cachedFedoraRenderStatus = {{QStringLiteral("status"), QStringLiteral("preparing")}};
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->iconText(), QStringLiteral("Preparing source…"));
+    QCOMPARE(action->data().toString(), QStringLiteral("first-publication-preparing"));
+    QVERIFY(!action->isEnabled());
+
+    shell->m_cachedFedoraRenderStatus = {{QStringLiteral("status"), QStringLiteral("building")}};
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->iconText(), QStringLiteral("Sync in progress — click for output"));
+    QVERIFY(action->isEnabled());
+
+    shell->m_cachedFedoraRenderStatus = {{QStringLiteral("status"), QStringLiteral("activating")}};
+    shell->updatePdfLibraryAction();
+    QCOMPARE(action->iconText(), QStringLiteral("Activating Library…"));
+    QVERIFY(!action->isEnabled());
+}
+
+void MainShellTest::testBuildTerminalLauncher()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString runDirectory = temporary.path();
+    QFile request(QDir(runDirectory).filePath(QStringLiteral("request.json")));
+    QVERIFY(request.open(QIODevice::WriteOnly));
+    request.write("{}\n");
+    request.close();
+    const QString watcher = QDir(runDirectory).filePath(QStringLiteral("thoughts-watch-build"));
+    QFile watcherFile(watcher);
+    QVERIFY(watcherFile.open(QIODevice::WriteOnly));
+    watcherFile.write("#!/bin/sh\n");
+    watcherFile.close();
+    QVERIFY(QFile::setPermissions(watcher, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+    QString launchedProgram;
+    QStringList launchedArguments;
+    QString focusedTty;
+    bool running = false;
+    Thoughts::BuildTerminalLauncher::Options options;
+    options.startDetached = [&](const QString &program, const QStringList &arguments) {
+        launchedProgram = program;
+        launchedArguments = arguments;
+        return true;
+    };
+    options.focusTerminal = [&](const QString &tty) {
+        focusedTty = tty;
+        return true;
+    };
+    options.processRunning = [&](const QString &) { return running; };
+    // The stored token belongs to whichever server the viewer is opened for; the test never reads the secret store.
+    QString tokenIssuedFor;
+    options.tokenMayBeSentTo = [&](const QString &serverUrl, QString *issuedFor) {
+        *issuedFor = tokenIssuedFor.isEmpty() ? Thoughts::ServerAddress::origin(serverUrl) : tokenIssuedFor;
+        return *issuedFor == Thoughts::ServerAddress::origin(serverUrl);
+    };
+    Thoughts::BuildTerminalLauncher launcher(options);
+
+    QString error;
+    QVERIFY(launcher.open(runDirectory, watcher, QStringLiteral("https://server.example.ts.net"), &error));
+    QCOMPARE(launchedProgram, QStringLiteral("/usr/bin/open"));
+    QCOMPARE(launchedArguments.mid(0, 2), QStringList({QStringLiteral("-a"), QStringLiteral("Terminal")}));
+    QFile script(QDir(runDirectory).filePath(QStringLiteral("build-output.command")));
+    QVERIFY(script.open(QIODevice::ReadOnly));
+    const QString scriptText = QString::fromUtf8(script.readAll());
+    QVERIFY(scriptText.contains(QStringLiteral("thoughts-source-sync")));
+    QVERIFY(scriptText.contains(watcher));
+    QVERIFY(scriptText.contains(QStringLiteral("--run-directory")));
+    QVERIFY(!scriptText.contains(QStringLiteral("THOUGHTS_TOKEN=<")));
+
+    QFile(QDir(runDirectory).filePath(QStringLiteral("launching"))).remove();
+    QFile activePid(QDir(runDirectory).filePath(QStringLiteral("active.pid")));
+    QVERIFY(activePid.open(QIODevice::WriteOnly));
+    activePid.write("123\n");
+    activePid.close();
+    QFile activeTty(QDir(runDirectory).filePath(QStringLiteral("active.tty")));
+    QVERIFY(activeTty.open(QIODevice::WriteOnly));
+    activeTty.write("/dev/ttys999\n");
+    activeTty.close();
+    running = true;
+    launchedProgram.clear();
+    QVERIFY(launcher.open(runDirectory, watcher, QStringLiteral("https://server.example.ts.net"), &error));
+    QCOMPARE(focusedTty, QStringLiteral("/dev/ttys999"));
+    QVERIFY(launchedProgram.isEmpty());
+
+    const QString directBuildId = QStringLiteral("test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString directRuntime = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/build-output/%1").arg(directBuildId));
+    launchedProgram.clear();
+    running = false;
+    // Any HTTPS server address reaches the viewer, not only Tailscale names.
+    QVERIFY(launcher.openBuild(directBuildId, QStringLiteral("manual.pdf"), watcher, QStringLiteral("https://thoughts.example.org"), &error));
+    QCOMPARE(launchedProgram, QStringLiteral("/usr/bin/open"));
+    QFile directScript(QDir(directRuntime).filePath(QStringLiteral("build-output.command")));
+    QVERIFY(directScript.open(QIODevice::ReadOnly));
+    const QString directScriptText = QString::fromUtf8(directScript.readAll());
+    QVERIFY(directScriptText.contains(QStringLiteral("--build-id")));
+    QVERIFY(directScriptText.contains(directBuildId));
+    QVERIFY(directScriptText.contains(QStringLiteral("--target 'manual.pdf'")));
+    QVERIFY(directScriptText.contains(QStringLiteral("--server 'https://thoughts.example.org'")));
+    QDir(directRuntime).removeRecursively();
+    const QString rejectedBuildId = QStringLiteral("test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    launchedProgram.clear();
+    for (const QString &server : {QStringLiteral("http://thoughts.example.org"), QStringLiteral("https://user@thoughts.example.org"), QStringLiteral("https://thoughts.example.org/?x=1")}) {
+        QVERIFY2(!launcher.openBuild(rejectedBuildId, QStringLiteral("manual.pdf"), watcher, server, &error), qPrintable(server));
+        QCOMPARE(error, QStringLiteral("The Thoughts server URL is invalid."));
+    }
+    QVERIFY(launchedProgram.isEmpty());
+    // A token issued for another server is not handed to a viewer of this one.
+    tokenIssuedFor = QStringLiteral("https://old.example.org");
+    QVERIFY(!launcher.openBuild(rejectedBuildId, QStringLiteral("manual.pdf"), watcher, QStringLiteral("https://new.example.org"), &error));
+    QVERIFY2(error.contains(QStringLiteral("was issued for https://old.example.org and is not sent to https://new.example.org")), qPrintable(error));
+    QVERIFY(!launcher.open(runDirectory, watcher, QStringLiteral("https://new.example.org/prefix"), &error));
+    QVERIFY(launchedProgram.isEmpty());
+    QVERIFY(!QFileInfo::exists(QDir(QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/build-output/%1").arg(rejectedBuildId))).filePath(QStringLiteral("build-output.command"))));
+    tokenIssuedFor.clear();
+    QDir(QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/build-output/%1").arg(rejectedBuildId))).removeRecursively();
+
+    running = false;
+    launchedProgram.clear();
+    const QString logPath = QDir(runDirectory).filePath(QStringLiteral("source-publication.log"));
+    QFile log(logPath);
+    QVERIFY(log.open(QIODevice::WriteOnly));
+    log.write("publication started\n");
+    log.close();
+    QVERIFY(launcher.openLog(runDirectory, logPath, &error));
+    QCOMPARE(launchedProgram, QStringLiteral("/usr/bin/open"));
+    QFile logScript(QDir(runDirectory).filePath(QStringLiteral("build-output.command")));
+    QVERIFY(logScript.open(QIODevice::ReadOnly));
+    const QString logScriptText = QString::fromUtf8(logScript.readAll());
+    QVERIFY(logScriptText.contains(QStringLiteral("tail -n 200 -f")));
+    QVERIFY(logScriptText.contains(logPath));
+}
+
+void MainShellTest::testActiveBuildActionOpensOutputWithoutResubmitting()
+{
+    const QString stateRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server"));
+    const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString runDirectory = QDir(stateRoot).filePath(QStringLiteral("build-runs/%1").arg(runId));
+    QVERIFY(QDir().mkpath(runDirectory));
+    QFile request(QDir(runDirectory).filePath(QStringLiteral("request.json")));
+    QVERIFY(request.open(QIODevice::WriteOnly));
+    request.write("{}\n");
+    request.close();
+    const QJsonObject repositoryState {
+        {QStringLiteral("build_runs"),
+         QJsonObject {{QStringLiteral("concepts.pdf"),
+                       QJsonObject {
+                           {QStringLiteral("run_id"), runId},
+                           {QStringLiteral("target"), QStringLiteral("concepts.pdf")},
+                           {QStringLiteral("status"), QStringLiteral("running")},
+                       }}}},
+    };
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.constFirst().part);
+    QVERIFY(part);
+    const QUrl pdfUrl = QUrl::fromLocalFile(libraryPdfLabel());
+    setPartUrl(part, pdfUrl);
+    QTRY_VERIFY_WITH_TIMEOUT(!shell->m_pdfLibraryRefreshRunning && !shell->m_pdfLibraryPartRefreshScheduled, 5000);
+    if (shell->m_pdfSourceFreshnessTimer) {
+        shell->m_pdfSourceFreshnessTimer->stop();
+    }
+    shell->m_pdfLibraryStateReady = true;
+    shell->m_pdfLibraryStateUrl = pdfUrl;
+    shell->m_cachedPdfLibraryState = Shell::PdfLibraryState::SourceLinked;
+    shell->m_cachedPdfLibraryRenderTarget = QStringLiteral("current_pdfs/concepts.pdf");
+    shell->m_cachedPdfLibrarySha256 = QString(64, QLatin1Char('a'));
+
+    // FedoraRepository intentionally marks persisted active builds as
+    // interrupted during construction. Install this live-run fixture only
+    // after startup reconciliation so this test exercises the active UI.
+    QFile stateFile(QDir(stateRoot).filePath(QStringLiteral("repository.json")));
+    QVERIFY(QDir().mkpath(stateRoot));
+    QVERIFY(stateFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    stateFile.write(QJsonDocument(repositoryState).toJson(QJsonDocument::Compact));
+    stateFile.close();
+
+    QString launchedProgram;
+    Thoughts::BuildTerminalLauncher::Options options;
+    options.startDetached = [&](const QString &program, const QStringList &) {
+        launchedProgram = program;
+        return true;
+    };
+    options.processRunning = [](const QString &) { return false; };
+    options.tokenMayBeSentTo = [](const QString &, QString *) { return true; };
+    shell->m_buildTerminalLauncher = std::make_unique<Thoughts::BuildTerminalLauncher>(options);
+
+    shell->updatePdfLibraryAction();
+    QCOMPARE(shell->m_pdfLibraryAction->iconText(), QStringLiteral("Sync in progress — click for output"));
+    QCOMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("source-linked-build-active"));
+    QCOMPARE(shell->m_pdfBuildStatusButton->text(), shell->m_pdfBuildStatusText);
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("Syncing…"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Open live build output"));
+    QVERIFY(shell->m_pdfLastBuiltMenuAction->isVisible());
+    {
+        // The launcher only accepts HTTPS servers, but test runs may point
+        // THOUGHTS_SERVER_URL at localhost. Any HTTPS host will do; the
+        // launcher no longer requires a Tailscale name. startDetached is
+        // stubbed, so nothing is contacted.
+        const bool hadServer = qEnvironmentVariableIsSet("THOUGHTS_SERVER_URL");
+        const QByteArray previousServer = qgetenv("THOUGHTS_SERVER_URL");
+        qputenv("THOUGHTS_SERVER_URL", "https://thoughts-autotest.invalid");
+        const auto restoreServer = qScopeGuard([&] {
+            if (hadServer) {
+                qputenv("THOUGHTS_SERVER_URL", previousServer);
+            } else {
+                qunsetenv("THOUGHTS_SERVER_URL");
+            }
+        });
+        shell->renderLinkedPdf();
+    }
+    QCOMPARE(launchedProgram, QStringLiteral("/usr/bin/open"));
+    QFile::remove(QDir(stateRoot).filePath(QStringLiteral("repository.json")));
+    QDir(runDirectory).removeRecursively();
+}
+
+void MainShellTest::testVisibleMarkupLeftToSidebarFilters()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf")));
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    auto *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    for (int index : {0, 1, 0}) {
+        shell->setActiveTab(index);
+        QAction *highlights = shell->m_tabs.at(index).part->actionCollection()->action(QStringLiteral("view_highlights"));
+        QAction *sidebarDisplay = shell->m_tabs.at(index).part->actionCollection()->action(QStringLiteral("sidebar_display"));
+        QVERIFY(highlights && sidebarDisplay && highlights->menu() && sidebarDisplay->menu());
+        QTRY_VERIFY(toolbar->actions().contains(sidebarDisplay));
+        // The Annotations sidebar filters switch this markup; the toolbar has no menu for it.
+        QVERIFY(!toolbar->actions().contains(highlights));
+        auto *sidebarButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(sidebarDisplay));
+        QVERIFY(sidebarButton);
+        QCOMPARE(sidebarButton->text(), QStringLiteral("Sidebar"));
+        QCOMPARE(sidebarButton->toolTip(), QStringLiteral("Choose sidebar display"));
+        QCOMPARE(sidebarButton->toolButtonStyle(), Qt::ToolButtonIconOnly);
+        QCOMPARE(sidebarButton->popupMode(), QToolButton::InstantPopup);
+        // Comments stay on every version; feedback (likes, dislikes, questions) belongs to its own.
+        QCOMPARE(highlights->menu()->actions().size(), 4);
+        QCOMPARE(highlights->menu()->actions().at(0)->text(), QStringLiteral("Comments"));
+        QCOMPARE(highlights->menu()->actions().at(1)->text(), QStringLiteral("Feedback"));
+        QCOMPARE(highlights->menu()->actions().at(2)->text(), QStringLiteral("Agent proposals"));
+        QCOMPARE(highlights->menu()->actions().at(3)->text(), QStringLiteral("Review cards"));
+    }
+}
+
+void MainShellTest::testHistoryButtonsBesidePageNumber()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    auto *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    auto indexOf = [toolbar](const QString &name) {
+        const QList<QAction *> actions = toolbar->actions();
+        for (int index = 0; index < actions.size(); ++index) {
+            if (actions.at(index)->objectName() == name) return index;
+        }
+        return -1;
+    };
+    QTRY_VERIFY(indexOf(QStringLiteral("page_number")) > 0);
+    const int page = indexOf(QStringLiteral("page_number"));
+    QCOMPARE(indexOf(QStringLiteral("go_document_back")), page - 1);
+    QCOMPARE(indexOf(QStringLiteral("go_document_forward")), page + 1);
+    // Cmd+[ and Cmd+] go back and forward, besides the standard shortcuts.
+    KActionCollection *actions = shell->m_tabs.at(0).part->actionCollection();
+    QVERIFY(actions->action(QStringLiteral("go_document_back"))->shortcuts().contains(QKeySequence(Qt::CTRL | Qt::Key_BracketLeft)));
+    QVERIFY(actions->action(QStringLiteral("go_document_forward"))->shortcuts().contains(QKeySequence(Qt::CTRL | Qt::Key_BracketRight)));
+    delete shell;
+}
+
+void MainShellTest::testReaderBarHoldsTitleAndTools()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    auto *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    const auto indexOf = [toolbar](const QString &name) {
+        const QList<QAction *> actions = toolbar->actions();
+        for (int index = 0; index < actions.size(); ++index) {
+            if (actions.at(index)->objectName() == name) return index;
+        }
+        return -1;
+    };
+    QTRY_VERIFY(indexOf(QStringLiteral("page_number")) > 0);
+    QCOMPARE(indexOf(QStringLiteral("window_buttons_space")), 0);
+    QCOMPARE(indexOf(QStringLiteral("sidebar_display")), 1);
+    QCOMPARE(indexOf(QStringLiteral("mouse_draw")), indexOf(QStringLiteral("mouse_select")) + 1);
+    QCOMPARE(indexOf(QStringLiteral("mouse_text_box")), indexOf(QStringLiteral("mouse_draw")) + 1);
+    QCOMPARE(indexOf(QStringLiteral("document_title")), indexOf(QStringLiteral("mouse_text_box")) + 1);
+    QCOMPARE(indexOf(QStringLiteral("zoom_to")), indexOf(QStringLiteral("pdf_library_status")) - 1);
+    QVERIFY(indexOf(QStringLiteral("zoom_to")) > indexOf(QStringLiteral("page_number")));
+
+    // Only a window whose title bar is merged leaves room for the window buttons.
+    QCOMPARE(toolbar->actions().at(0)->isVisible(), Thoughts::ReaderChrome::mergesTitleBar());
+
+    // The bar shows the title without Qt's modified mark, and shortens a long one.
+    QVERIFY(shell->m_documentTitle);
+    shell->setWindowTitle(QStringLiteral("A short title[*]"));
+    QCOMPARE(shell->m_documentTitle->text(), QStringLiteral("A short title"));
+    const QString longTitle = QString(400, QLatin1Char('x'));
+    shell->setWindowTitle(longTitle);
+    QVERIFY(shell->m_documentTitle->text().size() < longTitle.size());
+    QCOMPARE(shell->m_documentTitle->toolTip(), longTitle);
+    QVERIFY(shell->m_documentTitle->testAttribute(Qt::WA_TransparentForMouseEvents));
+
+    // Right-clicking the page reaches the panels and both windows.
+    KParts::ReadWritePart *part = shell->m_tabs.at(0).part;
+    auto *pageView = part->widget()->findChild<QAbstractScrollArea *>(QStringLiteral("okular::pageView"));
+    QVERIFY(pageView);
+    QMenu menu;
+    QVERIFY(QMetaObject::invokeMethod(pageView, "contextMenuReady", Qt::DirectConnection, Q_ARG(QMenu *, &menu)));
+    QVERIFY(menu.actions().contains(part->actionCollection()->action(QStringLiteral("sidebar_display_annotations"))));
+    QVERIFY(menu.actions().contains(part->actionCollection()->action(QStringLiteral("comments_overview"))));
+    QVERIFY(menu.actions().contains(shell->actionCollection()->action(QStringLiteral("review_overview"))));
+
+    // Cmd+S syncs, says so in its tooltip, and nothing else claims the key.
+    const QKeySequence syncKey(Qt::CTRL | Qt::Key_S);
+    QAction *sync = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QVERIFY(sync);
+    QCOMPARE(sync->shortcut(), syncKey);
+    QVERIFY2(sync->toolTip().contains(syncKey.toString(QKeySequence::NativeText)), qPrintable(sync->toolTip()));
+    int claims = 0;
+    for (KActionCollection *actions : {shell->actionCollection(), part->actionCollection()}) {
+        for (QAction *action : actions->actions()) {
+            claims += action->shortcuts().contains(syncKey) ? 1 : 0;
+        }
+    }
+    QCOMPARE(claims, 1);
+    delete shell;
+}
+
+void MainShellTest::testDocumentTabsAreQuiet()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+
+    QTabBar *tabs = shell->m_tabWidget->tabBar();
+    QTRY_VERIFY(tabs->isVisible());
+    const auto closeButton = [tabs](int tab) { return tabs->tabButton(tab, QTabBar::RightSide); };
+    QVERIFY(closeButton(0));
+    QVERIFY(closeButton(1));
+
+    // Each tab shows its close button only while the pointer is over it.
+    const auto hover = [tabs](int tab) {
+        const QPointF position = tabs->tabRect(tab).center();
+        QMouseEvent move(QEvent::MouseMove, position, tabs->mapToGlobal(position), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(tabs, &move);
+    };
+    hover(0);
+    QVERIFY(closeButton(0)->isVisibleTo(tabs));
+    QVERIFY(!closeButton(1)->isVisibleTo(tabs));
+    hover(1);
+    QVERIFY(closeButton(1)->isVisibleTo(tabs));
+    QVERIFY(!closeButton(0)->isVisibleTo(tabs));
+    QEvent leave(QEvent::Leave);
+    QCoreApplication::sendEvent(tabs, &leave);
+    QVERIFY(!closeButton(0)->isVisibleTo(tabs));
+    QVERIFY(!closeButton(1)->isVisibleTo(tabs));
+
+    // With one document left, the strip stays only where the window keeps its title bar.
+    shell->closeTab(1);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QTRY_COMPARE(tabs->isVisible(), !Thoughts::ReaderChrome::mergesTitleBar());
+}
+
+void MainShellTest::testSelectionToolsInToolbar()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+
+    auto *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    const auto indexOf = [toolbar](const QString &name) {
+        const QList<QAction *> actions = toolbar->actions();
+        for (int index = 0; index < actions.size(); ++index) {
+            if (actions.at(index)->objectName() == name) return index;
+        }
+        return -1;
+    };
+    QTRY_VERIFY(indexOf(QStringLiteral("sidebar_display")) >= 0);
+    const int sidebar = indexOf(QStringLiteral("sidebar_display"));
+    QCOMPARE(indexOf(QStringLiteral("mouse_textselect")), sidebar + 1);
+    QCOMPARE(indexOf(QStringLiteral("mouse_select")), sidebar + 2);
+    QCOMPARE(indexOf(QStringLiteral("mouse_draw")), sidebar + 3);
+    QVERIFY(!toolbar->actions().at(sidebar + 3)->icon().isNull());
+    // The Text tool next to the pencil, a button like it: an icon only, as large.
+    QCOMPARE(indexOf(QStringLiteral("mouse_text_box")), sidebar + 4);
+    QAction *textBoxTool = toolbar->actions().at(sidebar + 4);
+    QVERIFY(!textBoxTool->icon().isNull());
+    QVERIFY(textBoxTool->isCheckable());
+    QCOMPARE(textBoxTool->text().remove(QLatin1Char('&')), QStringLiteral("Text"));
+    QVERIFY(!textBoxTool->toolTip().isEmpty());
+    auto *pencilButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(toolbar->actions().at(sidebar + 3)));
+    auto *textBoxButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(textBoxTool));
+    QVERIFY(pencilButton);
+    QVERIFY(textBoxButton);
+    QCOMPARE(textBoxButton->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QCOMPARE(textBoxButton->iconSize(), pencilButton->iconSize());
+    QCOMPARE(textBoxButton->sizeHint(), pencilButton->sizeHint());
+    QCOMPARE(textBoxButton->autoRaise(), pencilButton->autoRaise());
+    QVERIFY(!textBoxTool->icon().pixmap(textBoxButton->iconSize()).isNull());
+
+    QAction *textTool = toolbar->actions().at(sidebar + 1);
+    QAction *rectangleTool = toolbar->actions().at(sidebar + 2);
+    QVERIFY(!textTool->icon().isNull());
+    QVERIFY(!rectangleTool->icon().isNull());
+    // Text selection, the way to like or comment on a passage, does not look like the Text tool.
+    const QSize iconSize = textBoxButton->iconSize();
+    QVERIFY(textTool->icon().pixmap(iconSize).toImage() != textBoxTool->icon().pixmap(iconSize).toImage());
+    QCOMPARE(rectangleTool->text().remove(QLatin1Char('&')), QStringLiteral("Rectangular Selection"));
+    for (QAction *tool : {textTool, rectangleTool}) {
+        auto *button = qobject_cast<QToolButton *>(toolbar->widgetForAction(tool));
+        QVERIFY(button);
+        QCOMPARE(button->toolButtonStyle(), Qt::ToolButtonIconOnly);
+        QVERIFY(button->isCheckable());
+    }
+
+    textTool->trigger();
+    QCOMPARE(Okular::Settings::mouseMode(), (int)Okular::Settings::EnumMouseMode::TextSelect);
+    QVERIFY(textTool->isChecked());
+    QVERIFY(!rectangleTool->isChecked());
+
+    // Clicking the tool in use keeps it chosen.
+    textTool->trigger();
+    QVERIFY(textTool->isChecked());
+    QVERIFY(!rectangleTool->isChecked());
+
+    // This PDF is no Library document, so there is nothing to keep a text box with: the Text tool's
+    // button says so, and text selection stays the tool in use.
+    textBoxTool->trigger();
+    QVERIFY(!textBoxTool->isChecked());
+    QVERIFY(textTool->isChecked());
+    QCOMPARE(Okular::Settings::mouseMode(), (int)Okular::Settings::EnumMouseMode::TextSelect);
+
+    // A tool picked in one tab applies to the other tab, and the toolbar says so there.
+    rectangleTool->trigger();
+    QCOMPARE(Okular::Settings::mouseMode(), (int)Okular::Settings::EnumMouseMode::RectSelect);
+    QVERIFY(rectangleTool->isChecked());
+    QVERIFY(!textTool->isChecked());
+    const auto toolOf = [&](int tab, const char *name) { return shell->m_tabs.at(tab).part->actionCollection()->action(QLatin1String(name)); };
+    QVERIFY(toolOf(0, "mouse_select")->isChecked());
+    QVERIFY(toolOf(1, "mouse_select")->isChecked());
+    const int otherTab = shell->m_tabWidget->currentIndex() == 0 ? 1 : 0;
+    shell->setActiveTab(otherTab);
+    QTRY_VERIFY(rectangleTool->isChecked() || toolbar->actions().at(sidebar + 2)->isChecked());
+
+    // Back to text from the other tab, for the tests after this one.
+    toolbar->actions().at(sidebar + 1)->trigger();
+    QVERIFY(toolOf(0, "mouse_textselect")->isChecked());
+    QVERIFY(toolOf(1, "mouse_textselect")->isChecked());
+    QCOMPARE(Okular::Settings::mouseMode(), (int)Okular::Settings::EnumMouseMode::TextSelect);
+}
+
+void MainShellTest::testSidebarChooserFollowsSidebar()
+{
+    // file1.pdf: a shown tocreload.pdf window makes the later
+    // testToolbarCustomizationPersistsAcrossTabChanges flaky (also on the base
+    // commit). The outline-driven availability of Contents is covered by
+    // PartTest::testSidebarDisplayChooser; here the first document gets Contents
+    // the way TOC::hasTOC enables it.
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    // The window stays unshown (isVisibleTo): showing it makes the later
+    // toolbar-customization tests flaky, as on the base commit.
+
+    const auto choice = [](KParts::ReadWritePart *part, const char *name) {
+        return part->actionCollection()->action(QLatin1String(name));
+    };
+    const auto checkedChoice = [&](KParts::ReadWritePart *part) -> QString {
+        QAction *hide = choice(part, "sidebar_display_hide");
+        QAction *checked = hide && hide->actionGroup() ? hide->actionGroup()->checkedAction() : nullptr;
+        return checked ? checked->objectName() : QString();
+    };
+    KParts::ReadWritePart *first = shell->m_tabs.at(0).part;
+    KParts::ReadWritePart *second = shell->m_tabs.at(1).part;
+    shell->setActiveTab(0);
+    QAction *showSidebar = choice(first, "show_leftpanel");
+    QVERIFY(showSidebar);
+    if (!showSidebar->isChecked()) showSidebar->trigger();
+    QTRY_VERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QVERIFY(!choice(first, "sidebar_display_contents")->isEnabled());
+    QVERIFY(QMetaObject::invokeMethod(first, "enableTOC", Q_ARG(bool, true)));
+    QVERIFY(choice(first, "sidebar_display_contents")->isEnabled());
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_annotations"));
+
+    // The chooser hides and shows the Shell's sidebar dock and picks its panel.
+    choice(first, "sidebar_display_hide")->trigger();
+    QTRY_VERIFY(!shell->m_sidebar->isVisibleTo(shell));
+    QVERIFY(!showSidebar->isChecked());
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_hide"));
+    choice(first, "sidebar_display_contents")->trigger();
+    QTRY_VERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QVERIFY(showSidebar->isChecked());
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_contents"));
+    QVERIFY(qobject_cast<Okular::ViewerInterface *>(first)->getSideContainer()->isVisibleTo(shell));
+
+    // The separate sidebar toggle (icon, F7) stays and the chooser follows it.
+    showSidebar->trigger();
+    QTRY_VERIFY(!shell->m_sidebar->isVisibleTo(shell));
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_hide"));
+    showSidebar->trigger();
+    QTRY_VERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_contents"));
+
+    // Switching tabs: the other document's chooser shows the window's sidebar
+    // state, and its own panel (no outline, so Contents is unavailable).
+    choice(first, "sidebar_display_hide")->trigger();
+    QTRY_VERIFY(!shell->m_sidebar->isVisibleTo(shell));
+    shell->setActiveTab(1);
+    QCOMPARE(checkedChoice(second), QStringLiteral("sidebar_display_hide"));
+    QVERIFY(!choice(second, "sidebar_display_contents")->isEnabled());
+    choice(second, "sidebar_display_annotations")->trigger();
+    QTRY_VERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QCOMPARE(checkedChoice(second), QStringLiteral("sidebar_display_annotations"));
+    shell->setActiveTab(0);
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_contents"));
+    QVERIFY(shell->m_sidebar->isVisibleTo(shell));
+
+    // A document moved into its own window keeps a chooser that matches it.
+    QScreen *const targetScreen = QGuiApplication::primaryScreen();
+    QVERIFY(targetScreen);
+    const QRect availableGeometry = targetScreen->availableGeometry();
+    const QPoint dropPosition(availableGeometry.right() - 10, availableGeometry.top() + 50);
+    const QRect expectedGeometry = shell->detachedWindowGeometry(dropPosition, shell->size());
+    shell->detachTab(1, dropPosition);
+    Shell *const detachedShell = findShell(shell);
+    QVERIFY(detachedShell);
+    // Let the new window's move animation finish before going on.
+    QTRY_COMPARE_WITH_TIMEOUT(detachedShell->geometry(), expectedGeometry, 1000);
+    QCOMPARE(detachedShell->m_tabs.constFirst().part, second);
+    QCOMPARE(checkedChoice(second), detachedShell->m_sidebar->isVisibleTo(detachedShell) ? QStringLiteral("sidebar_display_annotations") : QStringLiteral("sidebar_display_hide"));
+    choice(second, "sidebar_display_hide")->trigger();
+    QTRY_VERIFY(!detachedShell->m_sidebar->isVisibleTo(detachedShell));
+    QCOMPARE(checkedChoice(second), QStringLiteral("sidebar_display_hide"));
+    // The original window is unaffected.
+    QVERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QCOMPARE(checkedChoice(first), QStringLiteral("sidebar_display_contents"));
+
+    // Leave the saved sidebar state as later tests expect it.
+    choice(second, "sidebar_display_annotations")->trigger();
+    choice(first, "sidebar_display_annotations")->trigger();
+    QTRY_VERIFY(detachedShell->m_sidebar->isVisibleTo(detachedShell));
+}
+
+void MainShellTest::testReadingToolbarStaysStillDuringSync()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QTRY_VERIFY_WITH_TIMEOUT(!shell->m_pdfLibraryRefreshRunning && !shell->m_pdfLibraryPartRefreshScheduled, 5000);
+    shell->m_pdfSourceFreshnessTimer->stop();
+    shell->m_globalPendingChangesSnapshot = {{QStringLiteral("available"), true}, {QStringLiteral("total"), 0}};
+
+    QToolBar *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    QAction *reviewAction = shell->actionCollection()->action(QStringLiteral("review_overview"));
+    QVERIFY(toolbar->actions().contains(reviewAction));
+    QAction *overviewAction = shell->m_activePartToolbar->action(QStringLiteral("comments_overview"));
+    QCOMPARE(toolbar->actions().indexOf(overviewAction), toolbar->actions().indexOf(shell->m_pdfLibraryWidgetAction) + 1);
+    auto *overviewButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(overviewAction));
+    QVERIFY(overviewButton);
+    QCOMPARE(toolbar->actions().indexOf(reviewAction), toolbar->actions().indexOf(overviewAction) + 1);
+    auto *reviewButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(reviewAction));
+    QVERIFY(reviewButton);
+    QCOMPARE(reviewButton->text(), QStringLiteral("Review"));
+    QVERIFY(!reviewButton->icon().isNull());
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("pdf_sync_activity_status")));
+    const auto *part = shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part;
+    QWidget *page = toolbar->widgetForAction(part->actionCollection()->action(QStringLiteral("page_number")));
+    QVERIFY(page);
+    QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+    QToolButton *button = shell->m_pdfBuildStatusButton;
+    QVERIFY(!button->menu());
+    QVERIFY(!shell->m_pdfLibraryWidgetAction->menu());
+
+    Shell::latestGlobalSyncOperationSummary();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    const QString id = QStringLiteral("reading-toolbar-test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto removeRun = qScopeGuard([&] {
+        QSqlQuery remove(database);
+        remove.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+        remove.addBindValue(id);
+        remove.exec();
+    });
+    const qint64 timestamp = QDateTime::currentDateTimeUtc().addYears(50).toMSecsSinceEpoch();
+    QSqlQuery insert(database);
+    insert.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json) VALUES(?, ?, 'sync', '', 'running', 'downloading', ?, ?, ?, '{}')"));
+    insert.addBindValue(id);
+    insert.addBindValue(id);
+    insert.addBindValue(timestamp);
+    insert.addBindValue(timestamp);
+    insert.addBindValue(timestamp);
+    QVERIFY2(insert.exec(), qPrintable(insert.lastError().text()));
+    shell->updatePdfSyncStatus();
+    QCOMPARE(button->text(), QStringLiteral("Sync"));
+    QVERIFY(!button->isEnabled());
+    QVERIFY(!shell->m_pdfSyncNowMenuAction->isEnabled());
+    QTRY_VERIFY(button->isVisibleTo(toolbar));
+    QTRY_VERIFY(qAbs(toolbar->contentsRect().center().x() - page->geometry().center().x()) <= 2);
+    QTest::qWait(100);
+    const QRect syncGeometry = button->geometry();
+    const QRect overviewGeometry = overviewButton->geometry();
+    const QRect pageGeometry = page->geometry();
+    const int reservedWidth = button->width();
+
+    class GeometryObserver : public QObject
+    {
+    public:
+        bool moved = false;
+        bool eventFilter(QObject *, QEvent *event) override
+        {
+            moved |= event->type() == QEvent::Move || event->type() == QEvent::Resize || event->type() == QEvent::Hide;
+            return false;
+        }
+    } observer;
+    button->installEventFilter(&observer);
+    overviewButton->installEventFilter(&observer);
+    page->installEventFilter(&observer);
+    QSignalSpy statusChanged(shell->m_pdfLibraryWidgetAction, &QAction::changed);
+    for (int seconds : {19, 20, 34, 37, 59, 60, 999}) {
+        QSqlQuery age(database);
+        age.prepare(QStringLiteral("UPDATE sync_runs SET created_at_ms = ? WHERE id = ?"));
+        age.addBindValue(timestamp - seconds * 1000);
+        age.addBindValue(id);
+        QVERIFY(age.exec());
+        shell->updatePdfSyncStatus();
+        shell->syncPdfLibraryStatusToolButton();
+        shell->scheduleMainToolBarCentering();
+        QCoreApplication::processEvents();
+        QCOMPARE(button->text(), QStringLiteral("Sync"));
+        QCOMPARE(button->geometry(), syncGeometry);
+        QCOMPARE(overviewButton->geometry(), overviewGeometry);
+        QCOMPARE(page->geometry(), pageGeometry);
+    }
+    QCOMPARE(statusChanged.count(), 0);
+    QVERIFY(!observer.moved);
+
+    for (const auto &state : {qMakePair(QStringLiteral("succeeded"), QStringLiteral("Sync")), qMakePair(QStringLiteral("failed"), QStringLiteral("Sync")), qMakePair(QStringLiteral("running"), QStringLiteral("Sync"))}) {
+        QSqlQuery change(database);
+        change.prepare(QStringLiteral("UPDATE sync_runs SET status = ?, phase = ? WHERE id = ?"));
+        change.addBindValue(state.first);
+        change.addBindValue(state.first == QLatin1String("running") ? QStringLiteral("downloading") : state.first);
+        change.addBindValue(id);
+        QVERIFY(change.exec());
+        shell->updatePdfSyncStatus();
+        QCoreApplication::processEvents();
+        QCOMPARE(button->text(), state.second);
+        QCOMPARE(button->width(), reservedWidth);
+        QCOMPARE(button->geometry(), syncGeometry);
+        QCOMPARE(overviewButton->geometry(), overviewGeometry);
+        QCOMPARE(page->geometry(), pageGeometry);
+    }
+    QVERIFY(!observer.moved);
+    button->removeEventFilter(&observer);
+    overviewButton->removeEventFilter(&observer);
+    page->removeEventFilter(&observer);
+
+    for (int width : {760, 1100, 1700}) {
+        shell->resize(width, 750);
+        QTRY_VERIFY(button->isVisibleTo(toolbar));
+        QTRY_VERIFY(overviewButton->isVisibleTo(toolbar));
+        if (width == 760 && !reviewButton->isVisibleTo(toolbar)) {
+            // The extra dropdown can put Review in the native overflow area
+            // at narrow widths; the action must remain reachable there.
+            auto *overflow = toolbar->findChild<QToolButton *>(QStringLiteral("qt_toolbar_ext_button"));
+            QVERIFY(overflow && overflow->isVisibleTo(toolbar));
+            if (overflow->menu()) {
+                QVERIFY(overflow->menu()->actions().contains(reviewAction));
+            } else {
+                QTest::mouseClick(overflow, Qt::LeftButton);
+                QTRY_VERIFY(reviewButton->isVisibleTo(toolbar));
+                QTest::mouseClick(overflow, Qt::LeftButton);
+            }
+        } else {
+            QTRY_VERIFY(reviewButton->isVisibleTo(toolbar));
+            QTRY_VERIFY(toolbar->contentsRect().contains(reviewButton->geometry()));
+        }
+        QTRY_VERIFY(toolbar->contentsRect().contains(overviewButton->geometry()));
+        QTRY_VERIFY(toolbar->contentsRect().contains(button->geometry()));
+        QTRY_VERIFY(toolbar->contentsRect().contains(page->geometry()));
+    }
+    const QString screenshotPath = qEnvironmentVariable("THOUGHTS_TOOLBAR_SCREENSHOT");
+    if (!screenshotPath.isEmpty()) {
+        shell->resize(1100, 750);
+        QTest::qWait(100);
+        QVERIFY(shell->grab().save(screenshotPath));
+    }
+    QTest::mouseClick(button, Qt::LeftButton);
+    QVERIFY(!shell->m_pdfLibraryMenu->isVisible());
+    shell->actionCollection()->action(QStringLiteral("pdf_sync_details"))->trigger();
+    QTRY_VERIFY(shell->m_pdfLibraryMenu->isVisible());
+    QVERIFY(!shell->m_pdfSyncNowMenuAction->isEnabled());
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+    shell->m_pdfLibraryMenu->close();
+}
+
+void MainShellTest::testPdfBuildStatusWidgetStates()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QToolBar *const mainToolBar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QAction *const statusAction = shell->actionCollection()->action(QStringLiteral("pdf_library_status"));
+    QVERIFY(mainToolBar);
+    QVERIFY(statusAction);
+    shell->resize(1700, 800);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.constFirst().part);
+    QVERIFY(part);
+    const QUrl pdfUrl = QUrl::fromLocalFile(libraryPdfLabel());
+    setPartUrl(part, pdfUrl);
+    QTRY_VERIFY_WITH_TIMEOUT(!shell->m_pdfLibraryRefreshRunning && !shell->m_pdfLibraryPartRefreshScheduled, 5000);
+    if (shell->m_pdfSourceFreshnessTimer) {
+        shell->m_pdfSourceFreshnessTimer->stop();
+    }
+    shell->m_pdfLibraryStateReady = true;
+    shell->m_pdfLibraryStateUrl = pdfUrl;
+    shell->m_cachedPdfLibraryState = Shell::PdfLibraryState::SourceLinked;
+    shell->m_cachedPdfLibraryRenderTarget = QStringLiteral("current_pdfs/concepts.pdf");
+    shell->m_cachedPdfLibrarySha256 = QString(64, QLatin1Char('a'));
+    shell->m_cachedPdfLibraryGenerationCurrent = true;
+    shell->m_cachedPdfLibraryLocalFreshnessAvailable = true;
+    shell->m_cachedPdfLibraryLocalSourcesCurrent = true;
+    QVERIFY(shell->m_pdfSyncSummaryMenuAction);
+    QVERIFY(shell->m_pdfSyncNowMenuAction);
+    QVERIFY(!shell->findChild<QLabel *>(QStringLiteral("pdfDocumentSyncActivityTimestampLabel")));
+    shell->m_cachedFedoraRenderTarget = QStringLiteral("concepts.pdf");
+    shell->m_cachedFedoraRenderStatus = {
+        {QStringLiteral("status"), QStringLiteral("synced")},
+        {QStringLiteral("local_state"), QStringLiteral("current")},
+        {QStringLiteral("reason"), QStringLiteral("current")},
+        {QStringLiteral("build"), QVariantMap {{QStringLiteral("id"), QStringLiteral("build-123")}, {QStringLiteral("status"), QStringLiteral("succeeded")}}},
+    };
+    QAction *const pageNumberAction = part->actionCollection()->action(QStringLiteral("page_number"));
+    QVERIFY(pageNumberAction);
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    PdfStatusProbe statusProbe;
+    statusProbe.setDocumentUrl(pdfUrl);
+    shell->m_tabs[activeTab].part = &statusProbe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+
+    auto verifyStatusButton = [&](const QString &expectedStatus) {
+        QCOMPARE(statusAction->text(), QStringLiteral("Sync"));
+        QCOMPARE(statusAction->iconText(), QStringLiteral("Sync"));
+        QCOMPARE(mainToolBar->actions().count(statusAction), 1);
+        QTRY_VERIFY(shell->m_pdfBuildStatusButton);
+        QVERIFY(shell->m_pdfBuildStatusButton->actions().contains(statusAction));
+        QCOMPARE(shell->m_pdfBuildStatusButton->text(), shell->m_pdfBuildStatusText);
+        QCOMPARE(shell->m_pdfStatusMenuAction->text(), expectedStatus);
+        QCOMPARE(shell->m_pdfBuildStatusButton->toolButtonStyle(), Qt::ToolButtonTextBesideIcon);
+        QCOMPARE(shell->m_pdfBuildStatusButton->popupMode(), QToolButton::DelayedPopup);
+        QTRY_VERIFY(shell->m_pdfBuildStatusButton->isVisibleTo(mainToolBar));
+        QTRY_VERIFY(!shell->m_pdfBuildStatusButton->visibleRegion().isEmpty());
+        QVERIFY(shell->m_pdfBuildStatusButton->width() >= shell->m_pdfBuildStatusButton->iconSize().width() + shell->m_pdfBuildStatusButton->fontMetrics().horizontalAdvance(QStringLiteral("Sync")));
+        QTRY_VERIFY(mainToolBar->contentsRect().contains(shell->m_pdfBuildStatusButton->geometry()));
+        QWidget *const pageNumberWidget = mainToolBar->widgetForAction(pageNumberAction);
+        QVERIFY(pageNumberWidget);
+        QTRY_VERIFY(qAbs(mainToolBar->contentsRect().center().x() - pageNumberWidget->geometry().center().x()) <= 2);
+        QVERIFY(!shell->m_pdfLibraryMenu->isVisible());
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfStatusMenuAction));
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfStatusDetailMenuAction));
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfPrimaryMenuAction));
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfSourceConflictAction));
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfLastBuiltMenuAction));
+    };
+
+    shell->m_pdfLibraryStateReady = false;
+    shell->m_pdfLibraryRefreshRunning = true;
+    shell->updatePdfLibraryAction();
+    verifyStatusButton(QStringLiteral("Syncing…"));
+    shell->m_pdfLibraryRefreshRunning = false;
+    shell->m_pdfLibraryRefreshQueued = false;
+    shell->m_pdfLibraryStateReady = true;
+
+    shell->updatePdfLibraryAction();
+    verifyStatusButton(QStringLiteral("Synced"));
+    QVERIFY(!shell->m_pdfPrimaryMenuAction->isVisible());
+    QCOMPARE(shell->m_pdfLastBuiltMenuAction->text(), QStringLiteral("Logs…"));
+    QVERIFY(shell->m_pdfLastBuiltMenuAction->isEnabled());
+    QVERIFY(!shell->m_pdfSourceConflictAction->isVisible());
+    QCOMPARE(shell->m_cachedPdfLibraryLastBuildId, QStringLiteral("build-123"));
+
+    const QString longStatusDetail = QStringLiteral("First diagnostic line.\nSecond diagnostic line with enough detail to make a native menu far too wide. %1").arg(QString(160, QLatin1Char('x')));
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Error"), longStatusDetail, Thoughts::DocumentSyncStatus::Error);
+    QVERIFY(!shell->m_pdfStatusDetailMenuAction->text().contains(QLatin1Char('\n')));
+    QVERIFY(shell->m_pdfStatusDetailMenuAction->text().size() <= 120);
+    QVERIFY(shell->m_pdfStatusDetailMenuAction->text().endsWith(QChar(0x2026)));
+    QCOMPARE(shell->m_pdfStatusDetailMenuAction->toolTip(), longStatusDetail);
+
+    shell->handleFedoraRenderStatusChanged(
+        QStringLiteral("concepts.pdf"),
+        QJsonObject {
+            {QStringLiteral("status"), QStringLiteral("synced")}, {QStringLiteral("local_state"), QStringLiteral("sync_pending")}, {QStringLiteral("refreshed"), true}, {QStringLiteral("reason"), QStringLiteral("current on Fedora")}});
+    verifyStatusButton(QStringLiteral("Sync needed"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Sync"));
+
+    shell->handleFedoraRenderStatusChanged(
+        QStringLiteral("concepts.pdf"),
+        QJsonObject {
+            {QStringLiteral("status"), QStringLiteral("synced")}, {QStringLiteral("local_state"), QStringLiteral("error")}, {QStringLiteral("local_error"), QStringLiteral("activation failed")}, {QStringLiteral("refreshed"), true}});
+    verifyStatusButton(QStringLiteral("Error"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Sync"));
+
+    shell->m_cachedFedoraRenderStatus.insert(QStringLiteral("local_state"), QStringLiteral("current"));
+    shell->m_cachedFedoraRenderStatus.remove(QStringLiteral("local_error"));
+
+    shell->m_cachedPdfLibraryLocalSourcesCurrent = false;
+    shell->m_cachedPdfLibraryLocalFreshnessMessage = QStringLiteral("local edit");
+    shell->updatePdfLibraryAction();
+    verifyStatusButton(QStringLiteral("Sync needed"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Sync"));
+    QCOMPARE(shell->m_pdfLibraryAction->iconText(), QStringLiteral("Sync"));
+
+    shell->m_cachedPdfLibraryLocalSourcesCurrent = true;
+    shell->m_cachedFedoraRenderStatus = {
+        {QStringLiteral("status"), QStringLiteral("error")},
+        {QStringLiteral("reason"), QStringLiteral("latex failed")},
+        {QStringLiteral("build"), QVariantMap {{QStringLiteral("id"), QStringLiteral("build-124")}, {QStringLiteral("status"), QStringLiteral("failed")}}},
+    };
+    shell->updatePdfLibraryAction();
+    verifyStatusButton(QStringLiteral("Error"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Build"));
+    QCOMPARE(shell->m_cachedPdfLibraryLastBuildId, QStringLiteral("build-124"));
+
+    shell->m_pdfLibraryAction->setEnabled(true);
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Sync needed"), QStringLiteral("one unsynced comment"), Thoughts::DocumentSyncStatus::SyncNeeded);
+    QCOMPARE(shell->m_pdfStatusMenuAction->data().toString(), QStringLiteral("sync_needed"));
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Sync"));
+    QCOMPARE(shell->m_pdfPrimaryMenuCommand, QStringLiteral("sync"));
+    shell->m_pdfLibraryAction->setIconText(QStringLiteral("Build"));
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Build needed"), QStringLiteral("Fedora source changed"), Thoughts::DocumentSyncStatus::BuildNeeded);
+    QCOMPARE(shell->m_pdfPrimaryMenuAction->text(), QStringLiteral("Build"));
+    for (QAction *menuAction : shell->m_pdfLibraryMenu->actions()) {
+        QVERIFY(!menuAction->text().contains(QStringLiteral("Open PDF")));
+    }
+
+    shell->m_pdfLibraryAction->setData(QStringLiteral("outside-library"));
+    shell->updatePdfLibraryWidget(false);
+    verifyStatusButton(QStringLiteral("Not in Library"));
+
+    shell->m_pdfLibraryAction->setData(QStringLiteral("no-document"));
+    shell->updatePdfLibraryWidget(false);
+    verifyStatusButton(QStringLiteral("No PDF"));
+}
+
+void MainShellTest::testTargetBuildDispatch()
+{
+    BuildTargetProbe gateway;
+    QVERIFY(Shell::requestFedoraBuildForTarget(&gateway, QStringLiteral("clicked.pdf")));
+    QCOMPARE(gateway.requestedTarget, QStringLiteral("clicked.pdf"));
+    QVERIFY(!Shell::requestFedoraBuildForTarget(&gateway, QString()));
+}
+
+void MainShellTest::testLastSuccessfulGlobalSyncUsesGlobalScope()
+{
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isValid());
+    QVERIFY(database.isOpen());
+
+    const QString prefix = QStringLiteral("global-query-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&database, &prefix] {
+        QSqlQuery remove(database);
+        remove.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id LIKE ?"));
+        remove.addBindValue(QString(prefix + QLatin1Char('%')));
+        remove.exec();
+    });
+    const qint64 globalMs = QDateTime::currentDateTimeUtc().addYears(10).toMSecsSinceEpoch();
+    const auto insertRun = [&database, &prefix](const QString &suffix, const QString &kind, const QString &target, const QString &status, const QString &phase, qint64 timestamp) {
+        const QString id = prefix + suffix;
+        QSqlQuery insert(database);
+        insert.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')"));
+        insert.addBindValue(id);
+        insert.addBindValue(id);
+        insert.addBindValue(kind);
+        insert.addBindValue(target);
+        insert.addBindValue(status);
+        insert.addBindValue(phase);
+        insert.addBindValue(timestamp);
+        insert.addBindValue(timestamp);
+        insert.addBindValue(timestamp);
+        insert.addBindValue(timestamp);
+        return insert.exec();
+    };
+
+    QVERIFY(database.transaction());
+    QVERIFY(insertRun(QStringLiteral("global"), QStringLiteral("sync"), QString(), QStringLiteral("Synchronisiert"), QStringLiteral("succeeded"), globalMs));
+    for (int index = 0; index < 501; ++index) {
+        QVERIFY(insertRun(QStringLiteral("target-%1").arg(index), QStringLiteral("sync"), QStringLiteral("paper-%1.pdf").arg(index), QStringLiteral("succeeded"), QStringLiteral("succeeded"), globalMs + index + 1));
+    }
+    QVERIFY(insertRun(QStringLiteral("build"), QStringLiteral("build"), QString(), QStringLiteral("succeeded"), QStringLiteral("succeeded"), globalMs + 1000));
+    QVERIFY(database.commit());
+
+    QCOMPARE(Shell::lastSuccessfulGlobalSyncAt().toMSecsSinceEpoch(), globalMs);
+}
+
+void MainShellTest::testDocumentSyncSummaryDoesNotLoadHistory()
+{
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isValid());
+    QVERIFY(database.isOpen());
+
+    const QString prefix = QStringLiteral("document-summary-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&database, &prefix] {
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id LIKE ?"));
+        removeEvents.addBindValue(QString(prefix + QLatin1Char('%')));
+        removeEvents.exec();
+        QSqlQuery removeRuns(database);
+        removeRuns.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id LIKE ?"));
+        removeRuns.addBindValue(QString(prefix + QLatin1Char('%')));
+        removeRuns.exec();
+    });
+    const qint64 baseTime = QDateTime::currentDateTimeUtc().addYears(20).toMSecsSinceEpoch();
+    QSqlQuery insertRun(database);
+    insertRun.prepare(
+        QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, payload_json) VALUES(?, ?, 'sync', ?, 'succeeded', 'succeeded', ?, ?, ?, ?, ?)"));
+    QSqlQuery insertEvent(database);
+    insertEvent.prepare(QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, message, origin, server_sequence) VALUES(?, ?, 'succeeded', 'succeeded', 'seeded history', 'server', 1)"));
+
+    QVERIFY(database.transaction());
+    QString expectedId;
+    for (int index = 0; index < 500; ++index) {
+        const QString id = prefix + QString::number(index);
+        const QString target = index == 499 || index % 50 == 0 ? QStringLiteral("paper.pdf") : QStringLiteral("other-%1.pdf").arg(index);
+        const qint64 timestamp = baseTime + index;
+        const QJsonObject payload {{QStringLiteral("id"), id}, {QStringLiteral("events"), QJsonArray {QJsonObject {{QStringLiteral("message"), QStringLiteral("payload history must stay unloaded")}}}}};
+        insertRun.bindValue(0, id);
+        insertRun.bindValue(1, id);
+        insertRun.bindValue(2, target);
+        insertRun.bindValue(3, timestamp);
+        insertRun.bindValue(4, timestamp);
+        insertRun.bindValue(5, timestamp);
+        insertRun.bindValue(6, timestamp);
+        insertRun.bindValue(7, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        QVERIFY(insertRun.exec());
+        insertEvent.bindValue(0, id);
+        insertEvent.bindValue(1, timestamp);
+        QVERIFY(insertEvent.exec());
+        if (index == 499) {
+            expectedId = id;
+        }
+    }
+    expectedId = prefix + QStringLiteral("global");
+    const qint64 globalTimestamp = baseTime + 500;
+    const QJsonObject globalPayload {{QStringLiteral("id"), expectedId}, {QStringLiteral("events"), QJsonArray {QJsonObject {{QStringLiteral("message"), QStringLiteral("global payload history must stay unloaded")}}}}};
+    insertRun.bindValue(0, expectedId);
+    insertRun.bindValue(1, expectedId);
+    insertRun.bindValue(2, QString());
+    insertRun.bindValue(3, globalTimestamp);
+    insertRun.bindValue(4, globalTimestamp);
+    insertRun.bindValue(5, globalTimestamp);
+    insertRun.bindValue(6, globalTimestamp);
+    insertRun.bindValue(7, QString::fromUtf8(QJsonDocument(globalPayload).toJson(QJsonDocument::Compact)));
+    QVERIFY(insertRun.exec());
+    insertEvent.bindValue(0, expectedId);
+    insertEvent.bindValue(1, globalTimestamp);
+    QVERIFY(insertEvent.exec());
+    QVERIFY(database.commit());
+
+    const QJsonObject summary = Shell::latestDocumentSyncOperationSummary(QStringLiteral("paper.pdf"));
+    QCOMPARE(summary.value(QStringLiteral("id")).toString(), expectedId);
+    QVERIFY(summary.value(QStringLiteral("target")).toString().isEmpty());
+    QCOMPARE(summary.value(QStringLiteral("status")).toString(), QStringLiteral("succeeded"));
+    QVERIFY(!summary.contains(QStringLiteral("events")));
+    QCOMPARE(Shell::latestDocumentSyncOperationSummary(QStringLiteral("missing.pdf")).value(QStringLiteral("id")).toString(), expectedId);
+
+    const QJsonArray history = Shell::recentSyncOperationsWithHistory();
+    int seededRuns = 0;
+    for (const QJsonValue &value : history) {
+        const QJsonObject operation = value.toObject();
+        if (!operation.value(QStringLiteral("id")).toString().startsWith(prefix)) {
+            continue;
+        }
+        ++seededRuns;
+        const QJsonArray events = operation.value(QStringLiteral("events")).toArray();
+        QCOMPARE(events.size(), 2);
+        QVERIFY(std::any_of(events.cbegin(), events.cend(), [](const QJsonValue &event) { return event.toObject().value(QStringLiteral("origin")).toString() == QLatin1String("server"); }));
+    }
+    QCOMPARE(seededRuns, 500);
+}
+
+void MainShellTest::testBuildSourceDiffDialog()
+{
+    Shell shell;
+    const QString buildId = QStringLiteral("8095502b-1bcf-4608-ab48-fda019a7bed8");
+    const QJsonObject changed {{QStringLiteral("path"), QStringLiteral("project/tex/source/main.tex")},
+        {QStringLiteral("before"), QStringLiteral("Old source.\n")}, {QStringLiteral("after"), QStringLiteral("New source.\n")},
+        {QStringLiteral("change"), QStringLiteral("modified")}, {QStringLiteral("line"), 257}, {QStringLiteral("is_diagnostic"), true}};
+    const QJsonObject document {{QStringLiteral("target"), QStringLiteral("data-preprocessing.pdf")},
+        {QStringLiteral("diagnostic"), QStringLiteral("Source instrumentation produced no rendered proposal segments.")},
+        {QStringLiteral("files"), QJsonArray {changed}}};
+    const QJsonObject diff {{QStringLiteral("build_id"), buildId}, {QStringLiteral("documents"), QJsonArray {document}}};
+    bool inspected = false;
+    QTimer timer;
+    connect(&timer, &QTimer::timeout, &shell, [&] {
+        auto *dialog = shell.findChild<QDialog *>(QStringLiteral("buildSourceDiffDialog"));
+        if (!dialog || !dialog->isVisible()) return;
+        auto *tree = dialog->findChild<QTreeWidget *>(QStringLiteral("buildSourceDiffFiles"));
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        QCOMPARE(tree->currentItem()->text(0), QStringLiteral("project/tex/source/main.tex"));
+        QCOMPARE(tree->currentItem()->data(0, Qt::UserRole).toJsonObject().value(QStringLiteral("line")).toInt(), 257);
+        bool enabled = false;
+        for (auto *button : dialog->findChildren<QPushButton *>()) {
+            if (button->text() == QStringLiteral("Open diff in VS Code")) enabled = button->isEnabled();
+        }
+        QVERIFY(enabled);
+        if (qEnvironmentVariableIsSet("THOUGHTS_DIFF_TEST_SCREENSHOT")) dialog->grab().save(qEnvironmentVariable("THOUGHTS_DIFF_TEST_SCREENSHOT"));
+        inspected = true;
+        timer.stop();
+        dialog->accept();
+    });
+    timer.start(20);
+    QVERIFY(QMetaObject::invokeMethod(&shell, "showBuildSourceDiff", Qt::DirectConnection,
+        Q_ARG(QString, buildId), Q_ARG(QJsonObject, diff), Q_ARG(QString, QString())));
+    QVERIFY(inspected);
+}
+
+void MainShellTest::testSavedMergeCanBeSubmittedWithoutEditor()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    const QString conflictId = QStringLiteral("saved-merge-test-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString workspace = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/source-conflicts/%1").arg(conflictId));
+    const auto cleanup = qScopeGuard([&workspace] { QDir(workspace).removeRecursively(); });
+    const QString resolved = QDir(workspace).filePath(QStringLiteral("desktop-merge/Resolved.tex"));
+    const QVariantMap bundle {{QStringLiteral("id"), conflictId}, {QStringLiteral("path"), QStringLiteral("docs-demo/tex/source/main.tex")},
+                              {QStringLiteral("conflict_count"), 1}, {QStringLiteral("expected_revision"), 7},
+                              {QStringLiteral("current_sha256"), QString(64, QLatin1Char('a'))},
+                              {QStringLiteral("base_content_base64"), QString::fromLatin1(QByteArray("base\n").toBase64())},
+                              {QStringLiteral("fedora_content_base64"), QString::fromLatin1(QByteArray("fedora\n").toBase64())},
+                              {QStringLiteral("mac_content_base64"), QString::fromLatin1(QByteArray("mac\n").toBase64())}};
+    // Opens the resolver, reports what it offers, and cancels it.
+    const auto inspect = [shell, &bundle] {
+        bool submitOffered = false;
+        bool noteShown = false;
+        QTimer::singleShot(0, shell, [shell, &submitOffered, &noteShown] {
+            auto *dialog = shell->findChild<QDialog *>(QStringLiteral("sourceConflictResolver"));
+            QVERIFY(dialog);
+            auto *submit = dialog->findChild<QPushButton *>(QStringLiteral("sourceConflictSubmitSavedMerge"));
+            submitOffered = submit && submit->isVisible();
+            noteShown = dialog->findChild<QLabel *>(QStringLiteral("sourceConflictSavedMergeNote")) != nullptr;
+            dialog->reject();
+        });
+        shell->sourceConflictResolutionBundleReady(bundle, QString());
+        return std::pair {submitOffered, noteShown};
+    };
+
+    QCOMPARE(inspect(), std::pair(false, false));
+
+    QVERIFY(QDir().mkpath(QFileInfo(resolved).absolutePath()));
+    QFile unfinished(resolved);
+    QVERIFY(unfinished.open(QIODevice::WriteOnly));
+    unfinished.write("<<<<<<< MAC\nmac\n=======\nfedora\n>>>>>>> FEDORA\n");
+    unfinished.close();
+    QCOMPARE(inspect(), std::pair(false, true));
+
+    QFile finished(resolved);
+    QVERIFY(finished.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    finished.write("merged\n");
+    finished.close();
+    QCOMPARE(inspect(), std::pair(true, false));
+}
+
+void MainShellTest::testClosingShellWhileMergeEditorWaitsIsSilent()
+{
+    // A merge editor started with --wait is a child process of the window.
+    // Closing the window kills it; its error handler must not open a dialog
+    // on the window being destroyed (this crashed Thoughts).
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    auto *process = new QProcess(shell);
+    bool reported = false;
+    connect(process, &QProcess::errorOccurred, shell, [&reported](QProcess::ProcessError) { reported = true; });
+    process->start(QStringLiteral("/bin/sleep"), {QStringLiteral("30")});
+    QVERIFY(process->waitForStarted());
+    delete shell;
+    QVERIFY(!reported);
+}
+
+void MainShellTest::testResolveSourceConflictCommand()
+{
+    const QVariantMap bundle {{QStringLiteral("fedora_content_base64"), QString::fromLatin1(QByteArray("fedora\n").toBase64())},
+                              {QStringLiteral("mac_content_base64"), QString::fromLatin1(QByteArray("mac\n").toBase64())}};
+    const auto contents = [&bundle](const QJsonObject &request, QString *error) {
+        error->clear();
+        return Shell::sourceConflictCommandContents(bundle, request, error);
+    };
+    QString error;
+    QCOMPARE(contents({{QStringLiteral("keep"), QStringLiteral("fedora")}}, &error), QByteArray("fedora\n"));
+    QVERIFY(error.isEmpty());
+    QCOMPARE(contents({{QStringLiteral("keep"), QStringLiteral("local")}}, &error), QByteArray("mac\n"));
+    QVERIFY(error.isEmpty());
+    contents({{QStringLiteral("keep"), QStringLiteral("mine")}}, &error);
+    QVERIFY(!error.isEmpty());
+    contents({}, &error);
+    QVERIFY(!error.isEmpty());
+    contents({{QStringLiteral("keep"), QStringLiteral("fedora")}, {QStringLiteral("content_file"), QStringLiteral("/tmp/merge.tex")}}, &error);
+    QVERIFY(!error.isEmpty());
+    contents({{QStringLiteral("content_file"), QStringLiteral("relative/merge.tex")}}, &error);
+    QVERIFY(!error.isEmpty());
+    QTemporaryFile merge;
+    QVERIFY(merge.open());
+    merge.write("merged\n");
+    merge.close();
+    QCOMPARE(contents({{QStringLiteral("content_file"), merge.fileName()}}, &error), QByteArray("merged\n"));
+    QVERIFY(error.isEmpty());
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    const auto command = [shell](const QJsonObject &fields) {
+        QJsonObject request = fields;
+        request.insert(QStringLiteral("schema_version"), 1);
+        request.insert(QStringLiteral("command"), QStringLiteral("resolve-source-conflict"));
+        return shell->handleSyncCommandRequest(request);
+    };
+    QCOMPARE(command({}).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+
+    // While the command waits, the bundle reaches it and never the resolver dialog.
+    bool delivered = false;
+    shell->m_sourceConflictCommandBundleHandler = [&delivered](const QVariantMap &, const QString &) { delivered = true; };
+    shell->sourceConflictResolutionBundleReady({}, QStringLiteral("unavailable"));
+    QVERIFY(delivered);
+    QVERIFY(!shell->m_sourceConflictCommandBundleHandler);
+    QVERIFY(!shell->findChild<QDialog *>(QStringLiteral("sourceConflictResolver")));
+}
+
+void MainShellTest::testSourceConflictStaysOfferedAfterLaterSyncs()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isOpen());
+    const QString statePath = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/source-publication.json"));
+    QVERIFY(QDir().mkpath(QFileInfo(statePath).absolutePath()));
+    QFile existingState(statePath);
+    const QByteArray originalState = existingState.open(QIODevice::ReadOnly) ? existingState.readAll() : QByteArray();
+    existingState.close();
+    const bool hadState = QFileInfo::exists(statePath);
+    const QString prefix = QStringLiteral("conflict-offer-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&] {
+        for (const QString &table : {QStringLiteral("sync_events"), QStringLiteral("sync_runs")}) {
+            QSqlQuery remove(database);
+            remove.prepare(QStringLiteral("DELETE FROM %1 WHERE %2 LIKE ?").arg(table, table == QLatin1String("sync_events") ? QStringLiteral("run_id") : QStringLiteral("id")));
+            remove.addBindValue(QString(prefix + QLatin1Char('%')));
+            remove.exec();
+        }
+        if (hadState) {
+            QSaveFile restore(statePath);
+            if (restore.open(QIODevice::WriteOnly)) { restore.write(originalState); restore.commit(); }
+        } else {
+            QFile::remove(statePath);
+        }
+    });
+    const auto writeState = [&statePath](const QJsonObject &conflicts) {
+        QSaveFile file(statePath);
+        return file.open(QIODevice::WriteOnly) && file.write(QJsonDocument(QJsonObject {{QStringLiteral("conflicts"), conflicts}}).toJson()) > 0 && file.commit();
+    };
+    // The publication that creates the conflict reports it; a later Sync stops
+    // earlier with only "needs attention" for the blocked source.
+    const qint64 startedAt = QDateTime::currentDateTimeUtc().addYears(40).toMSecsSinceEpoch();
+    QSqlQuery run(database);
+    run.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json) VALUES(?, ?, 'sync', 'failed', 'failed', ?, ?, ?, ?)"));
+    QSqlQuery event(database);
+    event.prepare(QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, message, error_code) VALUES(?, ?, ?, ?, ?, ?)"));
+    const QList<std::tuple<QString, QString, QString, QString>> runs {
+        {QStringLiteral("publication"), QStringLiteral("uploading"), QStringLiteral("failed"), QStringLiteral("invalid_source_publication")},
+        {QStringLiteral("later"), QStringLiteral("installing_sources"), QStringLiteral("needs_attention"), QString()}};
+    for (int index = 0; index < runs.size(); ++index) {
+        const auto &[name, phase, state, code] = runs.at(index);
+        const QString id = prefix + name;
+        const qint64 atMs = startedAt + index * 1000;
+        const QJsonObject payload {{QStringLiteral("id"), id}, {QStringLiteral("trace_id"), id}, {QStringLiteral("kind"), QStringLiteral("sync")},
+                                   {QStringLiteral("status"), QStringLiteral("failed")}, {QStringLiteral("created_at_ms"), atMs}, {QStringLiteral("updated_at_ms"), atMs},
+                                   {QStringLiteral("last_error_code"), QStringLiteral("sync_failed")}};
+        run.bindValue(0, id);
+        run.bindValue(1, id);
+        run.bindValue(2, atMs);
+        run.bindValue(3, atMs);
+        run.bindValue(4, atMs);
+        run.bindValue(5, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        QVERIFY(run.exec());
+        event.bindValue(0, id);
+        event.bindValue(1, atMs);
+        event.bindValue(2, phase);
+        event.bindValue(3, state);
+        event.bindValue(4, QStringLiteral("docs-demo/tex/source/main.tex"));
+        event.bindValue(5, code);
+        QVERIFY(event.exec());
+    }
+    QCOMPARE(Shell::latestGlobalSyncOperationSummary().value(QStringLiteral("id")).toString(), QString(prefix + QStringLiteral("later")));
+
+    QVERIFY(writeState({}));
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Error"), QString(), Thoughts::DocumentSyncStatus::Error);
+    QVERIFY(!shell->m_pdfSourceConflictAction->isVisible());
+
+    QVERIFY(writeState({{QStringLiteral("docs-demo/tex/source/main.tex"), QJsonObject {{QStringLiteral("conflict_id"), QStringLiteral("conflict-1")}}}}));
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Error"), QString(), Thoughts::DocumentSyncStatus::Error);
+    QVERIFY(shell->m_pdfSourceConflictAction->isVisible());
+
+    QVERIFY(writeState({}));
+    shell->updatePdfLibraryWidget(true, QStringLiteral("Error"), QString(), Thoughts::DocumentSyncStatus::Error);
+    QVERIFY(!shell->m_pdfSourceConflictAction->isVisible());
+}
+
+void MainShellTest::testSourceFilesNeedingMergeListsEachFileAndWhy()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    const QString statePath = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/source-publication.json"));
+    QVERIFY(QDir().mkpath(QFileInfo(statePath).absolutePath()));
+    QFile existingState(statePath);
+    const QByteArray originalState = existingState.open(QIODevice::ReadOnly) ? existingState.readAll() : QByteArray();
+    existingState.close();
+    const bool hadState = QFileInfo::exists(statePath);
+    const auto cleanup = qScopeGuard([&] {
+        if (hadState) {
+            QSaveFile restore(statePath);
+            if (restore.open(QIODevice::WriteOnly)) { restore.write(originalState); restore.commit(); }
+        } else {
+            QFile::remove(statePath);
+        }
+    });
+    QSaveFile state(statePath);
+    QVERIFY(state.open(QIODevice::WriteOnly));
+    state.write(QJsonDocument(QJsonObject {{QStringLiteral("conflicts"), QJsonObject {
+        {QStringLiteral("docs-demo/tex/intro.tex"), QJsonObject {{QStringLiteral("conflict_id"), QStringLiteral("conflict-1")}}},
+        {QStringLiteral("docs-demo/tex/method.tex"), QJsonObject {{QStringLiteral("conflict_id"), QStringLiteral("conflict-2")}}}}}}).toJson());
+    QVERIFY(state.commit());
+
+    shell->showSourceFilesNeedingMerge();
+    auto *dialog = shell->findChild<QDialog *>(QStringLiteral("sourceMergeFilesDialog"));
+    QVERIFY(dialog);
+    const auto close = qScopeGuard([dialog] { dialog->reject(); });
+    QCOMPARE(dialog->windowTitle(), QStringLiteral("2 source files need a merge"));
+    auto *files = dialog->findChild<QTreeWidget *>(QStringLiteral("sourceMergeFiles"));
+    QVERIFY(files);
+    QCOMPARE(files->topLevelItemCount(), 2);
+    QCOMPARE(files->topLevelItem(0)->text(0), QStringLiteral("docs-demo/tex/intro.tex"));
+    QCOMPARE(files->topLevelItem(1)->text(0), QStringLiteral("docs-demo/tex/method.tex"));
+    for (int row = 0; row < files->topLevelItemCount(); ++row)
+        QVERIFY(files->topLevelItem(row)->text(1).contains(QStringLiteral("on this computer and on the server")));
+    QVERIFY(dialog->findChild<QPushButton *>(QStringLiteral("sourceMergeResolve")));
+}
+
+void MainShellTest::testLogsStayResponsiveDuringTraceReplay()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isOpen());
+    const QString prefix = QStringLiteral("logs-replay-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString selectedId = prefix + QStringLiteral("325");
+    const auto cleanup = qScopeGuard([&database, &prefix] {
+        for (const QString &table : {QStringLiteral("sync_events"), QStringLiteral("sync_runs")}) {
+            QSqlQuery remove(database);
+            remove.prepare(QStringLiteral("DELETE FROM %1 WHERE %2 LIKE ?").arg(table, table == QLatin1String("sync_events") ? QStringLiteral("run_id") : QStringLiteral("id")));
+            remove.addBindValue(QString(prefix + QLatin1Char('%')));
+            remove.exec();
+        }
+    });
+    const qint64 startedAt = QDateTime::currentDateTimeUtc().addYears(40).toMSecsSinceEpoch();
+    QSqlQuery run(database);
+    run.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json) VALUES(?, ?, 'sync', 'running', 'checking_server', ?, ?, ?, ?)"));
+    QSqlQuery event(database);
+    event.prepare(QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, message, error_code) VALUES(?, ?, 'checking_server', 'running', ?, ?)"));
+    QVERIFY(database.transaction());
+    for (int index = 0; index < 326; ++index) {
+        const QString id = prefix + QString::number(index);
+        const qint64 atMs = startedAt + index * 1000;
+        const QJsonObject payload {{QStringLiteral("id"), id}, {QStringLiteral("trace_id"), id},
+                                   {QStringLiteral("created_at_ms"), atMs}, {QStringLiteral("started_at_ms"), atMs},
+                                   {QStringLiteral("updated_at_ms"), atMs}, {QStringLiteral("kind"), QStringLiteral("sync")}};
+        run.bindValue(0, id);
+        run.bindValue(1, id);
+        run.bindValue(2, atMs);
+        run.bindValue(3, atMs);
+        run.bindValue(4, atMs);
+        run.bindValue(5, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        QVERIFY(run.exec());
+        for (int ordinal = 0; ordinal < 80; ++ordinal) {
+            event.bindValue(0, id);
+            event.bindValue(1, atMs + ordinal);
+            event.bindValue(2, QStringLiteral("Run %1 activity %2").arg(index).arg(ordinal));
+            event.bindValue(3, ordinal == 0 ? QStringLiteral("invalid_source_publication") : QStringLiteral(""));
+            QVERIFY(event.exec());
+        }
+    }
+    QVERIFY(database.commit());
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const QJsonArray summaries = Shell::recentSyncOperationSummaries();
+    qInfo() << "Logs summaries for 326 runs / 26080 events:" << elapsed.elapsed() << "ms";
+    QVERIFY(elapsed.elapsed() < 1000);
+    int seededSummaries = 0;
+    for (const QJsonValue &value : summaries) {
+        const QJsonObject summary = value.toObject();
+        QVERIFY(!summary.contains(QStringLiteral("events")));
+        if (summary.value(QStringLiteral("id")).toString().startsWith(prefix)) {
+            ++seededSummaries;
+            QVERIFY(summary.value(QStringLiteral("needs_source_conflict_resolution")).toBool());
+        }
+    }
+    QCOMPARE(seededSummaries, 326);
+    const QJsonObject selected = Shell::syncOperationWithHistory(selectedId);
+    QCOMPARE(selected.value(QStringLiteral("events")).toArray().size(), 80);
+    QVERIFY(Shell::syncOperationWithHistory(QString()).isEmpty());
+    QVERIFY(Shell::syncOperationWithHistory(prefix + QStringLiteral("missing")).isEmpty());
+
+    elapsed.restart();
+    shell->showSyncOperationLogs(selectedId);
+    const qint64 listOpenMs = elapsed.elapsed();
+    QPointer<QDialog> dialog = shell->findChild<QDialog *>(QStringLiteral("syncOperationsDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->isVisible());
+    QCOMPARE(dialog->windowModality(), Qt::NonModal);
+    QVERIFY(!QApplication::activeModalWidget());
+    auto *list = dialog->findChild<QListWidget *>(QStringLiteral("operationsList"));
+    QVERIFY(list);
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), selectedId);
+
+    QTRY_VERIFY(dialog->findChild<QDialog *>(QStringLiteral("syncOperationLogDialog")));
+    QPointer<QDialog> detail = dialog->findChild<QDialog *>(QStringLiteral("syncOperationLogDialog"));
+    const qint64 detailOpenMs = elapsed.elapsed();
+    QTRY_VERIFY(detail->isVisible());
+    QCOMPARE(detail->windowModality(), Qt::NonModal);
+    QVERIFY(!QApplication::activeModalWidget());
+    auto *log = detail->findChild<QPlainTextEdit *>(QStringLiteral("operationLogText"));
+    QVERIFY(log);
+    QTRY_VERIFY_WITH_TIMEOUT(log->toPlainText().contains(QStringLiteral("Run 325 activity 79")), 2000);
+    auto *outcome = detail->findChild<QLabel *>(QStringLiteral("operationOutcomeTitle"));
+    auto *diagnostics = detail->findChild<QWidget *>(QStringLiteral("operationDiagnostics"));
+    auto *toggle = detail->findChild<QToolButton *>(QStringLiteral("operationDiagnosticsToggle"));
+    QVERIFY(outcome);
+    QVERIFY(diagnostics);
+    QVERIFY(toggle);
+    QCOMPARE(outcome->text(), QStringLiteral("Syncing…"));
+    QVERIFY(!diagnostics->isVisible());
+    const int collapsedHeight = detail->height();
+    QVERIFY(collapsedHeight < 350);
+    auto *copy = detail->findChild<QPushButton *>(QStringLiteral("operationCopyDiagnostics"));
+    QVERIFY(copy);
+    QCOMPARE(toggle->text(), QStringLiteral("Show diagnostics"));
+    QVERIFY(qAbs(copy->geometry().center().y() - toggle->geometry().center().y()) <= 2);
+    toggle->click();
+    QVERIFY(diagnostics->isVisible());
+    QTRY_VERIFY(detail->height() >= 560);
+    QTRY_VERIFY(log->height() > 0);
+    QCOMPARE(toggle->text(), QStringLiteral("Hide diagnostics"));
+    toggle->click();
+    QVERIFY(!diagnostics->isVisible());
+    QTRY_COMPARE(detail->height(), collapsedHeight);
+
+    QSignalSpy resets(list->model(), &QAbstractItemModel::modelReset);
+    QSignalSpy textChanges(log, &QPlainTextEdit::textChanged);
+    event.bindValue(0, selectedId);
+    event.bindValue(1, startedAt + 400000);
+    event.bindValue(2, QStringLiteral("Trace replay completed"));
+    event.bindValue(3, QStringLiteral(""));
+    QVERIFY(event.exec());
+    QElapsedTimer replay;
+    replay.start();
+    for (int index = 0; index < 200; ++index) {
+        Q_EMIT shell->syncOperationJournalChanged(selectedId);
+    }
+    const qint64 burstMs = replay.elapsed();
+    QVERIFY2(burstMs < 1000, "Trace replay must schedule one refresh, not load every history for every event");
+    QCOMPARE(textChanges.count(), 0);
+    QCOMPARE(resets.count(), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(log->toPlainText().contains(QStringLiteral("Trace replay completed")), 2000);
+    QVERIFY(textChanges.count() <= 2);
+    QVERIFY(resets.count() <= 1);
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), selectedId);
+    QVERIFY(!log->toPlainText().contains(QStringLiteral("Run 324 activity")));
+    QVERIFY(listOpenMs < 1000);
+    QVERIFY(detailOpenMs < 1000);
+    qInfo() << "Logs list opened:" << listOpenMs << "ms; detail opened:" << detailOpenMs << "ms; 200 event notifications:" << burstMs << "ms";
+
+    detail->reject();
+    QTRY_VERIFY(detail.isNull());
+    shell->showSyncOperationLogs(prefix + QStringLiteral("324"));
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), prefix + QStringLiteral("324"));
+    QTRY_VERIFY(dialog->findChild<QDialog *>(QStringLiteral("syncOperationLogDialog")));
+    detail = dialog->findChild<QDialog *>(QStringLiteral("syncOperationLogDialog"));
+    QVERIFY(detail);
+    QTRY_VERIFY(detail->isVisible());
+    log = detail->findChild<QPlainTextEdit *>(QStringLiteral("operationLogText"));
+    QVERIFY(log);
+    QTRY_VERIFY_WITH_TIMEOUT(log->toPlainText().contains(QStringLiteral("Run 324 activity 79")), 2000);
+    QVERIFY(!log->toPlainText().contains(QStringLiteral("Run 325 activity")));
+    dialog->reject();
+    shell->showSyncOperations();
+    QPointer<QDialog> reopened = shell->m_syncOperationsDialog;
+    QVERIFY(reopened);
+    QVERIFY(reopened != dialog);
+    QTRY_VERIFY(dialog.isNull());
+    QVERIFY(!QApplication::activeModalWidget());
+    QTRY_VERIFY(reopened->isVisible());
+    reopened->reject();
+    QTRY_VERIFY(reopened.isNull());
+}
+
+void MainShellTest::testLegacyEmbeddedJournalMigrationIsIdempotent()
+{
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isValid());
+    QVERIFY(database.isOpen());
+
+    const QString operationId = QStringLiteral("embedded-journal-test-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&database, &operationId] {
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
+        removeEvents.addBindValue(operationId);
+        removeEvents.exec();
+        QSqlQuery removeRun(database);
+        removeRun.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+        removeRun.addBindValue(operationId);
+        removeRun.exec();
+    });
+    const qint64 baseTime = QDateTime::currentDateTimeUtc().addYears(30).toMSecsSinceEpoch();
+    QJsonArray embeddedEvents;
+    constexpr int eventTotal = 750;
+    for (int index = 0; index < eventTotal; ++index) {
+        embeddedEvents.append(QJsonObject {{QStringLiteral("at_ms"), baseTime + index},
+                                           {QStringLiteral("phase"), QStringLiteral("checking_server")},
+                                           {QStringLiteral("state"), QStringLiteral("running")},
+                                           {QStringLiteral("message"), QStringLiteral("legacy event %1").arg(index)}});
+    }
+    const QJsonObject payload {{QStringLiteral("id"), operationId},
+                               {QStringLiteral("trace_id"), operationId},
+                               {QStringLiteral("kind"), QStringLiteral("sync")},
+                               {QStringLiteral("target"), QString()},
+                               {QStringLiteral("status"), QStringLiteral("running")},
+                               {QStringLiteral("phase"), QStringLiteral("checking_server")},
+                               {QStringLiteral("created_at_ms"), baseTime},
+                               {QStringLiteral("started_at_ms"), baseTime},
+                               {QStringLiteral("updated_at_ms"), baseTime + eventTotal},
+                               {QStringLiteral("events"), embeddedEvents}};
+    QSqlQuery insertRun(database);
+    insertRun.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json) VALUES(?, ?, 'sync', '', 'running', 'checking_server', ?, ?, ?, ?)"));
+    insertRun.addBindValue(operationId);
+    insertRun.addBindValue(operationId);
+    insertRun.addBindValue(baseTime);
+    insertRun.addBindValue(baseTime);
+    insertRun.addBindValue(baseTime + eventTotal);
+    insertRun.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+    QVERIFY(insertRun.exec());
+
+    // Simulate a row already written by the old dual-storage code. Migration
+    // must recognize it instead of duplicating the first embedded event.
+    QSqlQuery insertExistingEvent(database);
+    insertExistingEvent.prepare(QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, message, origin) VALUES(?, ?, 'checking_server', 'running', 'legacy event 0', 'desktop')"));
+    insertExistingEvent.addBindValue(operationId);
+    insertExistingEvent.addBindValue(baseTime);
+    QVERIFY(insertExistingEvent.exec());
+
+    const auto operationFromHistory = [&operationId](const QJsonArray &history) {
+        for (const QJsonValue &value : history) {
+            if (value.toObject().value(QStringLiteral("id")).toString() == operationId) {
+                return value.toObject();
+            }
+        }
+        return QJsonObject();
+    };
+    const QJsonObject migrated = operationFromHistory(Shell::recentSyncOperationsWithHistory());
+    QVERIFY(!migrated.isEmpty());
+    QCOMPARE(migrated.value(QStringLiteral("events")).toArray().size(), eventTotal);
+    QCOMPARE(migrated.value(QStringLiteral("events")).toArray().first().toObject().value(QStringLiteral("message")).toString(), QStringLiteral("legacy event 0"));
+    QCOMPARE(migrated.value(QStringLiteral("events")).toArray().last().toObject().value(QStringLiteral("message")).toString(), QStringLiteral("legacy event 749"));
+
+    QSqlQuery stored(database);
+    stored.prepare(QStringLiteral("SELECT payload_json, (SELECT COUNT(*) FROM sync_events WHERE run_id = ?) FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    const QJsonObject compactPayload = QJsonDocument::fromJson(stored.value(0).toString().toUtf8()).object();
+    QVERIFY(!compactPayload.contains(QStringLiteral("events")));
+    QCOMPARE(stored.value(1).toInt(), eventTotal);
+
+    // A second compatibility read is a no-op: history remains complete and no
+    // journal row is appended again.
+    QCOMPARE(operationFromHistory(Shell::recentSyncOperationsWithHistory()).value(QStringLiteral("events")).toArray().size(), eventTotal);
+    stored.finish();
+    stored.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    QCOMPARE(stored.value(0).toInt(), eventTotal);
+}
+
+void MainShellTest::testManyJournalEventsDoNotGrowRunPayload()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QTest::qWait(100);
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isOpen());
+
+    const QString operationId = QStringLiteral("many-journal-events-test-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&database, &operationId] {
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
+        removeEvents.addBindValue(operationId);
+        removeEvents.exec();
+        QSqlQuery removeRun(database);
+        removeRun.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+        removeRun.addBindValue(operationId);
+        removeRun.exec();
+    });
+    const qint64 startedAt = QDateTime::currentMSecsSinceEpoch();
+    const QJsonObject payload {{QStringLiteral("id"), operationId},
+                               {QStringLiteral("trace_id"), operationId},
+                               {QStringLiteral("kind"), QStringLiteral("sync")},
+                               {QStringLiteral("target"), QString()},
+                               {QStringLiteral("status"), QStringLiteral("running")},
+                               {QStringLiteral("phase"), QStringLiteral("checking_server")},
+                               {QStringLiteral("created_at_ms"), startedAt},
+                               {QStringLiteral("started_at_ms"), startedAt},
+                               {QStringLiteral("updated_at_ms"), startedAt}};
+    QSqlQuery insertRun(database);
+    insertRun.prepare(QStringLiteral("INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json) VALUES(?, ?, 'sync', '', 'running', 'checking_server', ?, ?, ?, ?)"));
+    insertRun.addBindValue(operationId);
+    insertRun.addBindValue(operationId);
+    insertRun.addBindValue(startedAt);
+    insertRun.addBindValue(startedAt);
+    insertRun.addBindValue(startedAt);
+    insertRun.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+    QVERIFY(insertRun.exec());
+
+    constexpr int eventTotal = 520;
+    for (int index = 0; index < eventTotal; ++index) {
+        shell->updateSyncOperationJournalEvent(operationId,
+                                               QJsonObject {{QStringLiteral("at_ms"), startedAt + index + 1},
+                                                            {QStringLiteral("phase"), QStringLiteral("checking_server")},
+                                                            {QStringLiteral("state"), QStringLiteral("running")},
+                                                            {QStringLiteral("message"), QStringLiteral("journal event %1").arg(index)}});
+    }
+    // Repeating the same local transition must not append a second event.
+    shell->updateSyncOperationJournalEvent(operationId,
+                                           QJsonObject {{QStringLiteral("at_ms"), startedAt + eventTotal + 1},
+                                                        {QStringLiteral("phase"), QStringLiteral("checking_server")},
+                                                        {QStringLiteral("state"), QStringLiteral("running")},
+                                                        {QStringLiteral("message"), QStringLiteral("journal event %1").arg(eventTotal - 1)}});
+
+    QSqlQuery stored(database);
+    stored.prepare(QStringLiteral("SELECT payload_json, (SELECT COUNT(*) FROM sync_events WHERE run_id = ?) FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    const QByteArray compactPayloadBytes = stored.value(0).toString().toUtf8();
+    QVERIFY(compactPayloadBytes.size() < 2048);
+    QVERIFY(!QJsonDocument::fromJson(compactPayloadBytes).object().contains(QStringLiteral("events")));
+    QCOMPARE(stored.value(1).toInt(), eventTotal);
+
+    QJsonObject operation;
+    for (const QJsonValue &value : Shell::recentSyncOperationsWithHistory()) {
+        if (value.toObject().value(QStringLiteral("id")).toString() == operationId) {
+            operation = value.toObject();
+            break;
+        }
+    }
+    QCOMPARE(operation.value(QStringLiteral("events")).toArray().size(), eventTotal);
+    delete shell;
+}
+
+void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QTest::qWait(100);
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isValid());
+    QVERIFY(database.isOpen());
+
+    const QString prefix = QStringLiteral("directional-progress-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString operationId = prefix + QStringLiteral("active");
+    const QString untouchedId = prefix + QStringLiteral("untouched");
+    const auto cleanup = qScopeGuard([&database, &prefix] {
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id LIKE ?"));
+        removeEvents.addBindValue(QString(prefix + QLatin1Char('%')));
+        removeEvents.exec();
+        QSqlQuery removeRuns(database);
+        removeRuns.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id LIKE ?"));
+        removeRuns.addBindValue(QString(prefix + QLatin1Char('%')));
+        removeRuns.exec();
+    });
+    const qint64 startedAt = QDateTime::currentMSecsSinceEpoch() - 1000;
+    const auto insertRun = [&database, startedAt](const QString &id) {
+        const QJsonObject payload {{QStringLiteral("id"), id},
+                                   {QStringLiteral("trace_id"), id},
+                                   {QStringLiteral("kind"), QStringLiteral("sync")},
+                                   {QStringLiteral("status"), QStringLiteral("running")},
+                                   {QStringLiteral("phase"), QStringLiteral("downloading")},
+                                   {QStringLiteral("created_at_ms"), startedAt},
+                                   {QStringLiteral("started_at_ms"), startedAt},
+                                   {QStringLiteral("updated_at_ms"), startedAt},
+                                   {QStringLiteral("transfer_metrics_recorded"), true},
+                                   {QStringLiteral("uploaded_completed_bytes"), 0},
+                                   {QStringLiteral("uploaded_total_bytes"), 0},
+                                   {QStringLiteral("downloaded_completed_bytes"), 0},
+                                   {QStringLiteral("downloaded_total_bytes"), 0},
+                                   {QStringLiteral("events"), QJsonArray {}}};
+        QSqlQuery insert(database);
+        insert.prepare(QStringLiteral(
+            "INSERT INTO sync_runs(id, trace_id, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, payload_json, transfer_metrics_recorded) VALUES(?, ?, 'sync', '', 'running', 'downloading', ?, ?, ?, ?, 1)"));
+        insert.addBindValue(id);
+        insert.addBindValue(id);
+        insert.addBindValue(startedAt);
+        insert.addBindValue(startedAt);
+        insert.addBindValue(startedAt);
+        insert.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        return insert.exec();
+    };
+    QVERIFY(insertRun(operationId));
+    QVERIFY(insertRun(untouchedId));
+
+    QSignalSpy journalSpy(shell, &Shell::syncOperationJournalChanged);
+    const QJsonObject firstSnapshot {{QStringLiteral("schema_version"), 1},
+                                     {QStringLiteral("transfer_metrics_recorded"), true},
+                                     {QStringLiteral("uploaded_completed_bytes"), 120},
+                                     {QStringLiteral("uploaded_total_bytes"), 200},
+                                     {QStringLiteral("downloaded_completed_bytes"), 300},
+                                     {QStringLiteral("downloaded_total_bytes"), 500}};
+    shell->updateSyncOperationTransferProgress(operationId, firstSnapshot);
+    QTRY_COMPARE(journalSpy.count(), 1);
+
+    QSqlQuery stored(database);
+    stored.prepare(QStringLiteral("SELECT transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, payload_json FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    QCOMPARE(stored.value(0).toBool(), true);
+    QCOMPARE(stored.value(1).toLongLong(), 120);
+    QCOMPARE(stored.value(2).toLongLong(), 200);
+    QCOMPARE(stored.value(3).toLongLong(), 300);
+    QCOMPARE(stored.value(4).toLongLong(), 500);
+    QJsonObject payload = QJsonDocument::fromJson(stored.value(5).toString().toUtf8()).object();
+    QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 420);
+    QCOMPARE(payload.value(QStringLiteral("total_bytes")).toVariant().toLongLong(), 700);
+
+    QJsonObject retryRollback = firstSnapshot;
+    retryRollback.insert(QStringLiteral("uploaded_completed_bytes"), 40);
+    retryRollback.insert(QStringLiteral("downloaded_completed_bytes"), 250);
+    retryRollback.insert(QStringLiteral("flush"), true);
+    shell->updateSyncOperationTransferProgress(operationId, retryRollback);
+    QCOMPARE(journalSpy.count(), 2);
+    stored.finish();
+    stored.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes, payload_json FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    QCOMPARE(stored.value(0).toLongLong(), 40);
+    QCOMPARE(stored.value(1).toLongLong(), 250);
+    payload = QJsonDocument::fromJson(stored.value(2).toString().toUtf8()).object();
+    QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 290);
+
+    QSqlQuery untouched(database);
+    untouched.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes FROM sync_runs WHERE id = ?"));
+    untouched.addBindValue(untouchedId);
+    QVERIFY(untouched.exec());
+    QVERIFY(untouched.next());
+    QCOMPARE(untouched.value(0).toLongLong(), 0);
+    QCOMPARE(untouched.value(1).toLongLong(), 0);
+
+    QJsonObject invalidSnapshot = retryRollback;
+    invalidSnapshot.insert(QStringLiteral("uploaded_completed_bytes"), 201);
+    shell->updateSyncOperationTransferProgress(operationId, invalidSnapshot);
+    QCOMPARE(journalSpy.count(), 2);
+    QSqlQuery eventCount(database);
+    eventCount.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
+    eventCount.addBindValue(operationId);
+    QVERIFY(eventCount.exec());
+    QVERIFY(eventCount.next());
+    QCOMPARE(eventCount.value(0).toInt(), 0);
+
+    shell->updateSyncOperationProgress(operationId, QStringLiteral("downloading"), 999, 1000, QStringLiteral("Legacy stage progress"));
+    QCOMPARE(journalSpy.count(), 3);
+    stored.finish();
+    stored.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes, payload_json FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    QCOMPARE(stored.value(0).toLongLong(), 40);
+    QCOMPARE(stored.value(1).toLongLong(), 250);
+    payload = QJsonDocument::fromJson(stored.value(2).toString().toUtf8()).object();
+    QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 290);
+    eventCount.finish();
+    eventCount.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
+    eventCount.addBindValue(operationId);
+    QVERIFY(eventCount.exec());
+    QVERIFY(eventCount.next());
+    QCOMPARE(eventCount.value(0).toInt(), 1);
+
+    delete shell;
+    Shell::reconcileInterruptedSyncOperationsForTesting(QDateTime::currentMSecsSinceEpoch());
+    auto *restartedShell = new Shell;
+    QVERIFY(restartedShell->isValid());
+    QSqlQuery restartedState(database);
+    QTRY_VERIFY_WITH_TIMEOUT(([&restartedState, &operationId] {
+                                 restartedState.finish();
+                                 restartedState.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+                                 restartedState.addBindValue(operationId);
+                                 return restartedState.exec() && restartedState.next() && restartedState.value(0).toString() == QLatin1String("interrupted") && restartedState.value(1).toString() == QLatin1String("interrupted");
+                             }()),
+                             3000);
+
+    QJsonObject restoredOperation;
+    for (const QJsonValue &value : Shell::recentSyncOperationsWithHistory()) {
+        if (value.toObject().value(QStringLiteral("id")).toString() == operationId) {
+            restoredOperation = value.toObject();
+            break;
+        }
+    }
+    QVERIFY(!restoredOperation.isEmpty());
+    QVERIFY(restoredOperation.value(QStringLiteral("transfer_metrics_recorded")).toBool());
+    QCOMPARE(restoredOperation.value(QStringLiteral("uploaded_completed_bytes")).toVariant().toLongLong(), 40);
+    QCOMPARE(restoredOperation.value(QStringLiteral("uploaded_total_bytes")).toVariant().toLongLong(), 200);
+    QCOMPARE(restoredOperation.value(QStringLiteral("downloaded_completed_bytes")).toVariant().toLongLong(), 250);
+    QCOMPARE(restoredOperation.value(QStringLiteral("downloaded_total_bytes")).toVariant().toLongLong(), 500);
+    stored.finish();
+    stored.prepare(QStringLiteral("SELECT payload_json FROM sync_runs WHERE id = ?"));
+    stored.addBindValue(operationId);
+    QVERIFY(stored.exec());
+    QVERIFY(stored.next());
+    QVERIFY(!QJsonDocument::fromJson(stored.value(0).toString().toUtf8()).object().contains(QStringLiteral("events")));
+    delete restartedShell;
+}
+
+void MainShellTest::testSyncCommandServiceSurvivesMultipleWindows()
+{
+    auto *firstShell = new Shell;
+    QVERIFY(firstShell->isValid());
+    // Let the one process-start reconciliation finish before creating a live operation.
+    QTest::qWait(100);
+    Shell::lastSuccessfulGlobalSyncAt();
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isValid());
+    QVERIFY(database.isOpen());
+
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRunIds = runIds();
+    const auto cleanupRuns = qScopeGuard([&database, &runIds, &existingRunIds] {
+        const QSet<QString> createdRunIds = runIds() - existingRunIds;
+        for (const QString &id : createdRunIds) {
+            QSqlQuery removeEvents(database);
+            removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
+            removeEvents.addBindValue(id);
+            removeEvents.exec();
+            QSqlQuery removeRun(database);
+            removeRun.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+            removeRun.addBindValue(id);
+            removeRun.exec();
+        }
+    });
+
+    QString operationId;
+    KParts::ReadWritePart *repositoryForwardingPart = nullptr;
+    {
+        const int activeTab = firstShell->m_tabWidget->currentIndex();
+        QVERIFY(activeTab >= 0);
+        KParts::ReadWritePart *const originalPart = firstShell->m_tabs.at(activeTab).part;
+        QVERIFY(originalPart);
+        repositoryForwardingPart = originalPart;
+        SyncDispatchProbe probe;
+        firstShell->m_tabs[activeTab].part = &probe;
+        const auto restorePart = qScopeGuard([&] { firstShell->m_tabs[activeTab].part = originalPart; });
+        const QJsonObject commandResult = firstShell->startSyncCommand(QString());
+        operationId = commandResult.value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!operationId.isEmpty());
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+    }
+    QCOMPARE(firstShell->m_activeManualSyncOperationId, operationId);
+
+    // Constructing another window while the operation is live must not run a second startup reconciliation.
+    auto *secondShell = new Shell;
+    QVERIFY(secondShell->isValid());
+    QTest::qWait(100);
+    QSqlQuery state(database);
+    state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+    state.addBindValue(operationId);
+    QVERIFY(state.exec());
+    QVERIFY(state.next());
+    QCOMPARE(state.value(0).toString(), QStringLiteral("running"));
+    QCOMPARE(state.value(1).toString(), QStringLiteral("queued"));
+
+    // The singleton repository is forwarded through both Parts. Only the owning Shell may journal it.
+    Okular::FedoraRepository *repository = nullptr;
+    for (QObject *child : QCoreApplication::instance()->children()) {
+        if (child->inherits("Okular::FedoraRepository")) {
+            repository = static_cast<Okular::FedoraRepository *>(child);
+            break;
+        }
+    }
+    QVERIFY(repository);
+    QSignalSpy forwardedStateSpy(repositoryForwardingPart, SIGNAL(fedoraManualSyncStateChanged(int, QString, QString)));
+    QVERIFY(forwardedStateSpy.isValid());
+    // Shells re-read the repository's state, so set it as the repository does
+    // before it emits.
+    const auto restoreRepositoryState = qScopeGuard([this, repository] { setManualSyncState(repository, Okular::FedoraRepository::ManualSyncState::Idle); });
+    const auto emitManualSyncState = [this, repository](Okular::FedoraRepository::ManualSyncState state) {
+        setManualSyncState(repository, state);
+        const QString message;
+        const QString details;
+        return QMetaObject::invokeMethod(
+            repository, "manualSyncStateChanged", Qt::DirectConnection, QGenericArgument("Okular::FedoraRepository::ManualSyncState", &state), QGenericArgument("QString", &message), QGenericArgument("QString", &details));
+    };
+    QVERIFY(emitManualSyncState(Okular::FedoraRepository::ManualSyncState::Running));
+    QCOMPARE(forwardedStateSpy.count(), 1);
+    QCOMPARE(firstShell->m_fedoraManualSyncState, 1);
+    QCOMPARE(firstShell->m_activeManualSyncOperationId, operationId);
+    QCOMPARE(runIds() - existingRunIds, QSet<QString> {operationId});
+    QSqlQuery runningEvents(database);
+    runningEvents.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
+    runningEvents.addBindValue(operationId);
+    QVERIFY(runningEvents.exec());
+    QVERIFY(runningEvents.next());
+    QCOMPARE(runningEvents.value(0).toInt(), 1);
+    state.finish();
+    state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+    state.addBindValue(operationId);
+    QVERIFY(state.exec());
+    QVERIFY(state.next());
+    QCOMPARE(state.value(0).toString(), QStringLiteral("running"));
+    QCOMPARE(state.value(1).toString(), QStringLiteral("downloading"));
+    QVERIFY(secondShell->m_activeManualSyncOperationId.isEmpty());
+
+    delete firstShell;
+    QCOMPARE(secondShell->m_activeManualSyncOperationId, operationId);
+
+    QLocalSocket socket;
+    socket.connectToServer(Thoughts::syncCommandSocketPath());
+    QTRY_COMPARE_WITH_TIMEOUT(socket.state(), QLocalSocket::ConnectedState, 2000);
+    const QByteArray request = QJsonDocument(Thoughts::syncCommandStatusRequest(operationId)).toJson(QJsonDocument::Compact) + '\n';
+    QCOMPARE(socket.write(request), request.size());
+    socket.flush();
+    QTRY_VERIFY_WITH_TIMEOUT(socket.canReadLine(), 2000);
+    const QJsonDocument response = QJsonDocument::fromJson(socket.readLine());
+    QVERIFY(response.isObject());
+    QVERIFY(response.object().value(QStringLiteral("accepted")).toBool());
+    QCOMPARE(response.object().value(QStringLiteral("operation_id")).toString(), operationId);
+    QCOMPARE(response.object().value(QStringLiteral("state")).toString(), QStringLiteral("syncing"));
+
+    QVERIFY(emitManualSyncState(Okular::FedoraRepository::ManualSyncState::Succeeded));
+    state.finish();
+    state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+    state.addBindValue(operationId);
+    QVERIFY(state.exec());
+    QVERIFY(state.next());
+    QCOMPARE(state.value(0).toString(), QStringLiteral("succeeded"));
+    QCOMPARE(state.value(1).toString(), QStringLiteral("succeeded"));
+    QVERIFY(secondShell->m_activeManualSyncOperationId.isEmpty());
+    QVERIFY(!secondShell->hasProcessManualSyncOperation());
+    QCOMPARE(runIds() - existingRunIds, QSet<QString> {operationId});
+
+    delete secondShell;
+}
+
+void MainShellTest::testSyncEndingWhileNoWindowListenedIsRecorded()
+{
+    // 2026-10-19: the only window closed three seconds into a Sync. The Sync
+    // went on and ended, but its end reached no window, so the operation
+    // stayed "running" and every later Sync was ignored until a restart.
+    auto *firstShell = new Shell;
+    QVERIFY(firstShell->isValid());
+    QTest::qWait(100);
+    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QVERIFY(database.isOpen());
+    const auto runStatus = [&database](const QString &id) {
+        QSqlQuery query(database);
+        query.prepare(QStringLiteral("SELECT status FROM sync_runs WHERE id = ?"));
+        query.addBindValue(id);
+        return query.exec() && query.next() ? query.value(0).toString() : QString();
+    };
+    QString operationId;
+    const auto cleanupRun = qScopeGuard([&database, &operationId] {
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
+        removeEvents.addBindValue(operationId);
+        removeEvents.exec();
+        QSqlQuery removeRun(database);
+        removeRun.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+        removeRun.addBindValue(operationId);
+        removeRun.exec();
+    });
+    {
+        const int activeTab = firstShell->m_tabWidget->currentIndex();
+        QVERIFY(activeTab >= 0);
+        KParts::ReadWritePart *const originalPart = firstShell->m_tabs.at(activeTab).part;
+        SyncDispatchProbe probe;
+        firstShell->m_tabs[activeTab].part = &probe;
+        const auto restorePart = qScopeGuard([&] { firstShell->m_tabs[activeTab].part = originalPart; });
+        operationId = firstShell->startSyncCommand(QString()).value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!operationId.isEmpty());
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+    }
+    Okular::FedoraRepository *repository = nullptr;
+    for (QObject *child : QCoreApplication::instance()->children()) {
+        if (child->inherits("Okular::FedoraRepository")) {
+            repository = static_cast<Okular::FedoraRepository *>(child);
+            break;
+        }
+    }
+    QVERIFY(repository);
+    const auto restoreRepository = qScopeGuard([this, repository] {
+        setManualSyncState(repository, Okular::FedoraRepository::ManualSyncState::Idle);
+        setManualSyncOperation(repository, QString());
+    });
+    setManualSyncOperation(repository, operationId);
+    setManualSyncState(repository, Okular::FedoraRepository::ManualSyncState::Running);
+
+    delete firstShell;
+    // The Sync ends while no window exists: nobody hears it.
+    setManualSyncState(repository, Okular::FedoraRepository::ManualSyncState::Succeeded);
+    QCOMPARE(runStatus(operationId), QStringLiteral("running"));
+
+    auto *secondShell = new Shell;
+    QVERIFY(secondShell->isValid());
+    QTRY_COMPARE(runStatus(operationId), QStringLiteral("succeeded"));
+    QVERIFY(!secondShell->hasProcessManualSyncOperation());
+
+    // Only the claimed operation's own state counts: a claim the repository
+    // has not started yet is left alone although the repository reports the
+    // previous Sync as finished.
+    {
+        const int activeTab = secondShell->m_tabWidget->currentIndex();
+        KParts::ReadWritePart *const originalPart = secondShell->m_tabs.at(activeTab).part;
+        SyncDispatchProbe probe;
+        secondShell->m_tabs[activeTab].part = &probe;
+        const auto restorePart = qScopeGuard([&] { secondShell->m_tabs[activeTab].part = originalPart; });
+        const QString nextOperationId = secondShell->startSyncCommand(QString()).value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!nextOperationId.isEmpty());
+        QVERIFY(nextOperationId != operationId);
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        secondShell->m_tabs[activeTab].part = originalPart;
+        secondShell->reconcileOrphanedManualSync();
+        QVERIFY(secondShell->hasProcessManualSyncOperation());
+        secondShell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+        QVERIFY(!secondShell->hasProcessManualSyncOperation());
+        QSqlQuery removeEvents(database);
+        removeEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
+        removeEvents.addBindValue(nextOperationId);
+        removeEvents.exec();
+        QSqlQuery removeRun(database);
+        removeRun.prepare(QStringLiteral("DELETE FROM sync_runs WHERE id = ?"));
+        removeRun.addBindValue(nextOperationId);
+        removeRun.exec();
+    }
+    delete secondShell;
+}
+
+void MainShellTest::testOverviewTerminalStateWhileModalLogOpen()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    const auto cleanup = qScopeGuard([shell] {
+        delete Shell::s_commentsOverview.data();
+        Shell::s_commentsOverviewShell.clear();
+        delete shell;
+    });
+
+    auto *syncButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewSync"));
+    auto *syncStatus = Shell::s_commentsOverview->findChild<QLabel *>(QStringLiteral("commentsOverviewPdfSyncStatus"));
+    QVERIFY(syncButton);
+    QVERIFY(syncStatus);
+    Shell::s_commentsOverview->syncStarted();
+    QCOMPARE(syncButton->text(), QStringLiteral("Syncing…"));
+    QCOMPARE(syncStatus->text(), QStringLiteral("Syncing…"));
+
+    bool completedWhileDialogOpen = false;
+    QDialog logDialog(shell);
+    QTimer::singleShot(0, &logDialog, [&] {
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        completedWhileDialogOpen = !Shell::s_commentsOverview->syncOperationRunning() && syncButton->text() == QLatin1String("Sync") && syncStatus->text() != QLatin1String("Syncing…");
+        logDialog.accept();
+    });
+    logDialog.exec();
+
+    QVERIFY(completedWhileDialogOpen);
+}
+
+void MainShellTest::testSyncDispatchRenderPolicies()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    QVERIFY(originalPart);
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+
+        shell->startCommentsOverviewSync();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        QVERIFY(!shell->m_activeManualSyncOperationId.isEmpty());
+        const QString overviewOperationId = shell->m_activeManualSyncOperationId;
+        QSqlDatabase operationDatabase = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+        QVERIFY(operationDatabase.isOpen());
+        const auto eventCount = [&operationDatabase](const QString &operationId) {
+            QSqlQuery query(operationDatabase);
+            query.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
+            query.addBindValue(operationId);
+            return query.exec() && query.next() ? query.value(0).toInt() : -1;
+        };
+        const auto initiationControl = [&operationDatabase](const QString &operationId) {
+            QSqlQuery query(operationDatabase);
+            query.prepare(QStringLiteral("SELECT initiation_control, payload_json FROM sync_runs WHERE id = ?"));
+            query.addBindValue(operationId);
+            if (!query.exec() || !query.next()) {
+                return QPair<QString, QString>();
+            }
+            const QJsonObject payload = QJsonDocument::fromJson(query.value(1).toString().toUtf8()).object();
+            return qMakePair(query.value(0).toString(), payload.value(QStringLiteral("initiation_control")).toString());
+        };
+        const auto startedEventInitiationControl = [&operationDatabase](const QString &operationId) {
+            QSqlQuery query(operationDatabase);
+            query.prepare(QStringLiteral("SELECT metadata_json FROM sync_events WHERE run_id = ? ORDER BY id LIMIT 1"));
+            query.addBindValue(operationId);
+            return query.exec() && query.next() ? QJsonDocument::fromJson(query.value(0).toString().toUtf8()).object().value(QStringLiteral("initiation_control")).toString() : QString();
+        };
+        QCOMPARE(eventCount(overviewOperationId), 1);
+        QCOMPARE(initiationControl(overviewOperationId), qMakePair(QStringLiteral("comments_overview_sync"), QStringLiteral("comments_overview_sync")));
+        QCOMPARE(startedEventInitiationControl(overviewOperationId), QStringLiteral("comments_overview_sync"));
+        QSqlQuery operationTarget(operationDatabase);
+        operationTarget.prepare(QStringLiteral("SELECT target FROM sync_runs WHERE id = ?"));
+        operationTarget.addBindValue(overviewOperationId);
+        QVERIFY(operationTarget.exec());
+        QVERIFY(operationTarget.next());
+        QVERIFY(operationTarget.value(0).toString().isEmpty());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+        QCOMPARE(eventCount(overviewOperationId), 2);
+
+        shell->triggerFedoraSync();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        QVERIFY(probe.targetCalls.isEmpty());
+        const QString documentButtonOperationId = shell->m_activeManualSyncOperationId;
+        QVERIFY(!documentButtonOperationId.isEmpty());
+        QCOMPARE(initiationControl(documentButtonOperationId), qMakePair(QStringLiteral("direct_sync_request"), QStringLiteral("direct_sync_request")));
+        QCOMPARE(startedEventInitiationControl(documentButtonOperationId), QStringLiteral("direct_sync_request"));
+        operationTarget.finish();
+        operationTarget.prepare(QStringLiteral("SELECT target FROM sync_runs WHERE id = ?"));
+        operationTarget.addBindValue(documentButtonOperationId);
+        QVERIFY(operationTarget.exec());
+        QVERIFY(operationTarget.next());
+        QVERIFY(operationTarget.value(0).toString().isEmpty());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+
+        const QJsonObject fullSync = shell->startSyncCommand(QString());
+        const QString fullSyncOperationId = fullSync.value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!fullSyncOperationId.isEmpty());
+        QCOMPARE(initiationControl(fullSyncOperationId), qMakePair(QStringLiteral("command_api"), QStringLiteral("command_api")));
+        QCOMPARE(startedEventInitiationControl(fullSyncOperationId), QStringLiteral("command_api"));
+        QCOMPARE(eventCount(fullSyncOperationId), 1);
+        QSqlQuery storedLifecycle(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        storedLifecycle.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+        storedLifecycle.addBindValue(fullSyncOperationId);
+        QVERIFY(storedLifecycle.exec());
+        QVERIFY(storedLifecycle.next());
+        QCOMPARE(storedLifecycle.value(0).toString(), QStringLiteral("running"));
+        QCOMPARE(storedLifecycle.value(1).toString(), QStringLiteral("queued"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 3);
+        const QString failureSummary = QStringLiteral("The complete source dependency closure could not be frozen safely.");
+        const QString failureDetails = QStringLiteral(
+            "Local source data stopped responding while reading current_pdfs/.thoughts-source-index.json. "
+            "Make sure the Library folder is available locally, then choose Retry.");
+        shell->updateCommentsOverviewManualSyncState(3, failureSummary, failureDetails);
+        storedLifecycle.finish();
+        storedLifecycle.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
+        storedLifecycle.addBindValue(fullSyncOperationId);
+        QVERIFY(storedLifecycle.exec());
+        QVERIFY(storedLifecycle.next());
+        QCOMPARE(storedLifecycle.value(0).toString(), QStringLiteral("failed"));
+        QCOMPARE(storedLifecycle.value(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(eventCount(fullSyncOperationId), 2);
+        QSqlQuery storedFailure(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        storedFailure.prepare(QStringLiteral("SELECT message FROM sync_events WHERE run_id = ? AND state = 'failed' ORDER BY id DESC LIMIT 1"));
+        storedFailure.addBindValue(fullSyncOperationId);
+        QVERIFY(storedFailure.exec());
+        QVERIFY(storedFailure.next());
+        QCOMPARE(storedFailure.value(0).toString(), failureSummary + QLatin1Char(' ') + failureDetails);
+        shell->retrySyncOperation(fullSyncOperationId);
+        QTRY_COMPARE(probe.conditionalFullSyncs, 4);
+        const QString retryOperationId = shell->m_activeManualSyncOperationId;
+        QVERIFY(!retryOperationId.isEmpty());
+        QVERIFY(retryOperationId != fullSyncOperationId);
+        QCOMPARE(initiationControl(retryOperationId), qMakePair(QStringLiteral("logs_retry"), QStringLiteral("logs_retry")));
+        QCOMPARE(startedEventInitiationControl(retryOperationId), QStringLiteral("logs_retry"));
+        QCOMPARE(eventCount(retryOperationId), 1);
+        shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("retry cleanup"), QString());
+        QCOMPARE(eventCount(retryOperationId), 2);
+    }
+    delete Shell::s_commentsOverview.data();
+    Shell::s_commentsOverviewShell.clear();
+    delete shell;
+}
+
+void MainShellTest::testVisibleSyncButtonsUseGlobalScope_data()
+{
+    QTest::addColumn<bool>("sourceLinked");
+    QTest::addColumn<bool>("currentSnapshot");
+    QTest::addColumn<QString>("pdfPath");
+    QTest::newRow("source-linked") << true << true << libraryPdfLabel();
+    QTest::newRow("stale-source-linked-snapshot") << true << false << libraryPdfLabel();
+    QTest::newRow("not-in-library") << false << true << QStringLiteral("/tmp/not-in-library.pdf");
+}
+
+void MainShellTest::testVisibleSyncButtonsUseGlobalScope()
+{
+    QFETCH(bool, sourceLinked);
+    QFETCH(bool, currentSnapshot);
+    QFETCH(QString, pdfPath);
+    auto *shell = new Shell;
+    const auto deleteShell = qScopeGuard([&] { delete shell; });
+    QVERIFY(shell->isValid());
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    QVERIFY(originalPart);
+
+    SyncDispatchProbe probe;
+    shell->m_tabs[activeTab].part = &probe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+    const QUrl pdfUrl = QUrl::fromLocalFile(pdfPath);
+    probe.setDocumentUrl(pdfUrl);
+    const auto setSnapshot = [&] {
+        shell->m_pdfLibraryStateReady = true;
+        shell->m_pdfLibraryStateUrl = currentSnapshot ? pdfUrl : QUrl::fromLocalFile(QStringLiteral("/tmp/other.pdf"));
+        shell->m_cachedPdfLibraryState = sourceLinked ? Shell::PdfLibraryState::SourceLinked : Shell::PdfLibraryState::OutsideLibrary;
+        shell->m_cachedPdfLibraryRenderTarget = QStringLiteral("current_pdfs/concepts.pdf");
+    };
+    setSnapshot();
+
+    const auto storedOperation = [](const QString &operationId) {
+        QSqlQuery query(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        query.prepare(QStringLiteral("SELECT target, initiation_control, payload_json FROM sync_runs WHERE id = ?"));
+        query.addBindValue(operationId);
+        if (!query.exec() || !query.next()) {
+            return QJsonObject();
+        }
+        return QJsonObject {{QStringLiteral("target"), query.value(0).toString()},
+                            {QStringLiteral("initiation_control"), query.value(1).toString()},
+                            {QStringLiteral("payload"), QJsonDocument::fromJson(query.value(2).toString().toUtf8()).object()}};
+    };
+
+    QVERIFY(shell->m_pdfLibraryWidgetAction);
+    shell->updatePdfSyncStatus();
+    shell->syncPdfLibraryStatusToolButton();
+    QVERIFY(shell->m_pdfBuildStatusButton);
+    QVERIFY(shell->m_pdfBuildStatusButton->isEnabled());
+    QSignalSpy detailsShown(shell->m_pdfLibraryMenu, &QMenu::aboutToShow);
+    QTest::mouseClick(shell->m_pdfBuildStatusButton, Qt::LeftButton);
+    QCOMPARE(detailsShown.count(), 0);
+    QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+    QVERIFY(probe.targetCalls.isEmpty());
+    const QString toolbarOperationId = shell->m_activeManualSyncOperationId;
+    QVERIFY(!toolbarOperationId.isEmpty());
+    QVERIFY(!shell->m_pdfLibraryWidgetAction->isEnabled());
+    QCOMPARE(Shell::latestGlobalSyncOperationSummary().value(QStringLiteral("id")).toString(), toolbarOperationId);
+    QCOMPARE(shell->m_pdfBuildStatusText, QStringLiteral("Sync"));
+    const QJsonObject toolbarOperation = storedOperation(toolbarOperationId);
+    QVERIFY(toolbarOperation.value(QStringLiteral("target")).toString().isEmpty());
+    QCOMPARE(toolbarOperation.value(QStringLiteral("initiation_control")).toString(), QStringLiteral("pdf_toolbar_sync"));
+    QCOMPARE(toolbarOperation.value(QStringLiteral("payload")).toObject().value(QStringLiteral("initiation_control")).toString(), QStringLiteral("pdf_toolbar_sync"));
+
+    // Overview and the document controls share the running global operation.
+    shell->startCommentsOverviewSync();
+    shell->m_pdfLibraryWidgetAction->trigger();
+    shell->m_pdfPrimaryMenuCommand = QStringLiteral("sync");
+    shell->m_pdfPrimaryMenuAction->setEnabled(true);
+    shell->m_pdfPrimaryMenuAction->trigger();
+    QCoreApplication::processEvents();
+    QCOMPARE(probe.conditionalFullSyncs, 1);
+    QCOMPARE(shell->m_activeManualSyncOperationId, toolbarOperationId);
+    shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+
+    setSnapshot();
+    shell->m_pdfPrimaryMenuCommand = QStringLiteral("sync");
+    shell->m_pdfPrimaryMenuAction->setEnabled(true);
+    shell->m_pdfPrimaryMenuAction->trigger();
+    QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+    QVERIFY(probe.targetCalls.isEmpty());
+    const QJsonObject statusMenuOperation = storedOperation(shell->m_activeManualSyncOperationId);
+    QVERIFY(statusMenuOperation.value(QStringLiteral("target")).toString().isEmpty());
+    QCOMPARE(statusMenuOperation.value(QStringLiteral("initiation_control")).toString(), QStringLiteral("pdf_status_menu_sync"));
+    shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+
+    shell->startCommentsOverviewSync();
+    QTRY_COMPARE(probe.conditionalFullSyncs, 3);
+    QVERIFY(probe.targetCalls.isEmpty());
+    const QJsonObject overviewOperation = storedOperation(shell->m_activeManualSyncOperationId);
+    QVERIFY(overviewOperation.value(QStringLiteral("target")).toString().isEmpty());
+    QCOMPARE(overviewOperation.value(QStringLiteral("initiation_control")).toString(), QStringLiteral("comments_overview_sync"));
+    shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+
+    // The alternate source-linked menu path must also preserve global Sync.
+    if (sourceLinked && currentSnapshot) {
+        setSnapshot();
+        shell->m_pdfLibraryAction->setData(QStringLiteral("source-linked-sync-now"));
+        shell->renderLinkedPdf();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 4);
+        QVERIFY(probe.targetCalls.isEmpty());
+        const QJsonObject menuOperation = storedOperation(shell->m_activeManualSyncOperationId);
+        QVERIFY(menuOperation.value(QStringLiteral("target")).toString().isEmpty());
+        QCOMPARE(menuOperation.value(QStringLiteral("initiation_control")).toString(), QStringLiteral("pdf_status_menu_sync"));
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+    }
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+}
+
+void MainShellTest::testTargetSyncDispatchPolicies()
+{
+    QCOMPARE(Shell::normalizedRetrySyncTarget(QString()), QString());
+    QCOMPARE(Shell::normalizedRetrySyncTarget(QStringLiteral("All documents")), QString());
+    QCOMPARE(Shell::normalizedRetrySyncTarget(QStringLiteral("paper.pdf")), QStringLiteral("paper.pdf"));
+    QCOMPARE(Shell::normalizedRetrySyncTarget(QStringLiteral("not-a-pdf")), QStringLiteral("not-a-pdf"));
+
+    QVERIFY(Shell::targetSyncMode(true, true, QStringLiteral("source_linked")) == Shell::TargetSyncMode::PublishSources);
+    QVERIFY(Shell::targetSyncMode(true, true, QStringLiteral("unlinked")) == Shell::TargetSyncMode::SnapshotOnly);
+    QVERIFY(Shell::targetSyncMode(false, false, QStringLiteral("source_linked")) == Shell::TargetSyncMode::Reconcile);
+    QVERIFY(Shell::targetSyncMode(true, false, QStringLiteral("source_linked")) == Shell::TargetSyncMode::Reconcile);
+    QVERIFY(Shell::targetSyncMode(true, true, QStringLiteral("unknown")) == Shell::TargetSyncMode::Reconcile);
+
+    SyncDispatchProbe probe;
+    QVERIFY(Shell::dispatchTargetSync(&probe, QStringLiteral("linked.pdf"), Shell::TargetSyncMode::PublishSources, QStringLiteral("linked-trace")));
+    QTRY_COMPARE(probe.targetCalls.size(), 1);
+    QCOMPARE(probe.targetCalls.constFirst().target, QStringLiteral("linked.pdf"));
+    QVERIFY(probe.targetCalls.constFirst().publishSources);
+    QCOMPARE(probe.targetCalls.constFirst().traceId, QStringLiteral("linked-trace"));
+
+    QVERIFY(Shell::dispatchTargetSync(&probe, QStringLiteral("unlinked.pdf"), Shell::TargetSyncMode::SnapshotOnly, QStringLiteral("unlinked-trace")));
+    QTRY_COMPARE(probe.targetCalls.size(), 2);
+    QCOMPARE(probe.targetCalls.constLast().target, QStringLiteral("unlinked.pdf"));
+    QVERIFY(!probe.targetCalls.constLast().publishSources);
+    QCOMPARE(probe.targetCalls.constLast().traceId, QStringLiteral("unlinked-trace"));
+
+    QVERIFY(!Shell::dispatchTargetSync(&probe, QStringLiteral("unknown.pdf"), Shell::TargetSyncMode::Reconcile, QStringLiteral("unknown-trace")));
+    QVERIFY(!Shell::dispatchTargetSync(&probe, QStringLiteral("../invalid.pdf"), Shell::TargetSyncMode::PublishSources, QStringLiteral("invalid-trace")));
+    QCoreApplication::processEvents();
+    QCOMPARE(probe.targetCalls.size(), 2);
+}
+
+void MainShellTest::testProjectAttachmentChangeStaysLocal()
+{
+    auto *shell = new Shell;
+    const auto deleteShell = qScopeGuard([&] { delete shell; });
+    QVERIFY(shell->isValid());
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    QVERIFY(originalPart);
+
+    SyncDispatchProbe probe;
+    shell->m_tabs[activeTab].part = &probe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+    Shell::s_commentsOverviewShell = shell;
+    Thoughts::CommentsOverview *overview = shell->commentsOverview();
+    QVERIFY(overview);
+
+    Q_EMIT overview->projectAttachmentChangedLocally(QStringLiteral("concepts.pdf"));
+    QCoreApplication::processEvents();
+    QCOMPARE(probe.targetCalls.size(), 0);
+    QCOMPARE(probe.conditionalFullSyncs, 0);
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+}
+
+void MainShellTest::testLibraryRemovalCompletionStaysLocalUntilManualSync()
+{
+    auto *shell = new Shell;
+    const auto deleteShell = qScopeGuard([&] { delete shell; });
+    QVERIFY(shell->isValid());
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    QVERIFY(originalPart);
+
+    SyncDispatchProbe probe;
+    shell->m_tabs[activeTab].part = &probe;
+    const auto restorePart = qScopeGuard([&] { shell->m_tabs[activeTab].part = originalPart; });
+    const QString requestId = QStringLiteral("remove-locally");
+    const QString sha256(64, QLatin1Char('a'));
+    shell->m_pendingLibraryRemovalId = requestId;
+    shell->m_pendingLibraryRemovalPath = QStringLiteral("/tmp/paper.pdf");
+    shell->m_pendingLibraryRemovalSha256 = sha256;
+
+    shell->handleLibraryRemovalFinished(requestId, QStringLiteral("paper.pdf"), sha256, true, {});
+    QTest::qWait(50);
+    QCOMPARE(probe.conditionalFullSyncs, 0);
+    QVERIFY(probe.targetCalls.isEmpty());
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+    QVERIFY(shell->m_pendingLibraryRemovalId.isEmpty());
+}
+
+void MainShellTest::testSyncBuildOutputTargetRouting()
+{
+    const QJsonObject reusedFullSync {
+        {QStringLiteral("target"), QString()},
+        {QStringLiteral("build_id"), QStringLiteral("conditional-build")},
+        {QStringLiteral("build_target"), QStringLiteral("paper.pdf")},
+    };
+    QCOMPARE(Thoughts::syncOperationBuildOutputTarget(reusedFullSync), QStringLiteral("paper.pdf"));
+
+    const QJsonObject aggregateBuild {
+        {QStringLiteral("target"), QStringLiteral("All documents")},
+        {QStringLiteral("build_id"), QStringLiteral("aggregate-build")},
+        {QStringLiteral("build_target"), QStringLiteral("all")},
+    };
+    QVERIFY(Thoughts::syncOperationBuildOutputTarget(aggregateBuild).isEmpty());
+
+    const QJsonObject invalidBuildTarget {
+        {QStringLiteral("target"), QStringLiteral("All documents")},
+        {QStringLiteral("build_id"), QStringLiteral("invalid-build")},
+        {QStringLiteral("build_target"), QStringLiteral("../paper.pdf")},
+    };
+    QVERIFY(Thoughts::syncOperationBuildOutputTarget(invalidBuildTarget).isEmpty());
+}
+
+void MainShellTest::testEditableSourceConflictUsesNormalGitMarkers()
+{
+    const QByteArray serverMerge("before\n<<<<<<< FEDORA_CURRENT\nfedora edit\n=======\nmac edit\n>>>>>>> PHONE_INCOMING\nafter\n");
+    const QByteArray editable = Shell::editableSourceConflictForTesting(serverMerge, QByteArrayLiteral("mac file\n"), QByteArrayLiteral("fedora file\n"));
+    QCOMPARE(editable, QByteArray("before\n<<<<<<< THIS COMPUTER\nmac edit\n=======\nfedora edit\n>>>>>>> SERVER\nafter\n"));
+
+    const QByteArray fallback = Shell::editableSourceConflictForTesting({}, QByteArrayLiteral("mac file\n"), QByteArrayLiteral("fedora file\n"));
+    QCOMPARE(fallback, QByteArray("<<<<<<< THIS COMPUTER\nmac file\n=======\nfedora file\n>>>>>>> SERVER\n"));
+
+    // A Project file must stay valid JSON: keeping this computer's half and the
+    // rest of Fedora's after it is refused even without markers.
+    const QString project = QStringLiteral(".thoughts/projects/abc/documents/thoughts-project.json");
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(QByteArrayLiteral("{\n  \"name\": \"a\"\n},\n  {\"name\": \"b\"}\n}\n"), project).contains(QStringLiteral("JSON")));
+    QVERIFY(!Shell::sourceConflictContentsErrorForTesting(QByteArrayLiteral("[1]\n"), project).isEmpty());
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(QByteArrayLiteral("{\"name\": \"a\"}\n"), project).isEmpty());
+    QVERIFY(!Shell::sourceConflictContentsErrorForTesting(QByteArrayLiteral("{\n<<<<<<< THIS COMPUTER\n}\n"), project).isEmpty());
+    // TeX is not parsed.
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(QByteArrayLiteral("{ unbalanced\n"), QStringLiteral("docs-a/main.tex")).isEmpty());
+
+    // Proposal wrappers are. Fedora accepted the proposal (dropping its whole
+    // wrapper) while this computer revised it: the merge conflicts only on the
+    // wrapper's start and takes Fedora's line without the closing brace, so
+    // keeping this computer's half leaves the wrapper open (2026-10-19).
+    const QString tex = QStringLiteral("docs-a/tex/source/notes.tex");
+    const QByteArray wrapperStart("\\agentProposedEdit[created=2026-10-18T17:14:36.283Z,conversation_id=51fc18f7-5703-53b3-ab49-739b3ba89537]{agent-62666cbf}{Revised.}{Old heading.\n}{New heading.\n");
+    const QByteArray mac = "Intro.\n" + wrapperStart + "}After.\n";
+    const QByteArray fedora("Intro.\nAccepted heading.\nAfter.\n");
+    const QByteArray brokenMerge = "Intro.\n" + wrapperStart + "After.\n";
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(mac, tex, {fedora, mac}).isEmpty());
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(fedora, tex, {fedora, mac}).isEmpty());
+    const QString brokenError = Shell::sourceConflictContentsErrorForTesting(brokenMerge, tex, {fedora, mac});
+    QVERIFY2(brokenError.contains(QStringLiteral("agent-62666cbf")), qPrintable(brokenError));
+    QVERIFY(brokenError.contains(QStringLiteral("line 2")));
+    // A wrapper already broken the same way in a merged version is not the merge's doing.
+    QVERIFY(Shell::sourceConflictContentsErrorForTesting(brokenMerge, tex, {brokenMerge, mac}).isEmpty());
+}
+
+void MainShellTest::testOverviewIgnoresLegacyBuildAllState()
+{
+    const QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/overview-sync-operation.json"));
+    QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+    const auto removeLegacyState = qScopeGuard([&path] { QFile::remove(path); });
+    const QJsonObject obsoleteBuild {
+        {QStringLiteral("schema_version"), 1},
+        {QStringLiteral("operation_id"), QStringLiteral("obsolete-build-all")},
+        {QStringLiteral("phase"), QStringLiteral("building")},
+        {QStringLiteral("remaining_build_targets"), QJsonArray {QStringLiteral("paper.pdf")}},
+    };
+    QSaveFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    const QByteArray payload = QJsonDocument(obsoleteBuild).toJson(QJsonDocument::Indented);
+    QCOMPARE(file.write(payload), payload.size());
+    QVERIFY(file.commit());
+
+    auto *shell = new Shell;
+    Shell::s_commentsOverviewShell = shell;
+    QVERIFY(shell->commentsOverview());
+    QCoreApplication::processEvents();
+
+    QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
+    QVERIFY(shell->m_activeBuildOperationId.isEmpty());
+    QVERIFY(QFileInfo::exists(path));
+    delete shell;
+}
+
+void MainShellTest::testLocalSourceFreshnessUsesPublishedHashes()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString project = QStringLiteral("docs-paper");
+    const QString relativeSource = QStringLiteral("docs-paper/tex/source/main.tex");
+    const QString sourcePath = QDir(root.path()).filePath(relativeSource);
+    const QString manifestPath = QDir(root.path()).filePath(QStringLiteral("state/source-manifest.json"));
+    const QString publicationPath = QDir(root.path()).filePath(QStringLiteral("state/source-publication.json"));
+    QVERIFY(QDir().mkpath(QFileInfo(sourcePath).absolutePath()));
+    QVERIFY(QDir().mkpath(QFileInfo(manifestPath).absolutePath()));
+
+    const auto writeBytes = [](const QString &path, const QByteArray &bytes) {
+        QSaveFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit();
+    };
+    const auto sha256 = [](const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); };
+    // Projects own their styles; manifests declare no shared files.
+    const auto writeState = [&](const QByteArray &source, bool includeManagedPath = true) {
+        QJsonObject manifest {
+            {QStringLiteral("schema_version"), 3},
+            {QStringLiteral("projects"),
+             QJsonArray {QJsonObject {
+                 {QStringLiteral("project"), project},
+                 {QStringLiteral("targets"), QJsonArray {QStringLiteral("paper.pdf")}},
+                 {QStringLiteral("files"), QJsonArray {QJsonObject {
+                      {QStringLiteral("path"), includeManagedPath ? relativeSource : QStringLiteral("docs-other/tex/source/main.tex")},
+                      {QStringLiteral("role"), QStringLiteral("source")},
+                  }}},
+             }}},
+            {QStringLiteral("shared_files"), QJsonArray()},
+        };
+        QJsonObject publication {
+            {QStringLiteral("schema_version"), 1},
+            {QStringLiteral("bases"), QJsonObject {
+                 {relativeSource, QJsonObject {{QStringLiteral("sha256"), sha256(source)}}},
+             }},
+        };
+        return writeBytes(manifestPath, QJsonDocument(manifest).toJson(QJsonDocument::Compact)) && writeBytes(publicationPath, QJsonDocument(publication).toJson(QJsonDocument::Compact));
+    };
+
+    const QByteArray published("published source\n");
+    QVERIFY(writeBytes(sourcePath, published));
+    QVERIFY(writeState(published));
+    QVariantMap freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath);
+    QVERIFY(freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("current")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("watch_files")).toStringList().contains(sourcePath));
+    QVERIFY(!freshness.value(QStringLiteral("watch_directories")).toStringList().contains(QFileInfo(sourcePath).absolutePath()));
+
+    QVERIFY(writeBytes(sourcePath, QByteArrayLiteral("locally changed source\n")));
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath);
+    QVERIFY(!freshness.value(QStringLiteral("current")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("message")).toString().contains(relativeSource));
+
+    QVERIFY(writeState(QByteArrayLiteral("locally changed source\n")));
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath);
+    QVERIFY(freshness.value(QStringLiteral("current")).toBool());
+
+    QVERIFY(writeState(QByteArrayLiteral("locally changed source\n"), false));
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath);
+    QVERIFY(!freshness.value(QStringLiteral("current")).toBool());
+
+    const QString target = QStringLiteral("paper.pdf");
+    const QString publishedInputSnapshot(64, QLatin1Char('a'));
+    const QString generatedInputPath = QDir(root.path()).filePath(QStringLiteral("docs-paper/tex/generated/figure.svg"));
+    QVERIFY(QDir().mkpath(QFileInfo(generatedInputPath).absolutePath()));
+    QVERIFY(writeBytes(generatedInputPath, QByteArrayLiteral("<svg/>\n")));
+    QVERIFY(writeState(QByteArrayLiteral("locally changed source\n")));
+    QVariantMap inspection {
+        {QStringLiteral("schema_version"), 3},
+        {QStringLiteral("target"), target},
+        {QStringLiteral("project"), project},
+        {QStringLiteral("discovery_policy"), QStringLiteral("tex-closure-v1")},
+        {QStringLiteral("sha256"), publishedInputSnapshot},
+        {QStringLiteral("entries"), QVariantList {}},
+        {QStringLiteral("managed_files"), QStringList {relativeSource}},
+        {QStringLiteral("watch_files"), QStringList {generatedInputPath}},
+        {QStringLiteral("watch_directories"), QStringList {QFileInfo(generatedInputPath).absolutePath()}},
+    };
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath, target, publishedInputSnapshot, inspection);
+    QVERIFY(freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("current")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("watch_files")).toStringList().contains(generatedInputPath));
+
+    inspection.insert(QStringLiteral("sha256"), QString(64, QLatin1Char('b')));
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath, target, publishedInputSnapshot, inspection);
+    QVERIFY(freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(!freshness.value(QStringLiteral("current")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("message")).toString().contains(QStringLiteral("build inputs")));
+
+    const QString newRelativeSource = QStringLiteral("docs-paper/tex/source/new_section.tex");
+    QVERIFY(writeBytes(QDir(root.path()).filePath(newRelativeSource), QByteArrayLiteral("new unpublished source\n")));
+    inspection.insert(QStringLiteral("sha256"), publishedInputSnapshot);
+    inspection.insert(QStringLiteral("managed_files"), QStringList {relativeSource, newRelativeSource});
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath, target, publishedInputSnapshot, inspection);
+    QVERIFY(freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(!freshness.value(QStringLiteral("current")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("message")).toString().contains(newRelativeSource));
+
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath, target, QString(), inspection);
+    QVERIFY(!freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("message")).toString().contains(QStringLiteral("no verifiable build-input identity")));
+
+    QJsonObject legacyManifest {
+        {QStringLiteral("schema_version"), 2},
+        {QStringLiteral("projects"), QJsonArray()},
+    };
+    QVERIFY(writeBytes(manifestPath, QJsonDocument(legacyManifest).toJson(QJsonDocument::Compact)));
+    freshness = Shell::localSourceFreshnessForTesting(root.path(), project, manifestPath, publicationPath);
+    QVERIFY(!freshness.value(QStringLiteral("available")).toBool());
+    QVERIFY(freshness.value(QStringLiteral("message")).toString().contains(QStringLiteral("unavailable")));
+}
+
+void MainShellTest::testPdfSourceFreshnessWatcherSchedulesRefresh()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    QVERIFY(shell->m_pdfSourceFreshnessTimer);
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    const QString sourcePath = QDir(root.path()).filePath(QStringLiteral("source.tex"));
+    const QString missingDirectory = QDir(root.path()).filePath(QStringLiteral("generated"));
+    {
+        QFile source(sourcePath);
+        QVERIFY(source.open(QIODevice::WriteOnly));
+        QCOMPARE(source.write("before\n"), 7);
+    }
+    shell->configurePdfSourceFreshnessWatcher({sourcePath}, {missingDirectory});
+    shell->m_pdfSourceFreshnessTimer->stop();
+    shell->m_pdfSourceFreshnessTimer->setInterval(1000);
+
+    // Unrelated changes, including siblings of a watched file, are ignored.
+    shell->handlePdfSourcePathsChanged({QDir(root.path()).filePath(QStringLiteral("source.aux")), QDir(root.path()).filePath(QStringLiteral("other/source.tex"))});
+    QVERIFY(!shell->m_pdfSourceFreshnessTimer->isActive());
+
+    // An atomic replacement of the file is reported under its path.
+    shell->handlePdfSourcePathsChanged({sourcePath});
+    QVERIFY(shell->m_pdfSourceFreshnessTimer->isActive());
+    shell->m_pdfSourceFreshnessTimer->stop();
+
+    // A directory stands in for a missing file: anything appearing inside counts.
+    shell->handlePdfSourcePathsChanged({QDir(missingDirectory).filePath(QStringLiteral("table.tex"))});
+    QVERIFY(shell->m_pdfSourceFreshnessTimer->isActive());
+    shell->m_pdfSourceFreshnessTimer->stop();
+
+    shell->configurePdfSourceFreshnessWatcher({}, {});
+    shell->handlePdfSourcePathsChanged({sourcePath});
+    QVERIFY(!shell->m_pdfSourceFreshnessTimer->isActive());
+}
+
+void MainShellTest::testPdfLibraryRefreshCoalescing()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.constFirst().part);
+    QVERIFY(part);
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    setPartUrl(part, firstUrl);
+
+    shell->m_pdfLibraryRefreshRunning = true;
+    shell->m_pdfLibraryActiveRefreshUrl = firstUrl;
+    shell->m_pdfLibraryRefreshQueued = false;
+    shell->requestPdfLibraryStateRefresh(false);
+    QVERIFY(!shell->m_pdfLibraryRefreshQueued);
+
+    shell->requestPdfLibraryStateRefresh(true);
+    QVERIFY(shell->m_pdfLibraryRefreshQueued);
+
+    shell->m_pdfLibraryRefreshQueued = false;
+    setPartUrl(part, secondUrl);
+    shell->requestPdfLibraryStateRefresh(false);
+    QVERIFY(shell->m_pdfLibraryRefreshQueued);
+
+    shell->m_pdfLibraryRefreshRunning = false;
+    shell->m_pdfLibraryRefreshQueued = false;
+    shell->m_pdfLibraryActiveRefreshUrl = {};
+}
+
+void MainShellTest::testPdfStatusRejectsTransientReloadSnapshot()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.constFirst().part);
+    QVERIFY(part);
+    const QUrl pdfUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    setPartUrl(part, pdfUrl);
+    shell->m_pdfLibraryStateReady = false;
+    shell->updatePdfLibraryAction();
+    QTRY_COMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("outside-library"));
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("Not in Library"));
+
+    // Reproduce the old failure: a worker captured the empty URL while the
+    // part was closing, but the PDF had reopened before that result arrived.
+    const quint64 staleSerial = ++shell->m_pdfLibraryRefreshSerial;
+    shell->m_pdfLibraryActiveRefreshSerial = staleSerial;
+    shell->m_pdfLibraryRefreshRunning = true;
+    setPartUrl(part, QUrl());
+    setPartUrl(part, pdfUrl);
+    shell->finishPdfLibraryStateRefresh({
+        {QStringLiteral("request_serial"), staleSerial},
+        {QStringLiteral("url"), QUrl()},
+        {QStringLiteral("state"), static_cast<int>(Shell::PdfLibraryState::NoDocument)},
+    });
+
+    QVERIFY(shell->m_pdfStatusMenuAction->text() != QLatin1String("No PDF"));
+    QTRY_COMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("outside-library"));
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("Not in Library"));
+    QCOMPARE(shell->m_pdfLibraryStateUrl, pdfUrl);
+
+    // An actually empty part still settles to No PDF after the coalesced URL
+    // notification has had a chance to run.
+    setPartUrl(part, QUrl());
+    QTRY_COMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("no-document"));
+    QCOMPARE(shell->m_pdfStatusMenuAction->text(), QStringLiteral("No PDF"));
+}
+
+void MainShellTest::testDocumentLinkFallsBackToPublishedPdf()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QVERIFY(QDir(root.path()).mkpath(QStringLiteral("current_pdfs")));
+    QVERIFY(QDir(root.path()).mkpath(QStringLiteral("docs-notes/pdf")));
+    const QString published = root.filePath(QStringLiteral("current_pdfs/paper_3029bc601e4d.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file1.pdf"), published));
+    const QString sibling = root.filePath(QStringLiteral("docs-notes/pdf/other.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file1.pdf"), sibling));
+
+    // The path the build folder gave a PDF attached to the project.
+    const QUrl buildPath = QUrl::fromLocalFile(root.filePath(QStringLiteral(".thoughts/projects/4ced/default/paper_3029bc601e4d.pdf")));
+    QCOMPARE(Shell::documentLinkTarget(buildPath, root.path()), QUrl::fromLocalFile(published));
+    // A file that exists opens as linked; one never published keeps its error.
+    QCOMPARE(Shell::documentLinkTarget(QUrl::fromLocalFile(sibling), root.path()), QUrl::fromLocalFile(sibling));
+    const QUrl missing = QUrl::fromLocalFile(root.filePath(QStringLiteral("elsewhere/missing.pdf")));
+    QCOMPARE(Shell::documentLinkTarget(missing, root.path()), missing);
+    const QUrl web(QStringLiteral("https://example.com/paper_3029bc601e4d.pdf"));
+    QCOMPARE(Shell::documentLinkTarget(web, root.path()), web);
+}
+
+void MainShellTest::testPdfLibraryFilenameSanitizer()
+{
+    QCOMPARE(Shell::pdfLinkSafeFilename(QStringLiteral("paper.PDF")), QStringLiteral("paper.pdf"));
+    QCOMPARE(Shell::pdfLinkSafeFilename(QStringLiteral("paper copy.pdf")), QStringLiteral("paper_copy.pdf"));
+    QCOMPARE(Shell::pdfLinkSafeFilename(QStringLiteral("_draft.pdf")), QStringLiteral("document_draft.pdf"));
+    QCOMPARE(Shell::pdfLinkSafeFilename(QStringLiteral(".pdf")), QStringLiteral("document.pdf"));
+    QCOMPARE(Shell::pdfLinkSafeFilename(QStringLiteral("paper-2026_v2.pdf")), QStringLiteral("paper-2026_v2.pdf"));
+}
+
+void MainShellTest::testDetachTabPreservesState()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *sourceShell = findShell();
+    QVERIFY(sourceShell);
+    QCOMPARE(sourceShell->m_tabs.size(), 2);
+    sourceShell->setActiveTab(1);
+
+    auto *detachedPart = qobject_cast<Okular::Part *>(sourceShell->m_tabs.at(1).part);
+    QVERIFY(detachedPart);
+    detachedPart->setModified(true);
+    QVERIFY(detachedPart->isModified());
+
+    QWidget *const detachedPage = detachedPart->widget();
+    QWidget *const detachedSideContainer = qobject_cast<Okular::ViewerInterface *>(detachedPart)->getSideContainer();
+    const QString expectedText = secondUrl.fileName() + QStringLiteral(" *");
+    const QString expectedToolTip = sourceShell->m_tabWidget->tabToolTip(1);
+    const QIcon expectedIcon = sourceShell->m_tabWidget->tabIcon(1);
+
+    QScreen *const targetScreen = QGuiApplication::primaryScreen();
+    QVERIFY(targetScreen);
+    const QRect availableGeometry = targetScreen->availableGeometry();
+    const QPoint dropPosition(availableGeometry.right() - 10, availableGeometry.top() + 50);
+    const QRect expectedGeometry = sourceShell->detachedWindowGeometry(dropPosition, sourceShell->size());
+    QVERIFY(availableGeometry.contains(expectedGeometry));
+
+    sourceShell->detachTab(1, dropPosition);
+
+    QCOMPARE(getShells().size(), 2);
+    Shell *const detachedShell = findShell(sourceShell);
+    QVERIFY(detachedShell);
+    QCOMPARE(sourceShell->m_tabs.size(), 1);
+    QCOMPARE(sourceShell->m_tabs.constFirst().part->url(), firstUrl);
+    QCOMPARE(sourceShell->m_tabWidget->currentIndex(), 0);
+    QVERIFY(sourceShell->m_tabWidget->tabBar()->isVisible());
+    QVERIFY(!sourceShell->m_nextTabAction->isEnabled());
+    QVERIFY(!sourceShell->m_prevTabAction->isEnabled());
+
+    QCOMPARE(detachedShell->m_tabs.size(), 1);
+    QCOMPARE(detachedShell->m_tabs.constFirst().part, detachedPart);
+    QCOMPARE(detachedPart->parent(), detachedShell);
+    QCOMPARE(detachedShell->m_tabWidget->widget(0), detachedPage);
+    QCOMPARE(detachedShell->m_tabWidget->tabText(0), expectedText);
+    QCOMPARE(detachedShell->m_tabWidget->tabToolTip(0), expectedToolTip);
+    QCOMPARE(detachedShell->m_tabWidget->tabIcon(0).cacheKey(), expectedIcon.cacheKey());
+    QVERIFY(detachedPart->isModified());
+    QCOMPARE(detachedSideContainer->window(), detachedShell);
+    QVERIFY(detachedShell->m_tabWidget->tabBar()->isVisible());
+    QTRY_COMPARE_WITH_TIMEOUT(detachedShell->geometry(), expectedGeometry, 1000);
+    QCOMPARE(detachedShell->windowOpacity(), 1.0);
+
+    // A sole tab reuses its existing window instead of creating an empty
+    // source window and a duplicate destination window.
+    sourceShell->detachTab(0, dropPosition);
+    QCOMPARE(getShells().size(), 2);
+
+    detachedPart->setModified(false);
+}
+
+void MainShellTest::testMoveTabToNewWindowAction()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *sourceShell = findShell();
+    QVERIFY(sourceShell);
+    QCOMPARE(sourceShell->m_tabs.size(), 2);
+    sourceShell->setActiveTab(0);
+    KParts::ReadWritePart *const movedPart = sourceShell->m_tabs.at(1).part;
+    const QRect expectedGeometry = sourceShell->detachedWindowGeometry(sourceShell->newWindowPosition(), sourceShell->size());
+
+    QMenu menu;
+    sourceShell->addTabContextMenuActions(&menu, 1);
+    QAction *moveAction = menu.findChild<QAction *>(QStringLiteral("moveTabToNewWindowAction"));
+    QVERIFY(moveAction);
+    QVERIFY(moveAction->isEnabled());
+    moveAction->trigger();
+
+    QCOMPARE(getShells().size(), 2);
+    Shell *const newShell = findShell(sourceShell);
+    QVERIFY(newShell);
+    QCOMPARE(sourceShell->m_tabs.size(), 1);
+    QCOMPARE(sourceShell->m_tabs.constFirst().part->url(), firstUrl);
+    QCOMPARE(newShell->m_tabs.size(), 1);
+    QCOMPARE(newShell->m_tabs.constFirst().part, movedPart);
+    QCOMPARE(movedPart->url(), secondUrl);
+    QTRY_COMPARE_WITH_TIMEOUT(newShell->geometry(), expectedGeometry, 1000);
+
+    // A window's only tab has nowhere to move.
+    QMenu soleTabMenu;
+    newShell->addTabContextMenuActions(&soleTabMenu, 0);
+    QAction *soleTabMoveAction = soleTabMenu.findChild<QAction *>(QStringLiteral("moveTabToNewWindowAction"));
+    QVERIFY(soleTabMoveAction);
+    QVERIFY(!soleTabMoveAction->isEnabled());
+}
+
+void MainShellTest::testTransferTabBetweenWindows()
+{
+    const QUrl firstUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QUrl secondUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QUrl targetUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/contents.epub"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({firstUrl.toLocalFile(), secondUrl.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *sourceShell = findShell();
+    QVERIFY(sourceShell);
+
+    auto *targetShell = new Shell;
+    QVERIFY(targetShell->isValid());
+    targetShell->show();
+    QVERIFY(targetShell->openDocument(targetUrl, serializedOptions));
+    QCOMPARE(targetShell->m_tabs.size(), 1);
+
+    auto *movedPart = qobject_cast<Okular::Part *>(sourceShell->m_tabs.at(1).part);
+    QVERIFY(movedPart);
+    movedPart->setModified(true);
+    QWidget *const movedPage = movedPart->widget();
+    QWidget *const movedSidebar = qobject_cast<Okular::ViewerInterface *>(movedPart)->getSideContainer();
+
+    QVERIFY(sourceShell->transferTabTo(targetShell, movedPage, 0));
+    QCOMPARE(sourceShell->m_tabs.size(), 1);
+    QCOMPARE(sourceShell->m_tabs.constFirst().part->url(), firstUrl);
+    QVERIFY(sourceShell->m_tabWidget->tabBar()->isVisible());
+
+    QCOMPARE(targetShell->m_tabs.size(), 2);
+    QCOMPARE(targetShell->m_tabs.at(0).part, movedPart);
+    QCOMPARE(targetShell->m_tabs.at(1).part->url(), targetUrl);
+    QCOMPARE(movedPart->parent(), targetShell);
+    QCOMPARE(targetShell->m_tabWidget->widget(0), movedPage);
+    QCOMPARE(movedSidebar->window(), targetShell);
+    QVERIFY(movedPart->isModified());
+
+    // Moving the last source tab closes that empty source window.
+    QPointer<Shell> sourceGuard(sourceShell);
+    KParts::ReadWritePart *const finalSourcePart = sourceShell->m_tabs.constFirst().part;
+    QWidget *const finalSourcePage = finalSourcePart->widget();
+    QVERIFY(sourceShell->transferTabTo(targetShell, finalSourcePage, targetShell->m_tabs.size()));
+    QTRY_VERIFY_WITH_TIMEOUT(sourceGuard.isNull(), 1000);
+    QCOMPARE(targetShell->m_tabs.size(), 3);
+    QCOMPARE(targetShell->m_tabs.constLast().part, finalSourcePart);
+
+    movedPart->setModified(false);
+}
+
+void MainShellTest::testSingleTabDragReusesWindow()
+{
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main({url.toLocalFile()}, serializedOptions), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QVERIFY(shell->m_tabWidget->tabBar()->isVisible());
+
+    KParts::ReadWritePart *const part = shell->m_tabs.constFirst().part;
+    QScreen *const screen = QGuiApplication::primaryScreen();
+    QVERIFY(screen);
+    const QPoint dropPosition = screen->availableGeometry().center();
+    const QRect expectedGeometry = shell->detachedWindowGeometry(dropPosition, shell->size());
+
+    shell->detachTab(0, dropPosition);
+
+    QCOMPARE(getShells().size(), 1);
+    QCOMPARE(shell->m_tabs.constFirst().part, part);
+    QTRY_COMPARE_WITH_TIMEOUT(shell->geometry(), expectedGeometry, 1000);
+    QCOMPARE(shell->windowOpacity(), 1.0);
+}
+
+void MainShellTest::testDocumentTabsShareTheBarEvenly()
+{
+    const QStringList paths = {QStringLiteral(KDESRCDIR "data/file1.pdf"), QStringLiteral(KDESRCDIR "data/file2.pdf"), QStringLiteral(KDESRCDIR "data/tocreload.pdf")};
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main(paths, serializedOptions), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QTabBar *const tabBar = shell->m_tabWidget->tabBar();
+    // Very different title lengths must not give very different tab widths.
+    tabBar->setTabText(0, QStringLiteral("di"));
+    tabBar->setTabText(1, QStringLiteral("Privileged but Biased How PI-Conditioned Teachers Break Self-Distillation in LLMs"));
+    tabBar->setTabText(2, QStringLiteral("re"));
+    const auto widths = [tabBar] {
+        QList<int> result;
+        for (int tab = 0; tab < tabBar->count(); ++tab) result.append(tabBar->tabRect(tab).width());
+        return result;
+    };
+    const auto even = [&widths] {
+        const QList<int> w = widths();
+        return *std::max_element(w.cbegin(), w.cend()) - *std::min_element(w.cbegin(), w.cend()) <= 1;
+    };
+    shell->show();
+    shell->resize(500, 600);
+    QTRY_VERIFY2(even(), qPrintable(QString::number(widths().constFirst())));
+    QVERIFY(widths().constFirst() < 240);
+    shell->resize(1600, 600);
+    // With room to spare, every tab stops at the same maximum width.
+    QTRY_VERIFY(even() && widths().constFirst() == 240);
+}
+
+void MainShellTest::testDragTabOutsideWindow()
+{
+    const QStringList paths = {QStringLiteral(KDESRCDIR "data/file1.pdf"), QStringLiteral(KDESRCDIR "data/file2.pdf")};
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    QCOMPARE(Okular::main(paths, serializedOptions), Okular::Success);
+    Shell *sourceShell = findShell();
+    QVERIFY(sourceShell);
+    QCOMPARE(sourceShell->m_tabs.size(), 2);
+
+    QTabBar *const tabBar = sourceShell->m_tabWidget->tabBar();
+    QVERIFY(tabBar);
+    QVERIFY(!tabBar->isHidden());
+
+    const auto sendTabDrag = [tabBar](int tab, const QPoint &releaseGlobalPosition) {
+        const QPoint pressPosition = tabBar->tabRect(tab).center();
+        const QPoint pressGlobalPosition = tabBar->mapToGlobal(pressPosition);
+
+        QMouseEvent pressEvent(QEvent::MouseButtonPress, pressPosition, pressGlobalPosition, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(tabBar, &pressEvent);
+
+        const QPoint releasePosition = tabBar->mapFromGlobal(releaseGlobalPosition);
+        QMouseEvent moveEvent(QEvent::MouseMove, releasePosition, releaseGlobalPosition, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(tabBar, &moveEvent);
+
+        QMouseEvent releaseEvent(QEvent::MouseButtonRelease, releasePosition, releaseGlobalPosition, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(tabBar, &releaseEvent);
+    };
+
+    const QPoint firstTabCenter = tabBar->mapToGlobal(tabBar->tabRect(0).center());
+    const QPoint insideReleasePosition = firstTabCenter + QPoint(QApplication::startDragDistance() + 10, 0);
+    QVERIFY(sourceShell->frameGeometry().contains(insideReleasePosition));
+    sendTabDrag(0, insideReleasePosition);
+    QCoreApplication::processEvents();
+    QCOMPARE(getShells().size(), 1);
+
+    const QPixmap dragPixmap = sourceShell->tabDragPixmap(0);
+    QVERIFY(!dragPixmap.isNull());
+    QVERIFY(dragPixmap.deviceIndependentSize().width() > tabBar->tabRect(0).width());
+    QVERIFY(dragPixmap.deviceIndependentSize().height() > tabBar->tabRect(0).height());
+
+    const QPoint firstTabLeft = tabBar->mapToGlobal(tabBar->tabRect(0).topLeft() + QPoint(2, tabBar->height() / 2));
+    const QPoint firstTabRight = tabBar->mapToGlobal(tabBar->tabRect(0).topRight() - QPoint(2, -tabBar->height() / 2));
+    QCOMPARE(sourceShell->tabInsertionIndex(firstTabLeft), 0);
+    QCOMPARE(sourceShell->tabInsertionIndex(firstTabRight), 1);
+
+    sourceShell->showTabDropIndicator(1);
+    QWidget *const overlay = sourceShell->findChild<QWidget *>(QStringLiteral("tabDropOverlay"));
+    QVERIFY(overlay);
+    QVERIFY(overlay->isVisible());
+    sourceShell->hideTabDropIndicator();
+    QVERIFY(!overlay->isVisible());
+}
+
+void MainShellTest::testMiddleButtonCloseUndo()
+{
+    const QStringList paths = {QStringLiteral(KDESRCDIR "data/file1.pdf"), QStringLiteral(KDESRCDIR "data/file2.pdf")};
+    QString serializedOptions;
+    serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    Okular::Status status = Okular::main(paths, serializedOptions);
+    QCOMPARE(status, Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+
+    QCOMPARE(s->m_tabWidget->count(), paths.size());
+    // Close a tab using middle key
+    QWidget *firstTab = s->m_tabWidget->tabBar()->tabButton(0, QTabBar::RightSide);
+    if (!firstTab) {
+        firstTab = s->m_tabWidget->tabBar()->tabButton(0, QTabBar::LeftSide);
+    }
+    QVERIFY(firstTab);
+    QTest::mouseClick(firstTab, Qt::MiddleButton);
+    QCOMPARE(s->m_tabWidget->count(), paths.size() - 1);
+    // Undo tab close
+    s->undoCloseTab();
+    QCOMPARE(s->m_tabWidget->count(), paths.size());
+}
+
+// Catches the links the shell and the review bar open in the browser.
+class BrowserUrlCatcher : public QObject
+{
+    Q_OBJECT
+public:
+    QList<QUrl> urls;
+public Q_SLOTS:
+    void open(const QUrl &url)
+    {
+        urls.append(url);
+    }
+};
+
+void MainShellTest::testReviewActionAvailable()
+{
+    auto *shell = new Shell;
+    QAction *const action = shell->actionCollection()->action(QStringLiteral("review_overview"));
+    QVERIFY(action);
+    QCOMPARE(action->text(), QStringLiteral("Review"));
+    bool presentInMenu = false;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *const menu = menuAction->menu();
+        presentInMenu = presentInMenu || (menu && menu->actions().contains(action));
+    }
+    QVERIFY(presentInMenu);
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QToolBar *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    auto *reviewButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(action));
+    QVERIFY(reviewButton);
+    QTest::mouseClick(reviewButton, Qt::LeftButton);
+    QCoreApplication::processEvents();
+    auto *const overview = shell->findChild<Thoughts::ReviewOverview *>();
+    QVERIFY(overview);
+    auto *partActions = shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part->actionCollection();
+    auto *comments = partActions->action(QStringLiteral("highlight_comments"));
+    auto *proposals = partActions->action(QStringLiteral("highlight_agent_edits"));
+    auto *cards = partActions->action(QStringLiteral("highlight_review_cards"));
+    QVERIFY(comments && proposals && cards);
+    const bool savedComments = comments->isChecked();
+    const bool savedProposals = proposals->isChecked();
+    const bool savedCards = cards->isChecked();
+    comments->setChecked(false);
+    proposals->setChecked(false);
+    cards->setChecked(false);
+    overview->reviewStarted();
+    QVERIFY(comments->isChecked());
+    QVERIFY(proposals->isChecked());
+    QVERIFY(!cards->isChecked());
+    comments->setChecked(savedComments);
+    proposals->setChecked(savedProposals);
+    cards->setChecked(savedCards);
+    auto *const reviewQuestion = overview->findChild<QLabel *>(QStringLiteral("reviewQuestionLabel"));
+    auto *const browseCards = overview->findChild<QPushButton *>(QStringLiteral("reviewBrowseCardsButton"));
+    auto *const newCount = overview->findChild<QLabel *>(QStringLiteral("reviewNewCount"));
+    auto *const learningCount = overview->findChild<QLabel *>(QStringLiteral("reviewLearningCount"));
+    auto *const reviewCount = overview->findChild<QLabel *>(QStringLiteral("reviewReviewCount"));
+    QVERIFY(reviewQuestion);
+    QVERIFY(browseCards);
+    QVERIFY(newCount);
+    QVERIFY(learningCount);
+    QVERIFY(reviewCount);
+    QVERIFY(!overview->findChild<QPushButton *>(QStringLiteral("reviewOpenGenerationButton")));
+    QCOMPARE(overview->m_reviewStack->count(), 1);
+    QCOMPARE(overview->m_reviewStack->currentWidget(), overview->m_overviewPage);
+    QVERIFY(overview->m_reviewStack->indexOf(overview->m_sessionPage) < 0);
+
+    QTest::mouseClick(browseCards, Qt::LeftButton);
+    QCoreApplication::processEvents();
+    QVERIFY(Shell::s_commentsOverview);
+    auto *const overviewTabs = Shell::s_commentsOverview->findChild<QTabWidget *>(QStringLiteral("thoughtsOverviewTabs"));
+    QVERIFY(overviewTabs);
+    QCOMPARE(overviewTabs->currentWidget()->objectName(), QStringLiteral("thoughtsOverviewReviewPage"));
+    QCOMPARE(qobject_cast<QTabWidget *>(overviewTabs->currentWidget())->currentWidget()->objectName(), QStringLiteral("thoughtsOverviewReviewCardsPage"));
+    auto *const browserState = Shell::s_commentsOverview->findChild<QComboBox *>(QStringLiteral("reviewBrowseStateFilter"));
+    QVERIFY(browserState);
+    QCOMPARE(browserState->currentData().toString(), QStringLiteral("all"));
+    QStringList filterLabels;
+    for (int i = 0; i < browserState->count(); ++i) filterLabels << browserState->itemText(i);
+    QCOMPARE(filterLabels.mid(0, 6), QStringList({QStringLiteral("New"), QStringLiteral("Seen"), QStringLiteral("Never"), QStringLiteral("Retired / Unpublished"),
+        QStringLiteral("Unavailable"), QStringLiteral("All cards")}));
+
+    auto *const reviewCardsButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewReviewCards"));
+    QVERIFY(reviewCardsButton);
+    overviewTabs->setCurrentIndex(0);
+    QWidget *const summaryPage = overviewTabs->currentWidget();
+    QTest::mouseClick(reviewCardsButton, Qt::LeftButton);
+    QCoreApplication::processEvents();
+    QVERIFY(overview->isVisible());
+    QVERIFY(Shell::s_commentsOverview->isVisible());
+    QVERIFY(overview->isWindow());
+    QVERIFY(!overview->isModal());
+    QVERIFY(overview->window() != Shell::s_commentsOverview->window());
+    QCOMPARE(overviewTabs->currentWidget(), summaryPage);
+    QCOMPARE(overview->m_reviewStack->currentWidget(), overview->m_overviewPage);
+
+    QTest::mouseClick(reviewCardsButton, Qt::LeftButton);
+    QCoreApplication::processEvents();
+    QCOMPARE(shell->findChildren<Thoughts::ReviewOverview *>().size(), 1);
+    QVERIFY(overview->isVisible());
+    QVERIFY(Shell::s_commentsOverview->isVisible());
+    QCOMPARE(overviewTabs->currentWidget(), summaryPage);
+
+    QVERIFY(overview->close());
+    QVERIFY(Shell::s_commentsOverview->isVisible());
+    QCOMPARE(overviewTabs->currentWidget(), summaryPage);
+}
+
+// "A/B testing" sits right after Review and Agent Notes in the File menu and the
+// toolbar, and opens the A/B rating page in the browser. A build without a page
+// (THOUGHTS_AB_TESTING_URL, which the environment overrides) hides it.
+void MainShellTest::testAbTestingActionOpensRatingPage()
+{
+    const bool hadPage = qEnvironmentVariableIsSet("THOUGHTS_AB_TESTING_URL");
+    const QByteArray savedPage = qgetenv("THOUGHTS_AB_TESTING_URL");
+    const auto restorePage = qScopeGuard([hadPage, savedPage] {
+        if (hadPage) {
+            qputenv("THOUGHTS_AB_TESTING_URL", savedPage);
+        } else {
+            qunsetenv("THOUGHTS_AB_TESTING_URL");
+        }
+    });
+    qputenv("THOUGHTS_AB_TESTING_URL", "https://ab.example.org:8445/");
+    auto *shell = new Shell;
+    // Agent Notes (v45) sits between Review and A/B testing.
+    QAction *const reviewAction = shell->actionCollection()->action(QStringLiteral("agent_notes"));
+    QAction *const action = shell->actionCollection()->action(QStringLiteral("ab_testing"));
+    QVERIFY(reviewAction);
+    QVERIFY(action);
+    QCOMPARE(action->text(), QStringLiteral("A/B testing"));
+    QVERIFY(!action->icon().isNull());
+    QVERIFY(action->isVisible());
+    bool followsReviewInMenu = false;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *const menu = menuAction->menu();
+        if (menu && menu->actions().contains(action)) {
+            followsReviewInMenu = menu->actions().indexOf(action) == menu->actions().indexOf(reviewAction) + 1;
+        }
+    }
+    QVERIFY(followsReviewInMenu);
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QToolBar *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    QCOMPARE(toolbar->actions().indexOf(action), toolbar->actions().indexOf(reviewAction) + 1);
+    auto *abTestingButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(action));
+    QVERIFY(abTestingButton);
+    QCOMPARE(abTestingButton->text(), QStringLiteral("A/B testing"));
+
+    BrowserUrlCatcher catcher;
+    QDesktopServices::setUrlHandler(QStringLiteral("https"), &catcher, "open");
+    const auto unsetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
+    QTest::mouseClick(abTestingButton, Qt::LeftButton);
+    QCOMPARE(catcher.urls, QList<QUrl>({QUrl(QStringLiteral("https://ab.example.org:8445/"))}));
+
+    // Without a page the entry stays in place but hidden, in the menu and on the toolbar.
+    qputenv("THOUGHTS_AB_TESTING_URL", "");
+    auto *plain = new Shell;
+    QAction *const hidden = plain->actionCollection()->action(QStringLiteral("ab_testing"));
+    QVERIFY(hidden);
+    QVERIFY(!hidden->isVisible());
+    plain->resize(1100, 750);
+    plain->show();
+    QVERIFY(QTest::qWaitForWindowExposed(plain));
+    QToolBar *plainToolbar = plain->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(plainToolbar);
+    QWidget *const hiddenButton = plainToolbar->widgetForAction(hidden);
+    QVERIFY(!hiddenButton || !hiddenButton->isVisible());
+    QCOMPARE(catcher.urls.size(), 1);
+}
+
+// File › Agent Notes and its toolbar button, both right after Review, open the window of the
+// notes agents sent to the phone; the button tells how many are unread. Under test mode
+// nothing polls a server: the window says this Mac is not connected.
+void MainShellTest::testAgentNotesActionOpensWindow()
+{
+    const QByteArray savedToken = qgetenv("THOUGHTS_TOKEN");
+    const QByteArray savedUrl = qgetenv("THOUGHTS_SERVER_URL");
+    qunsetenv("THOUGHTS_TOKEN");
+    qunsetenv("THOUGHTS_SERVER_URL");
+    const auto restore = qScopeGuard([&] {
+        if (!savedToken.isNull()) qputenv("THOUGHTS_TOKEN", savedToken);
+        if (!savedUrl.isNull()) qputenv("THOUGHTS_SERVER_URL", savedUrl);
+        delete Shell::s_agentNotesWindow.data();
+    });
+    auto *shell = new Shell;
+    QAction *const reviewAction = shell->actionCollection()->action(QStringLiteral("review_overview"));
+    QAction *const action = shell->actionCollection()->action(QStringLiteral("agent_notes"));
+    QVERIFY(reviewAction);
+    QVERIFY(action);
+    QCOMPARE(action->text(), QStringLiteral("Agent Notes"));
+    QVERIFY(!action->icon().isNull());
+    bool followsReviewInMenu = false;
+    for (QAction *menuAction : shell->menuBar()->actions()) {
+        QMenu *const menu = menuAction->menu();
+        if (menu && menu->actions().contains(action)) {
+            followsReviewInMenu = menu->actions().indexOf(action) == menu->actions().indexOf(reviewAction) + 1;
+        }
+    }
+    QVERIFY(followsReviewInMenu);
+    QVERIFY(!Thoughts::AgentNotes::Center::instance()->isStarted());
+    shell->resize(1100, 750);
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QToolBar *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
+    QVERIFY(toolbar);
+    QCOMPARE(toolbar->actions().indexOf(action), toolbar->actions().indexOf(reviewAction) + 1);
+    QVERIFY(qobject_cast<QToolButton *>(toolbar->widgetForAction(action)));
+
+    const QImage plain = action->icon().pixmap(QSize(24, 24)).toImage();
+    shell->updateAgentNotesAction(3);
+    QVERIFY2(action->toolTip().contains(QStringLiteral("3 unread")), qPrintable(action->toolTip()));
+    // The unread dot changes the icon.
+    QVERIFY(action->icon().pixmap(QSize(24, 24)).toImage() != plain);
+    shell->updateAgentNotesAction(0);
+    QVERIFY(!action->toolTip().contains(QStringLiteral("unread")));
+    QCOMPARE(action->icon().pixmap(QSize(24, 24)).toImage(), plain);
+
+    action->trigger();
+    QVERIFY(Shell::s_agentNotesWindow);
+    QTRY_VERIFY(Shell::s_agentNotesWindow->isVisible());
+    QCOMPARE(Shell::s_agentNotesWindow->windowTitle(), QStringLiteral("Agent Notes"));
+    auto *placeholder = Shell::s_agentNotesWindow->findChild<QLabel *>(QStringLiteral("agentNotesPlaceholder"));
+    QVERIFY(placeholder);
+    QTRY_VERIFY2(placeholder->text().contains(QStringLiteral("not connected")), qPrintable(placeholder->text()));
+    QVERIFY(!Thoughts::AgentNotes::Center::instance()->isStarted());
+    // The same window again, not a second one.
+    Thoughts::AgentNotesWindow *window = Shell::s_agentNotesWindow;
+    Shell::showAgentNotes();
+    QCOMPARE(Shell::s_agentNotesWindow.data(), window);
+    window->close();
+    QVERIFY(!window->isVisible());
+
+    // The Library window has an Agent notes button between Sync and Review cards; it opens the
+    // same window.
+    shell->showCommentsOverview(false);
+    QVERIFY(Shell::s_commentsOverview);
+    auto *const notesButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewAgentNotes"));
+    auto *const syncButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewSync"));
+    auto *const cardsButton = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewReviewCards"));
+    QVERIFY(notesButton && syncButton && cardsButton);
+    QCOMPARE(notesButton->text(), QStringLiteral("Agent notes"));
+    QTRY_VERIFY(notesButton->isVisible());
+    QVERIFY(syncButton->x() < notesButton->x());
+    QVERIFY(notesButton->x() < cardsButton->x());
+    Shell::s_commentsOverview->setAgentNotesUnread(3);
+    QCOMPARE(notesButton->text(), QStringLiteral("Agent notes (3)"));
+    Shell::s_commentsOverview->setAgentNotesUnread(0);
+    QCOMPARE(notesButton->text(), QStringLiteral("Agent notes"));
+    QTest::mouseClick(notesButton, Qt::LeftButton);
+    QTRY_VERIFY(Shell::s_agentNotesWindow && Shell::s_agentNotesWindow->isVisible());
+    QCOMPARE(Shell::s_agentNotesWindow.data(), window);
+    window->close();
+}
+
+// Sidebar › Agent Notes: every tab's reader has the notes beside the document; Open Large
+// shows the note in the Agent Notes window.
+void MainShellTest::testAgentNotesSidebarEntry()
+{
+    const QByteArray savedToken = qgetenv("THOUGHTS_TOKEN");
+    const QByteArray savedUrl = qgetenv("THOUGHTS_SERVER_URL");
+    qunsetenv("THOUGHTS_TOKEN");
+    qunsetenv("THOUGHTS_SERVER_URL");
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    // Not a Library PDF: the notes are there all the same. The window stays unshown, as in
+    // testSidebarDisplayChooser.
+    shell->openUrl(QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    KParts::ReadWritePart *part = shell->m_tabs[0].part;
+    QVERIFY(part);
+    QAction *entry = part->actionCollection()->action(QStringLiteral("sidebar_display_agent_notes"));
+    QAction *annotations = part->actionCollection()->action(QStringLiteral("sidebar_display_annotations"));
+    QAction *hide = part->actionCollection()->action(QStringLiteral("sidebar_display_hide"));
+    QAction *showSidebar = part->actionCollection()->action(QStringLiteral("show_leftpanel"));
+    QVERIFY(entry && annotations && hide && showSidebar);
+    const bool sidebarWasShown = showSidebar->isChecked();
+    const auto restore = qScopeGuard([&] {
+        // Leave the saved sidebar state as later tests expect it.
+        (sidebarWasShown ? annotations : hide)->trigger();
+        if (!savedToken.isNull()) qputenv("THOUGHTS_TOKEN", savedToken);
+        if (!savedUrl.isNull()) qputenv("THOUGHTS_SERVER_URL", savedUrl);
+        delete Shell::s_agentNotesWindow.data();
+    });
+    // A choice of the Sidebar menu.
+    QVERIFY(entry->isVisible());
+    QCOMPARE(entry->text(), QStringLiteral("Agent Notes"));
+    auto *chooser = qobject_cast<KActionMenu *>(part->actionCollection()->action(QStringLiteral("sidebar_display")));
+    QVERIFY(chooser && chooser->menu()->actions().contains(entry));
+    auto *okularPart = qobject_cast<Okular::Part *>(part);
+    QVERIFY(okularPart);
+    auto *panel = qobject_cast<Thoughts::AgentNotesView *>(agentNotesPanel(okularPart));
+    QVERIFY(panel);
+    QCOMPARE(panel->objectName(), QStringLiteral("agentNotesSidebar"));
+    QCOMPARE(panel->viewLayout(), Thoughts::AgentNotesView::Layout::Sidebar);
+    // One panel, however often the part is connected (a tab moved to another window).
+    shell->connectPart(part);
+    QCOMPARE(agentNotesPanel(okularPart), panel);
+    QCOMPARE(shell->findChildren<Thoughts::AgentNotesView *>(QStringLiteral("agentNotesSidebar")).size(), 1);
+
+    // Chosen, it fills the Shell's sidebar beside the document.
+    hide->trigger();
+    QTRY_VERIFY(!shell->m_sidebar->isVisibleTo(shell));
+    entry->trigger();
+    QTRY_VERIFY(shell->m_sidebar->isVisibleTo(shell));
+    QVERIFY(panel->isVisibleTo(shell));
+    QVERIFY(entry->isChecked());
+    // Under test mode nothing polls; asked, it says this Mac is not connected where the list goes.
+    Thoughts::AgentNotes::Center::instance()->refresh();
+    auto *placeholder = panel->findChild<QLabel *>(QStringLiteral("agentNotesPlaceholder"));
+    QVERIFY(placeholder);
+    QTRY_VERIFY2(placeholder->isVisibleTo(shell) && placeholder->text().contains(QStringLiteral("not connected")), qPrintable(placeholder->text()));
+    QVERIFY(!Thoughts::AgentNotes::Center::instance()->isStarted());
+    // Send Page to Agent: the page on screen in this tab, drawn by Poppler at the width asked.
+    auto *sendPage = panel->findChild<QAbstractButton *>(QStringLiteral("agentNotesSendPage"));
+    QVERIFY(sendPage && sendPage->isVisibleTo(shell));
+    QVERIFY(panel->m_pageProvider);
+    const auto capture = panel->m_pageProvider();
+    QVERIFY(capture);
+    QCOMPARE(capture->page, 1);
+    QCOMPARE(capture->pages, int(okularPart->pages()));
+    QVERIFY(!capture->documentName.isEmpty());
+    QVERIFY(capture->documentId.isEmpty());  // not a Library PDF
+    QCOMPARE(capture->render(800).width(), 800);
+    // Too big for the sidebar: the note in the Agent Notes window.
+    QVERIFY(panel->m_openLarge);
+    panel->m_openLarge(QStringLiteral("n1"));
+    QVERIFY(Shell::s_agentNotesWindow);
+    QTRY_VERIFY(Shell::s_agentNotesWindow->isVisible());
+    // The window's Send Page goes to the reader in front, and never opens a reader window: here
+    // none is shown.
+    const int shells = int(KMainWindow::memberList().size());
+    QVERIFY(Shell::s_agentNotesWindow->m_pageProvider);
+    QVERIFY(!Shell::s_agentNotesWindow->m_pageProvider());
+    QCOMPARE(int(KMainWindow::memberList().size()), shells);
+    Shell::s_agentNotesWindow->close();
+}
+
+// open-agent-notes, for an agent (thoughtsctl, the Thoughts tool) or a thoughts://agent-notes
+// link: Agent Notes in front with one project's or document's notes, a note selected.
+void MainShellTest::testOpenAgentNotesForAgents()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    QVERIFY(QDir(library.path()).mkpath(QStringLiteral(".thoughts")));
+    const QString d1 = QStringLiteral("01e71f15-6c88-442b-aa0f-e9d8734b2f12");
+    const QString d2 = QStringLiteral("2b9f2c11-0a43-4a8e-9a47-4f3e1d7c2a10");
+    const QString d3 = QStringLiteral("8489a61a-4f2b-4d1f-8a24-d2f01dbb9ba9");
+    const auto document = [](const QString &id, const QString &filename, const QString &name) {
+        return QJsonObject{{QStringLiteral("document_id"), id}, {QStringLiteral("filename"), filename}, {QStringLiteral("name"), name}};
+    };
+    const QJsonObject catalogue{{QStringLiteral("projects"),
+                                 QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("new:a63fa59e")}, {QStringLiteral("name"), QStringLiteral("MethodsComparison")},
+                                                        {QStringLiteral("documents"), QJsonArray{document(d1, QStringLiteral("import-5ebe_main.pdf"), QStringLiteral("main")),
+                                                                                                 document(d2, QStringLiteral("import-5ebe_notes.pdf"), QStringLiteral("notes"))}}},
+                                            QJsonObject{{QStringLiteral("id"), QStringLiteral("new:77b1")}, {QStringLiteral("name"), QStringLiteral("Reading group")},
+                                                        {QStringLiteral("documents"), QJsonArray{document(d3, QStringLiteral("reading_group.pdf"), QStringLiteral("main"))}}}}}};
+    QFile file(QDir(library.path()).filePath(QStringLiteral(".thoughts/library-projects.json")));
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QJsonDocument(catalogue).toJson());
+    file.close();
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    const QByteArray savedToken = qgetenv("THOUGHTS_TOKEN");
+    const QByteArray savedUrl = qgetenv("THOUGHTS_SERVER_URL");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    qunsetenv("THOUGHTS_TOKEN");
+    qunsetenv("THOUGHTS_SERVER_URL");
+    const auto restore = qScopeGuard([&] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+        if (!savedToken.isNull()) qputenv("THOUGHTS_TOKEN", savedToken);
+        if (!savedUrl.isNull()) qputenv("THOUGHTS_SERVER_URL", savedUrl);
+        delete Shell::s_agentNotesWindow.data();
+    });
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+
+    // Through the app's command channel, as thoughtsctl hands it over: a project by name.
+    QJsonObject result = shell->handleSyncCommandRequest({{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("open-agent-notes")},
+                                                          {QStringLiteral("project"), QStringLiteral("methodscomparison")}, {QStringLiteral("note_id"), QStringLiteral("n1")}});
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("state")).toString(), QStringLiteral("opened"));
+    QCOMPARE(result.value(QStringLiteral("note_id")).toString(), QStringLiteral("n1"));
+    const QJsonObject filter = result.value(QStringLiteral("filter")).toObject();
+    QCOMPARE(filter.value(QStringLiteral("label")).toString(), QStringLiteral("MethodsComparison"));
+    QCOMPARE(filter.value(QStringLiteral("kind")).toString(), QStringLiteral("project"));
+    QCOMPARE(filter.value(QStringLiteral("document_ids")).toArray(), (QJsonArray{d1, d2}));
+    QVERIFY(Shell::s_agentNotesWindow);
+    QTRY_VERIFY(Shell::s_agentNotesWindow->isVisible());
+    QCOMPARE(Shell::s_agentNotesWindow->filter().key, QStringLiteral("new:a63fa59e"));
+    QVERIFY(Shell::s_agentNotesWindow->findChild<QComboBox *>(QStringLiteral("agentNotesFilter"))->currentText().startsWith(QStringLiteral("MethodsComparison")));
+
+    // A document by filename, by document_id, by its path in the Library; the same window.
+    Thoughts::AgentNotesWindow *window = Shell::s_agentNotesWindow;
+    result = Shell::openAgentNotesCommand({{QStringLiteral("document"), QStringLiteral("import-5ebe_notes.pdf")}});
+    QCOMPARE(result.value(QStringLiteral("filter")).toObject().value(QStringLiteral("label")).toString(), QStringLiteral("MethodsComparison › notes"));
+    QCOMPARE(window->filter().documentIds, QStringList{d2});
+    result = Shell::openAgentNotesCommand({{QStringLiteral("document"), d3}});
+    QCOMPARE(result.value(QStringLiteral("filter")).toObject().value(QStringLiteral("label")).toString(), QStringLiteral("Reading group"));
+    QCOMPARE(Shell::s_agentNotesWindow.data(), window);
+    result = Shell::openAgentNotesCommand({{QStringLiteral("document"), QDir(library.path()).filePath(QStringLiteral("current_pdfs/import-5ebe_main.pdf"))}});
+    QCOMPARE(window->filter().documentIds, QStringList{d1});
+    // A document the catalogue does not list yet: its notes by document_id.
+    const QString unlisted = QStringLiteral("5e0b3a77-1a2b-4c3d-8e9f-0a1b2c3d4e5f");
+    result = Shell::openAgentNotesCommand({{QStringLiteral("document"), unlisted}});
+    QVERIFY(result.value(QStringLiteral("accepted")).toBool());
+    QCOMPARE(window->filter().documentIds, QStringList{unlisted});
+    // Nothing named: every note.
+    result = Shell::openAgentNotesCommand({});
+    QVERIFY(result.value(QStringLiteral("accepted")).toBool());
+    QVERIFY(!result.contains(QStringLiteral("filter")));
+    QVERIFY(window->filter().isEmpty());
+    // Refused: unknown names, both at once, a non-string.
+    for (const QJsonObject &bad : {QJsonObject{{QStringLiteral("project"), QStringLiteral("Nope")}}, QJsonObject{{QStringLiteral("document"), QStringLiteral("nope.pdf")}},
+                                   QJsonObject{{QStringLiteral("document"), QStringLiteral("main")}},  // two documents are called main
+                                   QJsonObject{{QStringLiteral("project"), QStringLiteral("Reading group")}, {QStringLiteral("document"), d1}},
+                                   QJsonObject{{QStringLiteral("note_id"), 7}}}) {
+        result = Shell::openAgentNotesCommand(bad);
+        QVERIFY2(!result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(bad).toJson().constData());
+        QVERIFY(!result.value(QStringLiteral("error_code")).toString().isEmpty());
+    }
+    QVERIFY(window->filter().isEmpty());
+
+    // The link asks for the same.
+    QCOMPARE(Okular::agentNotesRequestFromUrl(QUrl(QStringLiteral("thoughts://agent-notes?project=MethodsComparison&note=n1"))),
+             (QJsonObject{{QStringLiteral("command"), QStringLiteral("open-agent-notes")}, {QStringLiteral("project"), QStringLiteral("MethodsComparison")},
+                          {QStringLiteral("note_id"), QStringLiteral("n1")}}));
+    QCOMPARE(Okular::agentNotesRequestFromUrl(QUrl(QStringLiteral("thoughts://agent-notes?document=Reading%20group%20notes.pdf"))).value(QStringLiteral("document")).toString(),
+             QStringLiteral("Reading group notes.pdf"));
+    QCOMPARE(Okular::agentNotesRequestFromUrl(QUrl(QStringLiteral("thoughts://agent-notes"))),
+             (QJsonObject{{QStringLiteral("command"), QStringLiteral("open-agent-notes")}}));
+    for (const QString &bad : {QStringLiteral("thoughts://agent-notes?colour=red"), QStringLiteral("thoughts://agent-notes?project=a&project=b"),
+                               QStringLiteral("thoughts://agent-notes/extra?project=a"), QStringLiteral("thoughts://agent-notes?project=a#x"),
+                               QStringLiteral("thoughts://review-card?project=a"), QStringLiteral("https://agent-notes?project=a"),
+                               QStringLiteral("thoughts://agent-notes?project=")}) {
+        QVERIFY2(Okular::agentNotesRequestFromUrl(QUrl(bad)).isEmpty(), qPrintable(bad));
+    }
+    window->close();
+}
+
+void MainShellTest::testReviewCandidatesAreRetired()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("concepts")},
+                               {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("page"), 3},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('b'))},
+                               {QStringLiteral("question"), QStringLiteral("What is this concept?")}};
+    const QJsonObject record {{QStringLiteral("schema_version"), 3},
+                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                              {QStringLiteral("card_id"), cardId},
+                              {QStringLiteral("status"), QStringLiteral("candidate")},
+                              {QStringLiteral("primary"), primary}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    QCOMPARE(cardFile.write(QJsonDocument(record).toJson(QJsonDocument::Compact)), qint64(QJsonDocument(record).toJson(QJsonDocument::Compact).size()));
+    cardFile.close();
+
+    Thoughts::ReviewCardsWidget cards(
+        temporary.path(),
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+        [](const QString &) {});
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 0);
+    cards.setStateFilter(QStringLiteral("all"));
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 0);
+    QCOMPARE(cards.m_browseStateFilter->findData(QStringLiteral("candidate")), -1);
+    QVERIFY(!cards.findChild<QWidget *>(QStringLiteral("reviewBrowseCandidateActions")));
+
+}
+
+void MainShellTest::testCardBrowserFiltersByCurrentTag()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    const auto at = QDateTime::currentDateTimeUtc().addDays(-1);
+    const auto card = [&at](const QString &id, const QString &document, const QStringList &tagHistory) {
+        Thoughts::ReviewBrowserCard item;
+        item.card.record = {{QStringLiteral("card_id"), id},
+            {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), id}, {QStringLiteral("pdf_stem"), document}}}};
+        int minute = 0;
+        for (const QString &tags : tagHistory) {
+            item.card.history.append(QJsonObject{{QStringLiteral("event_id"), QString(id + QString::number(minute))}, {QStringLiteral("card_id"), id},
+                {QStringLiteral("rating"), QStringLiteral("custom_interval")},
+                {QStringLiteral("review_tags"), QJsonArray::fromStringList(tags.split(QLatin1Char(',')))},
+                {QStringLiteral("reviewed_at"), at.addSecs(60 * minute).toString(Qt::ISODate)},
+                {QStringLiteral("scheduled_due_at"), at.addDays(2).toString(Qt::ISODate)}});
+            ++minute;
+        }
+        item.card.schedule = Thoughts::ReviewStore::foldEvents(item.card.history).value(id);
+        return item;
+    };
+    // Only a card's latest review counts: "first" was Wrong before it became Correct.
+    cards.m_browseCards = {card(QStringLiteral("first"), QStringLiteral("paper"), {QStringLiteral("wrong"), QStringLiteral("correct")}),
+        card(QStringLiteral("second"), QStringLiteral("paper"), {QStringLiteral("wrong,my tag")}),
+        card(QStringLiteral("third"), QStringLiteral("other"), {QStringLiteral("wrong")}),
+        card(QStringLiteral("fresh"), QStringLiteral("paper"), {})};
+    cards.m_browseDocumentFilter->addItem(QStringLiteral("other"), QStringLiteral("other"));
+    cards.refreshBrowseTable();
+    // Free tags are gone: no Tags filter, and tags no longer crowd the State list.
+    QVERIFY(!cards.findChild<QToolButton *>(QStringLiteral("reviewBrowseTagsButton")));
+    for (int i = 0; i < cards.m_browseStateFilter->count(); ++i)
+        QVERIFY(!cards.m_browseStateFilter->itemData(i).toString().startsWith(QLatin1String("tag:")));
+    QCOMPARE(cards.m_browseStateFilter->findData(QStringLiteral("good")), -1);
+
+    // Typed tag: tokens still filter, by stored name or label, next to ordinary search text; several show cards with any of them.
+    cards.m_browseSearch->setText(QStringLiteral("tag:correct"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 1);
+    QCOMPARE(cards.m_visibleBrowseCards.constFirst().card.id(), QStringLiteral("first"));
+    cards.m_browseSearch->setText(QStringLiteral("third tag:WRONG"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 1);
+    QCOMPARE(cards.m_visibleBrowseCards.constFirst().card.id(), QStringLiteral("third"));
+    cards.m_browseSearch->setText(QStringLiteral("tag:Wrong tag:\"my tag\""));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 2);
+
+    // A link to a tag opens All cards searching for it, within the chosen document.
+    cards.setStateFilter(QStringLiteral("tag:my tag"));
+    QCOMPARE(cards.m_browseSearch->text(), QStringLiteral("tag:\"my tag\""));
+    QCOMPARE(cards.m_browseStateFilter->currentData().toString(), QStringLiteral("all"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 1);
+    cards.m_browseDocumentFilter->setCurrentIndex(cards.m_browseDocumentFilter->findData(QStringLiteral("other")));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 0);
+
+    // Links that still ask for the retired good/Skip/wrong filters open All cards.
+    for (const auto &retired : {"good", "skip", "wrong", "skipped"}) {
+        cards.setStateFilter(QString::fromLatin1(retired));
+        QCOMPARE(cards.m_browseStateFilter->currentData().toString(), QStringLiteral("all"));
+        QCOMPARE(cards.m_visibleBrowseCards.size(), 4);
+    }
+
+    // Tag merges from Sync rename tags everywhere they are read; old names still find the cards.
+    const QHash<QString, QString> merges = Thoughts::ReviewTags::mergeMapping({QJsonObject{{QStringLiteral("merge_id"), QStringLiteral("m1")},
+        {QStringLiteral("from"), QJsonArray{QStringLiteral("wrong"), QStringLiteral("my tag")}}, {QStringLiteral("to"), QStringLiteral("mistake")},
+        {QStringLiteral("created_at"), QStringLiteral("2026-10-05T10:00:00Z")}}});
+    for (auto &item : cards.m_browseCards) item.card.tagMerges = merges;
+    cards.m_tagMerges = merges;
+    cards.m_browseDocumentFilter->setCurrentIndex(0);
+    cards.m_browseSearch->setText(QStringLiteral("tag:\"my tag\""));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 2);
+    cards.m_browseSearch->setText(QStringLiteral("tag:mistake"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 2);
+}
+
+void MainShellTest::testReviewSkipHistoryDetails()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    Thoughts::ReviewBrowserCard item;
+    item.card.record = {{QStringLiteral("card_id"), QStringLiteral("history-card")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), QStringLiteral("History test")}}}};
+    const auto at = QDateTime::currentDateTimeUtc().addDays(-2);
+    item.card.history = {
+        {{QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("review_action"), QStringLiteral("correct")},
+         {QStringLiteral("reviewed_at"), at.toString(Qt::ISODate)}, {QStringLiteral("scheduled_due_at"), at.addDays(1).toString(Qt::ISODate)}},
+        {{QStringLiteral("queue_action"), QStringLiteral("skip")}, {QStringLiteral("reviewed_at"), at.addDays(1).toString(Qt::ISODate)},
+         {QStringLiteral("skip_until"), at.addDays(8).toString(Qt::ISODate)}},
+        {{QStringLiteral("queue_action"), QStringLiteral("undo_skip")}, {QStringLiteral("reviewed_at"), at.addDays(1).addSecs(60).toString(Qt::ISODate)}},
+        {{QStringLiteral("interval_action"), QStringLiteral("set")}, {QStringLiteral("interval_unit"), QStringLiteral("weeks")},
+         {QStringLiteral("interval_amount"), 3}, {QStringLiteral("reviewed_at"), at.addDays(2).toString(Qt::ISODate)},
+         {QStringLiteral("scheduled_due_at"), at.addDays(23).toString(Qt::ISODate)}},
+        // An answer with group notes: named by the current groups, else Other or the group's ID.
+        {{QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("review_tags"), QJsonArray{QStringLiteral("interesting")}},
+         {QStringLiteral("review_group_notes"), QJsonObject{{QStringLiteral("other"), QStringLiteral("Ask about the lemma")},
+                                                             {QStringLiteral("note"), QStringLiteral("Redo the proof")},
+                                                             {QStringLiteral("u"), QStringLiteral("Mostly there")},
+                                                             {QStringLiteral("gone-group"), QStringLiteral("Old note")}}},
+         {QStringLiteral("reviewed_at"), at.addDays(3).toString(Qt::ISODate)}, {QStringLiteral("scheduled_due_at"), at.addDays(10).toString(Qt::ISODate)}}};
+    cards.m_tagGroups = {{QStringLiteral("u"), QStringLiteral("Understanding"), {}}};
+    cards.m_visibleBrowseCards.append(item);
+    auto *row = new QTreeWidgetItem(cards.m_browseTable, {QStringLiteral("History test")});
+    cards.m_browseTable->setCurrentItem(row);
+    row->setSelected(true);
+    QVERIFY(cards.m_browseHistoryPanel->isHidden());
+    QTest::mouseClick(cards.m_browseHistoryButton, Qt::LeftButton);
+    QVERIFY(!cards.m_browseHistoryPanel->isHidden());
+    QVERIFY(cards.m_browseHistoryPanel->findChild<QLabel *>(QStringLiteral("reviewBrowseHistoryTitle")));
+    QVERIFY(!cards.m_browseUpdateHistoryButton->isHidden());
+    const auto text = cards.m_browseHistory->toPlainText();
+    QVERIFY(text.contains(QStringLiteral("Correct")));
+    QVERIFY(text.contains(QStringLiteral("Skip")));
+    QVERIFY(text.contains(QStringLiteral("1 week")));
+    QVERIFY(text.contains(QStringLiteral("Undo Skip")));
+    QVERIFY(text.contains(QStringLiteral("Interval set")));
+    QVERIFY(text.contains(QStringLiteral("3 weeks")));
+    QVERIFY(text.contains(QStringLiteral("Next review")));
+    QVERIFY(!text.contains(QStringLiteral("Updated")));
+    QVERIFY(text.contains(at.addDays(8).toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"))));
+    QVERIFY(text.indexOf(QStringLiteral("Correct")) < text.indexOf(QStringLiteral("Skip")));
+    QVERIFY(text.contains(QStringLiteral("0 reviews")));
+    const QStringList lines = text.split(QLatin1Char('\n'));
+    const auto answer = std::find_if(lines.cbegin(), lines.cend(), [](const QString &line) { return line.startsWith(QStringLiteral("interesting · ")); });
+    QVERIFY(answer != lines.cend());
+    // The answer's own note ("note") comes last, as Note.
+    QCOMPARE(QStringList(answer + 1, std::min(answer + 5, lines.cend())),
+             QStringList({QStringLiteral("Understanding: Mostly there"), QStringLiteral("Other: Ask about the lemma"), QStringLiteral("gone-group: Old note"),
+                          QStringLiteral("Note: Redo the proof")}));
+}
+
+namespace
+{
+QByteArray testPdfBytes(const QString &name)
+{
+    QFile file(QStringLiteral(KDESRCDIR "data/") + name);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+QString testSha256(const QByteArray &bytes)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+}
+
+// A card's answer feedback record as the server keeps it (review-card-feedback.md).
+QJsonObject historyFeedback(const QString &cardId, const QString &polarity, const QString &quote, const QString &comment, const QString &pdfSha256,
+                            const QDateTime &created, const QDateTime &updated, bool stamped, const QDateTime &deleted = {})
+{
+    QJsonObject record{{QStringLiteral("schema_version"), 1},
+                       {QStringLiteral("feedback_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                       {QStringLiteral("card_id"), cardId},
+                       {QStringLiteral("polarity"), polarity},
+                       {QStringLiteral("comment"), comment},
+                       {QStringLiteral("anchor"), QJsonObject{{QStringLiteral("quote"), QJsonObject{{QStringLiteral("exact"), quote}}},
+                                                              {QStringLiteral("pdf"), QJsonObject{{QStringLiteral("pdf_sha256"), pdfSha256},
+                                                                                                 {QStringLiteral("regions"), QJsonArray{QJsonObject{
+                                                                                                      {QStringLiteral("page"), 1},
+                                                                                                      {QStringLiteral("rect"), QJsonArray{0.1, 0.1, 0.8, 0.15}}}}}}}}},
+                       {QStringLiteral("created_at"), created.toString(Qt::ISODateWithMs)},
+                       {QStringLiteral("updated_at"), (deleted.isValid() ? deleted : updated).toString(Qt::ISODateWithMs)},
+                       {QStringLiteral("revision"), deleted.isValid() ? 2 : 1},
+                       {QStringLiteral("deleted"), deleted.isValid()}};
+    if (deleted.isValid()) record.insert(QStringLiteral("deleted_at"), deleted.toString(Qt::ISODateWithMs));
+    if (stamped) record.insert(QStringLiteral("review_version"), QJsonObject{{QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("source_built"), true}});
+    return record;
+}
+
+// A server for GET /v1/objects/<sha256> that has none of them.
+class NoObjectsServer : public QTcpServer
+{
+public:
+    NoObjectsServer()
+    {
+        listen(QHostAddress::LocalHost);
+        connect(this, &QTcpServer::newConnection, this, [this] {
+            while (QTcpSocket *socket = nextPendingConnection()) {
+                connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+                    socket->readAll();
+                    socket->write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    socket->disconnectFromHost();
+                });
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+            }
+        });
+    }
+};
+}
+
+// The History of a card in the Feedback tab: its answer feedback among its review events by
+// time (deleted feedback too), and the PDF version of each entry that recorded one.
+void MainShellTest::testReviewHistoryShowsAnswerFeedbackAndVersions()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString docsRoot = temporary.filePath(QStringLiteral("docs"));
+    const QByteArray current = testPdfBytes(QStringLiteral("file1.pdf")), earlier = testPdfBytes(QStringLiteral("file2.pdf"));
+    QVERIFY(!current.isEmpty() && !earlier.isEmpty());
+    const QString currentSha = testSha256(current), earlierSha = testSha256(earlier), prunedSha(64, QLatin1Char('f'));
+    const QString documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QVERIFY(QDir().mkpath(QDir(docsRoot).filePath(QStringLiteral("current_pdfs"))));
+    {
+        QFile pdf(QDir(docsRoot).filePath(QStringLiteral("current_pdfs/paper.pdf")));
+        QVERIFY(pdf.open(QIODevice::WriteOnly));
+        pdf.write(current);
+        QFile index(QDir(docsRoot).filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+        QVERIFY(index.open(QIODevice::WriteOnly));
+        index.write(QJsonDocument(QJsonObject{{QStringLiteral("pdfs"), QJsonArray{QJsonObject{
+            {QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("document_id"), documentId},
+            {QStringLiteral("pdf_sha256"), currentSha}, {QStringLiteral("kind"), QStringLiteral("source_linked")}}}}}).toJson());
+    }
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QDateTime t0(QDate(2026, 10, 1), QTime(9, 0), QTimeZone::UTC);
+    const auto time = [](const QDateTime &at) { return at.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")); };
+    const auto version = [](const QString &sha) { return QJsonObject{{QStringLiteral("pdf_sha256"), sha}, {QStringLiteral("source_built"), true}}; };
+    // Liked on the current PDF, edited two hours later.
+    const QJsonObject liked = historyFeedback(cardId, QStringLiteral("positive"), QStringLiteral("random text put here"), QStringLiteral("Nice wording"),
+                                              currentSha, t0.addSecs(3600), t0.addSecs(3 * 3600), true);
+    // Deleted, given on the earlier PDF; its passage is still in the answer.
+    const QJsonObject deleted = historyFeedback(cardId, QStringLiteral("positive"), QStringLiteral("an empty pdf file"), {}, earlierSha,
+                                                t0.addDays(1).addSecs(300), {}, true, t0.addDays(2));
+    // Disliked on a version the server no longer keeps; its passage was rewritten since.
+    const QJsonObject disliked = historyFeedback(cardId, QStringLiteral("negative"), QStringLiteral("This sentence was rewritten later on"),
+                                                 QStringLiteral("Unclear\nwhy?"), prunedSha, t0.addDays(3), t0.addDays(3), true);
+    // Given before the stamps: its version only from its anchor.
+    const QJsonObject unstamped = historyFeedback(cardId, QStringLiteral("positive"), QStringLiteral("a bit silly"), {}, earlierSha,
+                                                  t0.addDays(4), t0.addDays(4), false);
+    QJsonObject projections;
+    for (const QJsonObject &record : {liked, deleted, disliked, unstamped})
+        projections.insert(Thoughts::ReviewCardFeedback::projectionKey(record.value(QStringLiteral("feedback_id")).toString()), record);
+    Thoughts::ReviewCardsWidget cards(docsRoot, {}, {}, nullptr, [&] { return projections; });
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    Thoughts::ReviewBrowserCard item;
+    item.card.record = {{QStringLiteral("schema_version"), 4}, {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("created_at"), t0.toString(Qt::ISODate)},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), QStringLiteral("History test")}, {QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+            {QStringLiteral("pdf_document_id"), documentId}, {QStringLiteral("page"), 1},
+            {QStringLiteral("regions"), QJsonArray{QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.0, 0.0, 1.0, 1.0}}}}}}}};
+    item.card.history = {
+        {{QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("review_action"), QStringLiteral("correct")},
+         {QStringLiteral("reviewed_at"), t0.addDays(1).toString(Qt::ISODate)}, {QStringLiteral("review_version"), version(currentSha)}},
+        // Recorded before review events named their PDF.
+        {{QStringLiteral("queue_action"), QStringLiteral("skip")}, {QStringLiteral("reviewed_at"), t0.addDays(2).addSecs(3600).toString(Qt::ISODate)},
+         {QStringLiteral("skip_until"), t0.addDays(9).toString(Qt::ISODate)}},
+        {{QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("review_action"), QStringLiteral("correct")},
+         {QStringLiteral("reviewed_at"), t0.addDays(5).toString(Qt::ISODate)}, {QStringLiteral("review_version"), version(earlierSha)}}};
+    cards.m_visibleBrowseCards.append(item);
+    auto *row = new QTreeWidgetItem(cards.m_browseTable, {QStringLiteral("History test")});
+    cards.m_browseTable->setCurrentItem(row);
+    row->setSelected(true);
+    QTest::mouseClick(cards.m_browseHistoryButton, Qt::LeftButton);
+    QVERIFY(!cards.m_browseHistoryPanel->isHidden());
+
+    const QStringList lines = cards.m_browseHistory->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    const auto lineStarting = [&lines](const QString &start) {
+        for (int i = 0; i < lines.size(); ++i)
+            if (lines.at(i).startsWith(start)) return i;
+        return -1;
+    };
+    const int created = lineStarting(QStringLiteral("Created · "));
+    const int likedLine = lineStarting(QStringLiteral("Liked · ") + time(t0.addSecs(3600)));
+    const int firstReview = lineStarting(QStringLiteral("Correct · ") + time(t0.addDays(1)));
+    const int deletedLine = lineStarting(QStringLiteral("Liked · ") + time(t0.addDays(1).addSecs(300)));
+    const int skip = lineStarting(QStringLiteral("Skip · "));
+    const int dislikedLine = lineStarting(QStringLiteral("Disliked · ") + time(t0.addDays(3)));
+    const int unstampedLine = lineStarting(QStringLiteral("Liked · ") + time(t0.addDays(4)));
+    const int lastReview = lineStarting(QStringLiteral("Correct · ") + time(t0.addDays(5)));
+    const QString text = lines.join(QLatin1Char('\n'));
+    // In time order, feedback among the review events.
+    QVERIFY2(created == 1 && created < likedLine && likedLine < firstReview && firstReview < deletedLine && deletedLine < skip && skip < dislikedLine
+                 && dislikedLine < unstampedLine && unstampedLine < lastReview, qPrintable(text));
+    QCOMPARE(lines.constFirst(), QStringLiteral("0 reviews · 0 lapses"));
+    // Each: Liked/Disliked, when (edited, deleted), its passage and its comment.
+    QCOMPARE(lines.at(likedLine), QStringLiteral("Liked · %1 · edited %2 · Open current version").arg(time(t0.addSecs(3600)), time(t0.addSecs(3 * 3600))));
+    QCOMPARE(lines.at(likedLine + 1), QStringLiteral("“random text put here”"));
+    QCOMPARE(lines.at(likedLine + 2), QStringLiteral("Nice wording"));
+    QCOMPARE(lines.at(deletedLine), QStringLiteral("Liked · %1 · deleted %2 · Open this version").arg(time(t0.addDays(1).addSecs(300)), time(t0.addDays(2))));
+    QCOMPARE(lines.at(deletedLine + 1), QStringLiteral("“an empty pdf file”"));
+    QCOMPARE(lines.at(dislikedLine), QStringLiteral("Disliked · %1 · Open this version").arg(time(t0.addDays(3))));
+    // Its passage is no longer in the answer of the current PDF.
+    QCOMPARE(lines.at(dislikedLine + 1), QStringLiteral("“This sentence was rewritten later on” (not in the current version)"));
+    QCOMPARE(lines.at(dislikedLine + 2), QStringLiteral("Unclear"));
+    QCOMPARE(lines.at(dislikedLine + 3), QStringLiteral("why?"));
+    QCOMPARE(lines.at(unstampedLine), QStringLiteral("Liked · %1 · Open this version").arg(time(t0.addDays(4))));
+    QCOMPARE(lines.at(unstampedLine + 1), QStringLiteral("“a bit silly”"));
+    QCOMPARE(lines.at(firstReview), QStringLiteral("Correct · %1 · Open current version").arg(time(t0.addDays(1))));
+    QCOMPARE(lines.at(lastReview), QStringLiteral("Correct · %1 · Open this version").arg(time(t0.addDays(5))));
+    // Entries that do not know their PDF have no version.
+    QVERIFY(!lines.at(skip).contains(QStringLiteral("Open")));
+    QVERIFY(!lines.at(created).contains(QStringLiteral("Open")));
+    QCOMPARE(text.count(QStringLiteral("not in the current version")), 1);
+
+    // The links, in History order.
+    QCOMPARE(cards.m_browseHistoryVersions.size(), 6);
+    const auto &versions = cards.m_browseHistoryVersions;
+    QCOMPARE(versions.at(0).sha256, currentSha);
+    QVERIFY(versions.at(0).current);
+    QCOMPARE(Thoughts::ReviewCardFeedback::regionsFromVariant(versions.at(0).regions).size(), 1);
+    QVERIFY(versions.at(1).current && versions.at(1).regions.isEmpty());
+    QCOMPARE(versions.at(2).sha256, earlierSha);
+    QCOMPARE(versions.at(3).sha256, prunedSha);
+    QCOMPARE(versions.at(4).sha256, earlierSha);
+    QCOMPARE(versions.at(5).sha256, earlierSha);
+    QVERIFY(!versions.at(5).current);
+    QVERIFY(versions.at(5).title.endsWith(QStringLiteral(" — version of ") + time(t0.addDays(5))));
+    QCOMPARE(versions.at(5).page, 1);
+    QVERIFY(cards.m_browseHistory->toHtml().contains(QStringLiteral("thoughts-version:5")));
+
+    QSignalSpy opened(&cards, &Thoughts::ReviewCardsWidget::pdfVersionOpenRequested);
+    // The current version: the card's own PDF, at the feedback's passage.
+    cards.openHistoryVersion(0);
+    QCOMPARE(opened.size(), 1);
+    QCOMPARE(opened.at(0).at(0).toString(), QDir(docsRoot).filePath(QStringLiteral("current_pdfs/paper.pdf")));
+    QVERIFY(opened.at(0).at(1).toString().isEmpty());
+    QCOMPARE(opened.at(0).at(3).toList(), versions.at(0).regions);
+    QVERIFY(opened.at(0).at(4).toBool());
+
+    // An earlier version: from the version cache (here filled already), else the server.
+    NoObjectsServer server;
+    QVERIFY(server.isListening());
+    QNetworkAccessManager network;
+    int downloads = 0;
+    const QString cacheRoot = temporary.filePath(QStringLiteral("pdf-versions"));
+    cards.m_versionFetcher = new Thoughts::PdfVersions::Fetcher(docsRoot, cacheRoot, [&](const QString &sha, Thoughts::PdfVersions::Failure *) {
+        ++downloads;
+        return network.get(QNetworkRequest(QUrl(QStringLiteral("http://127.0.0.1:%1/v1/objects/%2").arg(server.serverPort()).arg(sha))));
+    }, &cards);
+    QVERIFY(!Thoughts::PdfVersions::store(cacheRoot, earlierSha, earlier).isEmpty());
+    // Clicking the link of the last review.
+    Q_EMIT cards.m_browseHistory->anchorClicked(QUrl(QStringLiteral("thoughts-version:5")));
+    QTRY_COMPARE(opened.size(), 2);
+    QCOMPARE(opened.at(1).at(0).toString(), Thoughts::PdfVersions::cachePath(cacheRoot, earlierSha));
+    QCOMPARE(opened.at(1).at(1).toString(), versions.at(5).title);
+    QCOMPARE(opened.at(1).at(2).toInt(), 1);
+    QVERIFY(opened.at(1).at(3).toList().isEmpty());
+    QVERIFY(!opened.at(1).at(4).toBool());
+    QCOMPARE(downloads, 0);
+    // Deleted feedback opens too, at its passage.
+    cards.openHistoryVersion(2);
+    QTRY_COMPARE(opened.size(), 3);
+    QCOMPARE(opened.at(2).at(3).toList(), versions.at(2).regions);
+    // A version the server pruned: said in the History, nothing opened.
+    cards.openHistoryVersion(3);
+    QTRY_VERIFY(!cards.m_browseHistoryStatus->isHidden() && cards.m_browseHistoryStatus->text().contains(QStringLiteral("no longer kept on the server")));
+    QCOMPARE(downloads, 1);
+    QTest::qWait(50);
+    QCOMPARE(opened.size(), 3);
+    QVERIFY(!QFileInfo::exists(Thoughts::PdfVersions::cachePath(cacheRoot, prunedSha)));
+    // Opening another version clears the message.
+    cards.openHistoryVersion(4);
+    QTRY_COMPARE(opened.size(), 4);
+    QVERIFY(cards.m_browseHistoryStatus->isHidden());
+}
+
+// An earlier version opens in its own tab as a plain read-only PDF, labelled as the version; a
+// file that is not in the version cache is never opened that way.
+void MainShellTest::testShellOpensEarlierPdfVersion()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const QUrl libraryLike = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    shell->openUrl(libraryLike);
+    QTRY_COMPARE(shell->activePdfUrl(), libraryLike);
+    const QByteArray earlier = testPdfBytes(QStringLiteral("file2.pdf"));
+    const QString cached = Thoughts::PdfVersions::store(Thoughts::PdfVersions::defaultCacheRoot(), testSha256(earlier), earlier);
+    QVERIFY(!cached.isEmpty());
+    auto removeCached = qScopeGuard([&cached] {
+        QFile::remove(cached);
+        QFile::remove(cached.chopped(4) + QStringLiteral(".json"));
+    });
+    QString error;
+    QVERIFY(!shell->openPdfVersion(libraryLike.toLocalFile(), QStringLiteral("Not a version"), 1, {}, false, &error));
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(shell->m_tabs.size(), 1);
+
+    const QString title = QStringLiteral("Paper — version of 2026-10-05 10:00");
+    const QVariantList regions{QVariantMap{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QVariantList{0.1, 0.1, 0.8, 0.2}}}};
+    QVERIFY2(shell->openPdfVersion(cached, title, 1, regions, false, &error), qPrintable(error));
+    QCOMPARE(shell->m_tabs.size(), 2);
+    const QUrl url = QUrl::fromLocalFile(cached);
+    QCOMPARE(shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part->url(), url);
+    const auto tabTitle = [shell](int index) { return KLocalizedString::removeAcceleratorMarker(shell->m_tabWidget->tabText(index)); };
+    QTRY_COMPARE(tabTitle(shell->m_tabWidget->currentIndex()), title);
+    // Not a document to Add to Library, nor one for Open Recent.
+    QTRY_VERIFY(!shell->m_pdfLibraryRefreshRunning);
+    shell->updatePdfLibraryAction();
+    QCOMPARE(shell->m_pdfLibraryAction->data().toString(), QStringLiteral("earlier-version"));
+    QVERIFY(!shell->m_pdfLibraryAction->isEnabled());
+    QVERIFY(!shell->m_recent->urls().contains(url));
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.at(shell->m_tabWidget->currentIndex()).part);
+    QVERIFY(part);
+    QVERIFY(part->showPassageRegions(regions));
+    // Opened again: the same tab. A title kept for a restored tab.
+    QVERIFY(shell->openPdfVersion(cached, title, 1, {}, false, &error));
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(Thoughts::PdfVersions::title(cached), title);
+    part->setProperty("thoughtsTitleFallback", QVariant());
+    shell->refreshReaderTabTitles();
+    QCOMPARE(tabTitle(shell->m_tabWidget->currentIndex()), title);
+}
+
+void MainShellTest::testUpdateHistoryAddsIntervalWithoutReview()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_id"), id},
+        {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), QStringLiteral("Interval test")},
+            {QStringLiteral("pdf_stem"), QStringLiteral("paper")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+            {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('b'))}, {QStringLiteral("page"), 1},
+            {QStringLiteral("rect"), QJsonArray{0.1, 0.1, 0.8, 0.3}}}}};
+    const QString path = temporary.filePath(QStringLiteral("reviews/cards/%1.json").arg(id));
+    QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); file.write(QJsonDocument(record).toJson()); }
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    cards.resize(1000, 700);
+    cards.show();
+    QTRY_COMPARE(cards.m_browseCards.size(), 1);
+    cards.selectCard(id);
+    QTest::mouseClick(cards.m_browseHistoryButton, Qt::LeftButton);
+    QVERIFY(cards.m_browseHistoryPanel->isVisible());
+    QVERIFY(cards.m_browseUpdateHistoryButton->isEnabled());
+    QTimer::singleShot(0, &cards, [&] {
+        auto *dialog = cards.findChild<QDialog *>(QStringLiteral("reviewIntervalDialog"));
+        QVERIFY(dialog);
+        QCOMPARE(dialog->windowTitle(), QStringLiteral("Update history"));
+        dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->setValue(3);
+        auto *unit = dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"));
+        unit->setCurrentIndex(unit->findData(Thoughts::ReviewInterval::Weeks));
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    QTest::mouseClick(cards.m_browseUpdateHistoryButton, Qt::LeftButton);
+    QTRY_VERIFY(cards.m_browseHistory->toPlainText().contains(QStringLiteral("Interval set")));
+    QVERIFY(cards.m_browseHistoryPanel->isVisible());
+    QVERIFY(cards.m_browseHistory->toPlainText().contains(QStringLiteral("3 weeks")));
+    QVERIFY(cards.m_browseHistory->toPlainText().contains(QStringLiteral("Next review")));
+    const auto saved = Thoughts::ReviewStore(temporary.path()).cards().first();
+    QCOMPARE(saved.schedule.reviewCount, 0);
+    QVERIFY(saved.schedule.dueAt > QDateTime::currentDateTimeUtc().addDays(20));
+    QCOMPARE(saved.history.size(), 1);
+    QCOMPARE(saved.history.first().value(QStringLiteral("interval_action")).toString(), QStringLiteral("set"));
+
+    QTimer::singleShot(0, &cards, [&] {
+        auto *dialog = cards.findChild<QDialog *>(QStringLiteral("reviewIntervalDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewIntervalNever"))->setChecked(true);
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    QTest::mouseClick(cards.m_browseUpdateHistoryButton, Qt::LeftButton);
+    QTRY_VERIFY(cards.m_browseHistory->toPlainText().contains(QStringLiteral("Interval set"))
+        && cards.m_browseHistory->toPlainText().contains(QStringLiteral("Never")));
+    const auto neverCard = Thoughts::ReviewStore(temporary.path()).cards().first();
+    QCOMPARE(neverCard.schedule.reviewCount, 0);
+    QVERIFY(neverCard.schedule.retained);
+    QCOMPARE(neverCard.history.size(), 2);
+}
+
+void MainShellTest::testReviewBrowseShiftClickSelectsRange()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    Thoughts::ReviewCardsWidget cards(
+        temporary.path(),
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+        [](const QString &) {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    QCOMPARE(cards.m_browseTable->selectionMode(), QAbstractItemView::ExtendedSelection);
+    for (int row = 0; row < 4; ++row) {
+        Thoughts::ReviewBrowserCard item;
+        item.card.record = QJsonObject {
+            {QStringLiteral("card_id"), QStringLiteral("card-%1").arg(row)},
+            {QStringLiteral("primary"), QJsonObject {{QStringLiteral("question"), QStringLiteral("Question %1").arg(row)}}}
+        };
+        cards.m_visibleBrowseCards.append(item);
+    }
+    for (int row = 0; row < 4; ++row) {
+        new QTreeWidgetItem(cards.m_browseTable, {QStringLiteral("Card %1").arg(row + 1)});
+    }
+    cards.resize(900, 500);
+    cards.show();
+    QTRY_VERIFY(!cards.m_browseTable->visualItemRect(cards.m_browseTable->topLevelItem(0)).isEmpty());
+
+    QTest::mouseClick(cards.m_browseTable->viewport(),
+                      Qt::LeftButton,
+                      Qt::NoModifier,
+                      cards.m_browseTable->visualItemRect(cards.m_browseTable->topLevelItem(0)).intersected(cards.m_browseTable->viewport()->rect()).center());
+    QTest::mouseClick(cards.m_browseTable->viewport(),
+                      Qt::LeftButton,
+                      Qt::ShiftModifier,
+                      cards.m_browseTable->visualItemRect(cards.m_browseTable->topLevelItem(2)).intersected(cards.m_browseTable->viewport()->rect()).center());
+
+    QCOMPARE(cards.m_browseTable->selectedItems().size(), 3);
+    QVERIFY(cards.m_browseTable->topLevelItem(0)->isSelected());
+    QVERIFY(cards.m_browseTable->topLevelItem(1)->isSelected());
+    QVERIFY(cards.m_browseTable->topLevelItem(2)->isSelected());
+    QVERIFY(!cards.m_browseTable->topLevelItem(3)->isSelected());
+    QVERIFY(cards.m_browseQuestion->toPlainText().isEmpty());
+    QVERIFY(cards.m_browseQuestionCardId.isEmpty());
+    QVERIFY(cards.m_browseDetails->toPlainText().isEmpty());
+    QVERIFY(!cards.m_browseQuestion->isVisible());
+    QVERIFY(cards.m_browseReviewButton->isHidden());
+    QVERIFY(cards.m_browseEditButton->isHidden());
+    QVERIFY(cards.m_browseHistoryButton->isHidden());
+    QVERIFY(cards.m_browseDeleteRestoreButton->isEnabled());
+    QCOMPARE(cards.m_browseState->text(), QStringLiteral("3 cards selected"));
+
+    // Changing selection without changing the current row must also refresh the pane.
+    cards.m_browseTable->topLevelItem(0)->setSelected(false);
+    cards.m_browseTable->topLevelItem(1)->setSelected(false);
+    QCOMPARE(cards.m_browseQuestion->toPlainText(), QStringLiteral("Question 2"));
+    QVERIFY(!cards.m_browseQuestion->isVisible());
+    QVERIFY(cards.m_browseDetails->toPlainText().contains(QStringLiteral("Question 2")));
+    QVERIFY(cards.m_browseEditButton->isEnabled());
+    QTest::mouseClick(cards.m_browseEditButton, Qt::LeftButton);
+    QVERIFY(!cards.m_browseQuestion->isHidden());
+    cards.m_browseTable->clearSelection();
+    QVERIFY(cards.m_browseQuestion->toPlainText().isEmpty());
+    QVERIFY(!cards.m_browseEditButton->isEnabled());
+    QVERIFY(!cards.m_browseDeleteRestoreButton->isEnabled());
+}
+
+void MainShellTest::testReviewBrowseStartsAtLeft()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QJsonObject projections;
+    const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    projections.insert(QStringLiteral("review_card\ncards\n") + id, QJsonObject{
+        {QStringLiteral("schema_version"), 3}, {QStringLiteral("card_id"), id},
+        {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), QStringLiteral("Question")},
+            {QStringLiteral("pdf_stem"), QStringLiteral("paper")}}}});
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {}, nullptr, [&] { return projections; });
+    cards.resize(900, 500);
+    cards.ensureLoaded();
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 1);
+    auto *table = cards.m_browseTable;
+    // The app can populate this tab while another tab is visible.
+    // Simulate an offset left by hidden layout/selection work before first show.
+    table->horizontalScrollBar()->setRange(0, 20);
+    table->horizontalScrollBar()->setValue(1);
+    QCOMPARE(table->horizontalScrollBar()->value(), 1);
+    cards.show();
+    QTRY_VERIFY(table->horizontalScrollBar()->maximum() > 0);
+    QCoreApplication::processEvents();
+    QCOMPARE(table->horizontalScrollBar()->value(), table->horizontalScrollBar()->minimum());
+    cards.reload();
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    QCOMPARE(table->horizontalScrollBar()->value(), table->horizontalScrollBar()->minimum());
+    table->horizontalScrollBar()->setValue(1);
+    const int manualPosition = table->horizontalScrollBar()->value();
+    cards.sortBrowseTable();
+    QCOMPARE(table->horizontalScrollBar()->value(), manualPosition);
+    cards.hide();
+    cards.show();
+    QCoreApplication::processEvents();
+    QCOMPARE(table->horizontalScrollBar()->value(), manualPosition);
+}
+
+void MainShellTest::testReviewRefreshCoalescesAndPreservesRows()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QJsonObject projections;
+    for (int i = 0; i < 100; ++i) {
+        const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        projections.insert(QStringLiteral("review_card\ncards\n") + id, QJsonObject{
+            {QStringLiteral("schema_version"), 3}, {QStringLiteral("card_id"), id},
+            {QStringLiteral("status"), QStringLiteral("approved")},
+            {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), QStringLiteral("Question %1").arg(i)},
+                {QStringLiteral("pdf_stem"), QStringLiteral("paper")}}}});
+    }
+    int reads = 0;
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {}, nullptr, [&] {
+        ++reads;
+        return projections;
+    });
+    cards.setStateFilter(QStringLiteral("all"));
+    for (int i = 0; i < 20; ++i) cards.reload();
+    QTRY_COMPARE(cards.m_browseCards.size(), 100);
+    QCOMPARE(reads, 1);
+    for (int i = 0; i < 20; ++i) cards.ensureLoaded();
+    QCOMPARE(reads, 1);
+    QVERIFY(!cards.m_reloadTimer->isActive());
+    auto *first = cards.m_browseTable->topLevelItem(0);
+    auto *second = cards.m_browseTable->topLevelItem(1);
+    first->setSelected(true);
+    second->setSelected(true);
+    const auto firstId = first->data(0, Qt::UserRole).toString();
+    cards.reload();
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    QCOMPARE(cards.m_browseTable->topLevelItem(0), first);
+    QCOMPARE(cards.m_browseTable->selectedItems().size(), 2);
+    cards.m_browseSearch->setText(QStringLiteral("no matching question"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 0);
+    QVERIFY(first->isHidden());
+    cards.m_browseSearch->clear();
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 100);
+    QCOMPARE(cards.m_browseTable->topLevelItem(0), first);
+    QCOMPARE(first->data(0, Qt::UserRole).toString(), firstId);
+    QCOMPARE(reads, 2);
+
+    cards.setSyncInProgress(true);
+    for (int i = 0; i < 20; ++i) cards.reload();
+    cards.startReload();
+    QCOMPARE(reads, 2);
+    QCOMPARE(cards.m_browseTable->topLevelItem(0), first);
+    // A card deleted locally during Sync leaves the list at once, without a reload.
+    cards.dropDeletedBrowseCards({firstId});
+    QCOMPARE(reads, 2);
+    QCOMPARE(cards.m_browseCards.size(), 99);
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 99);
+    for (int i = 0; i < cards.m_browseTable->topLevelItemCount(); ++i) {
+        const auto *row = cards.m_browseTable->topLevelItem(i);
+        QVERIFY(row->isHidden() || row->data(0, Qt::UserRole).toString() != firstId);
+    }
+    cards.setSyncInProgress(false);
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    QCOMPARE(reads, 3);
+
+    // An invalidated in-flight result must not replace a newer projection.
+    cards.reload();
+    cards.m_reloadTimer->stop();
+    cards.startReload();
+    QVERIFY(cards.m_loading);
+    projections = {};
+    cards.reload();
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    QCOMPARE(cards.m_browseCards.size(), 0);
+    QCOMPARE(reads, 5);
+}
+
+void MainShellTest::testReviewBrowseColumnsResizeAndPersist()
+{
+    const QString groupName = QStringLiteral("ReviewCardOverview");
+    const QString key = QStringLiteral("BrowseHeaderStateV2");
+    const auto clearState = [&] {
+        KConfigGroup group(KSharedConfig::openConfig(), groupName);
+        group.deleteEntry(key);
+        group.sync();
+    };
+    clearState();
+    const auto cleanup = qScopeGuard(clearState);
+
+    // Restoring an older eight-column layout must not assign widths/visibility to different fields.
+    {
+        QTreeWidget legacy;
+        legacy.setColumnCount(8);
+        legacy.header()->setStretchLastSection(false);
+        legacy.setColumnWidth(0, 237);
+        legacy.setColumnHidden(5, true);
+        KConfigGroup group(KSharedConfig::openConfig(), groupName);
+        group.writeEntry(key, legacy.header()->saveState());
+        group.sync();
+        QTemporaryDir temporary;
+        Thoughts::ReviewCardsWidget migrated(temporary.path(),
+            [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [](const QString &) {});
+        QCOMPARE(migrated.m_browseTable->header()->logicalIndex(0), 8);
+        QCOMPARE(migrated.m_browseTable->columnWidth(0), 237);
+        QVERIFY(migrated.m_browseTable->isColumnHidden(5));
+        QVERIFY(!migrated.m_browseTable->isColumnHidden(8));
+    }
+    clearState();
+
+    int widenedQuestionWidth = 0;
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        Thoughts::ReviewCardsWidget cards(
+            temporary.path(),
+            [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+            [](const QString &) {});
+        QTreeWidget *const table = cards.m_browseTable;
+        QCOMPARE(table->columnCount(), 10);
+        const QStringList expected {QStringLiteral("Question"), QStringLiteral("Due"), QStringLiteral("Project"),
+            QStringLiteral("Document"), QStringLiteral("Page"), QStringLiteral("Source"), QStringLiteral("Current Tag"), QStringLiteral("Card Status"), QStringLiteral("Created"), QStringLiteral("Interval")};
+        for (int column = 0; column < expected.size(); ++column) QCOMPARE(table->headerItem()->text(column), expected.at(column));
+        // The column chooser is the header's right-click menu; there is no Columns button any more.
+        QVERIFY(!cards.findChild<QToolButton *>(QStringLiteral("reviewBrowseColumns")));
+        QCOMPARE(table->header()->contextMenuPolicy(), Qt::CustomContextMenu);
+        auto *chooser = table->header()->findChild<QMenu *>(QStringLiteral("reviewBrowseColumnsMenu"));
+        QVERIFY(chooser);
+        // Ten columns, then a section with the sorts that have no column.
+        QCOMPARE(chooser->actions().size(), 14);
+        QCOMPARE(chooser->findChildren<QAction *>(QStringLiteral("reviewBrowseExtraSort")).size(), 3);
+        const QList<QAction *> columns = chooser->actions().mid(0, 10);
+        QCOMPARE(table->header()->logicalIndex(0), 8);
+        QCOMPARE(columns.first()->text(), QStringLiteral("Created"));
+        columns.at(6)->trigger();
+        QVERIFY(table->isColumnHidden(5));
+        columns.at(0)->trigger();
+        QVERIFY(table->isColumnHidden(8));
+        // With one column left, its entry cannot be unchecked.
+        for (int index = 1; index < columns.size(); ++index)
+            if (columns.at(index)->isChecked() && index != 1) columns.at(index)->trigger();
+        Q_EMIT chooser->aboutToShow();
+        QVERIFY(!columns.at(1)->isEnabled());
+        QVERIFY(columns.at(2)->isEnabled());
+        for (int index = 2; index < columns.size(); ++index)
+            if (index != 6) columns.at(index)->trigger();
+        QVERIFY(table->isColumnHidden(5));
+        QVERIFY(table->isColumnHidden(8));
+        // Every column, including Question, must stay user-resizable so a chosen
+        // width survives interactive resizing and a restart.
+        for (int column = 0; column < table->columnCount(); ++column) {
+            QCOMPARE(table->header()->sectionResizeMode(column), QHeaderView::Interactive);
+        }
+        widenedQuestionWidth = table->columnWidth(0) + 90;
+        table->setColumnWidth(0, widenedQuestionWidth);
+        QCOMPARE(table->columnWidth(0), widenedQuestionWidth);
+        const int widenedPageWidth = table->columnWidth(1) + 25;
+        table->setColumnWidth(1, widenedPageWidth);
+        QCOMPARE(table->columnWidth(1), widenedPageWidth);
+    }
+
+    KConfigGroup group(KSharedConfig::openConfig(), groupName);
+    QVERIFY(!group.readEntry(key, QByteArray()).isEmpty());
+
+    {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        Thoughts::ReviewCardsWidget reopened(
+            temporary.path(),
+            [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+            [](const QString &) {});
+        QCOMPARE(reopened.m_browseTable->header()->logicalIndex(0), 8);
+        QCOMPARE(reopened.m_browseTable->columnWidth(0), widenedQuestionWidth);
+        QVERIFY(reopened.m_browseTable->isColumnHidden(5));
+        QVERIFY(reopened.m_browseTable->isColumnHidden(8));
+        QVERIFY(!reopened.m_browseTable->header()->findChild<QMenu *>(QStringLiteral("reviewBrowseColumnsMenu"))->actions().at(6)->isChecked());
+        for (int column = 0; column < reopened.m_browseTable->columnCount(); ++column) {
+            QCOMPARE(reopened.m_browseTable->header()->sectionResizeMode(column), QHeaderView::Interactive);
+        }
+    }
+}
+
+void MainShellTest::testReviewBrowseExportCards()
+{
+    QTemporaryDir temporary;
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    QList<Thoughts::ReviewBrowserCard> inputs;
+    for (int i = 0; i < 3; ++i) {
+        Thoughts::ReviewBrowserCard item;
+        item.card.record = {{QStringLiteral("card_id"), QStringLiteral("id-%1").arg(i)},
+            {QStringLiteral("note"), i == 1 ? QStringLiteral("line one\nline two") : QString()},
+            {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), i == 0 ? QStringLiteral("Why, \"exactly\"?") : QStringLiteral("Question %1").arg(i)},
+                {QStringLiteral("pdf_stem"), QStringLiteral("paper")}, {QStringLiteral("page"), i + 1}}}};
+        item.card.schedule.reviewCount = i;
+        inputs.append(item);
+    }
+    cards.m_browseCards = inputs;
+    cards.refreshBrowseTable();
+    auto *actions = cards.findChild<QToolButton *>(QStringLiteral("reviewBrowseActionsButton"));
+    QVERIFY(actions);
+    QCOMPARE(actions->text(), QStringLiteral("Actions"));
+    auto *exportAction = actions->menu()->findChild<QAction *>(QStringLiteral("reviewBrowseExportAction"));
+    auto *deleteAction = actions->menu()->findChild<QAction *>(QStringLiteral("reviewBrowseDeleteAction"));
+    QVERIFY(exportAction && deleteAction);
+    // The details panel always keeps one row selected; that alone does not rename the export.
+    QCOMPARE(cards.m_browseTable->selectedItems().size(), 1);
+    QCOMPARE(exportAction->text(), QStringLiteral("Export cards…"));
+    QVERIFY(deleteAction->isEnabled());
+    cards.m_browseTable->selectAll();
+    QCOMPARE(exportAction->text(), QStringLiteral("Export 3 selected…"));
+    QVERIFY(!deleteAction->isEnabled()); // Several cards are deleted with the details panel's button.
+
+    const QStringList fields{QStringLiteral("question"), QStringLiteral("card_id"), QStringLiteral("document"), QStringLiteral("note"), QStringLiteral("reviews")};
+    const QByteArray csv = cards.cardExportData(inputs, fields, QStringLiteral("csv"));
+    QVERIFY(csv.startsWith("\xEF\xBB\xBF" "Question,Card ID,Document,Note,Number of Repetitions\r\n"));
+    QVERIFY(csv.contains("\"Why, \"\"exactly\"\"?\",id-0,paper.pdf,,0\r\n"));
+    QVERIFY(csv.contains("Question 1,id-1,paper.pdf,\"line one\nline two\",1\r\n"));
+
+    const auto json = QJsonDocument::fromJson(cards.cardExportData(inputs, fields, QStringLiteral("json"))).array();
+    QCOMPARE(json.size(), 3);
+    QCOMPARE(json.at(0).toObject().value(QStringLiteral("question")).toString(), QStringLiteral("Why, \"exactly\"?"));
+    QCOMPARE(json.at(2).toObject().value(QStringLiteral("reviews")).toInt(), 2);
+    QCOMPARE(json.at(0).toObject().keys().size(), fields.size());
+
+    const QString markdown = QString::fromUtf8(cards.cardExportData(inputs, fields, QStringLiteral("md")));
+    QVERIFY(markdown.contains(QStringLiteral("## Question 1\n- **Card ID:** id-1")));
+    QVERIFY(markdown.contains(QStringLiteral("- **Note:** line one  \n  line two")));
+    QVERIFY(!markdown.contains(QStringLiteral("**Question:**")));
+}
+
+void MainShellTest::testReviewBrowseMergesCards()
+{
+    QTemporaryDir temporary;
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString sourcePath = QDir(temporary.path()).filePath(relative);
+    const QByteArray note("\\documentclass{article}\n\\begin{document}\nFirst answer.\n\nBetween the answers.\n\nSecond answer.\n\\end{document}\n");
+    const QString first = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString second = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString elsewhere = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    auto marked = Thoughts::markReviewSourceRanges(relative, note, {{7, 7}}, second);
+    QVERIFY2(marked.error.isEmpty(), qPrintable(marked.error));
+    marked = Thoughts::markReviewSourceRanges(relative, marked.replacement, {{3, 3}}, first);
+    QVERIFY2(marked.error.isEmpty(), qPrintable(marked.error));
+    const QByteArray source = marked.replacement;
+    QVERIFY(QDir().mkpath(QFileInfo(sourcePath).absolutePath()));
+    {
+        QFile file(sourcePath);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(source), source.size());
+    }
+    const auto writeCard = [&](const QString &id, const QString &stem, const QString &question, double top, bool linked) {
+        const QJsonArray rect{0.1, top, 0.9, top + 0.04};
+        QJsonObject primary{{QStringLiteral("pdf_stem"), stem}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+            {QStringLiteral("page"), 1}, {QStringLiteral("rect"), rect}, {QStringLiteral("regions"), QJsonArray{QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), rect}}}},
+            {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('b'))}, {QStringLiteral("question"), question}};
+        if (linked) primary.insert(QStringLiteral("source_anchor"), Thoughts::readReviewSourceAnchor(relative, source, id).anchor);
+        const QJsonObject record{{QStringLiteral("schema_version"), 4}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+            {QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("revision"), 1}, {QStringLiteral("primary"), primary}};
+        const QString path = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards/%1.json").arg(id));
+        QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(record).toJson());
+    };
+    writeCard(first, QStringLiteral("paper"), QStringLiteral("First?"), 0.1, true);
+    writeCard(second, QStringLiteral("paper"), QStringLiteral("Second?"), 0.5, true);
+    writeCard(elsewhere, QStringLiteral("other"), QStringLiteral("Elsewhere?"), 0.2, false);
+    {
+        // The second card was reviewed: it keeps its schedule unless the user chooses otherwise.
+        Thoughts::ReviewStore store(temporary.path());
+        QString error;
+        QVERIFY2(store.recordRating(second, QStringLiteral("good"), QDateTime::currentDateTimeUtc().addSecs(-60), &error), qPrintable(error));
+    }
+
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 3);
+    auto *actions = cards.findChild<QToolButton *>(QStringLiteral("reviewBrowseActionsButton"));
+    QVERIFY(actions);
+    auto *mergeAction = actions->menu()->findChild<QAction *>(QStringLiteral("reviewBrowseMergeAction"));
+    auto *mergeButton = cards.findChild<QPushButton *>(QStringLiteral("reviewBrowseMergeButton"));
+    QVERIFY(mergeAction && mergeButton);
+    QCOMPARE(mergeAction->text(), QStringLiteral("Merge cards…"));
+    QCOMPARE(mergeButton->text(), QStringLiteral("Merge cards…"));
+    QVERIFY(!mergeAction->isEnabled()); // One card is selected.
+    const auto select = [&](const QStringList &ids) {
+        cards.m_browseTable->clearSelection();
+        for (int row = 0; row < cards.m_browseTable->topLevelItemCount(); ++row) {
+            auto *item = cards.m_browseTable->topLevelItem(row);
+            if (ids.contains(item->data(0, Qt::UserRole).toString())) item->setSelected(true);
+        }
+    };
+    // Handles the modal window the next step opens, once it is shown.
+    const auto whenModal = [](std::function<void(QWidget *)> handle) {
+        auto *poll = new QTimer;
+        poll->setInterval(10);
+        QObject::connect(poll, &QTimer::timeout, [poll, handle] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal || !modal->isVisible()) return;
+            poll->stop();
+            poll->deleteLater();
+            handle(modal);
+        });
+        poll->start();
+    };
+    const auto labelsOf = [](QWidget *widget) {
+        QStringList texts;
+        for (auto *label : widget->findChildren<QLabel *>()) texts.append(label->text());
+        return texts.join(QLatin1Char('\n'));
+    };
+
+    // Cards of two documents: refused, with the reason.
+    select({first, elsewhere});
+    QVERIFY(mergeAction->isEnabled());
+    QVERIFY(!mergeButton->isHidden()); // Beside Delete, for the selection.
+    QString refusal;
+    whenModal([&](QWidget *modal) {
+        refusal = labelsOf(modal);
+        qobject_cast<QDialog *>(modal)->accept();
+    });
+    mergeAction->trigger();
+    QVERIFY2(refusal.contains(QStringLiteral("Only cards of one document can be merged")), qPrintable(refusal));
+    QCOMPARE(QFile(sourcePath).size(), source.size());
+
+    // Two cards of one document: the dialog proposes the reviewed card and both questions.
+    select({first, second});
+    QVERIFY(mergeButton->isEnabled());
+    QString keptByDefault, proposedQuestion, passages;
+    whenModal([&](QWidget *modal) {
+        QCOMPARE(modal->objectName(), QStringLiteral("reviewMergeCardsDialog"));
+        auto *kept = modal->findChild<QComboBox *>(QStringLiteral("reviewMergeKeptCard"));
+        auto *question = modal->findChild<QPlainTextEdit *>(QStringLiteral("reviewMergeQuestion"));
+        auto *merge = modal->findChild<QPushButton *>(QStringLiteral("reviewMergeButton"));
+        QVERIFY(kept && question && merge);
+        keptByDefault = kept->currentData().toString();
+        proposedQuestion = question->toPlainText();
+        passages = modal->findChild<QLabel *>(QStringLiteral("reviewMergePassages"))->text();
+        question->setPlainText(QString(501, QLatin1Char('x')));
+        QVERIFY(!merge->isEnabled());
+        question->setPlainText(QStringLiteral("Which answers?"));
+        QVERIFY(merge->isEnabled());
+        merge->click();
+    });
+    mergeButton->click();
+    QCOMPARE(keptByDefault, second);
+    QCOMPARE(proposedQuestion, QStringLiteral("First? Second?"));
+    QCOMPARE(passages, QStringLiteral("2 passages in %1").arg(relative));
+    QVERIFY(!QApplication::activeModalWidget());
+    QFile merged(sourcePath);
+    QVERIFY(merged.open(QIODevice::ReadOnly));
+    QCOMPARE(merged.readAll(), Thoughts::markReviewSourceRanges(relative, note, {{3, 3}, {7, 7}}, second).replacement);
+    // The browser lists the kept card with its new question; the other card is gone.
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 2);
+    QStringList listed;
+    for (int row = 0; row < cards.m_browseTable->topLevelItemCount(); ++row)
+        listed.append(cards.m_browseTable->topLevelItem(row)->data(0, Qt::UserRole).toString());
+    QVERIFY(listed.contains(second));
+    QVERIFY(!listed.contains(first));
+    Thoughts::ReviewStore store(temporary.path());
+    for (const auto &card : store.cards()) {
+        if (card.id() == second) {
+            QCOMPARE(card.question(), QStringLiteral("Which answers?"));
+            QCOMPARE(card.schedule.reviewCount, 1);
+        }
+        if (card.id() == first) QVERIFY(card.schedule.deleted);
+    }
+}
+
+void MainShellTest::testCardBrowserFiltersByType()
+{
+    QTemporaryDir temporary;
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    const auto card = [](const QString &id, const QJsonObject &primary, const QString &reanchor, const QString &location = {}) {
+        Thoughts::ReviewBrowserCard item;
+        QJsonObject full = primary;
+        full.insert(QStringLiteral("question"), id);
+        full.insert(QStringLiteral("pdf_stem"), QStringLiteral("paper"));
+        item.card.record = {{QStringLiteral("card_id"), id}, {QStringLiteral("primary"), full}};
+        if (!reanchor.isEmpty()) item.card.record.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), reanchor}});
+        if (!location.isEmpty()) item.card.sourceLocation = {{QStringLiteral("state"), location}};
+        return item;
+    };
+    const QJsonObject anchored{{QStringLiteral("source_anchor"), QJsonObject{{QStringLiteral("segments"), QJsonArray{QJsonObject{}}}}}};
+    cards.m_browseCards = {
+        card(QStringLiteral("linked"), anchored, QStringLiteral("current"), QStringLiteral("linked")),
+        card(QStringLiteral("pdf"), {{QStringLiteral("source_kind"), QStringLiteral("pdf")}}, {}),
+        card(QStringLiteral("pending"), {}, {}),
+        card(QStringLiteral("removed"), anchored, QStringLiteral("current"), QStringLiteral("missing")),
+    };
+    cards.refreshBrowseTable();
+    auto *type = cards.m_browseTypeFilter;
+    QStringList labels;
+    for (int i = 0; i < type->count(); ++i) labels << type->itemText(i);
+    QCOMPARE(labels, QStringList({QStringLiteral("All types"), QStringLiteral("Linked to source (1)"), QStringLiteral("PDF only (1)"),
+                                  QStringLiteral("Linking pending (1)"), QStringLiteral("Link problem (1)")}));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 4);
+    for (const QString &kind : {QStringLiteral("linked"), QStringLiteral("pdf"), QStringLiteral("pending")}) {
+        type->setCurrentIndex(type->findData(kind));
+        QCOMPARE(cards.m_visibleBrowseCards.size(), 1);
+        QCOMPARE(cards.m_visibleBrowseCards.constFirst().card.id(), kind);
+    }
+    type->setCurrentIndex(type->findData(QStringLiteral("problem")));
+    QCOMPARE(cards.m_visibleBrowseCards.constFirst().card.id(), QStringLiteral("removed"));
+    // The Type filter combines with the others, and links from elsewhere start from all types.
+    cards.m_browseSearch->setText(QStringLiteral("linked"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 0);
+    cards.setStateFilter(QStringLiteral("all"));
+    QCOMPARE(type->currentData().toString(), QStringLiteral("all"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 4);
+}
+
+void MainShellTest::testReviewBrowseHeaderSorting()
+{
+    QTemporaryDir temporary;
+    Thoughts::ReviewCardsWidget cards(temporary.path(),
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [](const QString &) {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    QList<Thoughts::ReviewBrowserCard> inputs;
+    for (int i = 0; i < 3; ++i) {
+        Thoughts::ReviewBrowserCard item;
+        item.state = Thoughts::ReviewBrowserState::New;
+        item.card.record = {{QStringLiteral("card_id"), QStringLiteral("id-%1").arg(i)},
+            {QStringLiteral("created_at"), i == 2 ? QString() : i == 0 ? QStringLiteral("2026-09-22T09:00:00Z") : QStringLiteral("2026-09-20T10:00:00+02:00")},
+            {QStringLiteral("primary"), QJsonObject{{QStringLiteral("question"), i == 0 ? QStringLiteral("Zebra") : i == 1 ? QStringLiteral("apple") : QStringLiteral("Middle")},
+                {QStringLiteral("pdf_stem"), QStringLiteral("document")}, {QStringLiteral("page"), i == 0 ? 10 : i == 1 ? 2 : 5}}}};
+        item.card.schedule.reviewCount = i == 0 ? 10 : i == 1 ? 2 : 5;
+        inputs.append(item);
+    }
+    cards.m_browseCards = inputs;
+    cards.refreshBrowseTable();
+    auto *table = cards.m_browseTable;
+    auto *header = table->header();
+    const auto ids = [&] {
+        QStringList result;
+        for (int i = 0; i < table->topLevelItemCount(); ++i) result.append(table->topLevelItem(i)->data(0, Qt::UserRole).toString());
+        return result;
+    };
+    cards.resize(1000, 600);
+    cards.show();
+    QTRY_VERIFY(header->isVisible());
+    const auto click = [&](int column) {
+        table->horizontalScrollBar()->setValue(header->sectionPosition(column));
+        QTest::mouseClick(header->viewport(), Qt::LeftButton, Qt::NoModifier,
+            QPoint(header->sectionViewportPosition(column) + header->sectionSize(column) / 2, header->height() / 2));
+    };
+    click(8);
+    QCOMPARE(ids(), QStringList({QStringLiteral("id-1"), QStringLiteral("id-0"), QStringLiteral("id-2")}));
+    QCOMPARE(header->sortIndicatorSection(), 8);
+    QCOMPARE(header->sortIndicatorOrder(), Qt::AscendingOrder);
+    table->clearSelection();
+    table->topLevelItem(0)->setSelected(true);
+    table->setCurrentItem(table->topLevelItem(0));
+    auto *selectedItem = table->currentItem();
+    cards.m_browseQuestion->setPlainText(QStringLiteral("Draft question"));
+    cards.m_browseQuestionSaveTimer->stop();
+    QSignalSpy editorChanges(cards.m_browseQuestion, &QPlainTextEdit::textChanged);
+    QSignalSpy detailsChanges(cards.m_browseDetails, &QTextBrowser::textChanged);
+    QSignalSpy selectionChanges(table->selectionModel(), &QItemSelectionModel::selectionChanged);
+    click(8);
+    QCOMPARE(table->currentItem(), selectedItem);
+    QCOMPARE(cards.selectedBrowseCard()->card.id(), QStringLiteral("id-1"));
+    QCOMPARE(cards.m_browseQuestion->toPlainText(), QStringLiteral("Draft question"));
+    QCOMPARE(editorChanges.count(), 0);
+    QCOMPARE(detailsChanges.count(), 0);
+    QCOMPARE(selectionChanges.count(), 0);
+    // Restore the draft without writing a synthetic card to the store.
+    cards.m_browseQuestion->setPlainText(cards.m_browseQuestionSavedText);
+    QCOMPARE(ids(), QStringList({QStringLiteral("id-0"), QStringLiteral("id-1"), QStringLiteral("id-2")}));
+    QCOMPARE(header->sortIndicatorOrder(), Qt::DescendingOrder);
+    QCOMPARE(table->currentItem()->data(0, Qt::UserRole).toString(), QStringLiteral("id-1"));
+    // Question and Page; the repetitions column became Card Status.
+    for (const int column : {0, 4}) {
+        click(column);
+        QCOMPARE(ids(), QStringList({QStringLiteral("id-1"), QStringLiteral("id-2"), QStringLiteral("id-0")}));
+        click(column);
+        QCOMPARE(ids(), QStringList({QStringLiteral("id-0"), QStringLiteral("id-2"), QStringLiteral("id-1")}));
+        QCOMPARE(header->sortIndicatorSection(), column);
+    }
+    // The Sort list is gone: sorts without a column come from the header's right-click menu.
+    QVERIFY(!cards.findChild<QComboBox *>(QStringLiteral("reviewBrowseSort")));
+    auto *menu = header->findChild<QMenu *>(QStringLiteral("reviewBrowseColumnsMenu"));
+    QAction *repetitions = nullptr;
+    for (auto *action : menu->findChildren<QAction *>(QStringLiteral("reviewBrowseExtraSort")))
+        if (action->text() == QStringLiteral("Number of Repetitions")) repetitions = action;
+    QVERIFY(repetitions);
+    repetitions->trigger();
+    QCOMPARE(ids(), QStringList({QStringLiteral("id-0"), QStringLiteral("id-2"), QStringLiteral("id-1")}));
+    QVERIFY(!header->isSortIndicatorShown());
+    Q_EMIT menu->aboutToShow();
+    QVERIFY(repetitions->isChecked());
+    repetitions->trigger();
+    QCOMPARE(ids(), QStringList({QStringLiteral("id-1"), QStringLiteral("id-2"), QStringLiteral("id-0")}));
+    table->topLevelItem(0)->setSelected(true);
+    table->topLevelItem(1)->setSelected(true);
+    const auto selectedItems = table->selectedItems();
+    click(8);
+    QCOMPARE(table->selectedItems().size(), selectedItems.size());
+    for (auto *item : selectedItems) QVERIFY(item->isSelected());
+    click(8);
+    cards.refreshBrowseTable();
+    QCOMPARE(header->sortIndicatorOrder(), Qt::DescendingOrder);
+    QCOMPARE(ids().first(), QStringLiteral("id-0"));
+
+    cards.m_browseCards.clear();
+    for (int i = 0; i < 100; ++i) {
+        auto item = inputs.at(i % inputs.size());
+        item.card.record.insert(QStringLiteral("card_id"), QStringLiteral("benchmark-%1").arg(i));
+        cards.m_browseCards.append(item);
+    }
+    cards.refreshBrowseTable();
+    QElapsedTimer timer;
+    timer.start();
+    for (int i = 0; i < 50; ++i) {
+        cards.m_browseSortOrder = i % 2 ? Qt::AscendingOrder : Qt::DescendingOrder;
+        cards.refreshBrowseTable();
+    }
+    const auto refreshNs = timer.nsecsElapsed();
+    timer.restart();
+    for (int i = 0; i < 50; ++i) {
+        cards.m_browseSortOrder = i % 2 ? Qt::AscendingOrder : Qt::DescendingOrder;
+        cards.sortBrowseTable();
+    }
+    qInfo() << "100-card sort, average milliseconds: full refresh" << refreshNs / 50.0 / 1000000.0
+            << "reorder only" << timer.nsecsElapsed() / 50.0 / 1000000.0;
+}
+
+void MainShellTest::testDeletedReviewCardsDoNotShowLocationWarnings()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    QStringList ids;
+    for (const QString &state : {QStringLiteral("needs_attention"), QStringLiteral("queued"), QStringLiteral("succeeded")}) {
+        const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ids.append(id);
+        const QJsonObject record {
+            {QStringLiteral("schema_version"), 3},
+            {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+            {QStringLiteral("card_id"), id},
+            {QStringLiteral("status"), QStringLiteral("approved")},
+            {QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), state}}},
+            {QStringLiteral("primary"), QJsonObject{
+                {QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+                {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+                {QStringLiteral("page"), 1},
+                {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+                {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('b'))},
+                {QStringLiteral("question"), QStringLiteral("What is the answer?")}}}};
+        QFile file(QDir(cardsDirectory).filePath(id + QStringLiteral(".json")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(record).toJson());
+    }
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [] { return QVariantMap{}; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+    overview.refreshDueQueue();
+    QVERIFY(!overview.m_attentionPanel->isHidden());
+    QVERIFY(overview.m_attentionSummary->text().contains(QStringLiteral("2 cards unavailable")));
+    QCOMPARE(overview.m_attentionBrowserState, QStringLiteral("unavailable"));
+    for (const QString &id : ids) {
+        QVERIFY(overview.m_store.recordRating(id, QStringLiteral("delete")));
+    }
+    overview.refreshDueQueue();
+    QVERIFY(overview.m_attentionPanel->isHidden());
+    QVERIFY(overview.m_dueCards.isEmpty());
+    QCOMPARE(overview.m_store.cards().size(), 3);
+    QVERIFY(overview.m_store.browserCards().isEmpty());
+}
+
+void MainShellTest::testUnsupportedCardLatexIsExplained()
+{
+    // The server names the LaTeX that card placement cannot instrument; the
+    // card's details say so instead of a generic location failure.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    Thoughts::ReviewBrowserCard item;
+    item.state = Thoughts::ReviewBrowserState::NeedsAttention;
+    QJsonObject reanchor{{QStringLiteral("state"), QStringLiteral("needs_attention")},
+        {QStringLiteral("strategy"), QStringLiteral("source_markers_v2")},
+        {QStringLiteral("error_code"), QStringLiteral("review_card_latex_unsupported")},
+        {QStringLiteral("unsupported_commands"), QJsonArray{QStringLiteral("mysteriousmacro"), QStringLiteral("othermacro")}}};
+    item.card.record = QJsonObject{{QStringLiteral("schema_version"), 4}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+        {QStringLiteral("card_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("reanchor"), reanchor},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")}, {QStringLiteral("page"), 1},
+            {QStringLiteral("question"), QStringLiteral("What is the answer?")}}}};
+    cards.showBrowseCard(&item);
+    QString text = cards.m_browseDetails->toPlainText();
+    QVERIFY2(text.contains(QStringLiteral("does not support (\\mysteriousmacro, \\othermacro)")), qPrintable(text));
+    QVERIFY(!text.contains(QStringLiteral("could not locate the answer reliably")));
+    reanchor.remove(QStringLiteral("unsupported_commands"));
+    item.card.record.insert(QStringLiteral("reanchor"), reanchor);
+    cards.showBrowseCard(&item);
+    text = cards.m_browseDetails->toPlainText();
+    QVERIFY2(text.contains(QStringLiteral("LaTeX that card placement does not support, so")), qPrintable(text));
+    QVERIFY(cards.m_browsePlaceAgainButton->isHidden());
+    // Markers that are missing or ambiguous: the card is placed again from its areas.
+    reanchor.insert(QStringLiteral("error_code"), QStringLiteral("review_source_marker_missing_or_ambiguous"));
+    item.card.record.insert(QStringLiteral("reanchor"), reanchor);
+    cards.showBrowseCard(&item);
+    text = cards.m_browseDetails->toPlainText();
+    QVERIFY2(text.contains(QStringLiteral("markers are missing, incomplete, or appear more than once")), qPrintable(text));
+    QVERIFY2(text.contains(QStringLiteral("Place This Card Again")), qPrintable(text));
+    QVERIFY(!cards.m_browsePlaceAgainButton->isHidden());
+    QCOMPARE(cards.m_browsePlaceAgainButton->text(), QStringLiteral("Place This Card Again…"));
+    // The server's message for a card it could not link is shown as stored.
+    reanchor.insert(QStringLiteral("error_code"), QStringLiteral("review_card_place_again"));
+    reanchor.insert(QStringLiteral("message"), QStringLiteral("No passage of docs-test/main.tex matches this card's areas."));
+    item.card.record.insert(QStringLiteral("reanchor"), reanchor);
+    cards.showBrowseCard(&item);
+    text = cards.m_browseDetails->toPlainText();
+    QVERIFY2(text.contains(QStringLiteral("No passage of docs-test/main.tex matches this card's areas.")), qPrintable(text));
+    QVERIFY(!cards.m_browsePlaceAgainButton->isHidden());
+    // A card with several passages lists them; that is no error.
+    item.state = Thoughts::ReviewBrowserState::Review;
+    item.card.record.remove(QStringLiteral("reanchor"));
+    QJsonObject primary = item.card.record.value(QStringLiteral("primary")).toObject();
+    primary.insert(QStringLiteral("source_anchor"), QJsonObject{{QStringLiteral("version"), 2}, {QStringLiteral("segments"), QJsonArray{
+        QJsonObject{{QStringLiteral("segment_id"), QStringLiteral("0")}, {QStringLiteral("source_file"), QStringLiteral("docs-test/main.tex")}},
+        QJsonObject{{QStringLiteral("segment_id"), QStringLiteral("1")}, {QStringLiteral("source_file"), QStringLiteral("docs-test/main.tex")}}}}});
+    item.card.record.insert(QStringLiteral("primary"), primary);
+    cards.showBrowseCard(&item);
+    text = cards.m_browseDetails->toPlainText();
+    QVERIFY2(!text.contains(QStringLiteral("multiple source ranges")), qPrintable(text));
+    QVERIFY(cards.m_browsePlaceAgainButton->isHidden());
+}
+
+void MainShellTest::testReviewColdOpenDuringSync_data()
+{
+    QTest::addColumn<bool>("savedCounts");
+    QTest::addColumn<bool>("sourceScanPending");
+    QTest::newRow("first-open-during-sync") << false << false;
+    QTest::newRow("first-open-during-source-scan") << false << true;
+    QTest::newRow("restart-during-sync") << true << false;
+    QTest::newRow("restart-during-source-scan") << true << true;
+}
+
+void MainShellTest::testReviewColdOpenDuringSync()
+{
+    QFETCH(bool, savedCounts);
+    QFETCH(bool, sourceScanPending);
+    QTemporaryDir temporary;
+    const auto root = temporary.path();
+    const auto directory = temporary.filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(directory));
+    const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_id"), id},
+        {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+            {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("page"), 1},
+            {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}}, {QStringLiteral("question"), QStringLiteral("Answer?")}}}};
+    const auto save = [&] {
+        QFile file(QDir(directory).filePath(id + QStringLiteral(".json")));
+        return file.open(QIODevice::WriteOnly) && file.write(QJsonDocument(record).toJson()) > 0;
+    };
+    QVERIFY(save());
+    const QJsonObject index{{QStringLiteral("schema_version"), 1}, {QStringLiteral("projects"), QJsonObject{}}};
+    Thoughts::installSourceLocationIndex(root, index);
+    const auto presenter = [](const Thoughts::ReviewCard &, bool, QString *) { return true; };
+    const auto document = [] { return QVariantMap{}; };
+    if (savedCounts) {
+        Thoughts::ReviewOverview previous(root, document, presenter, [] {});
+        QCOMPARE(previous.m_newCount->text(), QStringLiteral("1"));
+        QVERIFY(QFileInfo::exists(previous.dashboardSnapshotPath()));
+    }
+    record.insert(QStringLiteral("status"), QStringLiteral("needs_reanchor"));
+    QVERIFY(save());
+    if (sourceScanPending) Thoughts::invalidateSourceLocationIndex(root);
+    // Sync must be known before the constructor's first reload, even with a ready source index.
+    Thoughts::ReviewOverview cold(root, document, presenter, [] {}, nullptr, {}, {}, {}, true);
+    cold.showLandingPage();
+    QCOMPARE(cold.m_documentFilter->currentText(), QStringLiteral("All documents"));
+    // Saved counts let a review start during Sync; Start Review then reads the real queue.
+    QCOMPARE(cold.m_documentFilter->isEnabled(), savedCounts);
+    QCOMPARE(cold.m_newCount->text(), savedCounts ? QStringLiteral("1") : QStringLiteral("—"));
+    if (!savedCounts) QCOMPARE(cold.m_dueSummary->text(), QStringLiteral("Checking cards…"));
+    QVERIFY(cold.m_attentionPanel->isHidden());
+    QCOMPARE(cold.m_startButton->isEnabled(), savedCounts);
+    QVERIFY(cold.m_dueCards.isEmpty()); // Persisted labels never supply a review queue.
+    cold.startReview(); // The card now needs re-placing, so the real queue is empty.
+    QVERIFY(cold.m_dueCards.isEmpty());
+    QCOMPARE(cold.m_currentReview, -1);
+    cold.setSyncInProgress(false);
+    if (sourceScanPending) {
+        QCOMPARE(cold.m_newCount->text(), savedCounts ? QStringLiteral("1") : QStringLiteral("—"));
+        Thoughts::installSourceLocationIndex(root, index);
+        cold.reloadFromProjections();
+    }
+    QCOMPARE(cold.m_newCount->text(), QStringLiteral("0")); // A verified zero is now meaningful.
+    QVERIFY(cold.m_documentFilter->isEnabled());
+    QVERIFY(!cold.m_attentionPanel->isHidden());
+    QVERIFY(cold.m_attentionSummary->text().contains(QStringLiteral("1 card unavailable")));
+    // The new complete counts replace the persisted snapshot for the next restart.
+    Thoughts::ReviewOverview reopened(root, document, presenter, [] {}, nullptr, {}, {}, {}, true);
+    QCOMPARE(reopened.m_newCount->text(), QStringLiteral("0"));
+    QVERIFY(reopened.m_attentionSummary->text().contains(QStringLiteral("1 card unavailable")));
+    QVERIFY(!reopened.m_startButton->isEnabled());
+}
+
+void MainShellTest::testReviewCountsWaitForSyncAndSourceScan_data()
+{
+    QTest::addColumn<bool>("scanFinishesFirst");
+    QTest::newRow("scan-before-sync") << true;
+    QTest::newRow("scan-after-sync") << false;
+}
+
+void MainShellTest::testReviewCountsWaitForSyncAndSourceScan()
+{
+    QFETCH(bool, scanFinishesFirst);
+    QTemporaryDir temporary;
+    const QString directory = temporary.filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(directory));
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+        {QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+            {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("page"), 1},
+            {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+            {QStringLiteral("question"), QStringLiteral("What is the answer?")}}}};
+    const auto save = [&] {
+        QFile file(QDir(directory).filePath(id + QStringLiteral(".json")));
+        return file.open(QIODevice::WriteOnly) && file.write(QJsonDocument(record).toJson()) > 0;
+    };
+    QVERIFY(save());
+    const QJsonObject index{{QStringLiteral("schema_version"), 1}, {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), true}}}};
+    Thoughts::installSourceLocationIndex(temporary.path(), index);
+    Thoughts::ReviewOverview overview(temporary.path(), [] { return QVariantMap{}; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    const QString beforeDue = overview.m_dueSummary->text();
+    const QString beforeNew = overview.m_newCount->text();
+    QVERIFY(overview.m_attentionPanel->isHidden());
+    overview.setSyncInProgress(true);
+    Thoughts::invalidateSourceLocationIndex(temporary.path());
+    record.insert(QStringLiteral("status"), QStringLiteral("needs_reanchor"));
+    QVERIFY(save());
+    // Opening the landing page and changing its filter used to bypass the Sync guard.
+    overview.showLandingPage();
+    overview.refreshDueQueue();
+    overview.updateDueSummary();
+    overview.reloadFromProjections();
+    overview.close();
+    overview.showLandingPage();
+    QVERIFY(Thoughts::sourceLocationIndex(temporary.path()).value(QStringLiteral("projects")).toObject().isEmpty());
+    QCOMPARE(overview.m_dueSummary->text(), beforeDue);
+    QCOMPARE(overview.m_newCount->text(), beforeNew);
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(overview.m_attentionPanel->isHidden());
+    if (scanFinishesFirst) Thoughts::installSourceLocationIndex(temporary.path(), index);
+    else overview.setSyncInProgress(false);
+    overview.reloadFromProjections();
+    overview.showLandingPage();
+    QCOMPARE(overview.m_dueSummary->text(), beforeDue);
+    QVERIFY(overview.m_attentionPanel->isHidden());
+    if (scanFinishesFirst) overview.setSyncInProgress(false);
+    else {
+        Thoughts::installSourceLocationIndex(temporary.path(), index);
+        overview.reloadFromProjections(); // The completed scanner emits projectionsChanged.
+    }
+    QCOMPARE(overview.m_dueCards.size(), 0);
+    QCOMPARE(overview.m_newCount->text(), QStringLiteral("0"));
+    QVERIFY(!overview.m_attentionPanel->isHidden());
+    QVERIFY(overview.m_attentionSummary->text().contains(QStringLiteral("1 card unavailable")));
+    // A later verified source scan may make the card available again.
+    record.insert(QStringLiteral("status"), QStringLiteral("approved")); QVERIFY(save());
+    Thoughts::invalidateSourceLocationIndex(temporary.path()); overview.reload();
+    QCOMPARE(overview.m_dueCards.size(), 0);
+    Thoughts::installSourceLocationIndex(temporary.path(), index); overview.reloadFromProjections();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(overview.m_attentionPanel->isHidden());
+}
+
+void MainShellTest::testReviewCanStartDuringSync()
+{
+    QTemporaryDir temporary;
+    const QString directory = temporary.filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(directory));
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+        {QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+            {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("page"), 1},
+            {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+            {QStringLiteral("question"), QStringLiteral("What is the answer?")}}}};
+    QFile file(QDir(directory).filePath(id + QStringLiteral(".json")));
+    QVERIFY(file.open(QIODevice::WriteOnly) && file.write(QJsonDocument(record).toJson()) > 0);
+    file.close();
+    const QJsonObject index{{QStringLiteral("schema_version"), 1}, {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), true}}}};
+    Thoughts::installSourceLocationIndex(temporary.path(), index);
+    {
+        Thoughts::ReviewOverview overview(temporary.path(), [] { return QVariantMap{}; },
+            [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+        QCOMPARE(overview.m_dueCards.size(), 1);
+        const QString beforeDue = overview.m_dueSummary->text();
+        overview.setSyncInProgress(true);
+        // Sync freezes the counts but no longer blocks starting a review.
+        QVERIFY(overview.m_startButton->isEnabled());
+        QVERIFY(overview.m_documentFilter->isEnabled());
+        QCOMPARE(overview.m_dueSummary->text(), beforeDue);
+        overview.setSyncInProgress(false);
+    }
+    // A dashboard opened during Sync shows its saved counts and can still start:
+    // Start Review reads the due queue itself. (The card has no PDF, so the
+    // geometry check then declines to show it, exactly as outside Sync.)
+    Thoughts::ReviewOverview reopened(temporary.path(), [] { return QVariantMap{}; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {}, {}, true);
+    QVERIFY(reopened.m_dueCards.isEmpty());
+    QVERIFY(reopened.m_startButton->isEnabled());
+    reopened.startReview();
+    QCOMPARE(reopened.m_dueCards.size(), 1);
+}
+
+void MainShellTest::testReviewStartEnabledAfterSyncAndSourceScan()
+{
+    // PDF Review reopened while Sync ran showed "1 card due" with Start Review
+    // grey, and it stayed grey after Sync because the source scan outlasted it.
+    QTemporaryDir temporary;
+    const QString root = temporary.path();
+    const QString directory = temporary.filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(directory));
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+        {QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")},
+        {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")},
+            {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("page"), 1},
+            {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+            {QStringLiteral("question"), QStringLiteral("What is the answer?")}}}};
+    const auto save = [&] {
+        QFile file(QDir(directory).filePath(id + QStringLiteral(".json")));
+        return file.open(QIODevice::WriteOnly) && file.write(QJsonDocument(record).toJson()) > 0;
+    };
+    QVERIFY(save());
+    const QJsonObject index{{QStringLiteral("schema_version"), 1}, {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), true}}}};
+    Thoughts::installSourceLocationIndex(root, index);
+    const auto presenter = [](const Thoughts::ReviewCard &, bool, QString *) { return true; };
+    {
+        // Cached counts, then Sync starts after the constructor (as Shell does it).
+        Thoughts::ReviewOverview previous(root, [] { return QVariantMap{}; }, presenter, [] {});
+        QVERIFY(QFileInfo::exists(previous.dashboardSnapshotPath()));
+    }
+    Thoughts::ReviewOverview overview(root, [] { return QVariantMap{}; }, presenter, [] {});
+    QCOMPARE(overview.m_newCount->text(), QStringLiteral("1"));
+    // A session was running (or ended) when the dashboard is reopened during Sync.
+    overview.m_currentReview = 0;
+    overview.m_startButton->setEnabled(false);
+    overview.m_documentFilter->setEnabled(false);
+    overview.setSyncInProgress(true);
+    Thoughts::invalidateSourceLocationIndex(root);
+    overview.reload();
+    overview.showLandingPage();
+    QCOMPARE(overview.m_currentReview, -1);
+    QCOMPARE(overview.m_newCount->text(), QStringLiteral("1"));
+    QVERIFY(overview.m_startButton->isEnabled());
+    QVERIFY(overview.m_documentFilter->isEnabled());
+    // Sync ends while the source scan still runs: the counts stay frozen and usable.
+    record.insert(QStringLiteral("status"), QStringLiteral("needs_reanchor"));
+    QVERIFY(save());
+    overview.setSyncInProgress(false);
+    QCOMPARE(overview.m_newCount->text(), QStringLiteral("1"));
+    QVERIFY(overview.m_startButton->isEnabled());
+    // Nobody calls reload when the scan finishes: the dashboard retries by itself.
+    Thoughts::installSourceLocationIndex(root, index);
+    QTRY_COMPARE_WITH_TIMEOUT(overview.m_newCount->text(), QStringLiteral("0"), 5000);
+    QVERIFY(!overview.m_startButton->isEnabled());
+    QVERIFY(overview.m_attentionSummary->text().contains(QStringLiteral("1 card unavailable")));
+    // A verified card due again enables Start Review through the normal path.
+    record.insert(QStringLiteral("status"), QStringLiteral("approved"));
+    QVERIFY(save());
+    overview.reload();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(overview.m_startButton->isEnabled());
+    overview.close();
+}
+
+void MainShellTest::testReviewPanelFloatsOverANativeDocumentView()
+{
+    // The HTML view's web view is a native view: child widgets over it are hidden behind it, so
+    // while the reader shows it the review panel and its Hide button are tool windows over it.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3},
+                                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId},
+                                              {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    cardFile.close();
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget window;
+    window.resize(1000, 700);
+    auto *readerTab = new QWidget(&window);
+    readerTab->setGeometry(100, 50, 900, 650);
+    window.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [readerTab]() -> QWidget * { return readerTab; });
+    overview.startReview();
+    overview.showCurrentCard();
+    QCOMPARE(overview.m_sessionPage->parentWidget(), readerTab);
+    QVERIFY(!overview.m_sessionPage->isWindow());
+
+    readerTab->setProperty("thoughtsNativeDocumentView", true);
+    QTRY_VERIFY(overview.m_sessionPage->isWindow());
+    QCOMPARE(overview.m_sessionPage->parentWidget(), readerTab);
+    QVERIFY(overview.m_sessionPage->windowFlags().testFlag(Qt::Tool));
+    QVERIFY(!overview.m_sessionPage->isHidden());
+    QVERIFY(overview.m_reviewVisibilityButton->isWindow());
+    // Over the reader tab, on screen: bottom-centre of the tab, as before.
+    const QRect tab(readerTab->mapToGlobal(QPoint(0, 0)), readerTab->size());
+    QTRY_VERIFY(tab.contains(overview.m_sessionPage->geometry()));
+    QVERIFY(overview.m_sessionPage->geometry().bottom() > tab.center().y());
+    // The window moves: the panel follows.
+    const QPoint before = overview.m_sessionPage->pos();
+    window.move(window.pos() + QPoint(30, 20));
+    QTRY_VERIFY(overview.m_sessionPage->pos() != before);
+
+    readerTab->setProperty("thoughtsNativeDocumentView", false);
+    QTRY_VERIFY(!overview.m_sessionPage->isWindow());
+    QCOMPARE(overview.m_sessionPage->parentWidget(), readerTab);
+    QVERIFY(QRect(QPoint(0, 0), readerTab->size()).contains(overview.m_sessionPage->geometry()));
+}
+
+void MainShellTest::testReviewOfAnAttachmentCardShowsTheStoredAnswerWhenNotFound()
+{
+    // A card made in an HTML attachment page has no PDF place: it is presented by its page (the
+    // Part), and when its text is no longer there the panel shows the stored answer instead.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QString answer = QStringLiteral("agents pay a toll of one cent per page");
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("document_id"), QStringLiteral("c1870925-b9d7-45f5-b112-ba599f2b5af4")},
+                               {QStringLiteral("created_in"), QStringLiteral("html_attachment")},
+                               {QStringLiteral("html_attachment"), QJsonObject {{QStringLiteral("path"), QStringLiteral("docs-ideas/tex/support/html/explainer.html")},
+                                                                                {QStringLiteral("sha256"), QString(64, QLatin1Char('d'))}}},
+                               {QStringLiteral("text_quote"), QJsonObject {{QStringLiteral("exact"), answer}}},
+                               {QStringLiteral("page_state"), QJsonObject {{QStringLiteral("hash"), QStringLiteral("#simulator")}}},
+                               {QStringLiteral("selected_text"), answer},
+                               {QStringLiteral("question"), QStringLiteral("What do agents pay?")}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3},
+                                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId},
+                                              {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("source_authority"), QStringLiteral("client-v1")},
+                                              {QStringLiteral("source_link"), QJsonObject {{QStringLiteral("state"), QStringLiteral("html_attachment")}}},
+                                              {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    cardFile.close();
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QStringList presented;
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; },
+        [&presented](const Thoughts::ReviewCard &card, bool, QString *) {
+            presented.append(card.id());
+            return true;
+        },
+        [] {});
+    overview.startReview();
+    // Presented without PDF geometry (no "answer locations need to be updated").
+    QCOMPARE(overview.m_currentReview, 0);
+    QVERIFY(presented.contains(cardId));
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("What do agents pay?"));
+    // Another card's report changes nothing.
+    overview.showAnswerNotFound(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QVERIFY(overview.answerNotFoundCardId().isEmpty());
+    overview.showAnswerNotFound(cardId);
+    QCOMPARE(overview.answerNotFoundCardId(), cardId);
+    QVERIFY(!overview.m_reviewStatus->isHidden());
+    QCOMPARE(overview.m_reviewStatus->text(), QStringLiteral("Answer not found in the current page."));
+    // Revealed: the stored answer text instead of a mask.
+    overview.revealAnswer();
+    QVERIFY(overview.m_reviewStatus->text().startsWith(QStringLiteral("Answer not found in the current page.")));
+    QVERIFY(overview.m_reviewStatus->text().contains(answer));
+    overview.close();
+}
+
+void MainShellTest::testReviewPanelSurvivesClosingItsReaderTab()
+{
+    // The review panel lives in the active reader tab while reviewing. Closing
+    // that tab (or its window) deleted the panel with it, and the next Sync
+    // update used the freed rating panel and labels (crash in
+    // reloadFromProjections / refreshDueQueue).
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3},
+                                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId},
+                                              {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    cardFile.close();
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QPointer<QWidget> readerTab = new QWidget;
+    readerTab->resize(1000, 700);
+    readerTab->show();
+    QWidget nextTab;
+    nextTab.resize(1000, 700);
+    nextTab.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [document] { return document; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+        [] {},
+        nullptr,
+        {},
+        {},
+        [&readerTab, &nextTab]() -> QWidget * { return readerTab ? readerTab.data() : &nextTab; });
+    overview.startReview();
+    overview.showCurrentCard();
+    overview.revealAnswer();
+    QCOMPARE(overview.m_sessionPage->parentWidget(), readerTab.data());
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+
+    delete readerTab.data();
+    QVERIFY(!readerTab);
+    // The panel was taken back, not deleted with the tab.
+    QVERIFY(overview.m_sessionPage);
+    QCOMPARE(overview.m_sessionPage->parentWidget(), &overview);
+    QVERIFY(!overview.m_sessionHost);
+    // A Sync update after the tab closed must not touch freed widgets.
+    overview.reloadFromProjections();
+    overview.refreshDueQueue();
+    // The session continues in the next reader tab.
+    overview.showCurrentCard();
+    QCOMPARE(overview.m_sessionPage->parentWidget(), &nextTab);
+    QVERIFY(overview.m_reviewVisibilityButton);
+    QCOMPARE(overview.m_reviewVisibilityButton->parentWidget(), &nextTab);
+}
+
+void MainShellTest::testReviewAnswerTagGroups()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    // Two cards: the notes of one answer must not carry over to the next card. Three more,
+    // answered before and not due, give the steps their counts.
+    QStringList answeredBefore;
+    for (int index = 0; index < 5; ++index) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        if (index >= 2) answeredBefore << cardId;
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        QVERIFY(cardFile.open(QIODevice::WriteOnly));
+        cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                  {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                  {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    }
+    // Which groups are open is remembered on this device; start as if never opened or closed.
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    const QString u = QStringLiteral("u"), i = QStringLiteral("i");
+    const QString dontGet = QStringLiteral("Don't get it"), partly = QStringLiteral("Partly"), getIt = QStringLiteral("I get it");
+    const QString meh = QStringLiteral("Meh"), cool = QStringLiteral("cool");
+    // Two sliders, then a group of plain tags: tags are no longer offered, so it is not listed.
+    QVERIFY2(store.saveTagGroups({{u, QStringLiteral("Understanding"), {dontGet, partly, getIt}, {dontGet, partly, getIt}},
+                                  {i, QStringLiteral("Interest"), {meh, cool}, {meh, cool}},
+                                  {QStringLiteral("m"), QStringLiteral("Mood"), {QStringLiteral("happy")}}},
+                                 &error), qPrintable(error));
+    // The cards' current tags: I get it on 2 cards, Partly (by an old name) and cool on 1, next
+    // to the free tags Wrong and happy. The third card's undone answer counts for nothing.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    const auto answerBefore = [&](int card, int minute, const QStringList &tags, QString *eventId = nullptr) {
+        return store.recordRating(answeredBefore.at(card), QStringLiteral("custom_interval"), earlier.addSecs(60 * minute), &error, earlier.addDays(30), eventId, {}, tags);
+    };
+    QVERIFY2(answerBefore(0, 0, {getIt, cool, QStringLiteral("wrong")}), qPrintable(error));
+    QVERIFY2(answerBefore(1, 1, {QStringLiteral("partially"), QStringLiteral("happy")}), qPrintable(error));
+    QVERIFY2(answerBefore(2, 0, {getIt}), qPrintable(error));
+    QString undone;
+    QVERIFY2(answerBefore(2, 3, {dontGet, meh}, &undone), qPrintable(error));
+    QVERIFY2(store.retractRating(answeredBefore.at(2), undone, earlier.addSecs(240), &error), qPrintable(error));
+    QVERIFY2(store.recordTagMerge({QStringLiteral("partially")}, partly, &error), qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    overview.revealAnswer();
+    QCOMPARE(overview.m_dueCards.size(), 2);
+    const QString answeredId = overview.m_dueCards.at(overview.m_currentReview).id();
+    QCOMPARE(overview.m_tagField->findChild<QLabel *>(QStringLiteral("reviewFieldCaption"))->text(), QStringLiteral("Rating"));
+    QCOMPARE(overview.m_tagField->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(), QStringLiteral("Not rated"));
+
+    const auto groupNames = [&store] {
+        QStringList names;
+        for (const auto &group : store.tagGroups()) names << group.name;
+        return names;
+    };
+    // Runs @p check on the picker of the tag dialog the next step opens, then closes it.
+    const auto inTagDialog = [&overview](std::function<void(QDialog *, QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+            QVERIFY(picker);
+            check(dialog, picker);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+    };
+    const auto inGroup = [](QWidget *picker, const char *name, const QString &groupId) -> QWidget * {
+        for (auto *widget : picker->findChildren<QWidget *>(QString::fromLatin1(name)))
+            if (widget->property("reviewTagGroup").toString() == groupId) return widget;
+        return nullptr;
+    };
+    const auto stepTextsIn = [&inGroup](QWidget *picker, const QString &groupId) {
+        return inGroup(picker, "reviewAnswerTagScale", groupId)->property("reviewTagStepTexts").toStringList();
+    };
+    const auto valueIn = [&inGroup](QWidget *picker, const QString &groupId) {
+        return inGroup(picker, "reviewAnswerTagScale", groupId)->property("reviewTagScaleValue").toInt();
+    };
+
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        QCOMPARE(dialog->windowTitle(), QStringLiteral("Rating"));
+        // The reader behind it stays scrollable.
+        QVERIFY(!dialog->isModal());
+        QVERIFY(!QApplication::activeModalWidget());
+        const auto headings = [picker] {
+            QStringList labels;
+            for (auto *label : picker->findChildren<QLabel *>(QStringLiteral("reviewAnswerTagGroup"))) labels << label->text();
+            return labels;
+        };
+        // Nothing in the picker is cut at the dialog's edges, and no button is narrower than its text.
+        const auto unclipped = [dialog, picker]() -> QString {
+            for (auto *child : picker->findChildren<QWidget *>()) {
+                if (!child->isVisible() || child->objectName().isEmpty()) continue;
+                const QRect area(child->mapTo(dialog, QPoint(0, 0)), child->size());
+                if (!dialog->rect().contains(area)) return child->objectName() + QStringLiteral(" leaves the dialog");
+                auto *button = qobject_cast<QAbstractButton *>(child);
+                if (button && child->objectName() != QLatin1String("reviewAnswerTagGroupRow") && child->width() < child->sizeHint().width())
+                    return button->text() + QStringLiteral(" is cut");
+            }
+            return QString();
+        };
+        const auto widget = [picker, &inGroup](const char *name, const QString &groupId) { return inGroup(picker, name, groupId); };
+        const auto row = [&widget](const QString &groupId) { return qobject_cast<QPushButton *>(widget("reviewAnswerTagGroupRow", groupId)); };
+        const auto body = [&widget](const QString &groupId) { return widget("reviewAnswerTagGroupBody", groupId); };
+        const auto summaryShown = [&widget](const QString &groupId) {
+            auto *label = static_cast<QLabel *>(widget("reviewAnswerTagGroupSummary", groupId));
+            return label->isVisibleTo(label->parentWidget()) ? label->text() : QString();
+        };
+        const auto groupAction = [&widget](const QString &groupId, const char *name) -> QAction * {
+            auto *button = widget("reviewAnswerTagGroupMenu", groupId);
+            return button ? button->findChild<QAction *>(QString::fromLatin1(name)) : nullptr;
+        };
+        const auto stepTexts = [&](const QString &groupId) { return stepTextsIn(picker, groupId); };
+        const auto value = [&](const QString &groupId) { return valueIn(picker, groupId); };
+        // Clicks step @p index of the open slider of @p groupId.
+        const auto clickStep = [&widget](const QString &groupId, int index) {
+            QWidget *scale = widget("reviewAnswerTagScale", groupId);
+            QTest::mouseClick(scale, Qt::LeftButton, Qt::NoModifier, QPoint(scale->property("tickCenters").toList().at(index).toInt(), 12));
+        };
+        // Handles the modal window that the next step opens, once it is shown.
+        const auto whenModal = [dialog](std::function<void(QWidget *)> handle) {
+            auto *poll = new QTimer;
+            poll->setInterval(10);
+            QObject::connect(poll, &QTimer::timeout, [poll, dialog, handle] {
+                QWidget *modal = QApplication::activeModalWidget();
+                if (!modal || modal == dialog || !modal->isVisible()) return;
+                poll->stop();
+                poll->deleteLater();
+                handle(modal);
+            });
+            poll->start();
+        };
+        const auto answerPrompt = [&whenModal](const QString &text) {
+            whenModal([text](QWidget *modal) {
+                auto *prompt = qobject_cast<QInputDialog *>(modal);
+                QVERIFY(prompt);
+                prompt->setTextValue(text);
+                prompt->accept();
+            });
+        };
+        const auto next = overview.m_nextButton;
+
+        // Only the sliders, a header each: no group of tags, no Other, no New group, no tag chips
+        // or New tag. Never opened or closed, Understanding starts open, Interest closed.
+        QCOMPARE(headings(), QStringList({QStringLiteral("Understanding"), QStringLiteral("Interest")}));
+        for (const char *gone : {"reviewAnswerNewGroup", "reviewAnswerNewTag", "reviewAnswerTag", "reviewAnswerTagScaleTagsCaption"})
+            QVERIFY2(picker->findChildren<QWidget *>(QString::fromLatin1(gone)).isEmpty(), gone);
+        QVERIFY(!row(QString()) && !row(QStringLiteral("m")));
+        for (const QString &id : {u, i}) {
+            QVERIFY(row(id)->isVisible());
+            QCOMPARE(body(id)->isVisible(), id == u);
+            QCOMPARE(row(id)->isChecked(), id == u);
+        }
+        // Each step shows how many cards currently have it (an old name counts under its step),
+        // a step no card has too.
+        QCOMPARE(stepTexts(u), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (1)"), QStringLiteral("I get it (2)")}));
+        QCOMPARE(stepTexts(i), QStringList({QStringLiteral("Meh (0)"), QStringLiteral("cool (1)")}));
+        // A card never answered starts with no step chosen.
+        QCOMPARE(value(u), -1);
+        QCOMPARE(value(i), -1);
+        QCOMPARE(summaryShown(u), QString());
+        QVERIFY(next->isEnabled()); // Next records an answer with no rating.
+        // Choosing I get it counts this card: 2 cards show as 3.
+        clickStep(u, 2);
+        QCOMPARE(value(u), 2);
+        QCOMPARE(stepTexts(u).constLast(), QStringLiteral("I get it (3)"));
+        QCOMPARE(overview.m_selectedTags, QStringList{getIt});
+        // Open, the slider shows the choice; its header names it once closed.
+        QCOMPARE(summaryShown(u), QString());
+
+        // Each group opens and closes on its own; closing keeps its choice, and its header then
+        // names it on the name's line ("Understanding · I get it").
+        QTest::mouseClick(row(u), Qt::LeftButton);
+        QVERIFY(!body(u)->isVisible() && !row(u)->isChecked());
+        QCOMPARE(summaryShown(u), getIt);
+        QVERIFY(widget("reviewAnswerTagGroupSummary", u)->y() <= widget("reviewAnswerTagGroup", u)->y() + 4);
+        QCOMPARE(value(u), 2);
+        QVERIFY(row(u)->accessibleName().contains(QStringLiteral("Collapsed")));
+        QTest::mouseClick(row(i), Qt::LeftButton);
+        QVERIFY(!body(u)->isVisible() && body(i)->isVisible());
+        QTest::mouseClick(row(u), Qt::LeftButton);
+        QVERIFY(body(u)->isVisible() && body(i)->isVisible());
+        // The dialog follows: closing a group gives its height back.
+        const int bothOpen = dialog->height();
+        // From the keyboard: Enter and Space on a focused header toggle it.
+        row(i)->setFocus();
+        QTest::keyClick(row(i), Qt::Key_Return);
+        QVERIFY(!body(i)->isVisible() && !row(i)->isChecked());
+        QVERIFY(dialog->isVisible());
+        QVERIFY(dialog->height() < bothOpen);
+        QTest::keyClick(row(i), Qt::Key_Space);
+        QVERIFY(body(i)->isVisible());
+        QTest::keyClick(row(i), Qt::Key_Space);
+        QVERIFY(!body(i)->isVisible() && body(u)->isVisible());
+        QCOMPARE(unclipped(), QString());
+
+        // Groups have no note of their own (no toggle, no field, no marker): the answer has one Note.
+        for (const char *gone : {"reviewAnswerGroupNoteToggle", "reviewAnswerGroupNote", "reviewAnswerTagGroupNoteMarker"})
+            QVERIFY2(picker->findChildren<QWidget *>(QString::fromLatin1(gone)).isEmpty(), gone);
+
+        // A slider's menu: Rename, Section, Move up/down, Edit Slider, Delete; nothing about tags.
+        for (const QString &id : {u, i}) {
+            for (const char *name : {"reviewTagGroupRename", "reviewTagGroupSection", "reviewTagGroupMoveUp", "reviewTagGroupMoveDown",
+                                     "reviewTagGroupEditSlider", "reviewTagGroupDelete"})
+                QVERIFY2(groupAction(id, name), name);
+            for (const char *name : {"reviewTagGroupShowAsTags", "reviewTagGroupShowAsSlider", "reviewTagGroupMoveTagsHere"})
+                QVERIFY2(!groupAction(id, name), name);
+        }
+        QVERIFY(!groupAction(u, "reviewTagGroupMoveUp")->isEnabled());
+
+        // Move up and Rename keep the choice and the notes.
+        groupAction(i, "reviewTagGroupMoveUp")->trigger();
+        QCOMPARE(groupNames(), QStringList({QStringLiteral("Interest"), QStringLiteral("Understanding"), QStringLiteral("Mood")}));
+        QCOMPARE(headings(), QStringList({QStringLiteral("Interest"), QStringLiteral("Understanding")}));
+        answerPrompt(QStringLiteral("Curiosity"));
+        groupAction(i, "reviewTagGroupRename")->trigger();
+        QCOMPARE(groupNames(), QStringList({QStringLiteral("Curiosity"), QStringLiteral("Understanding"), QStringLiteral("Mood")}));
+        QVERIFY(body(u)->isVisible());
+        QCOMPARE(value(u), 2);
+
+        // Delete asks first; the slider leaves the list.
+        whenModal([](QWidget *confirmation) {
+            for (auto *button : confirmation->findChild<QDialogButtonBox *>()->buttons())
+                if (button->text().remove(QLatin1Char('&')) == QStringLiteral("Delete")) button->click();
+        });
+        groupAction(i, "reviewTagGroupDelete")->trigger();
+        QCOMPARE(groupNames(), QStringList({QStringLiteral("Understanding"), QStringLiteral("Mood")}));
+        QCOMPARE(headings(), QStringList{QStringLiteral("Understanding")});
+        QVERIFY(!row(i));
+        QVERIFY(picker->findChildren<QWidget *>(QStringLiteral("reviewAnswerTag")).isEmpty());
+
+        // The answer's own note: always shown, below every group row, about 3 lines high, cut at
+        // 500 characters, recorded under "note".
+        auto *answerNote = picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewAnswerNote"));
+        QVERIFY(answerNote);
+        QVERIFY(answerNote->isVisible());
+        QCOMPARE(answerNote->placeholderText(), QStringLiteral("Anything else about this answer…"));
+        QCOMPARE(picker->findChild<QLabel *>(QStringLiteral("reviewAnswerNoteCaption"))->text(), QStringLiteral("Note"));
+        const int noteTop = answerNote->mapTo(picker, QPoint(0, 0)).y();
+        for (auto *groupRow : picker->findChildren<QPushButton *>(QStringLiteral("reviewAnswerTagGroupRow")))
+            if (groupRow->isVisible()) QVERIFY(groupRow->mapTo(picker, QPoint(0, groupRow->height())).y() <= noteTop);
+        QVERIFY(answerNote->height() >= 3 * answerNote->fontMetrics().lineSpacing());
+        QVERIFY(answerNote->height() < 5 * answerNote->fontMetrics().lineSpacing());
+        answerNote->setPlainText(QString(600, QLatin1Char('x')));
+        QCOMPARE(answerNote->toPlainText().size(), 500);
+        answerNote->setPlainText(QStringLiteral("Redo the proof tomorrow"));
+        QCOMPARE(unclipped(), QString());
+        const QString screenshots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR");
+        if (!screenshots.isEmpty()) QVERIFY(dialog->grab().save(screenshots + QStringLiteral("/answer-tag-groups.png")));
+    });
+    overview.m_tagField->click();
+    QVERIFY(!overview.m_groupNotes.contains(u));
+    QCOMPARE(overview.m_groupNotes.value(QStringLiteral("note")), QStringLiteral("Redo the proof tomorrow"));
+    QCOMPARE(overview.m_tagField->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(), getIt);
+
+    // Closing and reopening the picker for the same card keeps the step, the notes and the
+    // groups as they were left open or closed, and this card is still counted once.
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        QVERIFY(inGroup(picker, "reviewAnswerTagGroupBody", u)->isVisible());
+        QCOMPARE(valueIn(picker, u), 2);
+        QCOMPARE(stepTextsIn(picker, u), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (1)"), QStringLiteral("I get it (3)")}));
+        QCOMPARE(picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewAnswerNote"))->toPlainText(), QStringLiteral("Redo the proof tomorrow"));
+    });
+    overview.m_tagField->click();
+
+    // Next records the notes with the step.
+    overview.m_nextButton->click();
+    const auto cards = store.cards();
+    const auto answered = std::find_if(cards.cbegin(), cards.cend(), [&answeredId](const auto &card) { return card.id() == answeredId; });
+    QVERIFY(answered != cards.cend());
+    QCOMPARE(answered->currentTags(), QStringList{getIt});
+    const auto event = std::find_if(answered->history.cbegin(), answered->history.cend(), [](const QJsonObject &event) {
+        return event.contains(QStringLiteral("review_tags"));
+    });
+    QVERIFY(event != answered->history.cend());
+    QCOMPARE(event->value(QStringLiteral("review_group_notes")).toObject(),
+             (QJsonObject{{QStringLiteral("note"), QStringLiteral("Redo the proof tomorrow")}}));
+
+    // The next card starts without notes and, never answered, without a step.
+    QVERIFY(overview.m_currentReview >= 0 && overview.m_currentReview < overview.m_dueCards.size());
+    QVERIFY(overview.m_dueCards.at(overview.m_currentReview).id() != answeredId);
+    QVERIFY(overview.m_groupNotes.isEmpty());
+    QVERIFY(overview.m_selectedTags.isEmpty());
+    overview.revealAnswer();
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        for (auto *note : picker->findChildren<QPlainTextEdit *>(QStringLiteral("reviewAnswerGroupNote"))) QVERIFY(note->toPlainText().isEmpty());
+        QVERIFY(picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewAnswerNote"))->toPlainText().isEmpty());
+        // The answered card is in the counts now under its step, not counted again; nothing is chosen.
+        QCOMPARE(stepTextsIn(picker, u).constLast(), QStringLiteral("I get it (3)"));
+        QCOMPARE(valueIn(picker, u), -1);
+        // Which groups are open is the device's, not the answer's: the next card's picker has them too.
+        QVERIFY(inGroup(picker, "reviewAnswerTagGroupBody", u)->isVisible());
+        const QStringList opened = KConfigGroup(KSharedConfig::openConfig(), QStringLiteral("ReviewTagGroups")).readEntry("Open", QStringList());
+        QVERIFY(opened.contains(u));
+    });
+    overview.m_tagField->click();
+}
+
+void MainShellTest::testReviewContextNotes()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    // Two cards of one document, both in section "1 Intro" of page 1.
+    QStringList ids;
+    for (double top : {0.5, 0.6}) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ids << cardId;
+        const QJsonObject primary{{QStringLiteral("document_id"), QStringLiteral("doc-context")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                                  {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, top, 0.5, top + 0.1}},
+                                  {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        QVERIFY(cardFile.open(QIODevice::WriteOnly));
+        cardFile.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                 {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                 {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    }
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    // First without headings in the PDF.
+    overview.setContextOutline([](const Thoughts::ReviewCard &) { return QVariantList(); });
+    overview.startReview();
+    overview.revealAnswer();
+    QCOMPARE(overview.m_dueCards.size(), 2);
+    const QString firstId = overview.m_dueCards.at(overview.m_currentReview).id();
+    const auto inTagDialog = [&overview](std::function<void(QDialog *, QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+            QVERIFY(picker);
+            check(dialog, picker);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+    };
+    const auto scopeButton = [](QWidget *picker, const QString &scope) -> QPushButton * {
+        for (auto *button : picker->findChildren<QPushButton *>(QStringLiteral("reviewContextScope")))
+            if (button->property("reviewContextScope").toString() == scope) return button;
+        return nullptr;
+    };
+    const auto noteBox = [](QWidget *picker) { return picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewContextNote")); };
+    const auto aboutLabel = [](QWidget *picker) { return picker->findChild<QLabel *>(QStringLiteral("reviewContextNoteLabel"))->text(); };
+
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        auto *section = picker->findChild<QWidget *>(QStringLiteral("reviewContextNoteSection"));
+        QVERIFY(section && section->isVisible());
+        QCOMPARE(picker->findChild<QLabel *>(QStringLiteral("reviewContextNoteCaption"))->text(), QStringLiteral("About this…"));
+        // Below the answer's Note.
+        auto *answerNote = picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewAnswerNote"));
+        QVERIFY(answerNote->mapTo(picker, QPoint(0, answerNote->height())).y() <= section->mapTo(picker, QPoint(0, 0)).y());
+        QVERIFY(!scopeButton(picker, QStringLiteral("section"))->isEnabled());
+        QCOMPARE(scopeButton(picker, QStringLiteral("section"))->toolTip(), QStringLiteral("No section headings in this PDF"));
+        QVERIFY(scopeButton(picker, QStringLiteral("page"))->isChecked());
+        QCOMPARE(aboutLabel(picker), QStringLiteral("Page 1"));
+        QVERIFY(QRect(QPoint(0, 0), dialog->size()).contains(QRect(noteBox(picker)->mapTo(dialog, QPoint(0, 0)), noteBox(picker)->size())));
+    });
+    overview.m_tagField->click();
+
+    // With a heading above both cards: Section is chosen first.
+    overview.setContextOutline([](const Thoughts::ReviewCard &) {
+        return QVariantList{QVariantMap{{QStringLiteral("title"), QStringLiteral("1 Intro")}, {QStringLiteral("page"), 1}, {QStringLiteral("top"), 0.1}}};
+    });
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        auto *sectionButton = scopeButton(picker, QStringLiteral("section"));
+        QVERIFY(sectionButton->isEnabled() && sectionButton->isChecked());
+        QCOMPARE(aboutLabel(picker), QStringLiteral("1 Intro"));
+        QVERIFY(noteBox(picker)->toPlainText().isEmpty());
+        QCOMPARE(noteBox(picker)->placeholderText(), QStringLiteral("Anything about this section…"));
+        noteBox(picker)->setPlainText(QStringLiteral("Intro skips the definitions"));
+        // Switching keeps what was typed in each scope.
+        scopeButton(picker, QStringLiteral("page"))->click();
+        QCOMPARE(aboutLabel(picker), QStringLiteral("Page 1"));
+        QVERIFY(noteBox(picker)->toPlainText().isEmpty());
+        noteBox(picker)->setPlainText(QString(600, QLatin1Char('p')));
+        QCOMPARE(noteBox(picker)->toPlainText().size(), 500);
+        noteBox(picker)->setPlainText(QStringLiteral("Page 1 has the key figure"));
+        scopeButton(picker, QStringLiteral("document"))->click();
+        QCOMPARE(aboutLabel(picker), QStringLiteral("file1"));
+        noteBox(picker)->setPlainText(QStringLiteral("typed, then removed"));
+        noteBox(picker)->clear();
+        scopeButton(picker, QStringLiteral("section"))->click();
+        QCOMPARE(noteBox(picker)->toPlainText(), QStringLiteral("Intro skips the definitions"));
+    });
+    overview.m_tagField->click();
+    // Closing the Tags window keeps them for this answer.
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        QCOMPARE(noteBox(picker)->toPlainText(), QStringLiteral("Intro skips the definitions"));
+        scopeButton(picker, QStringLiteral("page"))->click();
+        QCOMPARE(noteBox(picker)->toPlainText(), QStringLiteral("Page 1 has the key figure"));
+    });
+    overview.m_tagField->click();
+
+    // Next records the scopes changed, and only those.
+    overview.m_nextButton->click();
+    Thoughts::ReviewStore store(temporary.path());
+    const auto eventOf = [&store](const QString &cardId) {
+        for (const auto &card : store.cards())
+            if (card.id() == cardId)
+                for (const auto &event : card.history)
+                    if (event.contains(QStringLiteral("review_tags"))) return event;
+        return QJsonObject();
+    };
+    QCOMPARE(eventOf(firstId).value(QStringLiteral("review_context_notes")).toObject(),
+             (QJsonObject{{QStringLiteral("section"), QJsonObject{{QStringLiteral("key"), QStringLiteral("1 Intro")}, {QStringLiteral("label"), QStringLiteral("1 Intro")},
+                                                                  {QStringLiteral("text"), QStringLiteral("Intro skips the definitions")}}},
+                          {QStringLiteral("page"), QJsonObject{{QStringLiteral("key"), QStringLiteral("1")}, {QStringLiteral("label"), QStringLiteral("Page 1")},
+                                                               {QStringLiteral("text"), QStringLiteral("Page 1 has the key figure")}}}}));
+
+    // A session of due cards records so with each answer.
+    QCOMPARE(eventOf(firstId).value(QStringLiteral("review_entry")).toString(), QStringLiteral("due_queue"));
+
+    // The other card of the section shows the notes; left as they are, its answer records none.
+    QVERIFY(overview.m_currentReview >= 0 && overview.m_currentReview < overview.m_dueCards.size());
+    const QString secondId = overview.m_dueCards.at(overview.m_currentReview).id();
+    QVERIFY(secondId != firstId);
+    overview.revealAnswer();
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        QVERIFY(scopeButton(picker, QStringLiteral("section"))->isChecked());
+        QCOMPARE(noteBox(picker)->toPlainText(), QStringLiteral("Intro skips the definitions"));
+        scopeButton(picker, QStringLiteral("page"))->click();
+        QCOMPARE(noteBox(picker)->toPlainText(), QStringLiteral("Page 1 has the key figure"));
+        scopeButton(picker, QStringLiteral("document"))->click();
+        QVERIFY(noteBox(picker)->toPlainText().isEmpty());
+    });
+    overview.m_tagField->click();
+    overview.m_nextButton->click();
+    const QJsonObject secondEvent = eventOf(secondId);
+    QVERIFY(!secondEvent.isEmpty());
+    QVERIFY(!secondEvent.contains(QStringLiteral("review_context_notes")));
+}
+
+// Free tags are no longer offered: the picker lists only the sliders, and a card whose last
+// answer had free tags next to a step starts the bar with the step alone.
+void MainShellTest::testReviewTagPickerShowsOnlySliders()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    QStringList ids;
+    for (int index = 0; index < 2; ++index) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ids << cardId;
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        QVERIFY(cardFile.open(QIODevice::WriteOnly));
+        cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                  {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                  {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    }
+    const QString forgot = QStringLiteral("Forgot"), recalled = QStringLiteral("Recalled"), happy = QStringLiteral("happy"), askedAi = QStringLiteral("Asked AI");
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups({{QStringLiteral("r"), QStringLiteral("Recall"), {forgot, recalled}, {forgot, recalled}},
+                                  {QStringLiteral("m"), QStringLiteral("Mood"), {happy}}},
+                                 &error), qPrintable(error));
+    // The card under review, due again, was last answered with a step, a tag of Mood and a tag in
+    // no group; the other, not due, with the step.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(ids.at(0), QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(60), nullptr, {}, {happy, recalled, askedAi}),
+             qPrintable(error));
+    QVERIFY2(store.recordRating(ids.at(1), QStringLiteral("custom_interval"), earlier, &error, earlier.addDays(30), nullptr, {}, {recalled}), qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    overview.revealAnswer();
+    // The bar keeps only the step: the free tags of the last answer are not carried over.
+    QCOMPARE(overview.m_selectedTags, QStringList{recalled});
+    QCOMPARE(overview.m_tagField->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(), recalled);
+    // The current state still names the whole last answer.
+    QVERIFY2(overview.m_currentState->text().contains(askedAi), qPrintable(overview.m_currentState->text()));
+
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+        QVERIFY(dialog);
+        auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+        QVERIFY(picker);
+        // Recall alone: no Mood, no Other, no tag chips, New tag, New group or Tags caption.
+        QStringList headings;
+        for (auto *label : picker->findChildren<QLabel *>(QStringLiteral("reviewAnswerTagGroup"))) headings << label->text();
+        QCOMPARE(headings, QStringList{QStringLiteral("Recall")});
+        for (const char *gone : {"reviewAnswerTag", "reviewAnswerNewTag", "reviewAnswerNewGroup", "reviewAnswerTagScaleTagsCaption", "reviewAnswerTagSection"})
+            QVERIFY2(picker->findChildren<QWidget *>(QString::fromLatin1(gone)).isEmpty(), gone);
+        for (auto *row : picker->findChildren<QWidget *>(QStringLiteral("reviewAnswerTagGroupRow")))
+            QCOMPARE(row->property("reviewTagGroup").toString(), QStringLiteral("r"));
+        auto *scale = picker->findChild<QWidget *>(QStringLiteral("reviewAnswerTagScale"));
+        QVERIFY(scale && scale->isVisible());
+        QCOMPARE(scale->property("reviewTagScaleValue").toInt(), 1);
+        QCOMPARE(scale->property("reviewTagStepTexts").toStringList(), QStringList({QStringLiteral("Forgot (0)"), QStringLiteral("Recalled (2)")}));
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+    });
+    overview.m_tagField->click();
+    QCOMPARE(overview.m_selectedTags, QStringList{recalled});
+
+    // Next records the step alone.
+    overview.m_nextButton->click();
+    for (const auto &card : store.cards())
+        if (card.id() == ids.at(0)) QCOMPARE(card.currentTags(), QStringList{recalled});
+}
+
+void MainShellTest::testReviewTagSliderGroups()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    QStringList ids;
+    for (int index = 0; index < 3; ++index) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ids << cardId;
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        QVERIFY(cardFile.open(QIODevice::WriteOnly));
+        cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                  {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                  {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    }
+    const QString dontGet = QStringLiteral("Don't get it"), partly = QStringLiteral("Partly"), getIt = QStringLiteral("I get it");
+    const QString askedAi = QStringLiteral("Asked AI");
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    Thoughts::ReviewTags::TagGroup understanding{QStringLiteral("u"), QStringLiteral("Understanding"), {dontGet, partly, getIt, askedAi}, {dontGet, partly, getIt}};
+    QVERIFY2(store.saveTagGroups({understanding, {QStringLiteral("s"), QStringLiteral("Source"), {QStringLiteral("Me"), QStringLiteral("AI")}}}, &error), qPrintable(error));
+    // The card under review was last answered, before the slider, with two of its steps and Asked
+    // AI; the two others, not due, I get it.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(ids.at(0), QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(60), nullptr, {}, {getIt, partly, askedAi}), qPrintable(error));
+    for (int index = 1; index < 3; ++index)
+        QVERIFY2(store.recordRating(ids.at(index), QStringLiteral("custom_interval"), earlier, &error, earlier.addDays(30), nullptr, {}, {getIt, QStringLiteral("Me")}),
+                 qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    overview.revealAnswer();
+    // A reviewed card starts with its last answer's steps, not its free tags. The bar names two,
+    // slider steps in their order.
+    QCOMPARE(overview.m_selectedTags, QStringList({getIt, partly}));
+    QCOMPARE(overview.m_tagField->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(), QStringLiteral("Partly · I get it"));
+
+    const auto inTagDialog = [&overview](std::function<void(QDialog *, QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+            QVERIFY(picker);
+            check(dialog, picker);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+    };
+    const auto inGroup = [](QWidget *picker, const char *name, const QString &groupId) -> QWidget * {
+        for (auto *widget : picker->findChildren<QWidget *>(QString::fromLatin1(name)))
+            if (widget->property("reviewTagGroup").toString() == groupId) return widget;
+        return nullptr;
+    };
+    const auto whenModal = [](QDialog *dialog, std::function<void(QWidget *)> handle) {
+        auto *poll = new QTimer;
+        poll->setInterval(10);
+        QObject::connect(poll, &QTimer::timeout, [poll, dialog, handle] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal || modal == dialog || !modal->isVisible()) return;
+            poll->stop();
+            poll->deleteLater();
+            handle(modal);
+        });
+        poll->start();
+    };
+    const auto selected = [&overview] { return QSet<QString>(overview.m_selectedTags.cbegin(), overview.m_selectedTags.cend()); };
+
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        auto *block = inGroup(picker, "reviewAnswerTagScaleGroup", QStringLiteral("u"));
+        QVERIFY(block && block->isVisible());
+        // The slider group folds under its header. Source holds only tags: it is not listed.
+        auto *understandingRow = qobject_cast<QPushButton *>(inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("u")));
+        QVERIFY(understandingRow && understandingRow->isChecked());
+        QVERIFY(!inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("s")));
+        auto *scale = inGroup(picker, "reviewAnswerTagScale", QStringLiteral("u"));
+        QVERIFY(scale && scale->isVisible());
+        // Closed, its header names the steps; nothing is deselected.
+        const auto summaryShown = [&inGroup, picker](const QString &groupId) {
+            auto *label = static_cast<QLabel *>(inGroup(picker, "reviewAnswerTagGroupSummary", groupId));
+            return label->isVisibleTo(label->parentWidget()) ? label->property("fullText").toString() : QString();
+        };
+        QCOMPARE(summaryShown(QStringLiteral("u")), QString());
+        QTest::mouseClick(understandingRow, Qt::LeftButton);
+        QVERIFY(!scale->isVisible());
+        QCOMPARE(summaryShown(QStringLiteral("u")), QStringLiteral("Partly, I get it"));
+        QVERIFY(inGroup(picker, "reviewAnswerTagGroupEditSlider", QStringLiteral("u"))->isVisible());
+        const QString shots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR");
+        if (!shots.isEmpty()) QVERIFY(dialog->grab().save(shots + QStringLiteral("/answer-tag-groups-collapsed.png")));
+        QTest::mouseClick(understandingRow, Qt::LeftButton);
+        QVERIFY(scale->isVisible());
+        if (!shots.isEmpty()) QVERIFY(dialog->grab().save(shots + QStringLiteral("/answer-tag-groups-slider-open.png")));
+        // Both steps of the old answer are shown (bold), the thumb on the first; nothing changes
+        // until the slider is touched.
+        QCOMPARE(scale->property("reviewTagScaleValue").toInt(), 1);
+        QCOMPARE(scale->accessibleName(), QStringLiteral("Understanding: Partly, I get it"));
+        QCOMPARE(selected(), QSet<QString>({partly, getIt}));
+        // Each step shows its card count, a step no card has (0) too; it follows the selection:
+        // this card counts under the steps it would have once saved.
+        const auto stepTexts = [scale] { return scale->property("reviewTagStepTexts").toStringList(); };
+        QCOMPARE(stepTexts(), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (1)"), QStringLiteral("I get it (3)")}));
+        QVERIFY(scale->accessibleDescription().contains(QStringLiteral("I get it (3)")));
+        const QVariantList ticks = scale->property("tickCenters").toList();
+        QCOMPARE(ticks.size(), 3);
+        const auto clickStep = [scale, &ticks](int index) {
+            QTest::mouseClick(scale, Qt::LeftButton, Qt::NoModifier, QPoint(ticks.at(index).toInt(), 12));
+        };
+        // Touching it leaves one step: a click on the thumb keeps that one.
+        clickStep(1);
+        QCOMPARE(selected(), QSet<QString>({partly}));
+        QCOMPARE(scale->accessibleName(), QStringLiteral("Understanding: Partly"));
+        QCOMPARE(stepTexts(), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (1)"), QStringLiteral("I get it (2)")}));
+        if (const QString screenshots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR"); !screenshots.isEmpty())
+            QVERIFY(dialog->grab().save(screenshots + QStringLiteral("/answer-tag-slider.png")));
+        // Steps are not chips, and the group's free tag (Asked AI) has none either: no Tags
+        // caption, no chips, no New tag under the slider.
+        for (const char *gone : {"reviewAnswerTag", "reviewAnswerNewTag", "reviewAnswerTagScaleTagsCaption"})
+            QVERIFY2(picker->findChildren<QWidget *>(QString::fromLatin1(gone)).isEmpty(), gone);
+
+        // Another step replaces the step.
+        clickStep(2);
+        QCOMPARE(scale->property("reviewTagScaleValue").toInt(), 2);
+        QCOMPARE(selected(), QSet<QString>({getIt}));
+        QCOMPARE(stepTexts(), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (0)"), QStringLiteral("I get it (3)")}));
+        // Clicking the chosen step clears the slider.
+        clickStep(2);
+        QCOMPARE(scale->property("reviewTagScaleValue").toInt(), -1);
+        QVERIFY(selected().isEmpty());
+        QCOMPARE(stepTexts(), QStringList({QStringLiteral("Don't get it (0)"), QStringLiteral("Partly (0)"), QStringLiteral("I get it (2)")}));
+        clickStep(0);
+        QCOMPARE(selected(), QSet<QString>({dontGet}));
+        QCOMPARE(stepTexts(), QStringList({QStringLiteral("Don't get it (1)"), QStringLiteral("Partly (0)"), QStringLiteral("I get it (2)")}));
+        // The keyboard moves along the steps.
+        scale->setFocus();
+        QTest::keyClick(scale, Qt::Key_Right);
+        QCOMPARE(selected(), QSet<QString>({partly}));
+        QTest::keyClick(scale, Qt::Key_Delete);
+        QVERIFY(selected().isEmpty());
+        clickStep(1);
+        QCOMPARE(selected(), QSet<QString>({partly}));
+
+        // No note of its own: the answer's Note is the only one.
+        QVERIFY(!inGroup(picker, "reviewAnswerGroupNoteToggle", QStringLiteral("u")));
+        QVERIFY(!inGroup(picker, "reviewAnswerGroupNote", QStringLiteral("u")));
+
+        // The menu edits the slider; it cannot become tags.
+        auto *menu = inGroup(picker, "reviewAnswerTagGroupMenu", QStringLiteral("u"));
+        QVERIFY(menu);
+        QVERIFY(menu->findChild<QAction *>(QStringLiteral("reviewTagGroupEditSlider")));
+        for (const char *gone : {"reviewTagGroupShowAsTags", "reviewTagGroupShowAsSlider", "reviewTagGroupMoveTagsHere"})
+            QVERIFY2(!menu->findChild<QAction *>(QString::fromLatin1(gone)), gone);
+
+        // Edit slider lists only the steps, left to right; Add step takes a typed name or one of
+        // the group's free tags (quick picks), always at the end.
+        const auto editorSteps = [](QWidget *editor) { return editor->property("reviewSliderSteps").toStringList(); };
+        const auto stepButton = [](QWidget *editor, int index, const char *name) -> QToolButton * {
+            for (auto *row : editor->findChildren<QWidget *>(QStringLiteral("reviewSliderStep"))) {
+                if (row->findChild<QLabel *>(QStringLiteral("reviewSliderStepNumber"))->text() == QString::number(index + 1))
+                    return row->findChild<QToolButton *>(QString::fromLatin1(name));
+            }
+            return nullptr;
+        };
+        const auto addStep = [&whenModal](QWidget *editor, std::function<void(QDialog *)> handle) {
+            whenModal(qobject_cast<QDialog *>(editor), [handle](QWidget *modal) {
+                QCOMPARE(modal->objectName(), QStringLiteral("reviewSliderAddStepDialog"));
+                QCOMPARE(modal->windowTitle(), QStringLiteral("Add step"));
+                handle(qobject_cast<QDialog *>(modal));
+            });
+            editor->findChild<QPushButton *>(QStringLiteral("reviewSliderAddStep"))->click();
+        };
+        const auto picksOf = [](QDialog *add) {
+            QStringList tags;
+            for (auto *pick : add->findChildren<QPushButton *>(QStringLiteral("reviewSliderAddStepPick"))) tags.append(pick->property("reviewTag").toString());
+            return tags;
+        };
+        const auto typeStep = [](QDialog *add, const QString &name) {
+            add->findChild<QLineEdit *>(QStringLiteral("reviewSliderAddStepName"))->setText(name);
+            add->findChild<QDialogButtonBox *>(QStringLiteral("reviewSliderAddStepButtons"))->button(QDialogButtonBox::Ok)->click();
+        };
+        const auto editorButton = [](QWidget *editor, QDialogButtonBox::StandardButton which) {
+            return editor->findChild<QDialogButtonBox *>(QStringLiteral("reviewSliderButtons"))->button(which);
+        };
+
+        // The pencil edits the slider: a new step, moved left, and a removed one.
+        auto *pencil = qobject_cast<QToolButton *>(inGroup(picker, "reviewAnswerTagGroupEditSlider", QStringLiteral("u")));
+        QVERIFY(pencil && pencil->isVisible());
+        QCOMPARE(pencil->toolTip(), QStringLiteral("Edit slider"));
+        const QString mastered = QStringLiteral("Mastered");
+        whenModal(dialog, [&](QWidget *modal) {
+            QCOMPARE(modal->objectName(), QStringLiteral("reviewSliderDialog"));
+            QCOMPARE(modal->windowTitle(), QStringLiteral("Edit slider “Understanding”"));
+            QCOMPARE(editorSteps(modal), (QStringList{dontGet, partly, getIt}));
+            addStep(modal, [&](QDialog *add) {
+                QCOMPARE(picksOf(add), QStringList{askedAi});
+                typeStep(add, mastered);
+            });
+            QCOMPARE(editorSteps(modal), (QStringList{dontGet, partly, getIt, mastered}));
+            QCOMPARE(stepButton(modal, 0, "reviewSliderStepUp")->isEnabled(), false);
+            QCOMPARE(stepButton(modal, 3, "reviewSliderStepDown")->isEnabled(), false);
+            stepButton(modal, 3, "reviewSliderStepUp")->click();
+            QCOMPARE(editorSteps(modal), (QStringList{dontGet, partly, mastered, getIt}));
+            QCOMPARE(stepButton(modal, 2, "reviewSliderStepUp")->parentWidget()->property("reviewTag").toString(), mastered);
+            stepButton(modal, 0, "reviewSliderStepRemove")->click();
+            QCOMPARE(editorSteps(modal), (QStringList{partly, mastered, getIt}));
+            // The removed step is a free tag of the group again, so Add step offers it.
+            addStep(modal, [&](QDialog *add) {
+                const QStringList picks = picksOf(add);
+                QCOMPARE(QSet<QString>(picks.cbegin(), picks.cend()), (QSet<QString>{dontGet, askedAi}));
+                add->reject();
+            });
+            editorButton(modal, QDialogButtonBox::Save)->click();
+        });
+        pencil->click();
+        QCOMPARE(store.tagGroups().constFirst().scale, (QStringList{partly, mastered, getIt}));
+        // The removed step stays in the group as a plain tag; it is not shown.
+        QCOMPARE(store.tagGroups().constFirst().tags, (QStringList{dontGet, partly, getIt, askedAi, mastered}));
+        QVERIFY(picker->findChildren<QWidget *>(QStringLiteral("reviewAnswerTag")).isEmpty());
+        auto *edited = inGroup(picker, "reviewAnswerTagScale", QStringLiteral("u"));
+        QCOMPARE(edited->property("reviewTagScaleValue").toInt(), 0);
+        QCOMPARE(selected(), QSet<QString>({partly}));
+
+        // Cancel discards; the menu opens the same dialog.
+        whenModal(dialog, [&](QWidget *modal) {
+            stepButton(modal, 0, "reviewSliderStepRemove")->click();
+            QCOMPARE(editorSteps(modal).size(), 2);
+            editorButton(modal, QDialogButtonBox::Cancel)->click();
+        });
+        inGroup(picker, "reviewAnswerTagGroupMenu", QStringLiteral("u"))->findChild<QAction *>(QStringLiteral("reviewTagGroupEditSlider"))->trigger();
+        QCOMPARE(store.tagGroups().constFirst().scale, (QStringList{partly, mastered, getIt}));
+
+        // A typed name is the tag it names, ignoring case; a tag of another group moves here.
+        whenModal(dialog, [&](QWidget *modal) {
+            addStep(modal, [&](QDialog *add) { typeStep(add, QStringLiteral("me")); });
+            QCOMPARE(editorSteps(modal), (QStringList{partly, mastered, getIt, QStringLiteral("Me")}));
+            editorButton(modal, QDialogButtonBox::Save)->click();
+        });
+        qobject_cast<QToolButton *>(inGroup(picker, "reviewAnswerTagGroupEditSlider", QStringLiteral("u")))->click();
+        QCOMPARE(store.tagGroups().at(0).scale, (QStringList{partly, mastered, getIt, QStringLiteral("Me")}));
+        QCOMPARE(store.tagGroups().at(1).tags, QStringList{QStringLiteral("AI")});
+
+        // A slider needs two steps.
+        whenModal(dialog, [&](QWidget *modal) {
+            for (int removed = 0; removed < 3; ++removed) stepButton(modal, 0, "reviewSliderStepRemove")->click();
+            QCOMPARE(editorSteps(modal), QStringList{QStringLiteral("Me")});
+            whenModal(qobject_cast<QDialog *>(modal), [](QWidget *message) { qobject_cast<QDialog *>(message)->accept(); });
+            editorButton(modal, QDialogButtonBox::Save)->click();
+            QVERIFY(modal->isVisible());
+            editorButton(modal, QDialogButtonBox::Cancel)->click();
+        });
+        qobject_cast<QToolButton *>(inGroup(picker, "reviewAnswerTagGroupEditSlider", QStringLiteral("u")))->click();
+        QCOMPARE(store.tagGroups().at(0).scale, (QStringList{partly, mastered, getIt, QStringLiteral("Me")}));
+    });
+    overview.m_tagField->click();
+
+    // Next records plain tags: the step is an ordinary tag of the answer.
+    overview.m_nextButton->click();
+    for (const auto &card : store.cards()) {
+        if (card.id() != ids.at(0)) continue;
+        QCOMPARE(card.currentTags(), QStringList{partly});
+    }
+}
+
+// The user's groups (2026-10-20): Understanding and Recall start open, the others closed with
+// their choices named in the header; groups made later start closed too.
+void MainShellTest::testReviewTagGroupsFoldByDefault()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    cardFile.close();
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    const auto slider = [](const char *id, const char *name, const QStringList &steps, const QStringList &free = {}) {
+        return Thoughts::ReviewTags::TagGroup{QString::fromLatin1(id), QString::fromLatin1(name), steps + free, steps};
+    };
+    QVERIFY2(store.saveTagGroups({slider("g-u", "Understanding", {QStringLiteral("Don't get it"), QStringLiteral("Partly"), QStringLiteral("I get it"), QStringLiteral("Deeply")}, {QStringLiteral("Doubtful")}),
+                                  slider("g-r", "Recall", {QStringLiteral("Forgot"), QStringLiteral("Partly recalled"), QStringLiteral("Recalled"), QStringLiteral("Know by heart")}),
+                                  slider("g-i", "Interest", {QStringLiteral("Not interesting"), QStringLiteral("Somewhat"), QStringLiteral("Interesting"), QStringLiteral("Very interesting")}, {QStringLiteral("Submitted")}),
+                                  slider("g-e", "Effort", {QStringLiteral("Skimmed"), QStringLiteral("Read"), QStringLiteral("Studied"), QStringLiteral("Deep dive")}, {QStringLiteral("Asked AI")}),
+                                  slider("g-st", "Structure", {QStringLiteral("Missing steps"), QStringLiteral("Needs reordering"), QStringLiteral("Clear"), QStringLiteral("Exemplary")}),
+                                  slider("g-sy", "Style", {QStringLiteral("Hard to read"), QStringLiteral("Needs editing"), QStringLiteral("Clean"), QStringLiteral("Polished")}),
+                                  slider("g-so", "Source", {QStringLiteral("AI"), QStringLiteral("AI + my edits"), QStringLiteral("Me + AI edits"), QStringLiteral("Me")}, {QStringLiteral("Someone else")})},
+                                 &error), qPrintable(error));
+    // The card's last answer: a step in Understanding, Recall and Interest, plus the free tag
+    // Submitted, which the new answer does not start with.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(cardId, QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(60), nullptr, {},
+                                {QStringLiteral("I get it"), QStringLiteral("Recalled"), QStringLiteral("Somewhat"), QStringLiteral("Submitted")}), qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    overview.revealAnswer();
+    const auto inGroup = [](QWidget *picker, const char *name, const QString &groupId) -> QWidget * {
+        for (auto *widget : picker->findChildren<QWidget *>(QString::fromLatin1(name)))
+            if (widget->property("reviewTagGroup").toString() == groupId) return widget;
+        return nullptr;
+    };
+    const auto inTagDialog = [&overview](std::function<void(QDialog *, QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+            QVERIFY(picker);
+            check(dialog, picker);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+        overview.m_tagField->click();
+    };
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        const auto open = [&](const QString &id) { return inGroup(picker, "reviewAnswerTagGroupBody", id)->isVisible(); };
+        const auto summary = [&](const QString &id) {
+            auto *label = inGroup(picker, "reviewAnswerTagGroupSummary", id);
+            return label->isVisible() ? label->property("fullText").toString() : QString();
+        };
+        QVERIFY(open(QStringLiteral("g-u")) && open(QStringLiteral("g-r")));
+        for (const char *id : {"g-i", "g-e", "g-st", "g-sy", "g-so"}) QVERIFY2(!open(QString::fromLatin1(id)), id);
+        QVERIFY(!inGroup(picker, "reviewAnswerTagGroupBody", QString())); // No Other.
+        // A closed group names its step; one with nothing chosen names nothing.
+        QCOMPARE(summary(QStringLiteral("g-i")), QStringLiteral("Somewhat"));
+        QCOMPARE(summary(QStringLiteral("g-e")), QString());
+        QCOMPARE(summary(QStringLiteral("g-u")), QString()); // Open: its slider shows the step.
+        QCOMPARE(QSet<QString>(overview.m_selectedTags.cbegin(), overview.m_selectedTags.cend()),
+                 (QSet<QString>{QStringLiteral("I get it"), QStringLiteral("Recalled"), QStringLiteral("Somewhat")}));
+        // The dialog fits its content: nothing cut at its bottom.
+        auto *note = picker->findChild<QPlainTextEdit *>(QStringLiteral("reviewAnswerNote"));
+        QVERIFY(note->mapTo(dialog, QPoint(0, note->height())).y() <= dialog->height());
+        if (const QString shots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR"); !shots.isEmpty())
+            QVERIFY(dialog->grab().save(shots + QStringLiteral("/answer-tag-groups-folded-defaults.png")));
+        // Groups are made elsewhere now (the phone, review-tags apply): no New group here.
+        QVERIFY(!picker->findChild<QPushButton *>(QStringLiteral("reviewAnswerNewGroup")));
+    });
+    // A slider made later starts closed.
+    QVERIFY2(store.saveTagGroups(store.tagGroups() << slider("g-m", "Mood", {QStringLiteral("Low"), QStringLiteral("High")}), &error), qPrintable(error));
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        const auto open = [&](const QString &id) { return inGroup(picker, "reviewAnswerTagGroupBody", id)->isVisible(); };
+        QVERIFY(!open(QStringLiteral("g-m")));
+        QVERIFY(open(QStringLiteral("g-u")) && !open(QStringLiteral("g-i")));
+    });
+}
+
+// Adjacent groups with the same section show indented under one header that folds them all;
+// closed, it names what its groups have chosen. Section… puts a group in a section or takes it out.
+void MainShellTest::testReviewTagSections()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    cardFile.close();
+    KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups"));
+    const auto forgetFolding = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewTagGroups")); });
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    const auto group = [](const char *id, const char *name, const char *section, const QStringList &steps, const QStringList &free = {}) {
+        return Thoughts::ReviewTags::TagGroup{QString::fromLatin1(id), QString::fromLatin1(name), steps + free, steps, QString::fromLatin1(section)};
+    };
+    const QString left = QStringLiteral("Work left"), done = QStringLiteral("Work done");
+    // Content is a second Work left run: Interest (in no section) stands between.
+    QVERIFY2(store.saveTagGroups({group("g-r", "Recall", "", {QStringLiteral("Forgot"), QStringLiteral("Recalled")}),
+                                  group("g-st", "Structure", "Work left", {QStringLiteral("Missing steps"), QStringLiteral("Clear")}),
+                                  group("g-sy", "Style", "Work left", {QStringLiteral("Hard to read"), QStringLiteral("Clean")}, {QStringLiteral("Wordy")}),
+                                  group("g-i", "Interest", "", {QStringLiteral("Meh"), QStringLiteral("Interesting")}),
+                                  group("g-co", "Content", "Work left", {QStringLiteral("Thin"), QStringLiteral("Complete")}),
+                                  group("g-sd", "Structure done", "Work done", {QStringLiteral("Nothing"), QStringLiteral("Reordered")}),
+                                  group("g-yd", "Style done", "Work done", {}, {QStringLiteral("Edited")})},
+                                 &error), qPrintable(error));
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(cardId, QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(60), nullptr, {},
+                                {QStringLiteral("Recalled"), QStringLiteral("Missing steps"), QStringLiteral("Clean"), QStringLiteral("Wordy")}), qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    overview.revealAnswer();
+    const auto inGroup = [](QWidget *picker, const char *name, const QString &groupId) -> QWidget * {
+        for (auto *widget : picker->findChildren<QWidget *>(QString::fromLatin1(name)))
+            if (widget->property("reviewTagGroup").toString() == groupId) return widget;
+        return nullptr;
+    };
+    const auto sectionWidgets = [](QWidget *picker, const char *name, const QString &section) {
+        QList<QWidget *> result;
+        for (auto *widget : picker->findChildren<QWidget *>(QString::fromLatin1(name)))
+            if (widget->property("reviewTagSection").toString() == section) result.append(widget);
+        // In the order shown.
+        std::sort(result.begin(), result.end(), [picker](QWidget *a, QWidget *b) { return a->mapTo(picker, QPoint()).y() < b->mapTo(picker, QPoint()).y(); });
+        return result;
+    };
+    const auto inTagDialog = [&overview](std::function<void(QDialog *, QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+            QVERIFY(picker);
+            check(dialog, picker);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+        overview.m_tagField->click();
+    };
+    const auto whenModal = [](QDialog *dialog, std::function<void(QWidget *)> handle) {
+        auto *poll = new QTimer;
+        poll->setInterval(10);
+        QObject::connect(poll, &QTimer::timeout, [poll, dialog, handle] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal || modal == dialog || !modal->isVisible()) return;
+            poll->stop();
+            poll->deleteLater();
+            handle(modal);
+        });
+        poll->start();
+    };
+    const auto sectionAction = [&](QWidget *picker, const QString &groupId) {
+        return inGroup(picker, "reviewAnswerTagGroupMenu", groupId)->findChild<QAction *>(QStringLiteral("reviewTagGroupSection"));
+    };
+
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        // Two Work left headers (Interest splits them), one Work done; each open by default.
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionRow", left).size(), 2);
+        // Work done holds a slider and a group of tags: only the slider is listed, under one header.
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionRow", done).size(), 1);
+        const auto doneBodies = sectionWidgets(picker, "reviewAnswerTagSectionBody", done);
+        QVERIFY(doneBodies.at(0)->isAncestorOf(inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-sd"))));
+        QVERIFY(!inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-yd")));
+        QVERIFY(sectionWidgets(picker, "reviewAnswerTagSectionRow", QString()).isEmpty());
+        const auto bodies = sectionWidgets(picker, "reviewAnswerTagSectionBody", left);
+        QCOMPARE(bodies.size(), 2);
+        QVERIFY(bodies.at(0)->isVisible() && bodies.at(1)->isVisible());
+        auto *firstRow = qobject_cast<QPushButton *>(sectionWidgets(picker, "reviewAnswerTagSectionRow", left).at(0));
+        QVERIFY(firstRow->isChecked());
+        // The groups sit in the section's body, indented under its header, in layout order.
+        auto *structureRow = inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-st"));
+        auto *styleRow = inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-sy"));
+        QVERIFY(bodies.at(0)->isAncestorOf(structureRow) && bodies.at(0)->isAncestorOf(styleRow));
+        QVERIFY(bodies.at(1)->isAncestorOf(inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-co"))));
+        QVERIFY(!bodies.at(0)->isAncestorOf(inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-i"))));
+        QVERIFY(structureRow->mapTo(picker, QPoint()).x() > firstRow->mapTo(picker, QPoint()).x() + 8);
+        QVERIFY(firstRow->mapTo(picker, QPoint()).y() < structureRow->mapTo(picker, QPoint()).y());
+        QVERIFY(structureRow->mapTo(picker, QPoint()).y() < styleRow->mapTo(picker, QPoint()).y());
+        QVERIFY(styleRow->mapTo(picker, QPoint()).y() < inGroup(picker, "reviewAnswerTagGroupRow", QStringLiteral("g-i"))->mapTo(picker, QPoint()).y());
+        // The header: bold, a little larger than a group's name; no summary while open.
+        auto *title = static_cast<QLabel *>(sectionWidgets(picker, "reviewAnswerTagSectionTitle", left).at(0));
+        QCOMPARE(title->text(), left);
+        QVERIFY(title->font().bold());
+        QVERIFY(QFontInfo(title->font()).pointSizeF() > QFontInfo(inGroup(picker, "reviewAnswerTagGroup", QStringLiteral("g-st"))->font()).pointSizeF());
+        QVERIFY(!sectionWidgets(picker, "reviewAnswerTagSectionSummary", left).at(0)->isVisible());
+        // A group in a section still folds on its own.
+        QVERIFY(!inGroup(picker, "reviewAnswerTagGroupBody", QStringLiteral("g-st"))->isVisible());
+        static_cast<QPushButton *>(structureRow)->click();
+        QVERIFY(inGroup(picker, "reviewAnswerTagGroupBody", QStringLiteral("g-st"))->isVisible());
+        static_cast<QPushButton *>(structureRow)->click();
+
+        // Closed, the header hides its groups and names the steps they have chosen (the free tag
+        // Wordy of the last answer is not carried over); one with nothing chosen names nothing.
+        firstRow->click();
+        QVERIFY(!bodies.at(0)->isVisible() && !bodies.at(1)->isVisible()); // Remembered by name: both runs close.
+        QVERIFY(!firstRow->isChecked());
+        auto *summary = static_cast<QLabel *>(sectionWidgets(picker, "reviewAnswerTagSectionSummary", left).at(0));
+        QVERIFY(summary->isVisible());
+        const QString expected = QStringLiteral("Structure: Missing steps · Style: Clean");
+        QCOMPARE(summary->property("fullText").toString(), expected);
+        QCOMPARE(firstRow->toolTip(), expected);
+        QVERIFY(!sectionWidgets(picker, "reviewAnswerTagSectionSummary", left).at(1)->isVisible());
+        QVERIFY(KConfigGroup(KSharedConfig::openConfig(), QStringLiteral("ReviewTagGroups")).readEntry("ClosedSections", QStringList()).contains(left));
+        // Work done stays open: sections fold by name.
+        QVERIFY(sectionWidgets(picker, "reviewAnswerTagSectionBody", done).at(0)->isVisible());
+        // A long summary is cut at its end rather than widening the window.
+        QCOMPARE(summary->minimumSizeHint().width(), 0);
+        if (const QString shots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR"); !shots.isEmpty())
+            QVERIFY(dialog->grab().save(shots + QStringLiteral("/answer-tag-sections-closed.png")));
+    });
+    // Reopened, the section is still closed; its summary follows the answer.
+    inTagDialog([&](QDialog *, QWidget *picker) {
+        const auto bodies = sectionWidgets(picker, "reviewAnswerTagSectionBody", left);
+        QVERIFY(!bodies.at(0)->isVisible());
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionSummary", left).at(0)->property("fullText").toString(),
+                 QStringLiteral("Structure: Missing steps · Style: Clean"));
+        static_cast<QPushButton *>(sectionWidgets(picker, "reviewAnswerTagSectionRow", left).at(0))->click();
+        QVERIFY(bodies.at(0)->isVisible());
+        QVERIFY(!KConfigGroup(KSharedConfig::openConfig(), QStringLiteral("ReviewTagGroups")).readEntry("ClosedSections", QStringList()).contains(left));
+    });
+
+    // Section…: Interest joins Work left (picked), so the three runs become one; then leaves it.
+    inTagDialog([&](QDialog *dialog, QWidget *picker) {
+        QVERIFY(sectionAction(picker, QStringLiteral("g-i")));
+        QVERIFY(!inGroup(picker, "reviewAnswerTagGroupMenu", QString())); // No Other.
+        whenModal(dialog, [&](QWidget *modal) {
+            QCOMPARE(modal->objectName(), QStringLiteral("reviewTagSectionDialog"));
+            QVERIFY(modal->findChild<QLineEdit *>(QStringLiteral("reviewTagSectionName"))->text().isEmpty());
+            QVERIFY(!modal->findChild<QPushButton *>(QStringLiteral("reviewTagSectionRemove")));
+            QStringList picks;
+            QPushButton *pick = nullptr;
+            for (auto *button : modal->findChildren<QPushButton *>(QStringLiteral("reviewTagSectionPick"))) {
+                picks.append(button->property("reviewTagSection").toString());
+                if (button->property("reviewTagSection").toString() == QStringLiteral("Work left")) pick = button;
+            }
+            QCOMPARE(picks, (QStringList{QStringLiteral("Work left"), QStringLiteral("Work done")}));
+            pick->click();
+        });
+        sectionAction(picker, QStringLiteral("g-i"))->trigger();
+        QCOMPARE(store.tagGroups().at(3).section, left);
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionRow", left).size(), 1);
+        QCOMPARE(store.tagGroups().at(1).section, left); // The other groups keep theirs.
+        QCOMPARE(store.tagGroups().at(5).section, done);
+        // A typed name, trimmed; the current one is not offered as a pick.
+        whenModal(dialog, [&](QWidget *modal) {
+            auto *name = modal->findChild<QLineEdit *>(QStringLiteral("reviewTagSectionName"));
+            QCOMPARE(name->text(), left);
+            for (auto *button : modal->findChildren<QPushButton *>(QStringLiteral("reviewTagSectionPick")))
+                QVERIFY(button->property("reviewTagSection").toString() != left);
+            name->setText(QStringLiteral("  Taste  "));
+            modal->findChild<QDialogButtonBox *>(QStringLiteral("reviewTagSectionButtons"))->button(QDialogButtonBox::Ok)->click();
+        });
+        sectionAction(picker, QStringLiteral("g-i"))->trigger();
+        QCOMPARE(store.tagGroups().at(3).section, QStringLiteral("Taste"));
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionRow", QStringLiteral("Taste")).size(), 1);
+        QCOMPARE(sectionWidgets(picker, "reviewAnswerTagSectionRow", left).size(), 2);
+        // No Section.
+        whenModal(dialog, [&](QWidget *modal) { modal->findChild<QPushButton *>(QStringLiteral("reviewTagSectionRemove"))->click(); });
+        sectionAction(picker, QStringLiteral("g-i"))->trigger();
+        QVERIFY(store.tagGroups().at(3).section.isEmpty());
+        QVERIFY(sectionWidgets(picker, "reviewAnswerTagSectionRow", QStringLiteral("Taste")).isEmpty());
+        // Other edits keep the sections: a rename, a move.
+        QStringList sections;
+        for (const auto &stored : store.tagGroups()) sections.append(stored.section);
+        QCOMPARE(sections, (QStringList{QString(), left, left, QString(), left, done, done}));
+        inGroup(picker, "reviewAnswerTagGroupMenu", QStringLiteral("g-sy"))->findChild<QAction *>(QStringLiteral("reviewTagGroupMoveUp"))->trigger();
+        QCOMPARE(store.tagGroups().at(1).id, QStringLiteral("g-sy"));
+        QCOMPARE(store.tagGroups().at(1).section, left);
+        QCOMPARE(store.tagGroups().at(2).section, left);
+    });
+}
+
+// thoughtsctl review-tags apply: the running app records the plan as the tag picker would.
+void MainShellTest::testReviewTagsApplyCommand()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto request = [](const QJsonObject &plan) {
+        return QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("review-tags-apply")}, {QStringLiteral("plan"), plan}};
+    };
+    QCOMPARE(shell->handleSyncCommandRequest(request({{QStringLiteral("schema_version"), 1}})).value(QStringLiteral("error_code")).toString(),
+             QStringLiteral("invalid_plan"));
+    const QJsonObject plan{{QStringLiteral("schema_version"), 1}, {QStringLiteral("groups"), QJsonArray{
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("Recall")}, {QStringLiteral("scale"), QJsonArray{QStringLiteral("Forgot"), QStringLiteral("Recalled")}}},
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("Study")}, {QStringLiteral("tags"), QJsonArray{QStringLiteral("Skimmed")}}}}}};
+    const QJsonObject result = shell->handleSyncCommandRequest(request(plan));
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QVERIFY(result.value(QStringLiteral("applied")).toObject().value(QStringLiteral("groups_saved")).toBool());
+    const auto groups = Thoughts::ReviewStore(ShellUtils::docsRoot()).tagGroups();
+    QCOMPARE(groups.size(), 2);
+    QCOMPARE(groups.at(0).name, QStringLiteral("Recall"));
+    QCOMPARE(groups.at(0).scale, (QStringList{QStringLiteral("Forgot"), QStringLiteral("Recalled")}));
+    // Once applied, applying again changes nothing.
+    const QJsonObject again = shell->handleSyncCommandRequest(request(plan));
+    QVERIFY(again.value(QStringLiteral("accepted")).toBool());
+    QVERIFY(!again.value(QStringLiteral("applied")).toObject().value(QStringLiteral("groups_saved")).toBool());
+    delete shell;
+}
+
+void MainShellTest::testReviewBarStartsWithLastAnswerTags()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const auto newCard = [&]() {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        if (!cardFile.open(QIODevice::WriteOnly)) return QString();
+        cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                  {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                  {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+        return cardId;
+    };
+    const QString skipped = newCard(), undone = newCard(), allUndone = newCard(), merged = newCard(), legacySkip = newCard(), untagged = newCard(),
+                  fresh = newCard(), other = newCard();
+    for (const QString &id : {skipped, undone, allUndone, merged, legacySkip, untagged, fresh, other}) QVERIFY(!id.isEmpty());
+
+    // ReviewTags::onlySteps keeps, in their order, the tags that are a slider's step, by an old
+    // merged name too; free tags and tags of a group without a slider are dropped.
+    {
+        const QList<Thoughts::ReviewTags::TagGroup> groups{
+            {QStringLiteral("r"), QStringLiteral("Recall"), {QStringLiteral("Forgot"), QStringLiteral("Recalled")}, {QStringLiteral("Forgot"), QStringLiteral("Recalled")}},
+            {QStringLiteral("m"), QStringLiteral("Mood"), {QStringLiteral("happy")}}};
+        const QHash<QString, QString> merges{{QStringLiteral("remembered"), QStringLiteral("Recalled")}};
+        QCOMPARE(Thoughts::ReviewTags::onlySteps({QStringLiteral("Asked AI"), QStringLiteral("remembered"), QStringLiteral("happy"), QStringLiteral("Forgot")}, groups, merges),
+                 QStringList({QStringLiteral("remembered"), QStringLiteral("Forgot")}));
+        QVERIFY(Thoughts::ReviewTags::onlySteps({QStringLiteral("Asked AI"), QStringLiteral("happy")}, groups, merges).isEmpty());
+        QVERIFY(Thoughts::ReviewTags::onlySteps({QStringLiteral("Recalled")}, {}, {}).isEmpty());
+    }
+
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    // Four sliders; Recall and Understanding start open, Effort and Interest closed.
+    const auto slider = [](const char *id, const char *name, const QStringList &steps) {
+        return Thoughts::ReviewTags::TagGroup{QString::fromLatin1(id), QString::fromLatin1(name), steps, steps};
+    };
+    QVERIFY2(store.saveTagGroups({slider("g-r", "Recall", {QStringLiteral("alpha"), QStringLiteral("beta")}),
+                                  slider("g-u", "Understanding", {QStringLiteral("gamma"), QStringLiteral("delta")}),
+                                  slider("g-e", "Effort", {QStringLiteral("Hard"), QStringLiteral("Easy")}),
+                                  slider("g-i", "Interest", {QStringLiteral("omega"), QStringLiteral("zeta")})},
+                                 &error), qPrintable(error));
+    // Every answer is due again already, so each card can be reviewed now.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    const auto answer = [&](const QString &id, int minute, const QStringList &tags, QString *eventId = nullptr, const QString &action = {}) {
+        return store.recordRating(id, QStringLiteral("custom_interval"), earlier.addSecs(60 * minute), &error, earlier.addSecs(60 * minute + 30), eventId, action, tags);
+    };
+    // The latest answer decides, all its steps but not its free tag (loose); a later Skip only postpones.
+    QVERIFY2(answer(skipped, 0, {QStringLiteral("alpha")}), qPrintable(error));
+    QVERIFY2(answer(skipped, 1, {QStringLiteral("beta"), QStringLiteral("gamma"), QStringLiteral("loose")}), qPrintable(error));
+    Thoughts::ReviewSkipBatch batch;
+    QVERIFY2(store.skip(skipped, Thoughts::ReviewSkipScope::Card, earlier.addSecs(180), &batch, &error, earlier.addSecs(120)), qPrintable(error));
+    // An undone answer is not the last one: the one before it is.
+    QString undoneEvent;
+    QVERIFY2(answer(undone, 0, {QStringLiteral("alpha")}), qPrintable(error));
+    QVERIFY2(answer(undone, 1, {QStringLiteral("wrong")}, &undoneEvent), qPrintable(error));
+    QVERIFY2(store.retractRating(undone, undoneEvent, earlier.addSecs(120), &error), qPrintable(error));
+    // With its only answer undone a card was never answered.
+    QVERIFY2(answer(allUndone, 0, {QStringLiteral("beta")}, &undoneEvent), qPrintable(error));
+    QVERIFY2(store.retractRating(allUndone, undoneEvent, earlier.addSecs(60), &error), qPrintable(error));
+    // A merged step is chosen under its new name.
+    QVERIFY2(answer(merged, 0, {QStringLiteral("tough"), QStringLiteral("gamma")}), qPrintable(error));
+    QVERIFY2(store.recordTagMerge({QStringLiteral("tough")}, QStringLiteral("Hard"), &error), qPrintable(error));
+    // Older clients recorded a skip as an answer; it is still not one.
+    QVERIFY2(answer(legacySkip, 0, {QStringLiteral("gamma")}), qPrintable(error));
+    QVERIFY2(answer(legacySkip, 1, {}, nullptr, QStringLiteral("skip")), qPrintable(error));
+    // The last answer had no tag, so none is chosen, whatever came before.
+    QVERIFY2(answer(untagged, 0, {QStringLiteral("alpha")}), qPrintable(error));
+    QVERIFY2(answer(untagged, 1, {}), qPrintable(error));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    const auto fieldValue = [](QPushButton *field) { return field->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(); };
+    const auto barOf = [&](const QString &id) {
+        overview.showReviewLanding();
+        overview.reviewCard(id);
+        if (overview.m_currentReview < 0 || overview.m_dueCards.at(overview.m_currentReview).id() != id) return QStringList{QStringLiteral("<not shown>")};
+        overview.revealAnswer();
+        return overview.m_selectedTags;
+    };
+    QCOMPARE(barOf(skipped), QStringList({QStringLiteral("beta"), QStringLiteral("gamma")}));
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("beta · gamma"));
+    QCOMPARE(barOf(undone), QStringList{QStringLiteral("alpha")});
+    QCOMPARE(barOf(allUndone), QStringList{});
+    QCOMPARE(barOf(merged), QStringList({QStringLiteral("Hard"), QStringLiteral("gamma")}));
+    QCOMPARE(barOf(legacySkip), QStringList{QStringLiteral("gamma")});
+    QCOMPARE(barOf(untagged), QStringList{});
+    QVERIFY2(overview.m_currentState->text().startsWith(QStringLiteral("Current: Not rated")), qPrintable(overview.m_currentState->text()));
+    QCOMPARE(barOf(fresh), QStringList{});
+    QCOMPARE(overview.m_currentState->text(), QStringLiteral("Current: new card"));
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("Not rated"));
+    // The interval default is unchanged: two weeks for a new card.
+    QCOMPARE(fieldValue(overview.m_intervalField), QStringLiteral("2 weeks"));
+
+    // Next with no rating records an answer with no tag: an empty list, not an older client's Correct.
+    const auto usageBefore = store.reviewTagUsage();
+    QVERIFY(overview.m_nextButton->isEnabled());
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+    const auto cardOf = [&store](const QString &id) {
+        for (const auto &card : store.cards())
+            if (card.id() == id) return card;
+        return Thoughts::ReviewCard{};
+    };
+    QCOMPARE(cardOf(fresh).schedule.reviewCount, 1);
+    QCOMPARE(cardOf(fresh).history.size(), 1);
+    const QJsonObject untaggedEvent = cardOf(fresh).history.constFirst();
+    QCOMPARE(untaggedEvent.value(QStringLiteral("rating")).toString(), QStringLiteral("custom_interval"));
+    QVERIFY(untaggedEvent.value(QStringLiteral("review_tags")).isArray());
+    QVERIFY(untaggedEvent.value(QStringLiteral("review_tags")).toArray().isEmpty());
+    QVERIFY(!untaggedEvent.contains(QStringLiteral("review_action")));
+    QVERIFY(cardOf(fresh).currentTags().isEmpty());
+    QVERIFY(cardOf(fresh).wasAnswered());
+    QCOMPARE(store.reviewTagUsage(), usageBefore);
+    // Its history says so.
+    {
+        Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+        browser.selectCard(fresh);
+        QTRY_VERIFY(browser.selectedBrowseCard());
+        QTest::mouseClick(browser.m_browseHistoryButton, Qt::LeftButton);
+        const QString history = browser.m_browseHistory->toPlainText();
+        QVERIFY2(history.contains(QStringLiteral("Not rated · ")), qPrintable(history));
+        QVERIFY2(!history.contains(QStringLiteral("Correct")), qPrintable(history));
+        // The browser's state reads "Not rated", not New: the card was answered.
+        browser.setStateFilter(QStringLiteral("seen"));
+        QTRY_VERIFY(browser.selectedBrowseCard());
+        bool listed = false;
+        for (int row = 0; row < browser.m_browseTable->topLevelItemCount(); ++row) {
+            auto *item = browser.m_browseTable->topLevelItem(row);
+            for (int column = 0; column < item->columnCount(); ++column)
+                listed = listed || item->text(column) == QStringLiteral("Not rated");
+        }
+        QVERIFY(listed);
+    }
+
+    const auto openPicker = [&overview](std::function<void(QWidget *)> check) {
+        QTimer::singleShot(0, &overview, [&overview, check] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+            QVERIFY(dialog);
+            check(dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags")));
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+        });
+        overview.m_tagField->click();
+    };
+    const auto scaleOf = [](QWidget *picker, const QString &groupId) -> QWidget * {
+        for (auto *scale : picker->findChildren<QWidget *>(QStringLiteral("reviewAnswerTagScale")))
+            if (scale->property("reviewTagGroup").toString() == groupId) return scale;
+        return nullptr;
+    };
+    const auto stepTexts = [&scaleOf](QWidget *picker, const QString &groupId) { return scaleOf(picker, groupId)->property("reviewTagStepTexts").toStringList(); };
+    const auto valueOf = [&scaleOf](QWidget *picker, const QString &groupId) { return scaleOf(picker, groupId)->property("reviewTagScaleValue").toInt(); };
+    // Clicks step @p index of a slider, opening its group first when it is closed.
+    const auto clickStep = [&scaleOf](QWidget *picker, const QString &groupId, int index) {
+        QWidget *scale = scaleOf(picker, groupId);
+        if (!scale->isVisible()) {
+            for (auto *row : picker->findChildren<QPushButton *>(QStringLiteral("reviewAnswerTagGroupRow")))
+                if (row->property("reviewTagGroup").toString() == groupId) QTest::mouseClick(row, Qt::LeftButton);
+        }
+        QVERIFY(scale->isVisible());
+        QTest::mouseClick(scale, Qt::LeftButton, Qt::NoModifier, QPoint(scale->property("tickCenters").toList().at(index).toInt(), 12));
+    };
+    // A starting step the picker's counts do not know yet (answered elsewhere since they were
+    // taken) is still shown chosen.
+    QCOMPARE(barOf(merged), QStringList({QStringLiteral("Hard"), QStringLiteral("gamma")}));
+    openPicker([&](QWidget *picker) {
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-i")), QStringList({QStringLiteral("omega (0)"), QStringLiteral("zeta (0)")}));
+        QCOMPARE(valueOf(picker, QStringLiteral("g-i")), -1);
+    });
+    QVERIFY2(answer(other, 2, {QStringLiteral("omega")}), qPrintable(error));
+    QCOMPARE(barOf(other), QStringList{QStringLiteral("omega")});
+    openPicker([&](QWidget *picker) {
+        QCOMPARE(valueOf(picker, QStringLiteral("g-i")), 0);
+        // Changing the selection keeps it.
+        clickStep(picker, QStringLiteral("g-u"), 0);
+    });
+    QVERIFY(overview.m_selectedTags.contains(QStringLiteral("omega")) && overview.m_selectedTags.contains(QStringLiteral("gamma")));
+
+    // An answer given to a whole document counts for every card it covered.
+    overview.showReviewLanding();
+    overview.reviewCard(skipped);
+    overview.revealAnswer();
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewAnswerDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipDocument"))->setChecked(true);
+        dialog->findChild<QRadioButton *>(QStringLiteral("reviewSkipAllCards"))->setChecked(true);
+        // From beta and gamma to alpha and delta.
+        auto *picker = dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"));
+        clickStep(picker, QStringLiteral("g-r"), 0);
+        clickStep(picker, QStringLiteral("g-u"), 1);
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    overview.chooseAnswer(overview.m_selectedTags);
+    QCOMPARE(overview.m_scopedRatingEvents.size(), 1);
+    QCOMPARE(overview.m_scopedRatingEvents.constBegin()->size(), 8);
+    // Every card moved to the new steps in the session's counts, as the store counts them; the
+    // tags no card has now stay listed with 0.
+    QCOMPARE(overview.tagUsage().value(QStringLiteral("delta")), 8);
+    QCOMPARE(overview.tagUsage().value(QStringLiteral("alpha")), 8);
+    QCOMPARE(overview.tagUsage().value(QStringLiteral("gamma"), -1), 0);
+    QCOMPARE(overview.tagUsage(), store.reviewTagUsage());
+    const QStringList documentTags{QStringLiteral("alpha"), QStringLiteral("delta")};
+    for (const auto &card : store.cards()) {
+        auto tags = card.currentTags();
+        std::sort(tags.begin(), tags.end());
+        QCOMPARE(tags, documentTags);
+    }
+    // Undoing it gives each card back its own last answer, free tags included.
+    QVERIFY(overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewUndoAction"))->isEnabled());
+    overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewUndoAction"))->trigger();
+    QCOMPARE(cardOf(other).currentTags(), QStringList{QStringLiteral("omega")});
+    QCOMPARE(cardOf(undone).currentTags(), QStringList{QStringLiteral("alpha")});
+    QCOMPARE(cardOf(skipped).currentTags(), QStringList({QStringLiteral("beta"), QStringLiteral("gamma"), QStringLiteral("loose")}));
+    QVERIFY(cardOf(fresh).currentTags().isEmpty() && cardOf(fresh).wasAnswered());
+    QCOMPARE(barOf(other), QStringList{QStringLiteral("omega")});
+
+    // The sheet counts cards per current step: gamma 3 (skipped, merged, legacySkip), omega 1
+    // (this card), alpha 1 (undone; untagged's alpha is history). This card has omega: chosen, it
+    // keeps its count; cleared, one fewer. gamma, which it lacks, shows one more chosen.
+    openPicker([&](QWidget *picker) {
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-i")).constFirst(), QStringLiteral("omega (1)"));
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-u")).constFirst(), QStringLiteral("gamma (3)"));
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-r")).constFirst(), QStringLiteral("alpha (1)"));
+        clickStep(picker, QStringLiteral("g-i"), 0);
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-i")).constFirst(), QStringLiteral("omega (0)"));
+        clickStep(picker, QStringLiteral("g-u"), 0);
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-u")).constFirst(), QStringLiteral("gamma (4)"));
+        QCOMPARE(stepTexts(picker, QStringLiteral("g-r")).constFirst(), QStringLiteral("alpha (1)"));
+    });
+    QCOMPARE(overview.m_selectedTags, QStringList{QStringLiteral("gamma")});
+    // Next moves the card from omega to gamma in the session's counts, as the store counts it.
+    overview.m_nextButton->click();
+    QCOMPARE(cardOf(other).currentTags(), QStringList{QStringLiteral("gamma")});
+    QCOMPARE(overview.tagUsage().value(QStringLiteral("gamma")), 4);
+    QCOMPARE(overview.tagUsage().value(QStringLiteral("omega"), -1), 0);
+    QCOMPARE(overview.tagUsage(), store.reviewTagUsage());
+}
+
+namespace
+{
+// Review cards of autotests/data/file1.pdf in @p root, each due now; returns their IDs.
+QStringList twoStepCards(const QString &root, int count, QString *pdfSha256)
+{
+    QFile pdf(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    if (!pdf.open(QIODevice::ReadOnly)) return {};
+    *pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(root).filePath(QStringLiteral("reviews/cards"));
+    QDir().mkpath(cardsDirectory);
+    QStringList ids;
+    for (int index = 0; index < count; ++index) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), *pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), QStringLiteral("Question %1?").arg(index + 1)},
+                                  {QStringLiteral("selected_text"), QStringLiteral("Answer %1").arg(index + 1)}};
+        QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        if (!cardFile.open(QIODevice::WriteOnly)) return {};
+        cardFile.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                 {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                 {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+        ids.append(cardId);
+    }
+    return ids;
+}
+
+// Feeling asked before the answer only, Recall before and after, Understanding after.
+QList<Thoughts::ReviewTags::TagGroup> twoStepGroups()
+{
+    const auto slider = [](const char *id, const char *name, const QStringList &steps, const QString &phase) {
+        Thoughts::ReviewTags::TagGroup group{QString::fromLatin1(id), QString::fromLatin1(name), steps, steps};
+        group.phase = phase;
+        return group;
+    };
+    return {slider("g-f", "Feeling", {QStringLiteral("Meh"), QStringLiteral("Good")}, Thoughts::ReviewTags::beforePhase()),
+            slider("g-r", "Recall", {QStringLiteral("Forgot"), QStringLiteral("Partly recalled"), QStringLiteral("Recalled")}, Thoughts::ReviewTags::beforeAndAfterPhase()),
+            slider("g-u", "Understanding", {QStringLiteral("Lost"), QStringLiteral("I get it")}, QString())};
+}
+
+QWidget *beforeScale(QWidget *panel, const QString &groupId)
+{
+    for (auto *scale : panel->findChildren<QWidget *>(QStringLiteral("reviewBeforeTagScale"))) {
+        if (scale->property("reviewTagGroup").toString() == groupId && scale->parentWidget()->objectName() == QLatin1String("reviewBeforeGroupList")) return scale;
+    }
+    return nullptr;
+}
+}
+
+// review-phases spec, section 2: before the answer the groups asked before it and a before note,
+// locked once the answer is shown; the after step leaves out the before-only groups and starts
+// the groups asked before and after at the prediction; the answer records both steps.
+void MainShellTest::testReviewInTwoSteps()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 2, &pdfSha256);
+    QCOMPARE(ids.size(), 2);
+    const QString answered = ids.at(0), fresh = ids.at(1);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups(twoStepGroups(), &error), qPrintable(error));
+    // An older answer, given in one step, is due again already.
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(answered, QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(30), nullptr, {},
+                                {QStringLiteral("Good"), QStringLiteral("Recalled"), QStringLiteral("I get it")}, {{QStringLiteral("note"), QStringLiteral("old note")}}),
+             qPrintable(error));
+
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.reviewCard(answered);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), answered);
+
+    // The before panel: Feeling and Recall, nothing picked, an empty before note.
+    auto *panel = overview.m_beforePanel;
+    QVERIFY(panel->isVisible());
+    auto *feeling = beforeScale(panel, QStringLiteral("g-f"));
+    auto *recall = beforeScale(panel, QStringLiteral("g-r"));
+    QVERIFY(feeling && recall);
+    QVERIFY(!beforeScale(panel, QStringLiteral("g-u")));
+    QCOMPARE(feeling->property("reviewTagScaleValue").toInt(), -1);
+    QCOMPARE(recall->property("reviewTagScaleValue").toInt(), -1);
+    QVERIFY(overview.m_beforeNote->isVisible());
+    QVERIFY(overview.m_beforeNote->toPlainText().isEmpty());
+    QVERIFY(overview.m_beforeSummary->isHidden());
+    // The after step starts from the last answer without its Feeling.
+    QCOMPARE(overview.m_selectedTags, (QStringList{QStringLiteral("Recalled"), QStringLiteral("I get it")}));
+    // A prediction is never shown before the answer.
+    overview.m_predictions.insert(answered, {QStringLiteral("g-r"), {QStringLiteral("Forgot"), QStringLiteral("Partly recalled"), QStringLiteral("Recalled")},
+                                             QDateTime::currentDateTimeUtc(), {}, {}, true, nullptr});
+    overview.updateBeforePanel();
+    QVERIFY(overview.m_predictionLine->isHidden());
+
+    // Recall first, then Feeling: recorded in group order.
+    QTest::keyClick(recall, Qt::Key_Home);
+    QTest::keyClick(recall, Qt::Key_Right);
+    QTest::keyClick(feeling, Qt::Key_Home);
+    overview.m_beforeNote->setPlainText(QStringLiteral("not sure"));
+    QCOMPARE(overview.m_before.tags, (QStringList{QStringLiteral("Meh"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(overview.m_before.note, QStringLiteral("not sure"));
+
+    // Reveal locks it: one line, the agent's prediction (pending) under it; Recall starts at the prediction.
+    overview.toggleReveal();
+    QVERIFY(overview.m_before.answerShownAt.isValid());
+    QVERIFY(!overview.m_beforeGroups->isVisible());
+    QVERIFY(!overview.m_beforeNote->isVisible());
+    QVERIFY(overview.m_beforeSummary->isVisible());
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Before: Meh · Partly recalled — not sure"));
+    QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent: predicting…"));
+    QVERIFY(overview.m_predictionLine->isVisible());
+    QCOMPARE(overview.m_selectedTags, (QStringList{QStringLiteral("I get it"), QStringLiteral("Partly recalled")}));
+    // Picks after this point are never "before".
+    const QDateTime shownAt = overview.m_before.answerShownAt;
+    QTest::keyClick(feeling, Qt::Key_End);
+    overview.m_beforeNote->setPlainText(QStringLiteral("changed my mind"));
+    QCOMPARE(overview.m_before.tags, (QStringList{QStringLiteral("Meh"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(overview.m_before.note, QStringLiteral("not sure"));
+    // The prediction arrives after the answer was shown; Hide keeps the panel locked.
+    overview.applyRecallPrediction(answered, {{QStringLiteral("prediction_id"), QStringLiteral("p-1")}, {QStringLiteral("tag"), QStringLiteral("Recalled")},
+                                              {QStringLiteral("reason"), QStringLiteral("Recalled it last time.")}, {QStringLiteral("model"), QStringLiteral("m")},
+                                              {QStringLiteral("made_at"), shownAt.addSecs(5).toString(Qt::ISODateWithMs)}});
+    QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent predicted: Recalled — Recalled it last time."));
+    overview.toggleReveal();
+    QVERIFY(!overview.m_answerPeeked);
+    QVERIFY(overview.m_beforeSummary->isVisible());
+    QCOMPARE(overview.m_before.answerShownAt, shownAt);
+
+    // The after step: the tag sheet leaves out Feeling and asks Recall again.
+    overview.revealAnswer();
+    QTimer::singleShot(0, &overview, [&overview] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewTagsDialog"));
+        QVERIFY(dialog);
+        QStringList listed;
+        for (auto *scale : dialog->findChildren<QWidget *>(QStringLiteral("reviewAnswerTagScale"))) listed.append(scale->property("reviewTagGroup").toString());
+        QCOMPARE(listed, (QStringList{QStringLiteral("g-r"), QStringLiteral("g-u")}));
+        // Each group's menu says when it is asked.
+        QAction *asked = nullptr;
+        for (auto *button : dialog->findChildren<QToolButton *>(QStringLiteral("reviewAnswerTagGroupMenu"))) {
+            if (button->property("reviewTagGroup").toString() != QLatin1String("g-r")) continue;
+            for (auto *action : button->menu()->findChildren<QAction *>(QStringLiteral("reviewTagGroupPhase")))
+                if (action->isChecked()) asked = action;
+        }
+        QVERIFY(asked);
+        QCOMPARE(asked->property("reviewTagPhase").toString(), Thoughts::ReviewTags::beforeAndAfterPhase());
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+    });
+    overview.m_tagField->click();
+    // The actual recall, and the after note.
+    overview.m_selectedTags = {QStringLiteral("Recalled"), QStringLiteral("I get it")};
+    overview.m_groupNotes = {{Thoughts::ReviewTags::answerNoteKey(), QStringLiteral("ok")}};
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+    QVERIFY(!overview.m_beforePanel->isVisible());
+
+    const auto cardOf = [&store](const QString &id) {
+        for (const auto &card : store.cards())
+            if (card.id() == id) return card;
+        return Thoughts::ReviewCard{};
+    };
+    const Thoughts::ReviewCard card = cardOf(answered);
+    QCOMPARE(card.history.size(), 2);
+    const QJsonObject event = card.history.constLast();
+    // Reviewed with Review now, not from the due cards.
+    QCOMPARE(event.value(QStringLiteral("review_entry")).toString(), QStringLiteral("review_now"));
+    QCOMPARE(event.value(QStringLiteral("review_tags")).toArray(), (QJsonArray{QStringLiteral("Meh"), QStringLiteral("Recalled"), QStringLiteral("I get it")}));
+    QCOMPARE(event.value(QStringLiteral("review_group_notes")).toObject(),
+             (QJsonObject{{QStringLiteral("before_note"), QStringLiteral("not sure")}, {QStringLiteral("note"), QStringLiteral("ok")}}));
+    const QJsonObject phases = event.value(QStringLiteral("review_phases")).toObject();
+    QCOMPARE(phases.value(QStringLiteral("schema_version")).toInt(), 1);
+    QCOMPARE(phases.value(QStringLiteral("before")).toObject().value(QStringLiteral("tags")).toArray(),
+             (QJsonArray{QStringLiteral("Meh"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(phases.value(QStringLiteral("before")).toObject().value(QStringLiteral("answer_shown_at")).toString(), shownAt.toString(Qt::ISODateWithMs));
+    QCOMPARE(phases.value(QStringLiteral("after")).toObject().value(QStringLiteral("tags")).toArray(), (QJsonArray{QStringLiteral("Recalled"), QStringLiteral("I get it")}));
+    const QJsonObject prediction = phases.value(QStringLiteral("agent_prediction")).toObject();
+    QCOMPARE(prediction.value(QStringLiteral("tag")).toString(), QStringLiteral("Recalled"));
+    QCOMPARE(prediction.value(QStringLiteral("group_id")).toString(), QStringLiteral("g-r"));
+    QCOMPARE(prediction.value(QStringLiteral("prediction_id")).toString(), QStringLiteral("p-1"));
+    QCOMPARE(prediction.value(QStringLiteral("reason")).toString(), QStringLiteral("Recalled it last time."));
+    QVERIFY(!prediction.value(QStringLiteral("requested_at")).toString().isEmpty());
+    QVERIFY(!prediction.value(QStringLiteral("arrived_before_answer")).toBool());
+    // The card now has the tags in effect: the actual recall, not the predicted one.
+    QCOMPARE(card.currentTags(), (QStringList{QStringLiteral("Meh"), QStringLiteral("Recalled"), QStringLiteral("I get it")}));
+
+    // Its History: the older answer as before, the new one with its two steps and the prediction.
+    {
+        Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+        browser.selectCard(answered);
+        QTRY_VERIFY(browser.selectedBrowseCard());
+        QTest::mouseClick(browser.m_browseHistoryButton, Qt::LeftButton);
+        const QString history = browser.m_browseHistory->toPlainText();
+        QVERIFY2(history.contains(QStringLiteral("Before: Meh, Partly recalled — not sure")), qPrintable(history));
+        QVERIFY2(history.contains(QStringLiteral("After: Recalled, I get it — ok")), qPrintable(history));
+        QVERIFY2(history.contains(QStringLiteral("Agent predicted: Recalled")), qPrintable(history));
+        QCOMPARE(history.count(QStringLiteral("Before:")), 1);
+        QVERIFY2(history.contains(QStringLiteral("Good, Recalled, I get it · ")) && history.contains(QStringLiteral("Note: old note")), qPrintable(history));
+        QVERIFY(!history.contains(QStringLiteral("Note: ok")) && !history.contains(QStringLiteral("Before note")));
+    }
+
+    // Another card: nothing carries over into the before panel; the group menu's Ask changes the
+    // layout, and without a group asked before there is no before step at all.
+    overview.reviewCard(fresh);
+    QVERIFY(overview.m_predictions.isEmpty());
+    QVERIFY(panel->isVisible());
+    QTRY_VERIFY(beforeScale(panel, QStringLiteral("g-f")));
+    QCOMPARE(beforeScale(panel, QStringLiteral("g-f"))->property("reviewTagScaleValue").toInt(), -1);
+    QVERIFY(overview.m_before.tags.isEmpty() && overview.m_before.note.isEmpty() && overview.m_beforeNote->toPlainText().isEmpty());
+    QVERIFY(!overview.m_before.answerShownAt.isValid());
+    const auto askAfter = [&](const QString &groupId) {
+        for (auto *button : panel->findChildren<QToolButton *>(QStringLiteral("reviewBeforeGroupMenu"))) {
+            if (button->property("reviewTagGroup").toString() != groupId || button->parentWidget()->objectName() != QLatin1String("reviewBeforeGroupList")) continue;
+            for (auto *action : button->menu()->findChildren<QAction *>(QStringLiteral("reviewTagGroupPhase"))) {
+                if (action->property("reviewTagPhase").toString().isEmpty()) {
+                    action->trigger();
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    QVERIFY(askAfter(QStringLiteral("g-f")));
+    QVERIFY(store.tagGroups().at(0).phase.isEmpty());
+    QTRY_VERIFY(!beforeScale(panel, QStringLiteral("g-f")));
+    QVERIFY(beforeScale(panel, QStringLiteral("g-r")));
+    QVERIFY(askAfter(QStringLiteral("g-r")));
+    QTRY_VERIFY(!beforeScale(panel, QStringLiteral("g-r")));
+    // The next card shown has no before step, and its answer is recorded in one step.
+    overview.showCurrentCard();
+    QVERIFY(!overview.m_beforePanel->isVisible());
+    overview.revealAnswer();
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+    const QJsonObject plain = cardOf(fresh).history.constLast();
+    QVERIFY(!plain.contains(QStringLiteral("review_phases")));
+    QVERIFY(!plain.value(QStringLiteral("review_group_notes")).toObject().contains(QStringLiteral("before_note")));
+}
+
+// review-phases spec, section 4: once per card of a due session, in the background, the agent
+// recall prediction service is asked with the card, its answers and its document's other answers.
+void MainShellTest::testReviewAsksForARecallPrediction()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 3, &pdfSha256);
+    QCOMPARE(ids.size(), 3);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups(twoStepGroups(), &error), qPrintable(error));
+    const QDateTime earlier = QDateTime::currentDateTimeUtc().addSecs(-3600);
+    QVERIFY2(store.recordRating(ids.at(0), QStringLiteral("custom_interval"), earlier, &error, earlier.addSecs(30), nullptr, {}, {QStringLiteral("Forgot")},
+                                {{QStringLiteral("note"), QStringLiteral("blank")}}), qPrintable(error));
+    // Another card of the document: its answer of an hour ago is related; one of 20 days ago is not.
+    QVERIFY2(store.recordRating(ids.at(2), QStringLiteral("custom_interval"), earlier.addDays(-20), &error, earlier.addDays(-19), nullptr, {}, {QStringLiteral("Lost")}),
+             qPrintable(error));
+    QVERIFY2(store.recordRating(ids.at(2), QStringLiteral("custom_interval"), earlier, &error, earlier.addDays(30), nullptr, {}, {QStringLiteral("I get it")}),
+             qPrintable(error));
+
+    // The service: answers the first request, fails the next.
+    QTcpServer service;
+    QVERIFY(service.listen(QHostAddress::LocalHost));
+    QList<QPair<QByteArray, QJsonObject>> requests;
+    QObject::connect(&service, &QTcpServer::newConnection, &service, [&] {
+        while (QTcpSocket *socket = service.nextPendingConnection()) {
+            auto buffer = std::make_shared<QByteArray>();
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [&requests, socket, buffer] {
+                buffer->append(socket->readAll());
+                const qsizetype end = buffer->indexOf("\r\n\r\n");
+                if (end < 0) return;
+                const QByteArray head = buffer->left(end).toLower();
+                const qsizetype at = head.indexOf("content-length:");
+                qsizetype lineEnd = at < 0 ? -1 : head.indexOf("\r\n", at);
+                if (lineEnd < 0) lineEnd = head.size();
+                const qsizetype length = at < 0 ? 0 : head.mid(at + 15, lineEnd - at - 15).trimmed().toLongLong();
+                if (buffer->size() < end + 4 + length) return;
+                requests.append({head, QJsonDocument::fromJson(buffer->mid(end + 4, length)).object()});
+                const bool first = requests.size() == 1;
+                const QByteArray body = first ? QJsonDocument(QJsonObject{{QStringLiteral("prediction_id"), QStringLiteral("p-7")}, {QStringLiteral("tag"), QStringLiteral("Partly recalled")},
+                                                                          {QStringLiteral("reason"), QStringLiteral("Forgot it last time.")}, {QStringLiteral("model"), QStringLiteral("test-model")},
+                                                                          {QStringLiteral("made_at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}}).toJson(QJsonDocument::Compact)
+                                              : QByteArrayLiteral("{\"detail\":\"down\"}");
+                socket->write((first ? QByteArrayLiteral("HTTP/1.1 200 OK") : QByteArrayLiteral("HTTP/1.1 503 Service Unavailable"))
+                              + "\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+                socket->disconnectFromHost();
+            });
+        }
+    });
+    const QString config = QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("recall-predictor.json"));
+    QVERIFY(!config.startsWith(QDir::homePath() + QStringLiteral("/Library/Application Support/Thoughts/")));
+    QVERIFY(QDir().mkpath(QFileInfo(config).absolutePath()));
+    const auto removeConfig = qScopeGuard([config] { QFile::remove(config); });
+    {
+        QFile file(config);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(QJsonObject{{QStringLiteral("url"), QStringLiteral("http://127.0.0.1:%1/recall-prediction").arg(service.serverPort())},
+                                             {QStringLiteral("token"), QStringLiteral("test-token")}}).toJson());
+    }
+
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.reviewCard(ids.at(0));
+    QTRY_COMPARE_WITH_TIMEOUT(requests.size(), 1, 10000);
+    QVERIFY2(requests.at(0).first.startsWith("post /recall-prediction "), requests.at(0).first.constData());
+    QVERIFY(requests.at(0).first.contains("x-recall-token: test-token"));
+    const QJsonObject body = requests.at(0).second;
+    QCOMPARE(body.value(QStringLiteral("card_id")).toString(), ids.at(0));
+    QCOMPARE(body.value(QStringLiteral("question")).toString(), QStringLiteral("Question 1?"));
+    QCOMPARE(body.value(QStringLiteral("answer")).toString(), QStringLiteral("Answer 1"));
+    QCOMPARE(body.value(QStringLiteral("scale")).toArray(), (QJsonArray{QStringLiteral("Forgot"), QStringLiteral("Partly recalled"), QStringLiteral("Recalled")}));
+    QCOMPARE(body.value(QStringLiteral("recall_group_id")).toString(), QStringLiteral("g-r"));
+    const QJsonArray history = body.value(QStringLiteral("history")).toArray();
+    QCOMPARE(history.size(), 1);
+    QCOMPARE(history.at(0).toObject().value(QStringLiteral("tags")).toArray(), QJsonArray{QStringLiteral("Forgot")});
+    QCOMPARE(history.at(0).toObject().value(QStringLiteral("notes")).toObject(), (QJsonObject{{QStringLiteral("note"), QStringLiteral("blank")}}));
+    const QJsonArray related = body.value(QStringLiteral("related")).toArray();
+    QCOMPARE(related.size(), 1);
+    QCOMPARE(related.at(0).toObject().value(QStringLiteral("question")).toString(), QStringLiteral("Question 3?"));
+    QCOMPARE(related.at(0).toObject().value(QStringLiteral("tags")).toArray(), QJsonArray{QStringLiteral("I get it")});
+    QVERIFY(QDateTime::fromString(body.value(QStringLiteral("now")).toString(), Qt::ISODateWithMs).isValid());
+    // The answer arrives; it shows only once the answer is shown.
+    QTRY_VERIFY_WITH_TIMEOUT(!overview.m_predictions.value(ids.at(0)).result.isEmpty(), 10000);
+    QVERIFY(overview.m_predictionLine->isHidden());
+    // Shown again in the session, the card is not asked about again.
+    overview.showCurrentCard();
+    overview.toggleReveal();
+    QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent predicted: Partly recalled — Forgot it last time."));
+    QTest::qWait(200);
+    QCOMPARE(requests.size(), 1);
+    overview.revealAnswer();
+    overview.m_nextButton->click();
+    QJsonObject recorded;
+    for (const auto &card : store.cards())
+        if (card.id() == ids.at(0)) recorded = card.history.constLast();
+    const QJsonObject prediction = recorded.value(QStringLiteral("review_phases")).toObject().value(QStringLiteral("agent_prediction")).toObject();
+    QCOMPARE(prediction.value(QStringLiteral("prediction_id")).toString(), QStringLiteral("p-7"));
+    QCOMPARE(prediction.value(QStringLiteral("model")).toString(), QStringLiteral("test-model"));
+    QVERIFY(prediction.value(QStringLiteral("arrived_before_answer")).toBool());
+
+    // A failed request shows and records nothing.
+    overview.reviewCard(ids.at(1));
+    QTRY_COMPARE_WITH_TIMEOUT(requests.size(), 2, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(!overview.m_predictions.value(ids.at(1)).pending, 10000);
+    QVERIFY(overview.m_predictions.value(ids.at(1)).result.isEmpty());
+    overview.revealAnswer();
+    QVERIFY(overview.m_predictionLine->isHidden());
+    overview.m_nextButton->click();
+    for (const auto &card : store.cards())
+        if (card.id() == ids.at(1)) recorded = card.history.constLast();
+    QVERIFY(recorded.contains(QStringLiteral("review_phases")));
+    QVERIFY(!recorded.value(QStringLiteral("review_phases")).toObject().contains(QStringLiteral("agent_prediction")));
+}
+
+void MainShellTest::testReviewCopyForAgentNamesSharedFeedback()
+{
+    // Feedback is shared by the cards of a document: Copy for agent of the card under review lists
+    // the other cards' feedback the reader finds in its answer and names that card; another card's
+    // feedback not in this answer is not listed.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardA = QUuid::createUuid().toString(QUuid::WithoutBraces), cardB = QUuid::createUuid().toString(QUuid::WithoutBraces),
+                  cardC = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QDir reviews(QDir(temporary.path()).filePath(QStringLiteral("reviews")));
+    QVERIFY(reviews.mkpath(QStringLiteral("cards")));
+    QVERIFY(reviews.mkpath(QStringLiteral("review-feedback")));
+    const auto write = [](const QString &path, const QJsonObject &object) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    };
+    const QString document = QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848");
+    // A is due; B (same document) is not; C was deleted.
+    for (const QString &id : {cardA, cardB, cardC}) {
+        const QString question = id == cardA ? QStringLiteral("Which fact should be recalled?") : id == cardB ? QStringLiteral("What does  card B\nask?") : QStringLiteral("Deleted?");
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.15, 0.9, 0.2}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("pdf_document_id"), document}, {QStringLiteral("question"), question}};
+        QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("card_id"), id},
+                           {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("primary"), primary}};
+        if (id != cardA) record.insert(QStringLiteral("initial_due_at"), QStringLiteral("2099-01-01T00:00:00.000Z"));
+        if (id == cardC) record.insert(QStringLiteral("deleted"), true);
+        write(reviews.filePath(QStringLiteral("cards/%1.json").arg(id)), record);
+    }
+    const QList<QPair<int, QRectF>> passage{{1, QRectF(QPointF(0.2, 0.16), QPointF(0.5, 0.17))}};
+    const auto feedback = [&](const QString &cardId, const QString &polarity, const QString &quote, const QString &comment, const QString &createdAt) {
+        const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(quote, QString(), QString(), document, pdfSha256, Thoughts::ReviewCardFeedback::regionsJson(passage));
+        const QJsonObject result = Thoughts::ReviewCardFeedback::create(cardId, polarity, comment, anchor, QStringLiteral("android-pixel"),
+                                                                        QDateTime::fromString(createdAt, Qt::ISODateWithMs));
+        write(reviews.filePath(QStringLiteral("review-feedback/%1.json").arg(result.value(QStringLiteral("feedback_id")).toString())), result);
+        return result.value(QStringLiteral("feedback_id")).toString();
+    };
+    const QString own = feedback(cardA, QStringLiteral("positive"), QStringLiteral("some random text"), QString(), QStringLiteral("2026-10-20T09:00:00.000Z"));
+    const QString shared = feedback(cardB, QStringLiteral("negative"), QStringLiteral("a bit silly"), QStringLiteral("From B."), QStringLiteral("2026-10-20T10:00:00.000Z"));
+    // Neither is in A's answer, nor in Copy for agent.
+    feedback(cardB, QStringLiteral("negative"), QStringLiteral("not in A's answer"), QString(), QStringLiteral("2026-10-20T11:00:00.000Z"));
+    feedback(cardC, QStringLiteral("positive"), QStringLiteral("random"), QString(), QStringLiteral("2026-10-20T12:00:00.000Z"));
+
+    const QVariantMap documentInfo{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [documentInfo] { return documentInfo; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    // The reader: A's own record and B's record found in A's answer (it shows no other).
+    overview.setAnswerFeedbackStates([&] { return QVariantMap{{own, QStringLiteral("exact")}, {shared, QStringLiteral("exact")}}; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), cardA);
+    // The reader gets the cards that exist, whose feedback may be shared: B, not the deleted C.
+    const QJsonObject homeCards = overview.feedbackHomeCards(overview.m_dueCards.at(overview.m_currentReview));
+    QCOMPARE(homeCards.keys(), QStringList{cardB});
+    overview.toggleReveal();
+
+    // Copy for agent: the shared line names its card.
+    overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewCopyForAgentAction"))->trigger();
+    const QString copied = QApplication::clipboard()->text();
+    QVERIFY2(copied.endsWith(QStringLiteral("Answer feedback:\n"
+                                            "- Liked: \"some random text\"\n"
+                                            "- Disliked: \"a bit silly\" — From B. (from another card: \"What does card B ask?\")\n")),
+             qPrintable(copied));
+}
+
+void MainShellTest::testCardHistoryInSidebar()
+{
+    // A card's History is its document's, in the sidebar: the card menu's Show history asks for
+    // it, also before Reveal, and the card under review does not open from there until its answer
+    // is revealed. The document's History (Sidebar › History): one block per PDF version, newest
+    // first, then the entries whose version was not recorded; each lists the cards reviewed on it
+    // with their counts, and a card opens its answer in that version. And the Copy for agent section.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces), otherCardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QDir reviews(QDir(temporary.path()).filePath(QStringLiteral("reviews")));
+    QVERIFY(reviews.mkpath(QStringLiteral("cards")));
+    QVERIFY(reviews.mkpath(QStringLiteral("events")));
+    QVERIFY(reviews.mkpath(QStringLiteral("review-feedback")));
+    const auto write = [](const QString &path, const QJsonObject &object) {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    };
+    // The answer: both text lines of file1.pdf. A second card, never answered, comes after it.
+    for (const QString &id : {cardId, otherCardId}) {
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.15, 0.9, 0.2}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), id == cardId ? QStringLiteral("Which fact should be recalled?") : QStringLiteral("Another question?")}};
+        write(reviews.filePath(QStringLiteral("cards/%1.json").arg(id)),
+              QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("card_id"), id},
+                          {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("primary"), primary}});
+    }
+    // An earlier version of the PDF (in the version cache below) and one the server pruned.
+    const QString earlierPath = QStringLiteral(KDESRCDIR "data/file2.pdf");
+    QFile earlierPdf(earlierPath);
+    QVERIFY(earlierPdf.open(QIODevice::ReadOnly));
+    const QByteArray earlierBytes = earlierPdf.readAll();
+    const QString earlierSha256 = QString::fromLatin1(QCryptographicHash::hash(earlierBytes, QCryptographicHash::Sha256).toHex());
+    const QString prunedSha256(64, QLatin1Char('e'));
+    // Answers: one before the stamps, one on the earlier version, one on the current one.
+    const auto answer = [&](const QString &reviewedAt, const QString &dueAt, const QString &version, const QString &note) {
+        QJsonObject event{{QStringLiteral("event_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}, {QStringLiteral("card_id"), cardId},
+                          {QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("review_tags"), QJsonArray{QStringLiteral("interesting")}},
+                          {QStringLiteral("reviewed_at"), reviewedAt}, {QStringLiteral("scheduled_due_at"), dueAt}};
+        if (!version.isEmpty()) event.insert(QStringLiteral("review_version"), QJsonObject{{QStringLiteral("pdf_sha256"), version}, {QStringLiteral("source_built"), false}});
+        if (!note.isEmpty()) event.insert(Thoughts::ReviewTags::groupNotesField(), QJsonObject{{Thoughts::ReviewTags::answerNoteKey(), note}});
+        write(reviews.filePath(QStringLiteral("events/%1.json").arg(event.value(QStringLiteral("event_id")).toString())), event);
+    };
+    answer(QStringLiteral("2026-10-01T08:00:00Z"), QStringLiteral("2026-10-03T08:00:00Z"), {}, QStringLiteral("Before the stamps"));
+    answer(QStringLiteral("2026-10-10T08:00:00Z"), QStringLiteral("2026-10-11T08:00:00Z"), earlierSha256, QStringLiteral("Mixed up β and the KL weight"));
+    answer(QStringLiteral("2026-10-12T08:00:00Z"), QStringLiteral("2026-10-14T08:00:00Z"), pdfSha256, {});
+    const QList<QPair<int, QRectF>> passage{{1, QRectF(QPointF(0.2, 0.16), QPointF(0.5, 0.17))}};
+    const auto feedback = [&](const QString &polarity, const QString &quote, const QString &comment, const QString &createdAt, const QString &givenOn) {
+        const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(quote, QString(), QString(), QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"), givenOn,
+                                                                        Thoughts::ReviewCardFeedback::regionsJson(passage));
+        const QJsonObject result = Thoughts::ReviewCardFeedback::create(cardId, polarity, comment, anchor, QStringLiteral("android-pixel"),
+                                                                        QDateTime::fromString(createdAt, Qt::ISODateWithMs));
+        write(reviews.filePath(QStringLiteral("review-feedback/%1.json").arg(result.value(QStringLiteral("feedback_id")).toString())), result);
+        return result;
+    };
+    const QJsonObject liked = feedback(QStringLiteral("positive"), QStringLiteral("the KL term keeps the policy close"), QStringLiteral("Clear explanation."),
+                                       QStringLiteral("2026-10-12T09:00:00.000Z"), pdfSha256);
+    const QJsonObject disliked = feedback(QStringLiteral("negative"), QStringLiteral("β is set to 0.1"), QStringLiteral("Should be 0.05 in our setup."),
+                                          QStringLiteral("2026-10-10T10:00:00.000Z"), earlierSha256);
+    // Its comment is long: shown whole, wrapped.
+    const QString longComment = QStringLiteral("This should point to above where they are introduced and explain the judge's rubric, "
+                                               "the score scale and how disagreements between the two judges are resolved before averaging.");
+    const QJsonObject pruned = feedback(QStringLiteral("negative"), QStringLiteral("the LLM Judge and the rubric"), longComment,
+                                        QStringLiteral("2026-10-05T11:00:00.000Z"), prunedSha256);
+    const QString likedId = liked.value(QStringLiteral("feedback_id")).toString(), dislikedId = disliked.value(QStringLiteral("feedback_id")).toString(),
+                  prunedId = pruned.value(QStringLiteral("feedback_id")).toString();
+
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    // The reader finds the liked passage in the answer, also while it is masked (for the card it
+    // presents: the other card's answer has none of it).
+    overview.setAnswerFeedbackStates([&] {
+        if (overview.m_dueCards.value(overview.m_currentReview).id() != cardId) return QVariantMap();
+        return QVariantMap{{likedId, QStringLiteral("exact")}, {dislikedId, QStringLiteral("orphaned")}, {prunedId, QStringLiteral("orphaned")}};
+    });
+    QSignalSpy historyRequested(&overview, &Thoughts::ReviewOverview::cardHistoryRequested);
+    QSignalSpy maskChanged(&overview, &Thoughts::ReviewOverview::maskedHistoryCardChanged);
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 2);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), cardId);
+    // No count in the card panel: the card menu's Show history, also before Reveal.
+    QVERIFY(!overview.m_sessionPage->findChild<QToolButton *>(QStringLiteral("reviewFeedbackSummary")));
+    auto *history = overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewShowHistoryAction"));
+    QVERIFY(history);
+    QVERIFY(history->isVisible());
+    QCOMPARE(history->text(), QStringLiteral("Show history"));
+    // It asks for the History in the sidebar, at this card; nothing opens over the PDF.
+    history->trigger();
+    QCOMPARE(historyRequested.size(), 1);
+    QCOMPARE(historyRequested.at(0).at(0).toString(), cardId);
+    QVERIFY(reviewHost.findChildren<Thoughts::ReviewFeedbackPanel *>().isEmpty());
+    QCOMPARE(history->text(), QStringLiteral("Show history"));
+    // Masked, its pictures wait; revealed, they show; hidden again, they wait again.
+    QCOMPARE(overview.maskedHistoryCard(), cardId);
+    overview.toggleReveal();
+    QVERIFY(overview.maskedHistoryCard().isEmpty());
+    QVERIFY(!maskChanged.isEmpty() && maskChanged.last().at(0).toString().isEmpty());
+    overview.toggleReveal();
+    QCOMPARE(overview.maskedHistoryCard(), cardId);
+    QCOMPARE(maskChanged.last().at(0).toString(), cardId);
+    overview.revealAnswer(); // Set knowledge reveals it too
+    QVERIFY(overview.maskedHistoryCard().isEmpty());
+
+    // Copy for agent: the §6.5 section after the card lines, in created_at order, then (knowledge
+    // being set) the answer being given.
+    auto *menu = overview.m_cardMenuButton->menu();
+    menu->findChild<QAction *>(QStringLiteral("reviewCopyForAgentAction"))->trigger();
+    const QString copied = QApplication::clipboard()->text();
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+    const qsizetype currentReview = copied.indexOf(QStringLiteral("Current review (being given now, not saved yet):\n"));
+    QVERIFY2(currentReview > 0 && copied.indexOf(QStringLiteral("\n- Again in: "), currentReview) > 0, qPrintable(copied));
+    QVERIFY2(copied.left(currentReview).endsWith(QStringLiteral("\nAnswer pages: 1\n"
+                                            "Answer feedback:\n"
+                                            "- Disliked: \"the LLM Judge and the rubric\" — ") + longComment
+                                         + QStringLiteral(" (not found in the current answer)\n"
+                                                          "- Disliked: \"β is set to 0.1\" — Should be 0.05 in our setup. (not found in the current answer)\n"
+                                                          "- Liked: \"the KL term keeps the policy close\" — Clear explanation.\n")),
+             qPrintable(copied));
+    // The document's History, as the sidebar shows it (Shell::updateDocumentHistory). One more
+    // feedback, given on the earlier version on text the current answer still has (carried).
+    {
+        const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(QStringLiteral("some random text put here"), QString(), QString(),
+                                                                        QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"), earlierSha256, QJsonArray{});
+        const QJsonObject still = Thoughts::ReviewCardFeedback::create(cardId, QStringLiteral("positive"), QStringLiteral("Still true."), anchor,
+                                                                       QStringLiteral("android-pixel"), QDateTime::fromString(QStringLiteral("2026-10-10T11:00:00.000Z"), Qt::ISODateWithMs));
+        write(reviews.filePath(QStringLiteral("review-feedback/%1.json").arg(still.value(QStringLiteral("feedback_id")).toString())), still);
+    }
+    Thoughts::ReviewFeedbackPanel panel;
+    panel.setFrameShape(QFrame::NoFrame);
+    QSignalSpy versionRequested(&panel, &Thoughts::ReviewFeedbackPanel::versionRequested);
+    QSignalSpy shownRequested(&panel, &Thoughts::ReviewFeedbackPanel::shownPassageRequested);
+    panel.resize(300, 900);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    Thoughts::ReviewStore store(temporary.path());
+    // In the Library PDF's tab it shows the current version.
+    QList<Thoughts::ReviewFeedbackPanel::Version> versions = Thoughts::documentHistoryVersions(store, QStringLiteral("file1"), pdfPath);
+    for (auto &version : versions) version.shown = version.current;
+    panel.setHistory(versions, QStringLiteral("2 cards · 3 feedback"));
+    QCOMPARE(panel.findChild<QLabel *>(QStringLiteral("reviewFeedbackPanelTitle"))->text(), QStringLiteral("History"));
+    QCOMPARE(panel.findChild<QLabel *>(QStringLiteral("reviewHistorySummary"))->text(), QStringLiteral("2 cards · 3 feedback"));
+    // One block per version: the current one, then earlier ones newest first, then those not recorded.
+    const auto blocks = [&panel] {
+        QStringList names;
+        for (int i = 0; i < panel.m_listLayout->count(); ++i)
+            if (QWidget *widget = panel.m_listLayout->itemAt(i)->widget()) names.append(widget->objectName());
+        return names;
+    };
+    const QString prefix = QStringLiteral("reviewHistoryVersion-");
+    QCOMPARE(blocks(), QStringList({prefix + pdfSha256, prefix + earlierSha256, prefix + prunedSha256, prefix + QStringLiteral("unrecorded")}));
+    const auto block = [&](const QString &name) { return panel.findChild<QFrame *>(prefix + name); };
+    const auto title = [&](const QString &name) { return block(name)->findChild<QLabel *>(QStringLiteral("reviewHistoryVersionTitle"))->text(); };
+    const auto localTime = [](const QString &utc) { return QDateTime::fromString(utc, Qt::ISODate).toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")); };
+    QCOMPARE(title(pdfSha256), QStringLiteral("Current version"));
+    QCOMPARE(title(earlierSha256), QStringLiteral("Version of ") + localTime(QStringLiteral("2026-10-10T08:00:00Z")));
+    QCOMPARE(title(prunedSha256), QStringLiteral("Version of ") + localTime(QStringLiteral("2026-10-05T11:00:00Z")));
+    QCOMPARE(title(QStringLiteral("unrecorded")), QStringLiteral("Earlier (version not recorded)"));
+    // Each version lists the cards reviewed on it, with their counts, and no pictures.
+    QVERIFY(panel.findChildren<QLabel *>().size() > 0);
+    for (QLabel *label : panel.findChildren<QLabel *>()) QVERIFY2(label->pixmap().isNull(), qPrintable(label->objectName()));
+    const auto rows = [&](const QString &name) {
+        QStringList result;
+        for (QFrame *row : block(name)->findChildren<QFrame *>(QStringLiteral("reviewHistoryCard")))
+            result.append(row->findChild<QLabel *>(QStringLiteral("reviewHistoryCardQuestion"))->text() + QStringLiteral(" | ")
+                          + row->findChild<QLabel *>(QStringLiteral("reviewHistoryCardCounts"))->text());
+        return result;
+    };
+    // Feedback from an earlier version whose passage is still in the answer shows on the current one too.
+    QCOMPARE(rows(pdfSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 review · 1 feedback · 1 feedback from an earlier version")});
+    QCOMPARE(rows(earlierSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 review · 2 feedback")});
+    QCOMPARE(rows(prunedSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 feedback")});
+    QCOMPARE(rows(QStringLiteral("unrecorded")), QStringList{QStringLiteral("Which fact should be recalled? | 1 review")});
+    // The card never answered is only counted, on the version read now.
+    QCOMPARE(block(pdfSha256)->findChild<QLabel *>(QStringLiteral("reviewHistoryUnreviewed"))->text(), QStringLiteral("1 more card not reviewed on this version"));
+    QVERIFY(!block(earlierSha256)->findChild<QLabel *>(QStringLiteral("reviewHistoryUnreviewed")));
+    // The comments are in the tooltip.
+    const auto row = [&](const QString &name) { return block(name)->findChild<QFrame *>(QStringLiteral("reviewHistoryCard")); };
+    QVERIFY2(row(pdfSha256)->toolTip().contains(QStringLiteral("Liked “the KL term keeps the policy close”: Clear explanation.")), qPrintable(row(pdfSha256)->toolTip()));
+    QVERIFY(row(prunedSha256)->toolTip().contains(longComment.toHtmlEscaped()));
+    QVERIFY(row(pdfSha256)->toolTip().contains(QStringLiteral("Still true.")));
+    QVERIFY(!row(pdfSha256)->toolTip().contains(QStringLiteral("Should be 0.05")));
+    const QString screenshots = qEnvironmentVariable("THOUGHTS_TEST_SCREENSHOTS");
+    if (!screenshots.isEmpty()) {
+        QTest::qWait(100);
+        QVERIFY(panel.grab().save(screenshots + QStringLiteral("/history-sidebar.png")));
+    }
+
+    // A document without cards still has a History: every version, with the comments made on each.
+    {
+        const QString document = QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848");
+        const QString current = QString(64, QLatin1Char('a')), first = QString(64, QLatin1Char('b')), second = QString(64, QLatin1Char('c')), kept = QString(64, QLatin1Char('d'));
+        const auto made = [&document](const QString &polarity, const QString &comment, const QString &quote, const QString &sha, const QString &at, const QString &kind = QString()) {
+            const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(quote, QString(), QString(), document, sha,
+                                                                            Thoughts::ReviewCardFeedback::regionsJson({{1, QRectF(0.1, 0.2, 0.5, 0.05)}}));
+            return Thoughts::DocumentFeedback::withKind(Thoughts::DocumentFeedback::create(polarity, comment, anchor, QStringLiteral("mac"),
+                                                                                            QDateTime::fromString(at, Qt::ISODateWithMs)), kind);
+        };
+        QJsonObject gone = made(QStringLiteral("positive"), QStringLiteral("Deleted"), QStringLiteral("x"), first, QStringLiteral("2026-11-09T09:40:00.000Z"));
+        gone = Thoughts::DocumentFeedback::remove(gone, QStringLiteral("mac"));
+        const QList<QJsonObject> records{
+            made(QStringLiteral("negative"), QString(), QStringLiteral("Docs | Metrics"), first, QStringLiteral("2026-11-09T09:45:06.752Z")),
+            made(QStringLiteral("negative"), QStringLiteral("don't like this word"), QStringLiteral("certain"), second, QStringLiteral("2026-11-09T09:49:00.310Z")),
+            made(QStringLiteral("neutral"), QStringLiteral("Why the log?"), QStringLiteral("logarithm"), second, QStringLiteral("2026-11-09T09:50:00.000Z"), Thoughts::DocumentFeedback::question()),
+            Thoughts::DocumentFeedback::createDrawing(2, {{{QPointF(0.2, 0.3), QPointF(0.4, 0.5)}}}, document, current, QStringLiteral("mac"),
+                                                      QDateTime::fromString(QStringLiteral("2026-11-09T10:10:00.000Z"), Qt::ISODateWithMs)),
+            gone};
+        QList<Thoughts::ReviewFeedbackPanel::Version> history;
+        Thoughts::addDocumentVersions(history, records, {{kept, QDateTime::fromString(QStringLiteral("2026-11-01T08:00:00.000Z"), Qt::ISODateWithMs)}}, current, pdfPath);
+        for (auto &version : history) version.shown = version.current;
+        panel.setHistory(history, QStringLiteral("4 versions · 4 comments"));
+        // The current version even with only a drawing, then earlier ones newest first, one kept here with nothing on it.
+        QCOMPARE(blocks(), QStringList({prefix + current, prefix + second, prefix + first, prefix + kept}));
+        QCOMPARE(title(current), QStringLiteral("Current version"));
+        QCOMPARE(title(second), QStringLiteral("Version of ") + localTime(QStringLiteral("2026-11-09T09:49:00Z")));
+        const auto comments = [&](const QString &name) {
+            QStringList result;
+            for (QFrame *row : block(name)->findChildren<QFrame *>(QStringLiteral("reviewHistoryComment")))
+                result.append(row->findChild<QLabel *>(QStringLiteral("reviewHistoryCommentText"))->text() + QStringLiteral(" | ")
+                              + row->findChild<QLabel *>(QStringLiteral("reviewHistoryCommentKind"))->text());
+            return result;
+        };
+        // What was written, else the passage; the deleted one is not there.
+        QCOMPARE(comments(first), QStringList{QStringLiteral("“Docs | Metrics” | Dislike")});
+        QCOMPARE(comments(second), QStringList({QStringLiteral("don't like this word | Dislike · “certain”"), QStringLiteral("Why the log? | Question · “logarithm”")}));
+        QCOMPARE(comments(current), QStringList{QStringLiteral("Drawing on page 2 | Drawing")});
+        QVERIFY(block(kept)->findChild<QLabel *>(QStringLiteral("reviewHistoryEmpty")));
+        QVERIFY(!block(first)->findChild<QLabel *>(QStringLiteral("reviewHistoryEmpty")));
+        for (QLabel *label : panel.findChildren<QLabel *>()) QVERIFY2(label->pixmap().isNull(), qPrintable(label->objectName()));
+        // A click opens that version at the passage; on the version shown here it shows the passage.
+        versionRequested.clear();
+        shownRequested.clear();
+        QTest::mouseClick(block(second)->findChild<QFrame *>(QStringLiteral("reviewHistoryComment"))->findChild<QLabel *>(QStringLiteral("reviewHistoryCommentText")), Qt::LeftButton);
+        QCOMPARE(versionRequested.size(), 1);
+        QCOMPARE(versionRequested.constFirst().at(0).toString(), second);
+        QCOMPARE(versionRequested.constFirst().at(2).toList().size(), 1);
+        QTest::mouseClick(block(current)->findChild<QFrame *>(QStringLiteral("reviewHistoryComment"))->findChild<QLabel *>(QStringLiteral("reviewHistoryCommentText")), Qt::LeftButton);
+        QCOMPARE(shownRequested.size(), 1);
+        // The drawing opens at its strokes, not at its whole page.
+        const QJsonArray rect = QJsonObject::fromVariantMap(shownRequested.constFirst().at(0).toList().constFirst().toMap()).value(QStringLiteral("rect")).toArray();
+        QVERIFY(rect.at(2).toDouble() - rect.at(0).toDouble() < 0.5);
+        if (!screenshots.isEmpty()) {
+            QTest::qWait(100);
+            QVERIFY(panel.grab().save(screenshots + QStringLiteral("/history-comments.png")));
+        }
+
+        // The versions of a Library PDF this computer still has, from its Library generations.
+        QTemporaryDir docs;
+        QVERIFY(QDir(docs.path()).mkpath(QStringLiteral(".thoughts-library-stage-1")));
+        write(QDir(docs.path()).filePath(QStringLiteral(".thoughts-library-stage-1/.thoughts-library-index.json")),
+              QJsonObject{{QStringLiteral("generated_at"), QStringLiteral("2026-11-01T08:00:00.000Z")},
+                          {QStringLiteral("pdfs"), QJsonArray{QJsonObject{{QStringLiteral("filename"), QStringLiteral("metrics.pdf")}, {QStringLiteral("pdf_sha256"), kept}},
+                                                              QJsonObject{{QStringLiteral("filename"), QStringLiteral("other.pdf")}, {QStringLiteral("pdf_sha256"), first}}}}});
+        QCOMPARE(Thoughts::keptDocumentVersions(docs.path(), QStringLiteral("metrics.pdf")).size(), 0); // Listed, but its file is gone.
+        QFile pdf(QDir(docs.path()).filePath(QStringLiteral(".thoughts-library-stage-1/metrics.pdf")));
+        QVERIFY(pdf.open(QIODevice::WriteOnly));
+        pdf.close();
+        const auto keptHere = Thoughts::keptDocumentVersions(docs.path(), QStringLiteral("metrics.pdf"));
+        QCOMPARE(keptHere.size(), 1);
+        QCOMPARE(keptHere.constFirst().first, kept);
+        QCOMPARE(keptHere.constFirst().second, QDateTime::fromString(QStringLiteral("2026-11-01T08:00:00.000Z"), Qt::ISODateWithMs));
+    }
+    // Back to the History with cards, which the rest of this test reads.
+    panel.setHistory(versions, QStringLiteral("2 cards · 3 feedback"));
+    versionRequested.clear();
+    shownRequested.clear();
+
+    // A card of the version read now shows its answer in the PDF.
+    QList<QPair<int, QRectF>> answerRegions;
+    for (const Thoughts::ReviewCard &card : store.cards(nullptr, QStringLiteral("file1")))
+        if (card.id() == cardId) answerRegions = Thoughts::ReviewCardFeedback::regionsFromVariant(card.regions());
+    QVERIFY(!answerRegions.isEmpty());
+    QTest::mouseClick(row(pdfSha256)->findChild<QLabel *>(QStringLiteral("reviewHistoryCardQuestion")), Qt::LeftButton);
+    QCOMPARE(shownRequested.size(), 1);
+    QCOMPARE(shownRequested.at(0).at(0).toList(), Thoughts::ReviewCardFeedback::regionsJson(answerRegions).toVariantList());
+    QVERIFY(versionRequested.isEmpty());
+    // A card of an earlier version opens that version at the passages given on it.
+    QTest::mouseClick(row(earlierSha256), Qt::LeftButton);
+    QCOMPARE(versionRequested.size(), 1);
+    QCOMPARE(versionRequested.at(0).at(0).toString(), earlierSha256);
+    QCOMPARE(versionRequested.at(0).at(1).toDateTime(), QDateTime::fromString(QStringLiteral("2026-10-10T08:00:00Z"), Qt::ISODate));
+    QCOMPARE(versionRequested.at(0).at(2).toList(), Thoughts::ReviewCardFeedback::regionsJson(passage).toVariantList());
+    // So does "Open ›"; the current version and the unrecorded entries have none.
+    QTest::mouseClick(block(earlierSha256)->findChild<QPushButton *>(QStringLiteral("reviewHistoryOpenVersion")), Qt::LeftButton);
+    QCOMPARE(versionRequested.size(), 2);
+    QCOMPARE(versionRequested.at(1).at(0).toString(), earlierSha256);
+    QVERIFY(!block(pdfSha256)->findChild<QPushButton *>(QStringLiteral("reviewHistoryOpenVersion")));
+    QVERIFY(!block(QStringLiteral("unrecorded"))->findChild<QPushButton *>(QStringLiteral("reviewHistoryOpenVersion")));
+    QTest::mouseClick(row(QStringLiteral("unrecorded")), Qt::LeftButton);
+    QCOMPARE(versionRequested.size(), 2);
+    QCOMPARE(shownRequested.size(), 1);
+
+    // The card under review, masked: listed, but it opens nothing and keeps its comments back.
+    panel.setMaskedCard(cardId);
+    QCOMPARE(rows(pdfSha256).size(), 1);
+    QVERIFY(!row(pdfSha256)->toolTip().contains(QStringLiteral("Clear explanation.")));
+    QVERIFY(row(pdfSha256)->toolTip().contains(QStringLiteral("Opens once you reveal its answer in the review.")));
+    QTest::mouseClick(row(pdfSha256), Qt::LeftButton);
+    QTest::mouseClick(row(earlierSha256), Qt::LeftButton);
+    QCOMPARE(shownRequested.size(), 1);
+    QCOMPARE(versionRequested.size(), 2);
+    panel.setMaskedCard({});
+    QVERIFY(row(pdfSha256)->toolTip().contains(QStringLiteral("Clear explanation.")));
+
+    // An earlier version's tab: the document of the records made on it, and that version marked as
+    // shown, so its cards show their passages there and the current version opens instead.
+    QCOMPARE(Thoughts::versionPdfStem(store, earlierSha256), QStringLiteral("file1"));
+    QCOMPARE(Thoughts::versionPdfStem(store, prunedSha256), QStringLiteral("file1"));
+    QVERIFY(Thoughts::versionPdfStem(store, QString(64, QLatin1Char('f'))).isEmpty());
+    for (auto &version : versions) version.shown = version.sha256 == earlierSha256;
+    panel.setHistory(versions, QStringLiteral("2 cards · 3 feedback"));
+    QCOMPARE(title(earlierSha256), QStringLiteral("Version of ") + localTime(QStringLiteral("2026-10-10T08:00:00Z")) + QStringLiteral(" · open here"));
+    QCOMPARE(title(pdfSha256), QStringLiteral("Current version"));
+    QVERIFY(!block(earlierSha256)->findChild<QPushButton *>(QStringLiteral("reviewHistoryOpenVersion")));
+    QVERIFY(block(pdfSha256)->findChild<QPushButton *>(QStringLiteral("reviewHistoryOpenVersion")));
+    QTest::mouseClick(row(earlierSha256), Qt::LeftButton);
+    QCOMPARE(shownRequested.size(), 2);
+    QCOMPARE(shownRequested.at(1).at(0).toList(), Thoughts::ReviewCardFeedback::regionsJson(passage).toVariantList());
+    QTest::mouseClick(row(pdfSha256), Qt::LeftButton);
+    QCOMPARE(versionRequested.size(), 3);
+    QCOMPARE(versionRequested.at(2).at(0).toString(), pdfSha256);
+    QCOMPARE(versionRequested.at(2).at(2).toList(), Thoughts::ReviewCardFeedback::regionsJson(answerRegions).toVariantList());
+    for (auto &version : versions) version.shown = version.current;
+    panel.setHistory(versions, QStringLiteral("2 cards · 3 feedback"));
+
+    // Show history: at the card, under its newest version, marked for a moment.
+    panel.resize(300, 160);
+    QTRY_VERIFY(panel.m_scroll->verticalScrollBar()->maximum() > 0);
+    panel.m_scroll->verticalScrollBar()->setValue(panel.m_scroll->verticalScrollBar()->maximum());
+    panel.scrollToCard(cardId);
+    QTRY_COMPARE(row(pdfSha256)->property("historyRole").toString(), QStringLiteral("focus"));
+    const int top = row(pdfSha256)->mapTo(panel.m_scroll->viewport(), QPoint(0, 0)).y();
+    QVERIFY2(top >= 0 && top <= 24, qPrintable(QString::number(top)));
+    QTRY_COMPARE_WITH_TIMEOUT(row(pdfSha256)->property("historyRole").toString(), QStringLiteral("card"), 3000);
+
+    // The next card under review starts masked.
+    overview.skipWithDefaults();
+    QTRY_COMPARE(overview.m_dueCards.value(overview.m_currentReview).id(), otherCardId);
+    QVERIFY(history->isVisible());
+    QCOMPARE(overview.maskedHistoryCard(), otherCardId);
+}
+
+void MainShellTest::testReviewAnswerSurvivesPdfReload()
+{
+    // A Sync that rebuilds the PDF under review reloads it in its tab. The answer comes back as the
+    // card bar shows it: revealed, with Like / Dislike / Comment… for a passage of it, or masked.
+    // Before, the reload dropped the mask and its frame: the answer read as plain text (the card's
+    // light Library highlight still around it) while the bar said Hide, and no feedback was offered.
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QByteArray bytes = testPdfBytes(QStringLiteral("file1.pdf"));
+    QVERIFY(!bytes.isEmpty());
+    const QString sha256 = testSha256(bytes);
+    const QString documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QDir root(library.path());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")));
+    const QString pdfPath = root.filePath(QStringLiteral("current_pdfs/file1.pdf"));
+    {
+        QFile pdf(pdfPath);
+        QVERIFY(pdf.open(QIODevice::WriteOnly));
+        pdf.write(bytes);
+        QFile index(root.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+        QVERIFY(index.open(QIODevice::WriteOnly));
+        index.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("pdfs"), QJsonArray{QJsonObject{
+            {QStringLiteral("filename"), QStringLiteral("file1.pdf")}, {QStringLiteral("document_id"), documentId},
+            {QStringLiteral("pdf_sha256"), sha256}, {QStringLiteral("kind"), QStringLiteral("source_linked")}}}}}).toJson());
+    }
+    // As the review worker's visual_region cards: two answer areas on page 1, here both lines of file1.pdf.
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QJsonArray regions{QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.15, 0.9, 0.18}}},
+                             QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.181, 0.9, 0.2}}}};
+    const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), sha256},
+                              {QStringLiteral("pdf_document_id"), documentId}, {QStringLiteral("document_id"), documentId},
+                              {QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.15, 0.9, 0.18}}, {QStringLiteral("regions"), regions},
+                              {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("question"), QStringLiteral("What is in file1?")}};
+    Thoughts::ReviewCard card;
+    card.record = QJsonObject{{QStringLiteral("schema_version"), 4}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                              {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                              {QStringLiteral("origin_id"), QStringLiteral("thoughts-review-worker")}, {QStringLiteral("primary"), primary}};
+
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({pdfPath}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    auto *part = qobject_cast<Okular::Part *>(shell->m_tabs.constFirst().part);
+    QVERIFY(part);
+    Okular::PartTest internals;
+    Okular::Document *document = internals.partDocument(part);
+    PageView *pageView = internals.pageView(part);
+    QVERIFY(document && pageView);
+    QTRY_VERIFY(document->pages() == 1);
+    document->requestTextPage(0);
+    QTRY_VERIFY(!document->page(0)->text().isEmpty());
+    // The card's own records only: nothing is written here.
+    pageView->reviewFeedback()->setWriter([](const QJsonObject &, QString *) { return false; });
+
+    // The review session, at this card.
+    shell->showReviewOverview();
+    Thoughts::ReviewOverview *overview = shell->m_reviewOverview;
+    QVERIFY(overview);
+    overview->m_dueCards = {card};
+    overview->m_currentReview = 0;
+    overview->showCurrentCard();
+    QCOMPARE(overview->m_currentReview, 0);
+    QVERIFY(part->reviewMaskBlockCount() > 0);
+    QVERIFY(!pageView->reviewFeedbackVisible());
+
+    // "some random text", inside the answer.
+    const auto feedbackActions = [&] {
+        auto area = std::make_unique<Okular::RegularAreaRect>();
+        area->appendShape(Okular::NormalizedRect(0.29, 0.162, 0.43, 0.171));
+        document->setPageTextSelection(0, std::move(area), QColor(Qt::blue));
+        QMenu menu;
+        pageView->addReviewFeedbackActions(&menu);
+        QStringList names;
+        for (const QAction *action : menu.actions()) names.append(action->isSeparator() ? QStringLiteral("|") : action->objectName());
+        return names;
+    };
+    const QStringList offered{QStringLiteral("ReviewFeedbackLike"), QStringLiteral("ReviewFeedbackDislike"), QStringLiteral("ReviewFeedbackComment"), QStringLiteral("|")};
+    QVERIFY(feedbackActions().isEmpty());
+
+    // Reveal (the bar reads Flip | Hide | Set knowledge): the selection menu offers feedback.
+    overview->toggleReveal();
+    QVERIFY(overview->m_answerPeeked);
+    QVERIFY(pageView->reviewFeedbackVisible());
+    QCOMPARE(feedbackActions(), offered);
+
+    // Sync rebuilt the PDF: the tab reloads it. The answer is still revealed, and feedback still offered.
+    QVERIFY(internals.reload(part));
+    QTRY_VERIFY(document->pages() == 1);
+    document->requestTextPage(0);
+    QTRY_VERIFY(!document->page(0)->text().isEmpty());
+    QVERIFY(overview->m_answerPeeked);
+    QTRY_VERIFY(pageView->reviewFeedbackVisible());
+    QCOMPARE(pageView->reviewFeedback()->cardId(), cardId);
+    QCOMPARE(feedbackActions(), offered);
+
+    // Hide covers the answer again; a reload while it is covered keeps it covered.
+    overview->toggleReveal();
+    QVERIFY(!overview->m_answerPeeked);
+    const int blocks = part->reviewMaskBlockCount();
+    QVERIFY(blocks > 0);
+    QVERIFY(internals.reload(part));
+    QTRY_COMPARE(part->reviewMaskBlockCount(), blocks);
+    QVERIFY(!pageView->reviewFeedbackVisible());
+    QVERIFY(feedbackActions().isEmpty());
+    // And Reveal shows it with its feedback again.
+    overview->toggleReveal();
+    QCOMPARE(feedbackActions(), offered);
+}
+
+void MainShellTest::testReviewPresentationWaitsForTheRebuiltPdfsPlaces()
+{
+    // A reload of a rebuilt PDF takes the revealed answer away before Sync's projections place the
+    // card on it: the card comes back once they do, revealed as the bar shows it, through the
+    // restorer (no tab switch, no window raised); never on the places of the PDF it replaced.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QByteArray before = testPdfBytes(QStringLiteral("file1.pdf")), rebuilt = testPdfBytes(QStringLiteral("file2.pdf"));
+    QVERIFY(!before.isEmpty() && !rebuilt.isEmpty());
+    const QString pdfPath = temporary.filePath(QStringLiteral("file1.pdf"));
+    const auto writePdf = [&pdfPath](const QByteArray &bytes) {
+        QFile pdf(pdfPath);
+        QVERIFY(pdf.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        pdf.write(bytes);
+    };
+    writePdf(before);
+    QString pdfSha256 = testSha256(before);
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const auto writeCard = [&](const QString &sha256, double top) {
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), sha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, top, 0.9, top + 0.05}},
+                                  {QStringLiteral("regions"), QJsonArray{QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, top, 0.9, top + 0.05}}}}},
+                                  {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))}, {QStringLiteral("question"), QStringLiteral("Which fact?")}};
+        QFile file(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        file.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                             {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                             {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact));
+    };
+    writeCard(pdfSha256, 0.15);
+
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    int presented = 0;
+    QList<QVariantList> restored;
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [&] { return QVariantMap{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}}; },
+        [&presented](const Thoughts::ReviewCard &, bool masked, QString *) {
+            presented += masked ? 1 : 0;
+            return true;
+        },
+        [] {}, nullptr, {}, {}, [&reviewHost] { return &reviewHost; });
+    overview.setPresentationRestorer([&restored](const Thoughts::ReviewCard &card, QString *) {
+        restored.append(card.regions());
+        return true;
+    });
+    QSignalSpy revealed(&overview, &Thoughts::ReviewOverview::answerRevealed);
+    overview.startReview();
+    QCOMPARE(presented, 1);
+    overview.toggleReveal();
+    QCOMPARE(revealed.count(), 1);
+
+    // Sync rebuilt the PDF and the tab reloaded it, before the card's places on it arrived.
+    writePdf(rebuilt);
+    pdfSha256 = testSha256(rebuilt);
+    overview.restoreReviewPresentation(QUuid::createUuid().toString(QUuid::WithoutBraces)); // another card's: nothing
+    overview.restoreReviewPresentation(cardId);
+    QVERIFY(restored.isEmpty());
+    QCOMPARE(revealed.count(), 1);
+    QCOMPARE(overview.m_lostPresentationCardId, cardId);
+    // A projection refresh without them changes nothing yet.
+    overview.reloadFromProjections();
+    QVERIFY(restored.isEmpty());
+
+    // The card re-anchored on the rebuilt PDF: shown there, and revealed again as the bar says.
+    writeCard(pdfSha256, 0.16);
+    overview.reloadFromProjections();
+    QCOMPARE(restored.size(), 1);
+    QCOMPARE(restored.constFirst().constFirst().toMap().value(QStringLiteral("rect")).toList().at(1).toDouble(), 0.16);
+    QCOMPARE(revealed.count(), 2);
+    QVERIFY(overview.m_answerPeeked);
+    QVERIFY(overview.m_lostPresentationCardId.isEmpty());
+    QCOMPARE(presented, 1); // the card presenter (which raises the window) is not used
+    overview.reloadFromProjections();
+    QCOMPARE(restored.size(), 1);
+
+    // Masked when lost: masked again, nothing revealed.
+    overview.toggleReveal();
+    QCOMPARE(presented, 2);
+    overview.restoreReviewPresentation(cardId);
+    QCOMPARE(restored.size(), 2);
+    QCOMPARE(revealed.count(), 2);
+    // Hidden review: its mask was cleared on purpose and stays so.
+    overview.toggleReviewVisibility();
+    QVERIFY(overview.m_reviewHidden);
+    overview.restoreReviewPresentation(cardId);
+    QCOMPARE(restored.size(), 2);
+}
+
+// The picture of a passage: one scale for every passage of a document (its text column across the
+// panel, raised for small text), cropped to the passage's width and to whole lines, with no part
+// of another line; tinted; pages one below the other.
+void MainShellTest::testReviewRetireCard()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QStringList cardIds{QUuid::createUuid().toString(QUuid::WithoutBraces), QUuid::createUuid().toString(QUuid::WithoutBraces)};
+    const auto writeTestFile = [](const QString &path, const QByteArray &data) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(data) == data.size();
+    };
+    for (const QString &cardId : cardIds) {
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), QStringLiteral("Question %1?").arg(cardIds.indexOf(cardId) + 1)},
+                                  {QStringLiteral("document_id"), QStringLiteral("doc-file1")}};
+        QVERIFY(writeTestFile(QDir(temporary.path()).filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)),
+                              QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                                        {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")},
+                                                        {QStringLiteral("primary"), primary}}).toJson(QJsonDocument::Compact)));
+    }
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 2);
+    auto *menu = overview.m_cardMenuButton->menu();
+    const auto action = [menu](const char *name) { return menu->findChild<QAction *>(QString::fromLatin1(name)); };
+    QVERIFY(action("reviewRetireAction"));
+    QCOMPARE(action("reviewRetireAction")->text(), QStringLiteral("Retire card"));
+    QCOMPARE(menu->actions().indexOf(action("reviewRetireAction")) + 1, menu->actions().indexOf(action("reviewDeleteAction")));
+    overview.updateCardMenu();
+    QVERIFY(action("reviewRetireAction")->isEnabled());
+    QVERIFY(!action("reviewUndoAction")->isEnabled());
+
+    // Retire: the card leaves the session like Delete, but stays with its history.
+    const QString retiredId = overview.m_dueCards.at(overview.m_currentReview).id();
+    const QString otherId = cardIds.at(cardIds.at(0) == retiredId ? 1 : 0);
+    QSignalSpy recorded(&overview, &Thoughts::ReviewOverview::reviewRecorded);
+    action("reviewRetireAction")->trigger();
+    QCOMPARE(recorded.count(), 1);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), otherId);
+    const auto cardOf = [&temporary](const QString &id) {
+        const auto cards = Thoughts::ReviewStore(temporary.path()).cards();
+        return *std::find_if(cards.cbegin(), cards.cend(), [&id](const Thoughts::ReviewCard &card) { return card.id() == id; });
+    };
+    QVERIFY(cardOf(retiredId).schedule.retired);
+    QVERIFY(!cardOf(retiredId).schedule.deleted);
+    QCOMPARE(Thoughts::ReviewStore(temporary.path()).dueCards().size(), 1);
+    overview.updateCardMenu();
+    QVERIFY(action("reviewUndoAction")->isEnabled());
+
+    // Undo writes undo_retire for that retire and brings the card back.
+    action("reviewUndoAction")->trigger();
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), retiredId);
+    QVERIFY(!cardOf(retiredId).schedule.retired);
+    QStringList actions;
+    for (const auto &event : cardOf(retiredId).history) actions.append(event.value(QStringLiteral("queue_action")).toString());
+    QCOMPARE(actions, (QStringList{QStringLiteral("retire"), QStringLiteral("undo_retire")}));
+    QCOMPARE(cardOf(retiredId).history.at(1).value(QStringLiteral("undone_event_id")).toString(), cardOf(retiredId).history.at(0).value(QStringLiteral("event_id")).toString());
+    overview.updateCardMenu();
+    QVERIFY(!action("reviewUndoAction")->isEnabled());
+
+    // The card browser: a Retired state filter, Restore to review on a retired card, the state in its details and history.
+    QString error;
+    QVERIFY2(Thoughts::ReviewStore(temporary.path()).retireCard(retiredId, &error), qPrintable(error));
+    Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+    QTRY_VERIFY(browser.m_loadedAt.isValid());
+    QCOMPARE(browser.activeCardCount(), 1);
+    QCOMPARE(browser.dueCardCount(), 1);
+    // The Library's review-card columns count active cards only.
+    QCOMPARE(browser.libraryCardIds().value(QStringLiteral("doc-file1")), QSet<QString>{otherId});
+    const int retiredFilter = browser.m_browseStateFilter->findData(QStringLiteral("retired"));
+    QVERIFY(retiredFilter >= 0);
+    QCOMPARE(browser.m_browseStateFilter->itemText(retiredFilter), QStringLiteral("Retired / Unpublished"));
+    browser.setStateFilter(QStringLiteral("retired"));
+    QCOMPARE(browser.m_visibleBrowseCards.size(), 1);
+    QCOMPARE(browser.m_visibleBrowseCards.constFirst().card.id(), retiredId);
+    QCOMPARE(browser.m_visibleBrowseCards.constFirst().state, Thoughts::ReviewBrowserState::Retired);
+    browser.selectCard(retiredId);
+    QTRY_VERIFY(browser.selectedBrowseCard() && browser.selectedBrowseCard()->card.id() == retiredId);
+    QCOMPARE(browser.m_browseTable->currentItem()->text(1), QStringLiteral("Retired"));
+    QVERIFY(!browser.m_browseReviewButton->isEnabled());
+    const QString retiredLabel = QStringLiteral("Retired ") + cardOf(retiredId).schedule.retiredAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+    QVERIFY2(browser.m_browseDetails->toPlainText().contains(retiredLabel), qPrintable(browser.m_browseDetails->toPlainText()));
+    QVERIFY(browser.m_browseHistory->toPlainText().startsWith(retiredLabel));
+    QVERIFY(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Undo retire · ")));
+    QVERIFY(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Retired · ")));
+    const auto browseActions = browser.m_browseActionsButton->menu()->actions();
+    QCOMPARE(browseActions.indexOf(browser.m_browseRetireAction) + 1, browseActions.indexOf(browser.m_browseDeleteAction));
+    QCOMPARE(browser.m_browseRetireAction->text(), QStringLiteral("Restore to review"));
+    QVERIFY(browser.m_browseRetireAction->isEnabled());
+
+    // Restore to review: active again with its old schedule.
+    browser.m_browseRetireAction->trigger();
+    QTRY_VERIFY(!cardOf(retiredId).schedule.retired);
+    QTRY_COMPARE(browser.dueCardCount(), 2);
+    browser.setStateFilter(QStringLiteral("all"));
+    browser.selectCard(retiredId);
+    QTRY_VERIFY(browser.selectedBrowseCard() && browser.selectedBrowseCard()->card.id() == retiredId);
+    QCOMPARE(browser.m_browseRetireAction->text(), QStringLiteral("Retire card"));
+    QVERIFY(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Restored to review · ")));
+    QVERIFY(!browser.m_browseDetails->toPlainText().contains(QStringLiteral("Retired ")));
+    browser.m_browseRetireAction->trigger();
+    QTRY_VERIFY(cardOf(retiredId).schedule.retired);
+    QTRY_COMPARE(browser.dueCardCount(), 1);
+}
+
+void MainShellTest::testReviewCardAgentConversations()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3},
+                                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                              {QStringLiteral("card_id"), cardId},
+                                              {QStringLiteral("status"), QStringLiteral("approved")},
+                                              {QStringLiteral("primary"), primary}})
+                       .toJson(QJsonDocument::Compact));
+    cardFile.close();
+
+    // Private Claude sessions: no status dot is read from the real ones.
+    qputenv("CLAUDE_CONFIG_DIR", QDir(temporary.path()).filePath(QStringLiteral("claude")).toUtf8());
+    const auto restoreClaude = qScopeGuard([] { qunsetenv("CLAUDE_CONFIG_DIR"); });
+    QJsonObject projections;
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    // Only the conversations come from these projections (with them the store would want the card's PDF in a Library).
+    overview.m_conversationProjections = [&projections] { return projections; };
+    overview.startReview();
+    overview.showCurrentCard();
+    QVERIFY(overview.m_sessionPage->isVisible());
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(!overview.m_conversationLine->isVisible());
+    overview.fillAgentConversationsMenu();
+    QCOMPARE(overview.m_agentConversationsMenu->title(), QStringLiteral("Agent conversations (0)"));
+    QVERIFY(!overview.m_agentConversationsMenu->menuAction()->isEnabled());
+
+    namespace Conversations = Thoughts::AgentConversations;
+    const auto link = [&cardId](const QString &agent, const QString &conversation, const QString &title, const QString &url, const QString &session, const QString &time,
+                                const QString &card = QString()) {
+        Conversations::Touch touch;
+        touch.projectId = QStringLiteral("source:docs-test");
+        touch.agent = agent;
+        touch.conversationId = conversation;
+        touch.conversationUrl = url;
+        touch.title = title;
+        touch.titleSource = QStringLiteral("prompt");
+        touch.sessionName = session;
+        touch.linkedBy = QStringLiteral("tool");
+        touch.tool = QStringLiteral("prompt");
+        touch.reviewCardId = card.isEmpty() ? cardId : card;
+        touch.cardLinkedBy = QStringLiteral("prompt");
+        return Conversations::touch({}, touch, QStringLiteral("test"), QDateTime::fromString(time, Qt::ISODateWithMs), QStringLiteral("mac")).record;
+    };
+    const QString claudeUrl = QStringLiteral("https://claude.ai/code/session_01ExampleSessionCdefGhij");
+    const QJsonObject older = link(QStringLiteral("codex"), QStringLiteral("01900000-0000-7000-8000-000000000002"), QStringLiteral("Older codex thread"), QString(), QString(),
+                                   QStringLiteral("2026-10-26T10:00:00.000Z"));
+    const QJsonObject newer = link(QStringLiteral("claude"), QStringLiteral("9037f64f-185a-564e-a957-c7f4089267a6"), QStringLiteral("Why the std?"), claudeUrl,
+                                   QStringLiteral("alex-61"), QDateTime::currentDateTimeUtc().addSecs(-300).toString(Qt::ISODateWithMs));
+    const QJsonObject otherCard = link(QStringLiteral("claude"), QStringLiteral("11111111-2222-4333-8444-555555555555"), QStringLiteral("Another card"), QString(),
+                                       QString(), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs), QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"));
+    for (const QJsonObject &record : {older, newer, otherCard})
+        projections.insert(Conversations::projectionKey(record.value(QStringLiteral("link_id")).toString()), record);
+    overview.refreshAgentConversations(projections);
+    QVERIFY(overview.m_conversationLine->isVisible());
+    QCOMPARE(overview.m_conversationShown.value(QStringLiteral("link_id")).toString(), newer.value(QStringLiteral("link_id")).toString());
+    QCOMPARE(overview.m_conversationTitle->text(), QStringLiteral("Why the std?"));
+    // (The agent's name joins the details only where the theme has no Claude/Codex icon.)
+    QVERIFY2(overview.m_conversationDetails->text().endsWith(QStringLiteral("· alex-61 · 5 min ago")), qPrintable(overview.m_conversationDetails->text()));
+    QVERIFY(overview.m_conversationLine->toolTip().contains(claudeUrl));
+    // Above the buttons.
+    QVERIFY(overview.m_conversationLine->geometry().bottom() <= overview.m_answerRow->geometry().top());
+    // No running Claude session here: no status dot.
+    QVERIFY(!overview.m_conversationStatus->isVisibleTo(overview.m_conversationLine));
+
+    // A click opens the conversation.
+    BrowserUrlCatcher catcher;
+    QDesktopServices::setUrlHandler(QStringLiteral("https"), &catcher, "open");
+    const auto unsetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
+    overview.m_conversationLine->click();
+    QCOMPARE(catcher.urls, QList<QUrl>({QUrl(claudeUrl)}));
+
+    // The menu lists both, newest first, each with Open, Copy Link, Copy ID and Remove from this Card.
+    overview.fillAgentConversationsMenu();
+    QCOMPARE(overview.m_agentConversationsMenu->title(), QStringLiteral("Agent conversations (2)"));
+    QVERIFY(overview.m_agentConversationsMenu->menuAction()->isEnabled());
+    const QList<QAction *> entries = overview.m_agentConversationsMenu->actions();
+    QCOMPARE(entries.size(), 2);
+    QVERIFY(entries.at(0)->text().startsWith(QStringLiteral("Why the std? — Claude · alex-61 · ")));
+    QVERIFY(entries.at(1)->text().startsWith(QStringLiteral("Older codex thread — Codex · ")));
+    QMenu *newest = entries.at(0)->menu();
+    QVERIFY(newest);
+    QStringList labels;
+    for (QAction *action : newest->actions())
+        if (!action->isSeparator()) labels.append(action->text());
+    QCOMPARE(labels, QStringList({QStringLiteral("Open in Claude"), QStringLiteral("Copy Link"), QStringLiteral("Copy Conversation ID"), QStringLiteral("Remove from this Card")}));
+    QVERIFY(!entries.at(1)->menu()->findChild<QAction *>(QStringLiteral("reviewOpenAgentConversationAction"))->isEnabled());
+
+    // Remove from this Card queues the next revision with the card's entry removed.
+    QSignalSpy changes(&overview, &Thoughts::ReviewOverview::agentConversationChangeRequested);
+    newest->findChild<QAction *>(QStringLiteral("reviewRemoveAgentConversationAction"))->trigger();
+    QCOMPARE(changes.count(), 1);
+    const QJsonObject removed = QJsonObject::fromVariantMap(changes.at(0).at(0).toMap());
+    QCOMPARE(removed.value(QStringLiteral("revision")).toInt(), newer.value(QStringLiteral("revision")).toInt() + 1);
+    QVERIFY(Conversations::recordsForCard(QJsonObject{{QStringLiteral("k"), removed}}, cardId).isEmpty());
+    QVERIFY(Conversations::validationError(removed).isEmpty());
+    projections.insert(Conversations::projectionKey(removed.value(QStringLiteral("link_id")).toString()), removed);
+    overview.refreshAgentConversations(projections);
+    QVERIFY(overview.m_conversationLine->isVisible());
+    QCOMPARE(overview.m_conversationTitle->text(), QStringLiteral("Older codex thread"));
+
+    // While the knowledge is set, the line neither goes nor appears.
+    overview.revealAnswer();
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+    overview.refreshAgentConversations(QJsonObject{{QStringLiteral("logical_comment\ncomments\nx"), QJsonObject()}});
+    QVERIFY(overview.m_conversationLine->isVisible());
+    // The next card (here the same one, shown again) follows the projections.
+    projections = QJsonObject();
+    overview.showCurrentCard();
+    QVERIFY(!overview.m_conversationLine->isVisible());
+    overview.revealAnswer();
+    projections.insert(Conversations::projectionKey(older.value(QStringLiteral("link_id")).toString()), older);
+    overview.refreshAgentConversations(projections);
+    QVERIFY(!overview.m_conversationLine->isVisible());
+}
+
+void MainShellTest::testReviewCardMenu()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const QJsonObject record {{QStringLiteral("schema_version"), 3},
+                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                              {QStringLiteral("card_id"), cardId},
+                              {QStringLiteral("status"), QStringLiteral("approved")},
+                              {QStringLiteral("primary"), primary}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(record).toJson(QJsonDocument::Compact));
+    cardFile.close();
+    // Answers are rated on sliders, both open by default: Recall (Correct, Partly) and
+    // Understanding (Wrong, Fine).
+    {
+        Thoughts::ReviewStore groupsStore(temporary.path());
+        QString groupsError;
+        const QStringList recall{QStringLiteral("correct"), QStringLiteral("partly")}, understanding{QStringLiteral("wrong"), QStringLiteral("fine")};
+        QVERIFY2(groupsStore.saveTagGroups({{QStringLiteral("g-r"), QStringLiteral("Recall"), recall, recall},
+                                            {QStringLiteral("g-u"), QStringLiteral("Understanding"), understanding, understanding}},
+                                           &groupsError),
+                 qPrintable(groupsError));
+    }
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    int maskPresentations = 0;
+    int maskClears = 0;
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [document] { return document; },
+        [&maskPresentations](const Thoughts::ReviewCard &, bool masked, QString *) {
+            if (masked) {
+                ++maskPresentations;
+            }
+            return true;
+        },
+        [&maskClears] { ++maskClears; },
+        nullptr,
+        {},
+        {},
+        [&reviewHost] { return &reviewHost; });
+
+
+    QSignalSpy reviewStarts(&overview, &Thoughts::ReviewOverview::reviewStarted);
+    overview.startReview();
+    QCOMPARE(reviewStarts.count(), 1);
+    overview.showCurrentCard();
+    overview.revealAnswer();
+    QCOMPARE(reviewStarts.count(), 1); // Redisplay and reveal preserve session visibility choices.
+    overview.showCurrentCard();
+    // ‹ › appear only for several answer areas and cycle through them, wrapping around.
+    {
+        int areaCount = 1;
+        QList<int> focusedAreas;
+        overview.setAnswerAreaNavigation([&areaCount] { return areaCount; }, [&focusedAreas](int index) { focusedAreas << index; return true; });
+        overview.showCurrentCard();
+        QVERIFY(!overview.m_nextAreaButton->isVisible() && !overview.m_previousAreaButton->isVisible());
+        areaCount = 3;
+        overview.showCurrentCard();
+        QVERIFY(overview.m_nextAreaButton->isVisible() && overview.m_previousAreaButton->isVisible());
+        QCOMPARE(overview.m_nextAreaButton->accessibleName(), QStringLiteral("Next answer area"));
+        overview.m_previousAreaButton->click();
+        overview.m_nextAreaButton->click();
+        overview.m_nextAreaButton->click();
+        QCOMPARE(focusedAreas, QList<int>({2, 0, 1}));
+        overview.setAnswerAreaNavigation({}, {});
+        overview.showCurrentCard();
+        QVERIFY(!overview.m_nextAreaButton->isVisible());
+    }
+    auto *menu = overview.m_cardMenuButton->menu();
+    QVERIFY(overview.m_cardMenuButton->isVisible());
+    const auto action = [menu](const char *name) { return menu->findChild<QAction *>(QString::fromLatin1(name)); };
+    QCOMPARE(action("reviewFocusAction")->text(), QStringLiteral("Focus"));
+    QCOMPARE(action("reviewMoreInfoAction")->text(), QStringLiteral("More info"));
+    QCOMPARE(action("reviewEditAction")->text(), QStringLiteral("Edit"));
+    QCOMPARE(action("reviewUndoAction")->text(), QStringLiteral("Undo"));
+    QCOMPARE(action("reviewDeleteAction")->text(), QStringLiteral("Delete card"));
+    QVERIFY(!action("reviewUndoAction")->isEnabled());
+    QVERIFY(!action("reviewHideAgainAction")->isVisible());
+    // Show history is offered before the answer too, also for a card without feedback.
+    QVERIFY(action("reviewShowHistoryAction")->isVisible());
+    QCOMPARE(action("reviewShowHistoryAction")->text(), QStringLiteral("Show history"));
+    QVERIFY(overview.m_reviewVisibilityButton->isVisible());
+    overview.m_reviewVisibilityButton->click();
+    QVERIFY(overview.m_sessionPage->isHidden());
+    QCOMPARE(overview.m_reviewVisibilityButton->text(), QStringLiteral("Focus"));
+    overview.m_reviewVisibilityButton->click();
+    QVERIFY(overview.m_sessionPage->isVisible());
+    QCOMPARE(overview.m_reviewVisibilityButton->text(), QStringLiteral("Hide review"));
+    QVERIFY(overview.m_tagField && overview.m_intervalField && overview.m_nextButton);
+    QVERIFY(action("reviewSkipAction")->isVisible()); // Skip is available before the answer, unlike Hide again.
+    Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+    browser.m_browseSearch->setText(QStringLiteral("does not match"));
+    browser.setStateFilter(QStringLiteral("deleted"));
+    QSignalSpy infoRequested(&overview, &Thoughts::ReviewOverview::cardInfoRequested);
+    connect(&overview, &Thoughts::ReviewOverview::cardInfoRequested, &browser, &Thoughts::ReviewCardsWidget::selectCard);
+    action("reviewMoreInfoAction")->trigger();
+    QCOMPARE(infoRequested.count(), 1);
+    QCOMPARE(infoRequested.at(0).at(0).toString(), cardId);
+    QTRY_VERIFY(browser.selectedBrowseCard());
+    QCOMPARE(browser.selectedBrowseCard()->card.id(), cardId);
+    QVERIFY(browser.m_browseDetails->toPlainText().contains(cardId));
+    QVERIFY(!overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardInfoDialog")));
+    QVERIFY(overview.m_ratingPanel->isHidden());
+
+    // Copy for agent follows More info: the document as its tab copies it, then the card.
+    {
+        const auto actions = menu->actions();
+        const int copyIndex = actions.indexOf(action("reviewCopyForAgentAction"));
+        QCOMPARE(copyIndex, actions.indexOf(action("reviewMoreInfoAction")) + 1);
+        QCOMPARE(action("reviewCopyForAgentAction")->text(), QStringLiteral("Copy for agent"));
+        overview.updateCardMenu();
+        QVERIFY(action("reviewCopyForAgentAction")->isEnabled());
+        QApplication::clipboard()->setText(QStringLiteral("sentinel"));
+        action("reviewCopyForAgentAction")->trigger();
+        const QString copied = QApplication::clipboard()->text();
+        QVERIFY2(copied.startsWith(QStringLiteral("Thoughts document: \"file1.pdf\"\nBuilt PDF: %1  (").arg(pdfPath)), qPrintable(copied));
+        QVERIFY2(copied.contains(QStringLiteral("\nReview card: %1\nQuestion: \"Which fact should be recalled?\"\nAnswer pages: 1\n").arg(cardId)), qPrintable(copied));
+        QVERIFY(!copied.contains(QStringLiteral("Note:")));
+        // The answer is not copied.
+        QVERIFY(!copied.contains(QStringLiteral("Answer text")));
+        QVERIFY2(copied.endsWith(QStringLiteral("\nAnswer pages: 1\n")), qPrintable(copied));
+        // Copy for physical studying is gone (the phone's study mode prompt does that job).
+        QVERIFY(!action("reviewCopyForPhysicalStudyingAction"));
+        QCOMPARE(actions.at(copyIndex + 1)->objectName(), QStringLiteral("reviewEditAction"));
+        // It uses the template saved in Settings > Agent prompts.
+        Thoughts::AgentPrompts::saveTemplate(Thoughts::AgentPrompts::Kind::Agent, QStringLiteral("Card {card_id} on page {answer_pages}\n"));
+        action("reviewCopyForAgentAction")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("Card %1 on page 1\n").arg(cardId));
+        Thoughts::AgentPrompts::saveTemplate(Thoughts::AgentPrompts::Kind::Agent, QString());
+        action("reviewCopyForAgentAction")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), copied);
+        // Once knowledge is being set, the bar's tags, interval and notes follow the card lines,
+        // although nothing is saved yet.
+        overview.revealAnswer();
+        QVERIFY(!overview.m_ratingPanel->isHidden());
+        overview.m_selectedTags = {QStringLiteral("partly")};
+        overview.m_interval = Thoughts::ReviewInterval{4, Thoughts::ReviewInterval::Weeks};
+        overview.m_groupNotes = {{Thoughts::ReviewTags::answerNoteKey(), QStringLiteral("Mixed up the\nsign  ")}};
+        overview.refreshBarLabels();
+        action("reviewCopyForAgentAction")->trigger();
+        const QString giving = QApplication::clipboard()->text();
+        QCOMPARE(giving, copied + QStringLiteral("Current review (being given now, not saved yet):\n"
+                                                 "- Recall: partly\n"
+                                                 "- Again in: 4 weeks\n"
+                                                 "- Notes:\n"
+                                                 "  - Note: Mixed up the sign\n"));
+        // Hidden again (Hide again), the bar is not being given: back to the card alone.
+        overview.m_ratingPanel->hide();
+        action("reviewCopyForAgentAction")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), copied);
+        // The card browser's context menu copies the same text for the selected card.
+        QMenu browseMenu;
+        browser.populateBrowseContextMenu(&browseMenu);
+        auto *browseCopy = browseMenu.findChild<QAction *>(QStringLiteral("reviewBrowseCopyForAgentAction"));
+        QVERIFY(browseCopy && browseCopy->isEnabled());
+        QApplication::clipboard()->setText(QStringLiteral("sentinel"));
+        browseCopy->trigger();
+        const QString browsed = QApplication::clipboard()->text();
+        QVERIFY2(browsed.contains(QStringLiteral("\nReview card: %1\nQuestion: \"Which fact should be recalled?\"\nAnswer pages: 1\n").arg(cardId)), qPrintable(browsed));
+    }
+
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardRegionDialog"));
+        QVERIFY(dialog);
+        auto *editor = dialog->findChild<QPlainTextEdit *>();
+        auto *save = dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok);
+        editor->setPlainText(QString());
+        const bool emptyDisabled = !save->isEnabled();
+        editor->setPlainText(QStringLiteral("Which edited fact should be recalled?"));
+        // A card without source markers changes its answer with Edit Areas…, not coordinates or VS Code.
+        const bool coordinatesHidden = !dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewCardRegionLeft"))->isVisibleTo(dialog);
+        const bool noMarkers = !dialog->findChild<QPushButton *>(QStringLiteral("reviewCardRegionEditMarkers"));
+        auto *areas = dialog->findChild<QPushButton *>(QStringLiteral("reviewCardRegionEditAreas"));
+        const bool areasOffered = areas && areas->isVisibleTo(dialog);
+        const bool validEnabled = save->isEnabled();
+        save->click();
+        QVERIFY(emptyDisabled);
+        QVERIFY(coordinatesHidden);
+        QVERIFY(noMarkers);
+        QVERIFY(areasOffered);
+        QVERIFY(validEnabled);
+    });
+    const QVariantList rectBeforeEdit = Thoughts::ReviewStore(temporary.path()).cards().constFirst().rect();
+    action("reviewEditAction")->trigger();
+    Thoughts::ReviewStore store(temporary.path());
+    QCOMPARE(store.cards().constFirst().question(), QStringLiteral("Which edited fact should be recalled?"));
+    QCOMPARE(store.cards().constFirst().rect(), rectBeforeEdit);
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which edited fact should be recalled?"));
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    const auto beforeConflict = store.cards().constFirst();
+    QString error;
+    QVERIFY(store.updateQuestion(cardId, QStringLiteral("Updated by sync"), &error));
+    QVERIFY(!store.updateCardContent(beforeConflict, {0.2, 0.2, 0.5, 0.4}, QStringLiteral("Stale edit"), &error));
+    QCOMPARE(store.cards().constFirst().question(), QStringLiteral("Updated by sync"));
+    QCOMPARE(store.cards().constFirst().rect(), beforeConflict.rect());
+
+    overview.revealAnswer();
+    overview.updateCardMenu();
+    QVERIFY(action("reviewHideAgainAction")->isVisible());
+    action("reviewHideAgainAction")->trigger();
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    overview.revealAnswer();
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardRegionDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QPlainTextEdit *>()->setPlainText(QStringLiteral("Cancelled edit"));
+        dialog->reject();
+    });
+    action("reviewEditAction")->trigger();
+    QCOMPARE(store.cards().constFirst().question(), QStringLiteral("Updated by sync"));
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+
+    overview.m_selectedTags = {QStringLiteral("wrong")};
+    overview.refreshBarLabels();
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, 1);
+    QCOMPARE(store.cards().constFirst().currentTags(), QStringList{QStringLiteral("wrong")});
+    QVERIFY(overview.m_cardMenuButton->isVisible());
+    QVERIFY(!action("reviewMoreInfoAction")->isEnabled());
+    QVERIFY(action("reviewUndoAction")->isEnabled());
+    action("reviewUndoAction")->trigger();
+    QVERIFY(!overview.m_sessionComplete);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), cardId);
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Updated by sync"));
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, 0);
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QVERIFY(!action("reviewUndoAction")->isEnabled());
+
+    // The phone's bar: the tags of the card's last answer and twice the last interval (two weeks
+    // for a new card), then Next. The undone Wrong no longer counts, so nothing is rated.
+    overview.revealAnswer();
+    const auto fieldValue = [](QPushButton *field) { return field->findChild<QLabel *>(QStringLiteral("reviewFieldValue"))->text(); };
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("Not rated"));
+    QVERIFY(overview.m_selectedTags.isEmpty());
+    QCOMPARE(fieldValue(overview.m_intervalField), QStringLiteral("2 weeks"));
+    QCOMPARE(overview.m_nextButton->text(), QStringLiteral("Next"));
+    QCOMPARE(overview.m_nextButton->accessibleName(), QStringLiteral("Not rated, again in 2 weeks"));
+    QVERIFY(overview.m_nextButton->isEnabled()); // Next records an answer with no rating.
+    QVERIFY(action("reviewSkipAction")->isVisible());
+    overview.m_selectedTags.clear();
+    overview.refreshBarLabels();
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("Not rated"));
+    QVERIFY(overview.m_nextButton->isEnabled());
+    overview.m_selectedTags = {QStringLiteral("correct"), QStringLiteral("wrong")};
+    overview.refreshBarLabels();
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("Correct · Wrong"));
+    overview.m_selectedTags.append(QStringLiteral("later"));
+    overview.refreshBarLabels();
+    QCOMPARE(fieldValue(overview.m_tagField), QStringLiteral("Correct · Wrong +1"));
+    overview.m_selectedTags = {QStringLiteral("correct"), QStringLiteral("wrong")};
+    overview.refreshBarLabels();
+    QVERIFY(overview.m_nextButton->isEnabled());
+    // The interval field changes only this card's interval.
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewIntervalDialog"));
+        QVERIFY(dialog);
+        QCOMPARE(dialog->windowTitle(), QStringLiteral("Review again in"));
+        dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->setValue(90);
+        auto *units = dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"));
+        units->setCurrentIndex(units->findData(Thoughts::ReviewInterval::Minutes));
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    overview.m_intervalField->click();
+    QCOMPARE(fieldValue(overview.m_intervalField), QStringLiteral("90 min"));
+    overview.hideAnswer();
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QCOMPARE(fieldValue(overview.m_intervalField), QStringLiteral("90 min")); // Hide keeps the choice.
+    // Showing the card again starts from its own suggestion.
+    overview.showCurrentCard();
+    overview.revealAnswer();
+    QCOMPARE(fieldValue(overview.m_intervalField), QStringLiteral("2 weeks"));
+    QVERIFY(overview.m_reviewStatus->isHidden());
+    QCOMPARE(action("reviewEndSessionAction")->text(), QStringLiteral("End review"));
+    const QString answerScreenshots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR");
+    auto answer = [&](std::function<void()> open, std::function<void(QDialog *)> custom) {
+        QTimer::singleShot(0, &overview, [&, custom] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewAnswerDialog"));
+            QVERIFY(dialog);
+            custom(dialog);
+        });
+        open();
+    };
+    // Right-clicking Next opens the desktop's full answer: Never, or a whole document or project.
+    auto openInterval = [&] { overview.chooseAnswer({}); };
+    auto next = [](QDialog *dialog) { return dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok); };
+    // The slider with the step @p tag.
+    auto sliderOf = [](QDialog *dialog, const QString &tag) -> QWidget * {
+        for (auto *scale : dialog->findChildren<QWidget *>(QStringLiteral("reviewAnswerTagScale")))
+            if (scale->property("reviewTagSteps").toStringList().contains(tag)) return scale;
+        return nullptr;
+    };
+    // Chooses the step @p tag on its slider, as a person would.
+    auto pickTag = [&sliderOf](QDialog *dialog, const QString &tag) {
+        QWidget *scale = sliderOf(dialog, tag);
+        QVERIFY(scale && scale->isVisible());
+        const int index = scale->property("reviewTagSteps").toStringList().indexOf(tag);
+        QTest::mouseClick(scale, Qt::LeftButton, Qt::NoModifier, QPoint(scale->property("tickCenters").toList().at(index).toInt(), 12));
+        QCOMPARE(scale->property("reviewTagScaleValue").toInt(), index);
+    };
+    answer(openInterval, [&](QDialog *dialog) {
+        QCOMPARE(dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->value(), 2.0);
+        // The sliders under a Rating heading; Skip postpones without answering, so it is not a
+        // step, and tags have no chips.
+        QVERIFY(dialog->findChildren<QPushButton *>(QStringLiteral("reviewAnswerTag")).isEmpty());
+        QVERIFY(dialog->findChildren<QPushButton *>(QStringLiteral("reviewAnswerNewTag")).isEmpty());
+        QVERIFY(!sliderOf(dialog, QStringLiteral("skip")));
+        const auto labels = dialog->findChildren<QLabel *>();
+        QVERIFY(std::any_of(labels.cbegin(), labels.cend(), [](QLabel *label) { return label->text() == QLatin1String("Rating"); }));
+        QVERIFY(std::none_of(labels.cbegin(), labels.cend(), [](QLabel *label) { return label->text() == QLatin1String("Tags"); }));
+        QVERIFY(!dialog->findChild<QPushButton *>(QStringLiteral("reviewSkipRandom"))); // Random belongs to Skip only.
+        QVERIFY2(next(dialog)->isEnabled(), "An answer may have no tag");
+        pickTag(dialog, QStringLiteral("correct"));
+        QCOMPARE(sliderOf(dialog, QStringLiteral("correct"))->property("reviewTagStepTexts").toStringList().constFirst(), QStringLiteral("Correct (1)"));
+        QVERIFY(next(dialog)->isEnabled());
+        if (!answerScreenshots.isEmpty()) QVERIFY(dialog->grab().save(answerScreenshots + QStringLiteral("/answer-dialog.png")));
+        dialog->reject();
+    });
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, 0);
+    answer(openInterval, [&](QDialog *dialog) {
+        dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->setValue(2.5);
+        auto *units = dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"));
+        QCOMPARE(units->count(), 5);
+        units->setCurrentIndex(units->findData(Thoughts::ReviewInterval::Weeks));
+        pickTag(dialog, QStringLiteral("correct"));
+        next(dialog)->click();
+    });
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, 1);
+    QCOMPARE(store.cards().constFirst().schedule.lastRating, QStringLiteral("custom_interval"));
+    QCOMPARE(store.cards().constFirst().currentTags(), QStringList{QStringLiteral("correct")});
+    QCOMPARE(store.cards().constFirst().currentMark(), QStringLiteral("correct"));
+    auto scheduled = store.cards().constFirst().schedule;
+    const auto doubled = Thoughts::ReviewInterval::suggested(scheduled.lastReviewedAt, scheduled.dueAt);
+    QCOMPARE(doubled.unit, Thoughts::ReviewInterval::Weeks);
+    QVERIFY(qAbs(doubled.amount - 5) < .000001);
+    overview.previousQuestion();
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewNoteDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QPlainTextEdit *>()->setPlainText(QStringLiteral("A card note"));
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+    });
+    action("reviewNoteAction")->trigger();
+    QCOMPARE(store.cards().constFirst().record.value(QStringLiteral("note")).toString(), QStringLiteral("A card note"));
+    QVERIFY(overview.m_noteButton->isVisible());
+    QCOMPARE(action("reviewNoteAction")->text(), QStringLiteral("Edit note"));
+    const auto beforeSkip = store.cards().constFirst().schedule;
+    const auto tagsBeforeSkip = store.cards().constFirst().currentTags();
+    // Skip postpones by 10 minutes by default without answering: the tags stay.
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    action("reviewSkipAction")->trigger();
+    QVERIFY(overview.m_sessionComplete);
+    QVERIFY(store.dueCards().isEmpty());
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, beforeSkip.reviewCount);
+    QCOMPARE(store.cards().constFirst().currentTags(), tagsBeforeSkip);
+    QVERIFY(store.cards().constFirst().skippedUntil > QDateTime::currentDateTimeUtc().addSecs(9 * 60));
+    QVERIFY(store.cards().constFirst().skippedUntil < QDateTime::currentDateTimeUtc().addSecs(11 * 60));
+    QVERIFY(action("reviewUndoAction")->isEnabled());
+    action("reviewUndoAction")->trigger();
+    QVERIFY(!overview.m_sessionComplete);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), cardId);
+    QCOMPARE(store.cards().constFirst().schedule.reviewCount, beforeSkip.reviewCount);
+    QVERIFY(!store.cards().constFirst().skippedUntil.isValid());
+    // Random sets the interval to a whole number of days (2 days + exponential, 95% within 14
+    // days), the date option off; the user still confirms it.
+    {
+        const auto previousSource = Thoughts::randomSkipUniformSource();
+        double u = 0.95;
+        Thoughts::randomSkipUniformSource() = [&u] { return u; };
+        QTimer::singleShot(0, &overview, [&] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+            QVERIFY(dialog);
+            auto *random = dialog->findChild<QPushButton *>(QStringLiteral("reviewSkipRandom"));
+            QVERIFY(random && random->isVisible());
+            QCOMPARE(random->text(), QStringLiteral("Random"));
+            auto *date = dialog->findChild<QDateEdit *>(QStringLiteral("reviewIntervalDate"));
+            auto *amount = dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"));
+            auto *unit = dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"));
+            auto *due = dialog->findChild<QLabel *>(QStringLiteral("reviewIntervalDue"));
+            // A custom date chosen first is turned off.
+            dialog->findChild<QPushButton *>(QStringLiteral("reviewIntervalCustomDate"))->click();
+            QVERIFY(date->isVisible());
+            random->click();
+            QVERIFY(!date->isVisible());
+            QCOMPARE(amount->value(), 14.0);
+            QCOMPARE(unit->currentData().toInt(), int(Thoughts::ReviewInterval::Days));
+            QVERIFY(amount->isEnabled() && unit->isEnabled());
+            // Days are counted on the local calendar, as ReviewInterval::dueAt does: across a
+            // daylight saving change, 14 days are not 14 × 24 hours. Compare the local date only.
+            const auto dueDate = [](int days) {
+                return QLocale().toString(QDateTime::currentDateTimeUtc().toTimeZone(QTimeZone::systemTimeZone()).addDays(days).date(), QLocale::ShortFormat);
+            };
+            QVERIFY2(due->text().contains(dueDate(14)), qPrintable(due->text()));
+            u = 0; // Each click samples again.
+            random->click();
+            QCOMPARE(amount->value(), 2.0);
+            QCOMPARE(unit->currentData().toInt(), int(Thoughts::ReviewInterval::Days));
+            QVERIFY2(due->text().contains(dueDate(2)), qPrintable(due->text()));
+            dialog->reject(); // Cancel discards the random interval.
+        });
+        action("reviewSkipAction")->trigger();
+        QVERIFY(!overview.m_sessionComplete);
+        QVERIFY(!store.cards().constFirst().skippedUntil.isValid());
+        u = 0.95;
+        double chosen = 0;
+        QTimer::singleShot(0, &overview, [&] {
+            auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+            QVERIFY(dialog);
+            dialog->findChild<QPushButton *>(QStringLiteral("reviewSkipRandom"))->click();
+            chosen = dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->value();
+            next(dialog)->click();
+        });
+        const auto skippedAt = QDateTime::currentDateTimeUtc();
+        action("reviewSkipAction")->trigger();
+        Thoughts::randomSkipUniformSource() = previousSource;
+        QVERIFY(overview.m_sessionComplete);
+        QCOMPARE(chosen, 14.0);
+        // Now + 14 local calendar days through the normal interval logic (not 14 × 24 hours across
+        // a daylight saving change).
+        const auto until = store.cards().constFirst().skippedUntil;
+        QVERIFY2(qAbs(skippedAt.toTimeZone(QTimeZone::systemTimeZone()).addDays(14).secsTo(until)) < 60, qPrintable(until.toString(Qt::ISODate)));
+        action("reviewUndoAction")->trigger();
+        QVERIFY(!overview.m_sessionComplete);
+        QVERIFY(!store.cards().constFirst().skippedUntil.isValid());
+    }
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        QVERIFY(!dialog->findChild<QWidget *>(QStringLiteral("reviewAnswerTags"))); // Skip has no rating.
+        QVERIFY(dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipNever"))->isHidden());
+        auto *document = dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipDocument"));
+        auto *project = dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipProject"));
+        QVERIFY(document && project);
+        QVERIFY(!document->isChecked() && !project->isChecked());
+        QVERIFY(!project->isEnabled());
+        QVERIFY(!dialog->findChild<QGroupBox *>(QStringLiteral("reviewSkipWhichCards"))->isEnabled());
+        document->setChecked(true);
+        QVERIFY(dialog->findChild<QGroupBox *>(QStringLiteral("reviewSkipWhichCards"))->isEnabled());
+        QVERIFY(dialog->findChild<QRadioButton *>(QStringLiteral("reviewSkipDueOnly"))->isChecked());
+        QVERIFY(dialog->findChild<QLabel *>(QStringLiteral("reviewIntervalDue"))->text().startsWith(QStringLiteral("Due ")));
+        QCOMPARE(next(dialog)->text(), QStringLiteral("Next"));
+        next(dialog)->click();
+    });
+    action("reviewSkipAction")->trigger();
+    QVERIFY(overview.m_sessionComplete);
+    QCOMPARE(store.cards().constFirst().currentTags(), tagsBeforeSkip);
+    action("reviewUndoAction")->trigger();
+    QVERIFY(!overview.m_sessionComplete);
+    overview.revealAnswer();
+    answer(openInterval, [&](QDialog *dialog) {
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipDocument"))->setChecked(true);
+        dialog->reject();
+    });
+    QVERIFY(!overview.m_sessionComplete);
+    QCOMPARE(store.dueCards().size(), 1);
+    // Project is exclusive with document scope and includes another PDF.
+    QStringList extraFiles;
+    QString appendixId;
+    for (const auto &stem : {QStringLiteral("appendix"), QStringLiteral("other")}) {
+        const auto extraId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        if (stem == QLatin1String("appendix")) appendixId = extraId;
+        auto extra = record;
+        auto extraPrimary = primary;
+        extraPrimary.insert(QStringLiteral("pdf_stem"), stem);
+        extra.insert(QStringLiteral("primary"), extraPrimary);
+        extra.insert(QStringLiteral("card_id"), extraId);
+        QFile extraFile(QDir(cardsDirectory).filePath(extraId + QStringLiteral(".json")));
+        QVERIFY(extraFile.open(QIODevice::WriteOnly));
+        extraFile.write(QJsonDocument(extra).toJson());
+        extraFiles.append(extraFile.fileName());
+    }
+    QVERIFY(QDir().mkpath(temporary.path() + QStringLiteral("/current_pdfs")));
+    QFile index(temporary.path() + QStringLiteral("/current_pdfs/.thoughts-source-index.json"));
+    QVERIFY(index.open(QIODevice::WriteOnly));
+    index.write(R"({"schema_version":1,"pdfs":[{"filename":"file1.pdf","project":"A"},{"filename":"appendix.pdf","project":"A"},{"filename":"other.pdf","project":"B"}]})");
+    index.close();
+    answer(openInterval, [&](QDialog *dialog) {
+        auto *project = dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipProject"));
+        QVERIFY(project->isEnabled());
+        QVERIFY(!project->isChecked());
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipDocument"))->setChecked(true);
+        project->setChecked(true);
+        pickTag(dialog, QStringLiteral("wrong"));
+        next(dialog)->click();
+    });
+    QCOMPARE(overview.m_scopedRatingEvents.size(), 1);
+    QCOMPARE(overview.m_scopedRatingEvents.constBegin()->size(), 2);
+    QCOMPARE(store.dueCards().size(), 1);
+    QCOMPARE(store.dueCards().constFirst().pdfStem(), QStringLiteral("other"));
+    for (const auto &card : store.cards())
+        QCOMPARE(card.currentTags(), card.pdfStem() == QLatin1String("other") ? QStringList{} : QStringList{QStringLiteral("wrong")});
+    action("reviewUndoAction")->trigger();
+    QCOMPARE(store.dueCards().size(), 3);
+    const auto now = QDateTime::currentDateTimeUtc();
+    QVERIFY(store.recordRating(appendixId, QStringLiteral("custom_interval"), now, &error, now.addDays(2)));
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipProject"))->setChecked(true);
+        QVERIFY(dialog->findChild<QRadioButton *>(QStringLiteral("reviewSkipDueOnly"))->isChecked());
+        next(dialog)->click();
+    });
+    overview.chooseSkip();
+    // The appendix card is not due, so only this card is postponed.
+    QCOMPARE(overview.m_pendingSkip.cardIds, QStringList{cardId});
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipProject"))->setChecked(true);
+        dialog->findChild<QRadioButton *>(QStringLiteral("reviewSkipAllCards"))->setChecked(true);
+        next(dialog)->click();
+    });
+    overview.chooseSkip();
+    QCOMPARE(overview.m_pendingSkip.cardIds.size(), 2);
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    // S skips this card for the dialog's default ten minutes, without asking.
+    auto *skipShortcut = overview.m_sessionPage->findChild<QShortcut *>(QStringLiteral("reviewSkipShortcut"));
+    QVERIFY(skipShortcut);
+    QCOMPARE(skipShortcut->key(), QKeySequence(Qt::Key_S));
+    const auto beforeShortcut = QDateTime::currentDateTimeUtc();
+    Q_EMIT skipShortcut->activated();
+    QCOMPARE(overview.m_pendingSkip.cardIds, QStringList{cardId});
+    for (const auto &card : store.cards()) {
+        if (card.id() != cardId) continue;
+        QVERIFY(qAbs(beforeShortcut.secsTo(card.skippedUntil) - 600) <= 5);
+    }
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    // The bar's unsaved steps, interval and notes come back with the skipped card; a free tag
+    // in the draft does not.
+    const QStringList draftTags{QStringLiteral("partly")};
+    overview.m_selectedTags = draftTags + QStringList{QStringLiteral("Interesting")};
+    overview.m_interval = {3, Thoughts::ReviewInterval::Weeks, {}};
+    overview.m_groupNotes.insert(Thoughts::ReviewTags::answerNoteKey(), QStringLiteral("draft note"));
+    Q_EMIT skipShortcut->activated();
+    QVERIFY(overview.m_barDrafts.contains(cardId));
+    // The draft is on disk too: Thoughts restarting (an update) does not lose it.
+    QVERIFY(QFile::exists(overview.barDraftsPath()));
+    overview.m_barDrafts.clear();
+    overview.loadBarDrafts();
+    QVERIFY(overview.m_barDrafts.contains(cardId));
+    // As after another card was shown in between.
+    overview.m_barCardId = QStringLiteral("another card");
+    overview.m_selectedTags.clear();
+    overview.m_groupNotes.clear();
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QCOMPARE(overview.m_selectedTags, draftTags);
+    QCOMPARE(overview.m_interval.amount, 3.0);
+    QCOMPARE(overview.m_interval.unit, Thoughts::ReviewInterval::Weeks);
+    QCOMPARE(overview.m_groupNotes.value(Thoughts::ReviewTags::answerNoteKey()), QStringLiteral("draft note"));
+    // Shown again before being answered, the card still has its draft.
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QCOMPARE(overview.m_selectedTags, draftTags);
+    // A draft chosen before the card's latest answer (say, from the phone) is dropped.
+    Q_EMIT skipShortcut->activated();
+    overview.m_barDrafts[cardId].answeredAt = QDateTime(QDate(2000, 1, 1), QTime(0, 0), QTimeZone::UTC);
+    overview.m_barCardId = QStringLiteral("another card");
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QVERIFY(overview.m_groupNotes.isEmpty());
+    QVERIFY(!overview.m_barDrafts.contains(cardId));
+    QVERIFY(!QFile::exists(overview.barDraftsPath()));
+    // The Skip dialog can make its interval the default: the dialog then opens with it and S uses it.
+    const auto restoreSkipDefault = qScopeGuard([] { KSharedConfig::openConfig()->deleteGroup(QStringLiteral("ReviewSkip")); });
+    const auto skippedFor = [&](const QDateTime &from) {
+        for (const auto &card : store.cards())
+            if (card.id() == cardId) return from.secsTo(card.skippedUntil);
+        return qint64(-1);
+    };
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        auto *saveDefault = dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipSaveDefault"));
+        QVERIFY(saveDefault && saveDefault->isEnabled() && !saveDefault->isChecked());
+        // A custom date cannot be a default.
+        dialog->findChild<QPushButton *>(QStringLiteral("reviewIntervalCustomDate"))->click();
+        QVERIFY(!saveDefault->isEnabled());
+        dialog->findChild<QPushButton *>(QStringLiteral("reviewIntervalCustomDate"))->click();
+        QVERIFY(saveDefault->isEnabled());
+        dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->setValue(5);
+        saveDefault->setChecked(true);
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    const auto beforeSavedSkip = QDateTime::currentDateTimeUtc();
+    action("reviewSkipAction")->trigger();
+    QVERIFY(qAbs(skippedFor(beforeSavedSkip) - 300) <= 5);
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewSkipDialog"));
+        QVERIFY(dialog);
+        QCOMPARE(dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->value(), 5.0);
+        QCOMPARE(dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"))->currentData().toInt(), int(Thoughts::ReviewInterval::Minutes));
+        dialog->reject();
+    });
+    action("reviewSkipAction")->trigger();
+    const auto beforeSavedShortcut = QDateTime::currentDateTimeUtc();
+    Q_EMIT skipShortcut->activated();
+    QVERIFY(qAbs(skippedFor(beforeSavedShortcut) - 300) <= 5);
+    action("reviewUndoAction")->trigger();
+    overview.showReviewLanding();
+    overview.reviewCard(cardId);
+    overview.revealAnswer();
+    answer(openInterval, [&](QDialog *dialog) {
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipProject"))->setChecked(true);
+        dialog->findChild<QRadioButton *>(QStringLiteral("reviewSkipAllCards"))->setChecked(true);
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipNever"))->setChecked(true);
+        pickTag(dialog, QStringLiteral("correct"));
+        QCOMPARE(dialog->findChild<QLabel *>(QStringLiteral("reviewIntervalDue"))->text(), QStringLiteral("Due Never"));
+        next(dialog)->click();
+    });
+    const auto scopedCards = store.cards();
+    for (const auto &card : scopedCards) {
+        if (card.id() == cardId || card.id() == appendixId) QVERIFY(card.schedule.retained);
+    }
+    QVERIFY(overview.m_scopedRatingEvents.size() == 1);
+    action("reviewUndoAction")->trigger();
+    QCOMPARE(overview.m_scopedRatingEvents.size(), 0);
+    for (const auto &card : store.cards()) {
+        if (card.id() == cardId || card.id() == appendixId) QVERIFY(!card.schedule.retained);
+    }
+    for (const auto &path : extraFiles) QVERIFY(QFile::remove(path));
+    QVERIFY(index.remove());
+    overview.startReview();
+    overview.revealAnswer();
+    // Several tags on one answer; the interval alone schedules it.
+    answer(openInterval, [&](QDialog *dialog) {
+        dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewIntervalAmount"))->setValue(20);
+        auto *units = dialog->findChild<QComboBox *>(QStringLiteral("reviewIntervalUnit"));
+        units->setCurrentIndex(units->findData(Thoughts::ReviewInterval::Minutes));
+        pickTag(dialog, QStringLiteral("wrong"));
+        pickTag(dialog, QStringLiteral("correct"));
+        next(dialog)->click();
+    });
+    const auto taggedSchedule = store.cards().constFirst().schedule;
+    QCOMPARE(taggedSchedule.lastReviewedAt.secsTo(taggedSchedule.dueAt), 1200);
+    QCOMPARE(taggedSchedule.suggestionReviewedAt, taggedSchedule.lastReviewedAt);
+    auto bothTags = store.cards().constFirst().currentTags();
+    std::sort(bothTags.begin(), bothTags.end());
+    QCOMPARE(bothTags, (QStringList{QStringLiteral("correct"), QStringLiteral("wrong")}));
+    QCOMPARE(store.cards().constFirst().currentMark(), QStringLiteral("wrong"));
+    overview.previousQuestion();
+    overview.revealAnswer();
+    answer(openInterval, [&](QDialog *dialog) {
+        dialog->findChild<QCheckBox *>(QStringLiteral("reviewSkipNever"))->setChecked(true);
+        pickTag(dialog, QStringLiteral("correct"));
+        next(dialog)->click();
+    });
+    QVERIFY(store.cards().constFirst().schedule.retained);
+    QVERIFY(store.dueCards().isEmpty());
+    overview.previousQuestion();
+    QVERIFY(!store.cards().constFirst().schedule.retained);
+    overview.revealAnswer();
+    const QString screenshots = qEnvironmentVariable("THOUGHTS_REVIEW_PARITY_SCREENSHOT_DIR");
+    if (!screenshots.isEmpty()) {
+        QDir().mkpath(screenshots);
+        QVERIFY(overview.m_sessionPage->grab().save(screenshots + QStringLiteral("/review-panel.png")));
+    }
+    action("reviewEndSessionAction")->trigger();
+    QVERIFY(overview.m_reviewHistory.isEmpty());
+    overview.reload();
+    reviewStarts.clear();
+    overview.reviewCard(cardId);
+    QCOMPARE(reviewStarts.count(), 1);
+    overview.rateCurrent(QStringLiteral("delete"));
+    QVERIFY(store.cards().constFirst().schedule.deleted);
+    QVERIFY(store.browserCards().isEmpty());
+    QVERIFY(!action("reviewUndoAction")->isEnabled());
+
+}
+
+void MainShellTest::testReviewSessionKeepsCardBeingReplaced()
+{
+    // Editing the current card's source and syncing rebuilds its PDF and
+    // re-places the card, which hides it from the due queue for a while. The
+    // session used to end with "The current review card changed in another
+    // window or during synchronization".
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("What Alps and GH200 facts matter?")}};
+    QJsonObject record {{QStringLiteral("schema_version"), 3},
+                        {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                        {QStringLiteral("card_id"), cardId},
+                        {QStringLiteral("status"), QStringLiteral("approved")},
+                        {QStringLiteral("primary"), primary}};
+    const auto writeRecord = [&] {
+        QFile file(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(QJsonDocument(record).toJson(QJsonDocument::Compact)) > 0;
+    };
+    QVERIFY(writeRecord());
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [document] { return document; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+        [] {},
+        nullptr,
+        {},
+        {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    overview.showCurrentCard();
+    overview.revealAnswer();
+    QCOMPARE(overview.m_currentReview, 0);
+
+    record.insert(QStringLiteral("reanchor"), QJsonObject {{QStringLiteral("state"), QStringLiteral("queued")}});
+    QVERIFY(writeRecord());
+    QVERIFY(overview.m_store.dueCards().isEmpty()); // Hidden from the queue while re-placed.
+    overview.reloadFromProjections();
+    QCOMPARE(overview.m_currentReview, 0);
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), cardId);
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("What Alps and GH200 facts matter?"));
+    QVERIFY(overview.m_ratingPanel->isVisibleTo(overview.m_sessionPage)); // The revealed answer can still be rated.
+
+    // A card deleted meanwhile still ends the session.
+    record.insert(QStringLiteral("status"), QStringLiteral("rejected"));
+    QVERIFY(writeRecord());
+    overview.reloadFromProjections();
+    QCOMPARE(overview.m_currentReview, -1);
+    QVERIFY(overview.m_reviewQuestion->text().contains(QStringLiteral("changed in another window")));
+}
+
+void MainShellTest::testReviewProjectionRefreshPreservesWindows_data()
+{
+    QTest::addColumn<bool>("hiddenHost");
+    QTest::addColumn<bool>("hiddenPanel");
+    QTest::addColumn<bool>("removedCard");
+    for (bool hiddenHost : {false, true}) {
+        for (bool hiddenPanel : {false, true}) {
+            for (bool removedCard : {false, true}) {
+                const QByteArray name = QByteArray::number(hiddenHost) + "-" + QByteArray::number(hiddenPanel) + "-" + QByteArray::number(removedCard);
+                QTest::newRow(name.constData()) << hiddenHost << hiddenPanel << removedCard;
+            }
+        }
+    }
+}
+
+void MainShellTest::testReviewProjectionRefreshPreservesWindows()
+{
+    QFETCH(bool, hiddenHost);
+    QFETCH(bool, hiddenPanel);
+    QFETCH(bool, removedCard);
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const QJsonObject record {{QStringLiteral("schema_version"), 3},
+                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                              {QStringLiteral("card_id"), cardId},
+                              {QStringLiteral("status"), QStringLiteral("approved")},
+                              {QStringLiteral("primary"), primary}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(record).toJson(QJsonDocument::Compact));
+    cardFile.close();
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    int maskPresentations = 0;
+    int maskClears = 0;
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [document] { return document; },
+        [&maskPresentations](const Thoughts::ReviewCard &, bool masked, QString *) {
+            if (masked) {
+                ++maskPresentations;
+            }
+            return true;
+        },
+        [&maskClears] { ++maskClears; },
+        nullptr,
+        {},
+        {},
+        [&reviewHost] { return &reviewHost; });
+
+
+    overview.startReview();
+    QVERIFY(reviewHost.isVisible());
+    QVERIFY(overview.m_sessionPage->isVisible());
+    overview.revealAnswer();
+    if (hiddenHost) reviewHost.hide();
+    if (hiddenPanel) overview.m_sessionPage->hide();
+    overview.show();
+    QCoreApplication::processEvents();
+
+    class WindowChanges : public QObject {
+    public:
+        int count = 0;
+        bool eventFilter(QObject *, QEvent *event) override
+        {
+            switch (event->type()) {
+            case QEvent::Show:
+            case QEvent::Hide:
+            case QEvent::WindowActivate:
+            case QEvent::ZOrderChange:
+            case QEvent::ParentChange:
+                ++count;
+                break;
+            default:
+                break;
+            }
+            return false;
+        }
+    } changes;
+    reviewHost.installEventFilter(&changes);
+    overview.installEventFilter(&changes);
+    overview.m_sessionPage->installEventFilter(&changes);
+    QWidget *const activeWindow = QApplication::activeWindow();
+
+    if (removedCard) {
+        QVERIFY(cardFile.remove());
+    } else {
+        QJsonObject updated = record;
+        QJsonObject updatedPrimary = primary;
+        updatedPrimary.insert(QStringLiteral("question"), QStringLiteral("Updated by source refresh"));
+        updated.insert(QStringLiteral("primary"), updatedPrimary);
+        QVERIFY(cardFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        cardFile.write(QJsonDocument(updated).toJson(QJsonDocument::Compact));
+        cardFile.close();
+    }
+    overview.reloadFromProjections();
+    QCoreApplication::processEvents();
+    QCOMPARE(changes.count, 0);
+    QCOMPARE(QApplication::activeWindow(), activeWindow);
+    QCOMPARE(reviewHost.isHidden(), hiddenHost);
+    QCOMPARE(overview.m_sessionPage->isHidden(), hiddenPanel);
+    QVERIFY(overview.isVisible());
+    QCOMPARE(overview.m_sessionPage->parentWidget(), &reviewHost);
+    QCOMPARE(maskPresentations, 1);
+    if (removedCard) {
+        QVERIFY(overview.m_sessionComplete);
+        QVERIFY(overview.m_reviewQuestion->text().contains(QStringLiteral("changed in another window or during synchronization")));
+    } else {
+        QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Updated by source refresh"));
+        QVERIFY(!overview.m_ratingPanel->isHidden());
+        QVERIFY(overview.m_answerRow->isHidden()); // Set knowledge survives the refresh.
+    }
+}
+
+void MainShellTest::testReviewNamesThePagesOfAMultiPageAnswer()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/simple-multipage.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const auto writeCard = [&](const QString &question, const QJsonArray &regions) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage")},
+                                   {QStringLiteral("pdf_sha256"), pdfSha256},
+                                   {QStringLiteral("page"), regions.first().toObject().value(QStringLiteral("page"))},
+                                   {QStringLiteral("rect"), regions.first().toObject().value(QStringLiteral("rect"))},
+                                   {QStringLiteral("regions"), regions},
+                                   {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                   {QStringLiteral("question"), question}};
+        QFile file(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+        return file.open(QIODevice::WriteOnly)
+            && file.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("primary"), primary}}).toJson()) > 0;
+    };
+    const auto region = [](int page, double top) {
+        return QJsonObject {{QStringLiteral("page"), page}, {QStringLiteral("rect"), QJsonArray {0.1, top, 0.5, top + 0.1}}};
+    };
+    QVERIFY(writeCard(QStringLiteral("Spread over two pages?"), QJsonArray {region(1, 0.8), region(2, 0.1)}));
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage")},
+                                {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 2}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; },
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    QTRY_VERIFY(overview.m_startButton->isEnabled());
+    overview.startReview();
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Spread over two pages?"));
+    QVERIFY(!overview.m_reviewStatus->isHidden());
+    QCOMPARE(overview.m_reviewStatus->text(), QStringLiteral("Answer on pages 1, 2"));
+    overview.revealAnswer();
+    QVERIFY(!overview.m_reviewStatus->isHidden());
+
+    // A card with several areas but no source markers (an imported PDF) is changed with Edit Areas…:
+    // no VS Code marker button, no coordinates of its first area.
+    const QVariantList originalRect = overview.m_dueCards.at(overview.m_currentReview).rect();
+    QTimer::singleShot(0, &overview, [&] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardRegionDialog"));
+        QVERIFY(dialog);
+        const bool noMarkers = !dialog->findChild<QPushButton *>(QStringLiteral("reviewCardRegionEditMarkers"));
+        auto *areas = dialog->findChild<QPushButton *>(QStringLiteral("reviewCardRegionEditAreas"));
+        const bool areasOffered = areas && areas->isVisibleTo(dialog);
+        const bool coordinatesHidden = !dialog->findChild<QDoubleSpinBox *>(QStringLiteral("reviewCardRegionLeft"))->isVisibleTo(dialog);
+        auto *buttons = dialog->findChild<QDialogButtonBox *>();
+        const auto actions = buttons->buttons();
+        const bool previewHidden = std::none_of(actions.cbegin(), actions.cend(), [&](QAbstractButton *button) {
+            return button->text() == QStringLiteral("Preview Region") && button->isVisibleTo(dialog);
+        });
+        dialog->findChild<QPlainTextEdit *>()->setPlainText(QStringLiteral("Spread over which pages?"));
+        buttons->button(QDialogButtonBox::Ok)->click();
+        QVERIFY(noMarkers);
+        QVERIFY(areasOffered);
+        QVERIFY(coordinatesHidden);
+        QVERIFY(previewHidden);
+    });
+    overview.editCurrentCard();
+    Thoughts::ReviewStore store(temporary.path());
+    QCOMPARE(store.cards().constFirst().question(), QStringLiteral("Spread over which pages?"));
+    QCOMPARE(store.cards().constFirst().rect(), originalRect);
+}
+
+void MainShellTest::testReviewQuestionRemainsVisibleAfterReveal()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString cardsDirectory = QDir(temporary.path()).filePath(QStringLiteral("reviews/cards"));
+    QVERIFY(QDir().mkpath(cardsDirectory));
+    const QJsonObject primary {{QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256},
+                               {QStringLiteral("page"), 1},
+                               {QStringLiteral("rect"), QJsonArray {0.1, 0.2, 0.5, 0.4}},
+                               {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("question"), QStringLiteral("Which fact should be recalled?")}};
+    const QJsonObject record {{QStringLiteral("schema_version"), 3},
+                              {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                              {QStringLiteral("card_id"), cardId},
+                              {QStringLiteral("status"), QStringLiteral("approved")},
+                              {QStringLiteral("primary"), primary}};
+    QFile cardFile(QDir(cardsDirectory).filePath(cardId + QStringLiteral(".json")));
+    QVERIFY(cardFile.open(QIODevice::WriteOnly));
+    cardFile.write(QJsonDocument(record).toJson(QJsonDocument::Compact));
+    cardFile.close();
+
+    const QVariantMap document {{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    int maskPresentations = 0;
+    int maskClears = 0;
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(),
+        [document] { return document; },
+        [&maskPresentations](const Thoughts::ReviewCard &, bool masked, QString *) {
+            if (masked) {
+                ++maskPresentations;
+            }
+            return true;
+        },
+        [&maskClears] { ++maskClears; },
+        nullptr,
+        {},
+        {},
+        [&reviewHost] { return &reviewHost; });
+
+    Thoughts::ReviewCardsWidget cards(
+        temporary.path(),
+        [](const Thoughts::ReviewCard &, bool, QString *) { return true; },
+        [](const QString &) {});
+    QTRY_COMPARE(cards.m_browseCards.size(), 1);
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 1);
+    QCOMPARE(cards.m_browseTable->topLevelItem(0)->text(0), QStringLiteral("Which fact should be recalled?"));
+    QCOMPARE(cards.m_browseQuestion->toPlainText(), QStringLiteral("Which fact should be recalled?"));
+    QVERIFY(!cards.m_browseQuestion->isReadOnly());
+    // The question editor opens from Edit question.
+    auto *editButton = cards.findChild<QPushButton *>(QStringLiteral("reviewBrowseEditButton"));
+    QVERIFY(editButton);
+    QVERIFY(cards.m_browseEditorPanel->isHidden());
+    editButton->click();
+    QVERIFY(!cards.m_browseEditorPanel->isHidden());
+    cards.m_browseQuestion->setPlainText(QStringLiteral("Which updated fact should be recalled?"));
+    QTRY_COMPARE(cards.m_browseQuestionStatus->text(), QStringLiteral("Saved"));
+    QCOMPARE(cards.m_browseTable->topLevelItem(0)->text(0), QStringLiteral("Which updated fact should be recalled?"));
+    const QList<Thoughts::ReviewBrowserCard> savedCards = Thoughts::ReviewStore(temporary.path()).browserCards();
+    QCOMPARE(savedCards.size(), 1);
+    QCOMPARE(savedCards.constFirst().card.question(), QStringLiteral("Which updated fact should be recalled?"));
+    cards.m_browseSearch->setText(QStringLiteral("no matching review card"));
+    QCOMPARE(cards.m_visibleBrowseCards.size(), 0);
+    QVERIFY(cards.m_browseTable->topLevelItem(0)->isHidden());
+    cards.m_browseSearch->clear();
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 1);
+
+    QCOMPARE(overview.m_reviewStack->currentWidget(), overview.m_overviewPage);
+    QVERIFY(overview.m_sessionPage->isHidden());
+    overview.startReview();
+    QCOMPARE(overview.m_reviewStack->currentWidget(), overview.m_overviewPage);
+    QCOMPARE(overview.m_sessionPage->parentWidget(), &reviewHost);
+    QVERIFY(overview.isHidden());
+    QVERIFY(overview.m_sessionPage->isVisible());
+    QVERIFY(!overview.m_revealButton->isHidden());
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
+    QCOMPARE(maskPresentations, 1);
+    QVERIFY(overview.m_revealButton->isEnabled());
+    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
+    QCOMPARE(overview.m_setKnowledgeButton->text(), QStringLiteral("Set knowledge"));
+    QVERIFY(overview.m_setKnowledgeButton->isVisible());
+    QVERIFY(overview.m_currentState->isHidden());
+
+    // Flip, as on the phone: offered before the answer is revealed, it hides
+    // the context instead of the answer and survives Hide review / Focus.
+    // The session panel floats over the PDF, so it is not the dialog's child.
+    auto *flip = overview.m_sessionPage->findChild<QPushButton *>(QStringLiteral("reviewFlipButton"));
+    QVERIFY(flip);
+    QCOMPARE(flip->text(), QStringLiteral("Flip"));
+    QVERIFY(flip->isCheckable());
+    QVERIFY(!flip->isHidden());
+    QVERIFY(flip->isEnabled());
+    QVERIFY(!flip->isChecked());
+    QSignalSpy inverted(&overview, &Thoughts::ReviewOverview::reviewMaskInvertedChanged);
+    QSignalSpy revealed(&overview, &Thoughts::ReviewOverview::answerRevealed);
+    flip->click();
+    QCOMPARE(inverted.count(), 1);
+    QCOMPARE(inverted.last().constFirst().toBool(), true);
+    overview.toggleReviewVisibility();
+    overview.toggleReviewVisibility();
+    QCOMPARE(inverted.last().constFirst().toBool(), true);
+    QVERIFY(flip->isChecked());
+    QCOMPARE(flip->text(), QStringLiteral("Unflip"));
+
+    // Reveal is a peek: it outlines the answer and records nothing; it reads Hide and Flip waits.
+    overview.m_revealButton->click();
+    QCOMPARE(revealed.count(), 1);
+    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Hide"));
+    QVERIFY(!flip->isEnabled());
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QVERIFY(overview.m_setKnowledgeButton->isVisible());
+    // Hide covers it again and keeps Flip.
+    overview.m_revealButton->click();
+    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
+    QVERIFY(flip->isEnabled() && flip->isChecked());
+    QCOMPARE(inverted.last().constFirst().toBool(), true);
+
+    // Set knowledge: the row gives way to the current state and the Tag | Interval | Next bar.
+    overview.m_setKnowledgeButton->click();
+    QVERIFY(!flip->isVisible());
+    QVERIFY(!overview.m_revealButton->isVisible());
+    QVERIFY(overview.m_answerRow->isHidden());
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
+    QVERIFY(overview.m_ratingPanel->isVisible());
+    QVERIFY(overview.m_currentState->isVisible());
+    QCOMPARE(overview.m_currentState->text(), QStringLiteral("Current: new card"));
+    QVERIFY(maskClears >= 2);
+    QVERIFY(overview.m_tagField->isEnabled() && overview.m_intervalField->isEnabled() && overview.m_nextButton->isEnabled());
+    // Reveal outlines the answer instead of clearing it; hiding the review and coming back outlines it again.
+    QCOMPARE(revealed.count(), 2);
+    overview.toggleReviewVisibility();
+    overview.toggleReviewVisibility();
+    QCOMPARE(revealed.count(), 3);
+    QVERIFY(overview.m_ratingPanel->isVisible());
+
+    overview.show();
+    overview.startReview();
+    QCoreApplication::processEvents();
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
+    QCOMPARE(maskPresentations, 5); // start, Focus after Hide review, Hide after Reveal, Focus after Set knowledge (outlined again), restart
+    QVERIFY(overview.m_revealButton->isEnabled());
+
+    const int maskClearsBeforeClose = maskClears;
+    QVERIFY(overview.close());
+    QCoreApplication::processEvents();
+    QCOMPARE(maskClears, maskClearsBeforeClose + 1);
+    QCOMPARE(overview.m_currentReview, -1);
+    // Closing keeps the verified due-card snapshot for the next opening.
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(overview.m_reviewQuestion->text().isEmpty());
+    QVERIFY(overview.m_reviewStatus->text().isEmpty());
+    QVERIFY(!overview.m_revealButton->isEnabled());
+    QVERIFY(!overview.m_nextButton->isEnabled());
+    QVERIFY(overview.m_sessionPage->isHidden());
+    QVERIFY(!overview.isVisible());
+
+    overview.reload();
+    overview.show();
+    overview.startReview();
+    QCoreApplication::processEvents();
+    QCOMPARE(maskPresentations, 6);
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
+    QVERIFY(overview.m_revealButton->isEnabled());
+
+    // Existing deletions disappear from every browser filter after reload.
+    const QString secondId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject secondRecord = record;
+    secondRecord.insert(QStringLiteral("card_id"), secondId);
+    QFile secondFile(QDir(cardsDirectory).filePath(secondId + QStringLiteral(".json")));
+    QVERIFY(secondFile.open(QIODevice::WriteOnly));
+    secondFile.write(QJsonDocument(secondRecord).toJson(QJsonDocument::Compact));
+    secondFile.close();
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.deleteCard(cardId, QDateTime::currentDateTimeUtc(), &error), qPrintable(error));
+    cards.reload();
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    cards.m_browseStateFilter->setCurrentIndex(cards.m_browseStateFilter->findData(QStringLiteral("all")));
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 1);
+    QVERIFY(cards.m_browseStateFilter->findData(QStringLiteral("deleted")) < 0);
+    QVERIFY2(store.deleteCard(secondId, QDateTime::currentDateTimeUtc(), &error), qPrintable(error));
+    cards.reload();
+    QTRY_VERIFY(!cards.m_reloadPending && !cards.m_loading);
+    QCOMPARE(cards.m_browseTable->topLevelItemCount(), 0);
+    QVERIFY(!cards.m_browseDeleteRestoreButton->isEnabled());
+    QVERIFY(store.browserCards().isEmpty());
+
+}
+
+void MainShellTest::testReviewDocumentPayloadUsesOpenPdf()
+{
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString serializedOptions = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, serializedOptions), Okular::Success);
+
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    const QVariantMap document = shell->currentReviewDocument();
+    QVERIFY2(!document.contains(QStringLiteral("error")), qPrintable(document.value(QStringLiteral("error")).toString()));
+    QCOMPARE(document.value(QStringLiteral("pdf_path")).toString(), QFileInfo(url.toLocalFile()).absoluteFilePath());
+    QCOMPARE(document.value(QStringLiteral("pdf_stem")).toString(), QStringLiteral("file1"));
+    QCOMPARE(document.value(QStringLiteral("pdf_sha256")).toString().size(), 64);
+    QVERIFY(document.value(QStringLiteral("page_count")).toInt() > 0);
+    QVERIFY(!document.contains(QStringLiteral("selected_text")));
+}
+
+void MainShellTest::testOpenCommentSourceFileWithoutLine()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QDir directory(temporary.path());
+    const QString sourcePath = directory.filePath(QStringLiteral("source with spaces.tex"));
+    QFile source(sourcePath);
+    QVERIFY(source.open(QIODevice::WriteOnly));
+    source.write("Authored source.\n");
+    source.close();
+    const QString argumentPath = directory.filePath(QStringLiteral("arguments.txt"));
+    QFile executable(directory.filePath(QStringLiteral("code")));
+    QVERIFY(executable.open(QIODevice::WriteOnly));
+    executable.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$THOUGHTS_TEST_CODE_ARGUMENTS\"\n");
+    executable.close();
+    QVERIFY(executable.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+    const QByteArray previousPath = qgetenv("PATH");
+    const QByteArray previousArguments = qgetenv("THOUGHTS_TEST_CODE_ARGUMENTS");
+    const auto restoreEnvironment = qScopeGuard([&]() {
+        qputenv("PATH", previousPath);
+        if (previousArguments.isNull()) {
+            qunsetenv("THOUGHTS_TEST_CODE_ARGUMENTS");
+        } else {
+            qputenv("THOUGHTS_TEST_CODE_ARGUMENTS", previousArguments);
+        }
+    });
+    const QByteArray testPath = temporary.path().toUtf8() + ':' + previousPath;
+    qputenv("PATH", testPath);
+    qputenv("THOUGHTS_TEST_CODE_ARGUMENTS", argumentPath.toUtf8());
+    auto *shell = new Shell;
+    for (const int line : {0, 17}) {
+        QFile::remove(argumentPath);
+        shell->openCommentSource(sourcePath, line);
+        QTRY_VERIFY(QFileInfo(argumentPath).size() > 0);
+        QFile arguments(argumentPath);
+        QVERIFY(arguments.open(QIODevice::ReadOnly));
+        QByteArray expected = QFileInfo(sourcePath).canonicalFilePath().toUtf8();
+        if (line > 0) {
+            expected.prepend("--goto\n");
+            expected.append(":17:1");
+        }
+        expected.append('\n');
+        QCOMPARE(arguments.readAll(), expected);
+    }
+}
+
+void MainShellTest::testReviewSourceLinkStatusAndManualRepair()
+{
+    QTemporaryDir temporary;
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString sourceId = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString sourcePath = temporary.filePath(sourceId);
+    QVERIFY(QDir().mkpath(QFileInfo(sourcePath).absolutePath()));
+    { QFile f(sourcePath); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("The answer remains in the selected PDF region.\n"); }
+    const QJsonObject record {{QStringLiteral("schema_version"),3},{QStringLiteral("card_id"),id},
+        {QStringLiteral("card_type"),QStringLiteral("visual_region")},{QStringLiteral("status"),QStringLiteral("approved")},
+        {QStringLiteral("source_link"),QJsonObject{{QStringLiteral("state"),QStringLiteral("linking_failed")},
+            {QStringLiteral("reason"),QStringLiteral("the historical source line could not be mapped safely")},{QStringLiteral("source_file"),sourceId}}},
+        {QStringLiteral("primary"),QJsonObject{{QStringLiteral("question"),QStringLiteral("What is hidden?")},
+            {QStringLiteral("pdf_stem"),QStringLiteral("paper")},{QStringLiteral("pdf_sha256"),QString(64,QLatin1Char('a'))},
+            {QStringLiteral("page_visual_sha256"),QString(64,QLatin1Char('b'))},{QStringLiteral("page"),1},
+            {QStringLiteral("rect"),QJsonArray{.1,.1,.8,.3}}}}};
+    const QString cardPath = temporary.filePath(QStringLiteral("reviews/cards/%1.json").arg(id));
+    QVERIFY(QDir().mkpath(QFileInfo(cardPath).absolutePath()));
+    { QFile f(cardPath); QVERIFY(f.open(QIODevice::WriteOnly)); f.write(QJsonDocument(record).toJson()); }
+    Thoughts::ReviewCardsWidget cards(temporary.path(),[](const Thoughts::ReviewCard &,bool,QString *) { return true; },[](const QString &) {});
+    cards.resize(1000,700);
+    cards.show();
+    QTRY_COMPARE(cards.m_browseCards.size(),1);
+    cards.selectCard(id);
+    QVERIFY(cards.m_browseDetails->toPlainText().contains(QStringLiteral("Linking status: Error:")));
+    QVERIFY(cards.m_browseDetails->toPlainText().contains(QStringLiteral("historical source line")));
+    QVERIFY(!cards.m_browseReviewButton->isEnabled());
+    QTest::mouseClick(cards.m_browseEditButton, Qt::LeftButton);
+    QVERIFY(cards.m_browseSourceButton->isVisible());
+    QSignalSpy openSource(&cards,&Thoughts::ReviewCardsWidget::openSourceRequested);
+    QTimer::singleShot(0,&cards,[&] {
+        auto *dialog = cards.findChild<QDialog *>(QStringLiteral("reviewSourceLinkDialog"));
+        QVERIFY(dialog);
+        auto *format = dialog->findChild<QComboBox *>(QStringLiteral("reviewSourceFormat"));
+        QVERIFY(format);
+        QCOMPARE(format->currentData().toString(), QStringLiteral("tex"));
+        QVERIFY(dialog->findChild<QPushButton *>(QStringLiteral("reviewOpenLinkedDocument")));
+        QVERIFY(!dialog->findChild<QPushButton *>(QStringLiteral("reviewCheckSourceLink")));
+        // Simulate the user's source-editor repair, never touching real notes.
+        QFile f(sourcePath); QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(QStringLiteral("\\ReviewCardMaskStart{%1}{0}%\nThe answer remains in the selected PDF region.\n\\ReviewCardMaskEnd{%1}{0}%\n").arg(id).toUtf8());
+        f.close();
+        QTimer::singleShot(1100, dialog, [&, dialog] {
+            auto *openMarkers = dialog->findChild<QPushButton *>(QStringLiteral("reviewOpenSourceMarkers"));
+            QVERIFY(openMarkers);
+            QVERIFY(openMarkers->isVisible());
+            QTest::mouseClick(openMarkers, Qt::LeftButton);
+            dialog->reject();
+        });
+    });
+    QTest::mouseClick(cards.m_browseSourceButton,Qt::LeftButton);
+    QCOMPARE(openSource.count(),2);
+    QCOMPARE(openSource.first().first().toString(),sourcePath);
+    QCOMPARE(openSource.last().at(1).toInt(),1);
+    QTRY_COMPARE(cards.m_browseCards.first().card.linkingState(), QStringLiteral("linked"));
+    QVERIFY(!cards.m_browseDetails->toPlainText().contains(QStringLiteral("historical source line")));
+    QCOMPARE(cards.m_browseCards.size(),1);
+    Thoughts::ReviewBrowserCard pdfOnly;
+    pdfOnly.card.record = record;
+    pdfOnly.card.record.insert(QStringLiteral("source_link"),QJsonObject{{QStringLiteral("state"),QStringLiteral("pdf_without_source")}});
+    cards.showBrowseCard(&pdfOnly);
+    QVERIFY(cards.m_browseDetails->toPlainText().contains(QStringLiteral("PDF without source location")));
+    QVERIFY(!cards.m_browseSourceButton->isVisible());
+}
+
+namespace
+{
+const QString PageTabPath = QStringLiteral("docs-ideas/tex/support/html/explainer.html");
+const QString PageTabTitle = QStringLiteral("Agent paywall (test attachment)");
+const QString PageTabDocumentId = QStringLiteral("c1870925-b9d7-45f5-b112-ba599f2b5af4");
+
+QString sha256Hex(const QByteArray &bytes)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+}
+
+bool writeBytes(const QString &path, const QByteArray &bytes)
+{
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+}
+
+// A Library PDF of the test home with one HTML attachment page, as htmlviewtest's fixture: its
+// identity (cards, feedback) in current_pdfs and its page in the Library's source bundle.
+QString addLibraryPdfWithPage(const QString &stem)
+{
+    const QDir docs(ShellUtils::docsRoot());
+    const QString path = docs.filePath(QStringLiteral("current_pdfs/") + stem + QStringLiteral(".pdf"));
+    QFile source(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    if (!source.open(QIODevice::ReadOnly)) return {};
+    // One PDF version per document.
+    const QByteArray pdf = source.readAll() + "%" + stem.toUtf8() + "\n";
+    if (!writeBytes(path, pdf)) return {};
+    const QString filename = stem + QStringLiteral(".pdf");
+    QJsonObject index {{QStringLiteral("pdfs"), QJsonArray {QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("pdf_sha256"), sha256Hex(pdf)},
+                                                                         {QStringLiteral("document_id"), PageTabDocumentId}, {QStringLiteral("kind"), QStringLiteral("source_linked")}}}}};
+    QJsonObject generation {{QStringLiteral("publications"), QJsonArray {QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("sha256"), sha256Hex(pdf)}}}}};
+    for (QJsonObject *object : {&index, &generation}) {
+        object->insert(QStringLiteral("library_revision"), QStringLiteral("test-revision-1"));
+        object->insert(QStringLiteral("source_index_sha256"), QString(64, QLatin1Char('5')));
+    }
+    if (!writeBytes(docs.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")), QJsonDocument(index).toJson())
+        || !writeBytes(docs.filePath(QStringLiteral("current_pdfs/.thoughts-generation.json")), QJsonDocument(generation).toJson()))
+        return {};
+    QFile page(QStringLiteral(KDESRCDIR "data/html-attachment/explainer.html"));
+    if (!page.open(QIODevice::ReadOnly)) return {};
+    const QByteArray html = page.readAll();
+    const QDir bundle(docs.filePath(QStringLiteral(".runtime/target/source-bundle")));
+    const QJsonObject document {{QStringLiteral("filename"), filename}, {QStringLiteral("pdf_sha256"), sha256Hex(pdf)}};
+    const QJsonObject resource {{QStringLiteral("kind"), QStringLiteral("html_attachment")}, {QStringLiteral("path"), PageTabPath}, {QStringLiteral("sha256"), sha256Hex(html)},
+                                {QStringLiteral("object"), sha256Hex(html)}, {QStringLiteral("bytes"), html.size()}};
+    const QByteArray manifest = QJsonDocument(QJsonObject {{QStringLiteral("pdf"), document}, {QStringLiteral("resources"), QJsonArray {resource}}}).toJson();
+    QJsonObject pointer = document;
+    pointer.insert(QStringLiteral("artifact_sha256"), sha256Hex(manifest));
+    if (!writeBytes(bundle.filePath(QStringLiteral("objects/") + sha256Hex(html)), html) || !writeBytes(bundle.filePath(QStringLiteral("objects/") + sha256Hex(manifest)), manifest)
+        || !writeBytes(bundle.filePath(QStringLiteral("documents/") + filename + QStringLiteral(".json")), QJsonDocument(pointer).toJson()))
+        return {};
+    return path;
+}
+
+QToolButton *pageBackButton(KParts::ReadWritePart *part)
+{
+    auto *view = part->widget()->findChild<QWidget *>(QStringLiteral("thoughtsHtmlAttachmentView"));
+    return view ? view->findChild<QToolButton *>(QStringLiteral("thoughtsHtmlShowPdf")) : nullptr;
+}
+}
+
+void MainShellTest::testHtmlAttachmentLinkOpensItsOwnTab()
+{
+    // A thoughts-html: link (the "here" of a figure's caption) opens its page in a tab of its own
+    // next to the document's: the PDF stays where it was, and Close goes back to it.
+    const QString pdfPath = addLibraryPdfWithPage(QStringLiteral("irt"));
+    QVERIFY(!pdfPath.isEmpty());
+    QString error;
+    QVERIFY2(Thoughts::resolveHtmlAttachment(PageTabPath, pdfPath, &error).isValid(), qPrintable(error));
+    const QUrl otherUrl = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file2.pdf"));
+    const QUrl link(QStringLiteral("thoughts-html:") + PageTabPath);
+    // No web view on the offscreen platform: the page shows inside Thoughts anyway, as in the app.
+    Okular::Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    const auto restoreWebView = qScopeGuard([] { Okular::Part::setHtmlAttachmentsWithoutWebViewForTesting(false); });
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({pdfPath, otherUrl.toLocalFile()}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QCOMPARE(shell->m_tabs.size(), 2);
+    shell->setActiveTab(0);
+    auto *document = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(document);
+    const QUrl pdfUrl = document->url();
+    const auto tabTitle = [shell](int index) { return KLocalizedString::removeAcceleratorMarker(shell->m_tabWidget->tabText(index)); };
+    const QString documentTitle = tabTitle(0);
+
+    QVERIFY(document->openHtmlAttachmentLink(link));
+    // A new tab right after the document's (before the other document), titled after the page.
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QVERIFY(shell->isHtmlAttachmentTab(1));
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QPointer<Okular::Part> page = qobject_cast<Okular::Part *>(shell->m_tabs.at(1).part);
+    QVERIFY(page && page.data() != document);
+    QCOMPARE(shell->m_tabs.at(2).part->url(), otherUrl);
+    QCOMPARE(page->url(), pdfUrl);
+    QCOMPARE(tabTitle(1), PageTabTitle);
+    QVERIFY(shell->m_tabWidget->tabToolTip(1).contains(documentTitle));
+    QCOMPARE(tabTitle(0), documentTitle);
+    const QVariantMap state = page->htmlAttachmentState();
+    QVERIFY(state.value(QStringLiteral("shown")).toBool());
+    QVERIFY(state.value(QStringLiteral("tab")).toBool());
+    QCOMPARE(state.value(QStringLiteral("path")).toString(), PageTabPath);
+    QCOMPARE(state.value(QStringLiteral("title")).toString(), PageTabTitle);
+    // The document's tab still shows its PDF; the page's tab has Close instead of Back, and no
+    // HTML edition or place in the PDF of its own.
+    QVERIFY(!document->htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    QVERIFY(!document->isHtmlAttachmentTab());
+    QVERIFY(pageBackButton(page) && pageBackButton(document));
+    QCOMPARE(pageBackButton(page)->text(), QStringLiteral("Close"));
+    QCOMPARE(pageBackButton(document)->text(), QStringLiteral("Back"));
+    QVERIFY(!page->actionCollection()->action(QStringLiteral("view_html_edition"))->isEnabled());
+    for (const auto &location : std::as_const(shell->m_navigationHistory)) {
+        QVERIFY(location.part.data() != static_cast<KParts::ReadWritePart *>(page.data()));
+    }
+    const QString screenshots = qEnvironmentVariable("THOUGHTS_TEST_SCREENSHOTS");
+    if (!screenshots.isEmpty()) {
+        QDir().mkpath(screenshots);
+        shell->resize(1100, 720);
+        QTest::qWait(300);
+        QVERIFY(shell->grab().save(screenshots + QStringLiteral("/html-page-tab.png")));
+    }
+
+    // The same link again: the same tab.
+    shell->setActiveTab(0);
+    QVERIFY(document->openHtmlAttachmentLink(link));
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(shell->m_tabs.at(1).part, static_cast<KParts::ReadWritePart *>(page.data()));
+
+    // The page's tab is not the document's: opening the PDF again shows the document's tab.
+    QCOMPARE(shell->findTabIndex(pdfUrl), 0);
+    shell->openUrl(pdfUrl);
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+
+    // Its menu: the page and its document, none of the PDF's file actions.
+    {
+        QMenu menu;
+        shell->addTabContextMenuActions(&menu, 1);
+        QStringList names;
+        for (QAction *action : menu.actions()) {
+            if (!action->isSeparator()) names.append(action->objectName());
+        }
+        QCOMPARE(names,
+                 QStringList({QStringLiteral("htmlPageOpenInBrowserAction"), QStringLiteral("htmlPageShowDocumentAction"), QStringLiteral("htmlPageCopyNameAction"),
+                              QStringLiteral("moveTabToNewWindowAction"), QStringLiteral("closeOtherTabsAction")}));
+        QCOMPARE(menu.actions().at(2)->data().toString(), PageTabTitle);
+        shell->setActiveTab(1);
+        menu.actions().at(1)->trigger();
+        QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    }
+
+    // The session keeps the page's tab and brings it back next to its document.
+    {
+        QTemporaryFile configFile;
+        QVERIFY(configFile.open());
+        KConfig config(configFile.fileName(), KConfig::SimpleConfig);
+        shell->savePropertiesInternal(&config, 1);
+        auto *restored = new Shell;
+        const auto deleteRestored = qScopeGuard([restored] { delete restored; });
+        restored->readPropertiesInternal(&config, 1);
+        QCOMPARE(restored->m_tabs.size(), 3);
+        QVERIFY(!restored->isHtmlAttachmentTab(0));
+        QVERIFY(restored->isHtmlAttachmentTab(1));
+        QVERIFY(!restored->isHtmlAttachmentTab(2));
+        QCOMPARE(restored->m_tabs.at(1).part->property("thoughtsHtmlAttachmentTab").toString(), PageTabPath);
+        QCOMPARE(KLocalizedString::removeAcceleratorMarker(restored->m_tabWidget->tabText(1)), PageTabTitle);
+        QCOMPARE(restored->m_tabWidget->currentIndex(), 0);
+    }
+
+    // Close in the page's bar: the document's tab again, not the tab beside the page.
+    shell->setActiveTab(1);
+    pageBackButton(page)->click();
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(shell->m_tabs.at(0).part, static_cast<KParts::ReadWritePart *>(document));
+    QCOMPARE(shell->m_closedTabUrls.constLast(), pdfUrl);
+    QCOMPARE(shell->m_closedTabPages.constLast(), PageTabPath);
+    if (!screenshots.isEmpty()) {
+        QTest::qWait(300);
+        QVERIFY(shell->grab().save(screenshots + QStringLiteral("/html-page-tab-closed.png")));
+    }
+
+    // Undo Close Tab brings the page's tab back next to its document.
+    shell->undoCloseTab();
+    QCOMPARE(shell->m_tabs.size(), 3);
+    QVERIFY(shell->isHtmlAttachmentTab(1));
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(tabTitle(1), PageTabTitle);
+
+    // Closing the tab itself (its ×, ⌘W) shows the document's tab too.
+    shell->closeTab(1);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 0);
+
+    // The window's last tab was a page's: its Part is an ordinary one for the next document.
+    QVERIFY(document->openHtmlAttachmentLink(link));
+    shell->closeTab(2);
+    shell->closeTab(0);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    QVERIFY(shell->isHtmlAttachmentTab(0));
+    shell->closeTab(0);
+    QVERIFY(!shell->isHtmlAttachmentTab(0));
+    QVERIFY(!shell->m_tabs.at(0).part->property("thoughtsHtmlAttachmentTab").isValid());
+    bool pageTab = true;
+    QVERIFY(QMetaObject::invokeMethod(shell->m_tabs.at(0).part, "isHtmlAttachmentTab", Qt::DirectConnection, Q_RETURN_ARG(bool, pageTab)));
+    QVERIFY(!pageTab);
+}
+
+void MainShellTest::testHtmlAttachmentCardAndFeedbackOpenInItsTab()
+{
+    // A card or feedback of a page opened from elsewhere (the card browser, Annotations, the
+    // comments overview) is reading too: it shows in the page's tab, not in the document's. A
+    // passage of the PDF chosen in the page's tab shows in the document's tab.
+    const QString pdfPath = addLibraryPdfWithPage(QStringLiteral("irt-cards"));
+    QVERIFY(!pdfPath.isEmpty());
+    QString error;
+    const auto target = Thoughts::resolveHtmlAttachment(PageTabPath, pdfPath, &error);
+    QVERIFY2(target.isValid(), qPrintable(error));
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({pdfPath}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QCOMPARE(shell->m_tabs.size(), 1);
+    auto *document = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(document);
+
+    const QString answer = QStringLiteral("one cent per page");
+    const QJsonObject fields = Thoughts::HtmlAttachmentReader::newCardFields({{QStringLiteral("text_quote"), QJsonObject {{QStringLiteral("exact"), answer}}}}, target);
+    QVERIFY(!fields.isEmpty());
+    // As ReviewStore::createHtmlAttachmentCard saves it.
+    QJsonObject primary = fields;
+    primary.insert(QStringLiteral("question"), QStringLiteral("How much?"));
+    primary.insert(QStringLiteral("pdf_stem"), QStringLiteral("irt-cards"));
+    primary.insert(QStringLiteral("document_id"), PageTabDocumentId);
+    primary.insert(QStringLiteral("selected_text"), answer);
+    const QJsonObject card {{QStringLiteral("schema_version"), 3},
+                            {QStringLiteral("card_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                            {QStringLiteral("status"), QStringLiteral("approved")},
+                            {QStringLiteral("source_authority"), QStringLiteral("client-v1")},
+                            {QStringLiteral("source_link"), QJsonObject {{QStringLiteral("state"), QStringLiteral("html_attachment")}}},
+                            {QStringLiteral("primary"), primary}};
+    QVERIFY(Thoughts::isHtmlAttachmentCard(card));
+    // Shell::presentReviewCard (the card browser's Open) asks the document's Part.
+    bool shown = false;
+    QVERIFY(QMetaObject::invokeMethod(document, "showHtmlAttachmentCard", Qt::DirectConnection, Q_RETURN_ARG(bool, shown), Q_ARG(QJsonObject, card)));
+    QVERIFY(shown);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QVERIFY(shell->isHtmlAttachmentTab(1));
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    auto *page = qobject_cast<Okular::Part *>(shell->m_tabs.at(1).part);
+    QVERIFY(page);
+    QVERIFY(page->htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    QCOMPARE(page->htmlAttachmentState().value(QStringLiteral("path")).toString(), PageTabPath);
+    QVERIFY(!document->htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+
+    // Feedback on the page, opened from the document's tab: the page's tab again.
+    const QString pdfSha256 = sha256Hex([&pdfPath] {
+        QFile file(pdfPath);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    }());
+    const QJsonObject version = Thoughts::FeedbackVersion::forPdf(ShellUtils::docsRoot(), pdfPath, false, pdfSha256);
+    QJsonObject liked = Thoughts::DocumentFeedback::create(Thoughts::ReviewCardFeedback::positive(), QStringLiteral("Clear"),
+                                                           Thoughts::DocumentFeedback::attachmentAnchor(fields, PageTabDocumentId, pdfSha256), Thoughts::Platform::reviewOriginId());
+    liked.insert(QStringLiteral("view"), Thoughts::DocumentFeedback::attachmentView());
+    liked = Thoughts::FeedbackVersion::stamped(liked, version);
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(liked).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(liked)));
+    bool queued = false;
+    QVERIFY(QMetaObject::invokeMethod(document, "enqueueDocumentFeedbackRecord", Qt::DirectConnection, Q_RETURN_ARG(bool, queued), Q_ARG(QVariantMap, liked.toVariantMap())));
+    QVERIFY(queued);
+    shell->setActiveTab(0);
+    const auto openFeedback = [](KParts::ReadWritePart *part, const QString &feedbackId) {
+        bool opened = false;
+        QMetaObject::invokeMethod(part, "openDocumentFeedback", Qt::DirectConnection, Q_RETURN_ARG(bool, opened), Q_ARG(QString, feedbackId));
+        return opened;
+    };
+    QTRY_VERIFY(openFeedback(document, liked.value(QStringLiteral("feedback_id")).toString()));
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QCOMPARE(shell->m_tabWidget->currentIndex(), 1);
+    QCOMPARE(shell->m_tabs.at(1).part, static_cast<KParts::ReadWritePart *>(page));
+    QVERIFY(!document->htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+
+    // A passage of the PDF chosen in the page's tab (its Annotations): the document's tab shows it.
+    QJsonObject box = Thoughts::DocumentFeedback::createTextBox(1, QRectF(0.1, 0.1, 0.3, 0.05), 0.02, QStringLiteral("A note"), PageTabDocumentId, pdfSha256,
+                                                                Thoughts::Platform::reviewOriginId());
+    box = Thoughts::FeedbackVersion::stamped(box, version);
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(box).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(box)));
+    QVERIFY(QMetaObject::invokeMethod(page, "enqueueDocumentFeedbackRecord", Qt::DirectConnection, Q_RETURN_ARG(bool, queued), Q_ARG(QVariantMap, box.toVariantMap())));
+    QVERIFY(queued);
+    QTRY_VERIFY(openFeedback(page, box.value(QStringLiteral("feedback_id")).toString()));
+    QTRY_COMPARE(shell->m_tabWidget->currentIndex(), 0);
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QVERIFY(page->htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+}
+
+QTEST_MAIN(MainShellTest)
+#include "mainshelltest.moc"

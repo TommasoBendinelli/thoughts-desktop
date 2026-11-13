@@ -1,0 +1,60 @@
+{
+  "name": "thoughts-pdf-links",
+  "displayName": "Thoughts PDF Links",
+  "description": "Open PDFs and source-linked LaTeX documents directly in Thoughts, and follow Thoughts document links in LaTeX sources.",
+  "version": "1.2.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCustomEditor:thoughts.externalPdf"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "test": "node test/open-thoughts.test.js && node test/linked-pdfs.test.js && node test/package-manifest.test.js && node test/source-links.test.js"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "thoughts.openLinkedPdf",
+        "title": "Open PDF in Thoughts"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "thoughts.externalPdf",
+        "displayName": "Open in Thoughts",
+        "selector": [
+          {
+            "filenamePattern": "*.pdf"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "thoughts.openLinkedPdf",
+          "when": "false"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "thoughts.openLinkedPdf",
+          "when": "resourceScheme == file && resourceExtname == .tex && resourcePath in thoughts.linkedTexPaths",
+          "group": "2_open@1"
+        }
+      ]
+    }
+  }
+}

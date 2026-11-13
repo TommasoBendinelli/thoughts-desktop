@@ -1,0 +1,19 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: Default source folder belongs to another Project"
+   ],
+   "stdout": ""
+  }
+ ]
+}

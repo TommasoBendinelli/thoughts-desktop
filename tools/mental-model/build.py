@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: 2026 Tommaso Bendinelli
+"""Builds Review › Mental Model (mental-model/mental-model.md in the Thoughts application data folder).
+
+The page is what an agent reads before it explains a new topic to the user (and the user reads it too). The model
+writes it from prompt.md and four inputs of the last --months months:
+  - the review cards (a card is in the window when it was reviewed in it, or has never been reviewed): its question,
+    its note, its whole answer, its state now (status, due date, interval, counts, current tags), every review with its
+    tags, its note and group notes, the before step (mood, setup and predicted recall, before the answer was shown)
+    and the agent's prediction, and the passages of the answer the user liked or disliked;
+  - the feedback on documents (`thoughtsctl list-document-feedback`): the likes, dislikes, questions, drawings and
+    text boxes the user gave while reading, with their comments, each inside the text of its page on the PDF version
+    it was given on; the pictures of drawings and text boxes go with them (comments are left out: they never go to
+    agents);
+  - the drawings agents sent to the phone (the local copies in ~/Thoughts/agent-notes): title, the card or document,
+    the text sent with it, and the user's replies; the pictures of some go with them (see note_data);
+  - the explanation pilot's results, when explanation-pilot.md lies next to the output (card-pilot-gen/export_pilot.py
+    writes it): blind comparisons of two explanations of a new topic, with ratings, quiz and chat questions.
+The model cites cards as [[<first 8 hex of a card id>]]; those become links that open the card. The model's page is
+kept as summary.md next to the output, and --summary builds from a page instead of asking the model. The finished page
+can also be copied (scp) to --publish, for example where the phone's Review › Mental Model reads it, and to --predictor,
+for example where a recall prediction service reads it (best effort, silently skipped when that host cannot be reached).
+The app runs this script without those options; then THOUGHTS_MENTAL_MODEL_PUBLISH and THOUGHTS_MENTAL_MODEL_PREDICTOR,
+else "publish" and "predictor" in copy-targets.json next to the output, name them. Without any, nothing is copied.
+
+Cards come from `thoughtsctl search-review-cards` (read-only; works without Thoughts running); document feedback from
+`thoughtsctl list-document-feedback` (read-only; fetches the PDF versions it needs from the server). --request writes
+what the model would read to a file and stops, to check the input without asking the model.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+THOUGHTSCTL = "/Applications/Thoughts.app/Contents/MacOS/thoughtsctl"
+# Thoughts starts this with the GUI's short PATH, so the usual places of the Claude CLI are searched as well.
+CLAUDE_PLACES = ["~/.npm-global/bin", "~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin"]
+MODEL = "claude-opus-5-5"
+PROMPT = Path(__file__).with_name("prompt.md")
+# Settings for the copies of the page, next to the output: {"publish": "host:path", "predictor": "host:path"}.
+COPY_TARGETS = "copy-targets.json"
+NOTES = Path.home() / "Thoughts/agent-notes"
+PICTURES = 30  # at most this many pictures of drawings sent to the phone go to the model
+PAGE_PICTURES = 15  # and at most this many pictures of drawings and text boxes on documents
+LIMIT = 200  # search-review-cards returns at most this many cards per request
+STATUS = {"never": "not asked again (their choice)", "unpublished": "its document is unpublished"}
+FEEDBACK_KINDS = {"like": "liked", "dislike": "disliked", "question": "asked", "drawing": "drew on the page",
+                  "text_box": "wrote a text box on the page"}
+
+
+def thoughtsctl(command, request):
+    run = subprocess.run([args.thoughtsctl, "--json", command], input=json.dumps(request), capture_output=True, text=True)
+    try:
+        result = json.loads(run.stdout)
+    except ValueError:
+        result = {"message": run.stderr.strip().splitlines()[-1] if run.stderr.strip() else f"exit {run.returncode}"}
+    return result
+
+
+def search(request):
+    result = thoughtsctl("search-review-cards", {**request, "include_history": True, "full_answer": True})
+    if not result.get("accepted") and "full_answer" in str(result.get("message")):
+        # A thoughtsctl from before whole answers: its excerpts, then.
+        result = thoughtsctl("search-review-cards", {**request, "include_history": True})
+    if not result.get("accepted"):
+        raise SystemExit(f"search-review-cards failed: {result.get('message')}")
+    return result
+
+
+def all_cards(docs):
+    """Every card, one request per project when the Library has more than one request returns."""
+    first = search({"limit": LIMIT})
+    if first["matched"] <= first["returned"]:
+        return first["cards"], first["tag_groups"]
+    projects = json.loads((Path(docs) / ".thoughts/library-projects.json").read_text())["projects"]
+    cards = {}
+    for project in projects:
+        part = search({"limit": LIMIT, "project": project["name"]})
+        if part["matched"] > part["returned"]:
+            print(f"warning: only {part['returned']} of {part['matched']} cards of {project['name']}", file=sys.stderr)
+        cards.update((c["card_id"], c) for c in part["cards"])
+    return list(cards.values()), first["tag_groups"]
+
+
+def when(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def flat(text):
+    return " ".join(str(text).split())
+
+
+def days(value):
+    return f"{value:g}" if isinstance(value, (int, float)) else "?"
+
+
+def state_line(card):
+    """The card as it stands now: status, when it is due, its interval and counts, and its current tags."""
+    status = card.get("status") or "?"
+    parts = [STATUS.get(status, status)]
+    if card.get("due_at"):
+        parts.append(f"due {when(card['due_at']).astimezone():%Y-%m-%d}")
+    if card.get("overdue_days"):
+        parts.append(f"{card['overdue_days']} d overdue")
+    if card.get("retired_at"):
+        parts.append(f"retired {when(card['retired_at']).astimezone():%Y-%m-%d}")
+    parts.append(f"interval {days(card.get('interval_days'))} d")
+    parts.append(f"{card.get('review_count', 0)} reviews, {card.get('wrong_count', 0)} wrong, {card.get('lapse_count', 0)} lapses")
+    if card.get("current_tags"):
+        parts.append(f"current tags: {', '.join(card['current_tags'])}")
+    return "now: " + "; ".join(parts)
+
+
+def card_block(card, group_of):
+    """One card as the model reads it: question, note, answer, state now, author, reviews, marked passages."""
+    lines = [f"[[{card['card_id'][:8]}]] {card.get('project') or 'No project'} › "
+             f"{(card.get('document') or {}).get('name') or 'No document'}",
+             f"question: {flat(card['question'])}"]
+    if card.get("note"):
+        lines.append(f"card note: {flat(card['note'])}")
+    answer = flat((card.get("answer") or {}).get("text") or "")
+    if answer:
+        lines.append(f"answer: {answer}")
+    lines.append(state_line(card))
+    history = sorted(card["history"], key=lambda h: h["reviewed_at"])
+    sources = [t for h in history for t in h.get("tags", []) if group_of.get(t) == "Source"]
+    if sources:
+        lines.append(f"source: {sources[-1]}")
+    if history:
+        lines.append("reviews:")
+        for h in history:
+            local = when(h["reviewed_at"]).astimezone()
+            tags = ", ".join(t for t in h.get("tags", []) if group_of.get(t) != "Source") or "no tags"
+            # A review in two steps: what they picked and noted before seeing the answer, and the agent's prediction.
+            before = []
+            if "before_tags" in h:
+                said = f" \u2014 \u201c{' '.join(h['before_note'].split())}\u201d" if h.get("before_note") else ""
+                before.append(f"before: {', '.join(h['before_tags']) or 'no tags'}{said}")
+            if (h.get("agent_prediction") or {}).get("tag"):
+                before.append(f"agent: {h['agent_prediction']['tag']}")
+            phases = f" ({'; '.join(before)})" if before else ""
+            groups = "".join(f" \u2014 {group} note: {flat(text)}" for group, text in (h.get("group_notes") or {}).items())
+            note = f" \u2014 note: {flat(h['note'])}" if h.get("note") else ""
+            never = " \u2014 chose not to be asked again" if h.get("never") else ""
+            lines.append(f"  {local:%Y-%m-%d %a %H:%M}, next in {days(h.get('interval_days'))} d: {tags}{phases}{groups}{note}{never}")
+    else:
+        lines.append("reviews: none")
+    for f in sorted(card.get("feedback", []), key=lambda f: f["created_at"]):
+        kind = "liked" if f["polarity"] == "positive" else "disliked"
+        where = " (on another card's answer)" if f.get("shared") else " (the answer changed since)" if f.get("source_changed") else ""
+        comment = f" \u2014 comment: {flat(f['comment'])}" if f.get("comment") else ""
+        lines.append(f"{kind}{where}: \u201c{flat(f['quote'])}\u201d{comment}")
+    return "\n".join(lines)
+
+
+def card_data(cards, tag_groups, since):
+    """The cards of the window (reviewed in it, or never reviewed) as text for the model."""
+    group_of = {tag: group["name"] for group in tag_groups for tag in group["tags"]}
+    shown = [c for c in cards if not c["history"] or max(when(h["reviewed_at"]) for h in c["history"]) >= since]
+    shown.sort(key=lambda c: (str(c.get("project")).casefold(), str((c.get("document") or {}).get("name")).casefold()))
+    return len(shown), "\n\n".join(card_block(c, group_of) for c in shown)
+
+
+def note_data(since):
+    """The drawings sent to the phone in the window, newest first, with the user's replies, as text for the model, and the
+    pictures to show it: of each drawing the user replied to and of the newest drawing for each card, as the user marked
+    them when they drew on them, at most PICTURES."""
+    notes = []
+    for folder in NOTES.iterdir() if NOTES.is_dir() else []:
+        try:
+            note = json.loads((folder / "note.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not note.get("deleted") and note.get("created_at") and when(note["created_at"]) >= since:
+            notes.append((note["created_at"], folder, note))
+    notes.sort(key=lambda n: n[0], reverse=True)
+    blocks, pictures, cards = [], [], set()
+    for created, folder, note in notes:
+        local = when(created).astimezone()
+        card = note.get("review_card_id")
+        about = (f"for card [[{card[:8]}]] \u201c{' '.join((note.get('review_question') or '').split())}\u201d" if card else
+                 f"for document {note['document_filename']}" if note.get("document_filename") else "not tied to a card")
+        title = note.get("title")
+        lines = [f"drawing \u201c{title}\u201d, {local:%Y-%m-%d %a %H:%M}, {about}"]
+        if note.get("message"):
+            lines.append(f"sent with it: {' '.join(note['message'].split())[:600]}")
+        replies = sorted((p for p in folder.glob("reply-*.json") if re.fullmatch(r"reply-\d+\.json", p.name)),
+                         key=lambda p: int(p.stem.split("-")[1]))
+        if (folder / "note.png").exists() and (replies or card and card not in cards) and len(pictures) < PICTURES:
+            pictures.append((f"drawing \u201c{title}\u201d", folder / "note.png"))
+            lines.append(f"picture: attached as picture {len(pictures)}")
+        cards.add(card)
+        for k, path in enumerate(replies, 1):
+            reply = json.loads(path.read_text())
+            try:
+                marks = json.loads(path.with_suffix(".strokes.json").read_text())
+                drew = len(marks.get("strokes") or []) + len(marks.get("markers") or [])
+            except (OSError, ValueError):
+                drew = reply.get("stroke_count") or 0
+            said = f"\u201c{' '.join(reply['message'].split())}\u201d" if reply.get("message") else "no text"
+            marked = f"; drew {drew} marks on it" if drew else ""
+            if drew and path.with_suffix(".png").exists() and len(pictures) < PICTURES:
+                pictures.append((f"reply {k} to \u201c{title}\u201d, as they marked it", path.with_suffix(".png")))
+                marked += f" (attached as picture {len(pictures)})"
+            lines.append(f"reply {k}: {said}{marked}")
+        blocks.append("\n".join(lines))
+    return len(notes), "\n\n".join(blocks), pictures
+
+
+def mark(text, items):
+    """@p text with the passage of each (k, feedback) wrapped in ⟦k⟧ … ⟦/k⟧; the numbers it marked."""
+    def find(words):
+        found = re.search(r"\s*".join(re.escape(w) for w in words), text)
+        return (found.start(), found.end()) if found else None
+
+    spans = []
+    for k, item in items:
+        quote = (item.get("quote") or {}).get("exact") or ""
+        words = quote.split()
+        if not words:
+            continue
+        # The whole passage; else from its first words to its last ones (a symbol in between may read differently).
+        span = find(words)
+        if not span and len(words) > 12:
+            start, end = find(words[:6]), find(words[-6:])
+            if start and end and start[0] < end[1] <= start[0] + 2 * len(quote):
+                span = (start[0], end[1])
+        if span and not any(span[0] < e and s < span[1] for s, e, _ in spans):
+            spans.append((*span, k))
+    for start, end, k in sorted(spans, reverse=True):
+        text = f"{text[:start]}⟦{k}⟧{text[start:end]}⟦/{k}⟧{text[end:]}"
+    return text, {k for _, _, k in spans}
+
+
+def feedback_line(k, item, marked, pictures, first_picture):
+    """One piece of feedback: when, what kind, the passage unless it is marked in the page text, where, the comment."""
+    parts = [f"⟦{k}⟧ {when(item['created_at']).astimezone():%Y-%m-%d %a %H:%M}, "
+             f"{FEEDBACK_KINDS.get(item['kind'], item['kind'])}"]
+    if item.get("quote") and k not in marked:
+        parts.append(f"“{flat(item['quote']['exact'])}”")
+    if item.get("area") and item.get("pages"):
+        x, y, w, h = item["area"]
+        parts.append(f"on page {item['pages'][0]}, around x {x * 100:.0f}–{(x + w) * 100:.0f} %, "
+                     f"y {y * 100:.0f}–{(y + h) * 100:.0f} % of the page")
+    if item.get("view") == "html_attachment":
+        parts.append("in the HTML page")
+    if "resolved" in item:
+        parts.append("closed since" if item["resolved"] else "still open")
+    if item.get("comment"):
+        parts.append(f"comment: {flat(item['comment'])}")
+    if item.get("image") and len(pictures) < PAGE_PICTURES:
+        pictures.append((f"⟦{k}⟧ on page {item['pages'][0]}, as they marked it", Path(item["image"])))
+        parts.append(f"picture {first_picture + len(pictures) - 1}")
+    return " — ".join(parts)
+
+
+def feedback_data(since, images, first_picture):
+    """The feedback on documents in the window as text for the model, grouped by document and by the PDF version it was
+    given on, each page of that version that carries feedback with the passages marked; and the pictures of drawings
+    and text boxes (their numbers follow the first_picture - 1 pictures before them)."""
+    result = thoughtsctl("list-document-feedback", {"since": f"{since:%Y-%m-%dT%H:%M:%SZ}", "images_dir": str(images)})
+    if not result.get("accepted"):
+        print(f"warning: no feedback on documents: {result.get('message')}", file=sys.stderr)
+        return 0, "", []
+    versions = {v["pdf_sha256"]: v for v in result.get("versions", [])}
+    groups = {}  # document id -> version -> feedback, newest feedback first
+    for item in result["feedback"]:
+        document = groups.setdefault(item["document"]["document_id"], {"document": item["document"], "versions": {}})
+        document["versions"].setdefault(item.get("pdf_sha256") or "", []).append(item)
+    blocks, pictures, k = [], [], 0
+    for group in groups.values():
+        document = group["document"]
+        name = f"{document.get('project') or 'No project'} › {document.get('name') or document.get('filename') or 'a removed document'}"
+        for sha, items in group["versions"].items():
+            numbered = [(k + n, item) for n, item in enumerate(reversed(items), 1)]
+            k += len(items)
+            first, last = (when(numbered[i][1]["created_at"]).astimezone() for i in (0, -1))
+            dates = f"{first:%Y-%m-%d}" + (f" to {last:%Y-%m-%d}" if f"{last:%Y-%m-%d}" != f"{first:%Y-%m-%d}" else "")
+            which = ("the current version" if any(i["current_version"] for i in items) else "an earlier version") if sha else "no PDF version"
+            lines = [f"## {name}: {which}" + (f" ({sha[:8]})" if sha else "") + f", feedback of {dates}"]
+            version = versions.get(sha, {})
+            marked = set()
+            for page in version.get("pages", []):
+                on_page = [(n, item) for n, item in numbered if page["page"] in item["pages"] and n not in marked]
+                text, found = mark(page["text"], on_page)
+                marked |= found
+                lines.append(f"page {page['page']}:\n{text}")
+            if sha and not version.get("available", True):
+                lines.append(f"(this version could not be read: {version.get('unavailable')})")
+            lines.append("feedback:")
+            lines += [feedback_line(n, item, marked, pictures, first_picture) for n, item in numbered]
+            blocks.append("\n".join(lines))
+    return len(result["feedback"]), "\n\n".join(blocks), pictures
+
+
+def image(path):
+    """A picture as an image block for the model: a JPEG 600 px wide (sips), small enough to send a few dozen."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "picture.jpg"
+        subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "--resampleWidth", "600", str(path),
+                        "--out", str(out)], check=True, capture_output=True)
+        data = base64.b64encode(out.read_bytes()).decode("ascii")
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}}
+
+
+def write_page(cards, tag_groups, since, months):
+    """The model's Mental Model page, from the saved prompt, the cards, the feedback on documents, the drawings and the
+    pilot's results; with --request, what the model would read is written there instead, and nothing is returned."""
+    count, data = card_data(cards, tag_groups, since)
+    drawings, notes, pictures = note_data(since)
+    pilot = args.out.parent / "explanation-pilot.md"
+    with tempfile.TemporaryDirectory() as images:
+        marks, feedback, page_pictures = feedback_data(since, Path(images), len(pictures) + 1)
+        request = (f"Today is {datetime.now():%d %B %Y}.\n\n# Review cards\n\nThe {count} review cards of the last {months} "
+                   f"months.\n\n{data}\n\n# Feedback on documents\n\nThe {marks} pieces of feedback of the last {months} "
+                   f"months, by document and PDF version, newest first; {len(page_pictures)} of their pictures follow the "
+                   f"input.\n\n{feedback or 'None.'}\n\n# Drawings sent to the phone\n\nThe {drawings} drawings of the last "
+                   f"{months} months, newest first; {len(pictures)} of their pictures follow the input.\n\n{notes or 'None.'}\n\n"
+                   "# Explanation pilot\n\n" + (pilot.read_text() if pilot.exists() else "No results.") + "\n")
+        content = [{"type": "text", "text": request}]
+        for k, (label, path) in enumerate(pictures + page_pictures, 1):
+            content += [{"type": "text", "text": f"Picture {k}: {label}"}, image(path)]
+    if args.request:
+        args.request.write_text(request + "".join(f"\nPicture {k}: {label}" for k, (label, _) in enumerate(pictures + page_pictures, 1)) + "\n")
+        print(f"{args.request}: {len(request)} characters, {len(pictures) + len(page_pictures)} pictures; the model was not asked")
+        return None
+    # The npm install of claude is a node script, so node must be found the same way.
+    path = ":".join([os.environ.get("PATH", "")] + [str(Path(p).expanduser()) for p in CLAUDE_PLACES])
+    claude = shutil.which("claude", path=path)
+    if not claude:
+        raise SystemExit("the Claude CLI (claude) was not found")
+    # No tools; the pictures go in the message itself, which needs the stream-json input format.
+    result = subprocess.run([claude, "-p", "--model", MODEL, "--tools", "", "--no-session-persistence",
+                             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                             "--system-prompt", PROMPT.read_text()],
+                            input=json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n",
+                            capture_output=True, text=True, timeout=1800, env={**os.environ, "PATH": path})
+    events = []
+    for line in result.stdout.splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            pass
+    done = next((e for e in events if e.get("type") == "result"), {})
+    if result.returncode != 0 or done.get("is_error") or not (done.get("result") or "").strip():
+        raise SystemExit(f"the model did not write the page: {done.get('result') or result.stderr.strip() or 'no result'}")
+    return done["result"].strip()
+
+
+def copy_target(name, out):
+    """An scp target for a copy of the page: the environment, else copy-targets.json next to the page, else none."""
+    configured = os.environ.get(f"THOUGHTS_MENTAL_MODEL_{name.upper()}")
+    if configured is not None:
+        return configured
+    try:
+        return json.loads((out.parent / COPY_TARGETS).read_text()).get(name) or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def main():
+    global args
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--summary", type=Path, help="use this page (Markdown, [[card]] citations) instead of asking the model")
+    parser.add_argument("--request", type=Path, help="write what the model would read to this file and stop")
+    parser.add_argument("--months", type=int, default=6)
+    parser.add_argument("--thoughtsctl", default=THOUGHTSCTL)
+    parser.add_argument("--publish", help="scp target for the phone's copy; empty to skip (default: see above)")
+    parser.add_argument("--predictor", help="scp target for the recall prediction service's copy; empty to skip (default: see above)")
+    parser.add_argument("--docs", default=str(Path.home() / "Thoughts/docs"))
+    parser.add_argument("--out", type=Path, default=Path.home() / "Library/Application Support/Thoughts/mental-model/mental-model.md")
+    args = parser.parse_args()
+    for name in ("publish", "predictor"):
+        if getattr(args, name) is None:
+            setattr(args, name, copy_target(name, args.out))
+    cards, tag_groups = all_cards(args.docs)
+    ids = {c["card_id"][:8]: c["card_id"] for c in cards}
+    since = datetime.now(timezone.utc) - timedelta(days=round(args.months * 30.44))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.summary:
+        page = args.summary.read_text()
+    else:
+        page = write_page(cards, tag_groups, since, args.months)
+        if page is None:
+            return
+        (args.out.parent / "summary.md").write_text(page + "\n")
+    unknown = sorted({k for k in re.findall(r"\[\[([0-9a-f]{8})\]\]", page) if k not in ids})
+    if unknown:
+        print(f"warning: dropped citations of unknown cards: {', '.join(unknown)}", file=sys.stderr)
+        page = re.sub(r" ?\[\[(" + "|".join(unknown) + r")\]\]", "", page)
+    page = re.sub(r"\[\[([0-9a-f]{8})\]\]", lambda m: f"[{m.group(1)}](thoughts-card:{ids[m.group(1)]})", page)
+    args.out.write_text(page.rstrip() + "\n")
+    print(f"{args.out}: {len(cards)} cards read")
+    if args.publish:
+        sent = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(args.out), args.publish],
+                              capture_output=True, text=True)
+        if sent.returncode:
+            print(f"warning: not copied to the phone's page ({args.publish}): {sent.stderr.strip()}", file=sys.stderr)
+    if args.predictor:
+        # Best effort: the service keeps the page it has when its host cannot be reached.
+        subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", str(args.out), args.predictor],
+                       capture_output=True, text=True)
+
+
+if __name__ == "__main__":
+    main()

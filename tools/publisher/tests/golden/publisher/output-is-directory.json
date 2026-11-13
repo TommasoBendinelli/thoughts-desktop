@@ -1,0 +1,19 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "IsADirectoryError: [Errno 21] Is a directory: '<ROOT>/.out.json.XXXXXXXX' -> '<ROOT>/out.json'"
+   ],
+   "stdout": ""
+  }
+ ]
+}

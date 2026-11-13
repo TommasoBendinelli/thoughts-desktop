@@ -1,0 +1,35 @@
+{
+ "files": {
+  "out.json": {
+   "content": "{\n  \"schema_version\": 3,\n  \"projects\": []\n}\n",
+   "mode": "0o600"
+  }
+ },
+ "runs": [
+  {
+   "arguments": [
+    "generate-manifest",
+    "--docs-root",
+    "docs",
+    "--output",
+    "out.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 0,
+   "stderr": [
+    "THOUGHTS_LOCAL_SOURCE_PROGRESS {\"event\":\"local_source_access\",\"operation\":\"scan_directory\",\"path\":\"current_pdfs\",\"schema_version\":1}"
+   ],
+   "stdout": "Wrote 0 managed source paths.\n"
+  },
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "[]\n"
+  }
+ ]
+}

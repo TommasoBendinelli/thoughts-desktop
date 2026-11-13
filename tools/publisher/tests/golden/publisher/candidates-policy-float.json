@@ -1,0 +1,15 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "list-candidates",
+    "--docs-root",
+    "docs"
+   ],
+   "exit": 0,
+   "stderr": [],
+   "stdout": "[]\n"
+  }
+ ]
+}

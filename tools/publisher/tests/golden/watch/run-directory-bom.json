@@ -1,0 +1,6 @@
+{
+ "exit": 1,
+ "requests": [],
+ "stderr": "ValueError: could not read the build request: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)\n",
+ "stdout": ""
+}

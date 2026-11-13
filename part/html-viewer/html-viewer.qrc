@@ -1,0 +1,12 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <!-- The shared HTML edition viewer, vendored by thoughts-server clients/html-viewer/install-into.py. -->
+    <qresource prefix="/thoughts/html-viewer">
+        <file>html-viewer.json</file>
+        <file>VERSION</file>
+        <file>geometry.js</file>
+        <file>text.js</file>
+        <file>viewer.js</file>
+        <file>viewer.css</file>
+    </qresource>
+</RCC>

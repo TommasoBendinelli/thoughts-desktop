@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: 2026 Tommaso Bendinelli
+"""Prints one line per new reply to an agent note, and one per page the user sends (from the phone, or the Thoughts app on this Mac; long-polls the Thoughts server).
+Run it as a background monitor in an agent conversation; each line is a new reply or page. Read a reply
+with the Thoughts get_note_reply / list_note_replies tools, a page with get_note. Starts after the newest
+existing reply and page. Installed as ~/.local/bin/thoughts-watch-replies.
+
+It listens for the replies to the notes of the conversation it runs in (found from the process tree, as
+the Thoughts MCP finds it), and tells the server so: while it runs, the phone shows the user that the
+agent hears their reply; once it stops, the phone warns that nobody is listening. --all listens for every
+note this Mac sent; --conversation ID names the conversation.
+
+It imports agent_notes.py from THOUGHTS_MCP_SCRIPTS, else from its own folder (tools/mcp in the
+repository, the plugin's scripts), else from the Thoughts plugin's scripts (~/plugins/thoughts/scripts).
+"""
+import argparse
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+for _folder in (os.environ.get("THOUGHTS_MCP_SCRIPTS"), Path(__file__).resolve().parent,
+                Path.home() / "plugins/thoughts/scripts"):
+    if _folder and (Path(_folder) / "agent_notes.py").is_file():
+        sys.path.insert(0, str(_folder))
+        break
+import agent_notes as a  # noqa: E402
+import conversation_identity  # noqa: E402
+
+lock = threading.Lock()
+
+
+def say(line):
+    with lock:
+        print(line, flush=True)
+
+
+def conversation_to_hear(args) -> tuple[str | None, str]:
+    """(conversation_id or None for every note of this Mac, what the first line says)."""
+    if args.all:
+        return None, "LISTENING for replies to every note this Mac sent"
+    if args.conversation:
+        return args.conversation, f"LISTENING for replies to the notes of conversation {args.conversation}"
+    record = conversation_identity.claude_session_of_ancestors()
+    if record is None:
+        return None, ("LISTENING for replies to every note this Mac sent (this conversation could not be found; "
+                      "pass --conversation ID to listen for one conversation)")
+    name = record.get("name")
+    title = name if isinstance(name, str) and name else record["sessionId"][:8]
+    return record["sessionId"], f"LISTENING for replies to the notes of this conversation ({title!r})"
+
+
+def replies(client, conversation_id):
+    after = None
+    while after is None:
+        try:
+            after = a.feed_cursor(client, conversation_id)
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+    while True:
+        try:
+            # listen: the server tells the phone that an agent hears replies to these notes.
+            result = client.replies(after=after, wait=50, conversation_id=conversation_id, listen=True)
+            for reply in result.get("replies", []):
+                after = max(after, reply.get("sequence", 0))
+                note = reply.get("note") or {}
+                photo = reply.get("photo") or {}
+                with_photo = f" photo={photo.get('capture') or 'yes'}" if photo else ""
+                say(f"REPLY note={reply.get('note_id')} title={note.get('title')!r} "
+                    f"strokes={reply.get('stroke_count')}{with_photo} message={reply.get('message')!r}")
+            after = max(after, result.get("cursor") or after)
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+
+
+def pages(client):
+    # Study mode: the PDF page on the phone's screen (or in the Thoughts app on this Mac), sent with or
+    # without marks. The note list (not the inbox), so this Mac never counts as a phone listening for notes.
+    after = None
+    while after is None:
+        try:
+            after = max([n.get("sequence", 0) for n in client.list_notes(limit=50).get("notes", [])] + [0])
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+    while True:
+        try:
+            for note in a.new_phone_pages(client, after):
+                after = max(after, note.get("sequence", 0))
+                origin = note.get("origin") or {}
+                say(f"PAGE note={note.get('note_id')} title={note.get('title')!r} page={origin.get('page')} "
+                    f"strokes={origin.get('stroke_count')} message={note.get('message')!r}")
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+        time.sleep(3)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--all", action="store_true", help="listen for replies to every note this Mac sent")
+    scope.add_argument("--conversation", help="listen for the notes of this conversation ID")
+    args = parser.parse_args(argv)
+    conversation_id, first_line = conversation_to_hear(args)
+    say(first_line)
+    client = a.default_client()
+    threading.Thread(target=pages, args=(client,), daemon=True).start()
+    replies(client, conversation_id)
+
+
+if __name__ == "__main__":
+    main()

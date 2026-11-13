@@ -1,0 +1,117 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad1.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: normal runtime requires source-manifest schema version three; use migrate-manifest for a legacy import"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad2.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest has an unsupported schema"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad3.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest has an invalid or duplicate target"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad4.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest targets differ from current project configuration"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad5.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest has an invalid project or target list"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "bad6.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: duplicate source-manifest path: a"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "ok.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "ValueError: source manifest targets differ from current project configuration"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "inspect-library-build-inputs",
+    "--root",
+    "docs",
+    "--manifest",
+    "missing.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "FileNotFoundError: [Errno 2] No such file or directory: 'missing.json'"
+   ],
+   "stdout": ""
+  }
+ ]
+}

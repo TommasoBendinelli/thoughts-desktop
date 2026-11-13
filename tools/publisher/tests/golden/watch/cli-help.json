@@ -1,0 +1,6 @@
+{
+ "exit": 0,
+ "requests": [],
+ "stderr": "",
+ "stdout": "usage: thoughts-watch-build [-h] --server SERVER\n                            (--run-directory RUN_DIRECTORY |\n                            --build-id BUILD_ID) [--target TARGET]\n                            [--token TOKEN] [--poll-interval POLL_INTERVAL]\n\nFollow one Thoughts server build in a terminal\n\noptions:\n  -h, --help            show this help message and exit\n  --server SERVER\n  --run-directory RUN_DIRECTORY\n  --build-id BUILD_ID\n  --target TARGET\n  --token TOKEN\n  --poll-interval POLL_INTERVAL\n"
+}

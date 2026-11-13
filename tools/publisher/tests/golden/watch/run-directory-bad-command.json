@@ -1,0 +1,6 @@
+{
+ "exit": 1,
+ "requests": [],
+ "stderr": "ValueError: the build request does not contain a valid submission command\n",
+ "stdout": ""
+}

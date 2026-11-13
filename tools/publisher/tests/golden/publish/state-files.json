@@ -1,0 +1,48 @@
+{
+ "final": {
+  "docs": {
+   ".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json": [
+    "2606a110b52783f4",
+    "0o644"
+   ],
+   "docs-paper/tex/source/main.tex": [
+    "73cb3858a687a849",
+    "0o644"
+   ]
+  },
+  "manifest": "{\n  \"schema_version\": 3,\n  \"projects\": [\n    {\n      \"project\": \"docs-paper\",\n      \"targets\": [\n        \"paper_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-paper/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    }\n  ],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+  "reports": [],
+  "state": "{\"schema_version\": 2}",
+  "state_files": {
+   "source-manifest.json": [
+    "679664ecdc64eb1c",
+    "0o600"
+   ],
+   "source-sync-state.json": [
+    "f6c93bba1b968c23",
+    "0o644"
+   ]
+  },
+  "tree": []
+ },
+ "steps": [
+  [
+   "publish ",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Inspecting the selected managed source identities.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Inspecting the selected managed source identities.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Read 2 managed path(s); 0 path(s) are absent locally.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Read 2 managed path(s); 0 path(s) are absent locally.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Checking the current server source frontier.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Checking the current server source frontier.\",\"phase\":\"checking_server\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Uploading source change .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json (871 B).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"bytes_transferred\":0,\"message\":\"Uploading source change .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json (871 B).\",\"path\":\".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"total_bytes\":871,\"type\":\"thoughts_sync_event\"}\n[STAMP] Transfer progress: 871 B uploaded; 0 B downloaded.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"downloaded_bytes\":0,\"message\":\"Transfer progress: 871 B uploaded; 0 B downloaded.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\",\"uploaded_bytes\":871}\n[STAMP] Uploaded source change .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json (871 B).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"bytes_transferred\":871,\"message\":\"Uploaded source change .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json (871 B).\",\"path\":\".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"total_bytes\":871,\"type\":\"thoughts_sync_event\"}\n[STAMP] Scheduling source update: .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Scheduling source update: .thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Uploading source change docs-paper/tex/source/main.tex (2 B).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"bytes_transferred\":0,\"message\":\"Uploading source change docs-paper/tex/source/main.tex (2 B).\",\"path\":\"docs-paper/tex/source/main.tex\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"total_bytes\":2,\"type\":\"thoughts_sync_event\"}\n[STAMP] Transfer progress: 873 B uploaded; 0 B downloaded.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"downloaded_bytes\":0,\"message\":\"Transfer progress: 873 B uploaded; 0 B downloaded.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\",\"uploaded_bytes\":873}\n[STAMP] Uploaded source change docs-paper/tex/source/main.tex (2 B).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"bytes_transferred\":2,\"message\":\"Uploaded source change docs-paper/tex/source/main.tex (2 B).\",\"path\":\"docs-paper/tex/source/main.tex\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"total_bytes\":2,\"type\":\"thoughts_sync_event\"}\n[STAMP] Scheduling source update: docs-paper/tex/source/main.tex\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Scheduling source update: docs-paper/tex/source/main.tex\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Transfer progress: 873 B uploaded; 0 B downloaded.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"downloaded_bytes\":0,\"message\":\"Transfer progress: 873 B uploaded; 0 B downloaded.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\",\"uploaded_bytes\":873}\n[STAMP] Uploading metadata for 2 source change(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Uploading metadata for 2 source change(s).\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: {\"detail\":\"base and incoming content objects must be uploaded first\"}.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"http_409\",\"message\":\"Source publication failed: {\\\"detail\\\":\\\"base and incoming content objects must be uploaded first\\\"}.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nthoughts_server.source_agent.ApiError: {\"detail\":\"base and incoming content objects must be uploaded first\"}"
+  ],
+  [
+   "publish ",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Retrying metadata for 2 pending source change(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Retrying metadata for 2 pending source change(s).\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Transfer progress: 0 B uploaded; 0 B downloaded.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"downloaded_bytes\":0,\"message\":\"Transfer progress: 0 B uploaded; 0 B downloaded.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\",\"uploaded_bytes\":0}\n[STAMP] Source publication failed: {\"detail\":\"base and incoming content objects must be uploaded first\"}.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"http_409\",\"message\":\"Source publication failed: {\\\"detail\\\":\\\"base and incoming content objects must be uploaded first\\\"}.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nthoughts_server.source_agent.ApiError: {\"detail\":\"base and incoming content objects must be uploaded first\"}"
+  ],
+  [
+   "publish ",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: source-publication state has an unsupported schema.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: source-publication state has an unsupported schema.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nValueError: source-publication state has an unsupported schema"
+  ]
+ ]
+}

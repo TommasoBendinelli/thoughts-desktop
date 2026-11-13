@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<!DOCTYPE gui SYSTEM "kpartgui.dtd">
+<gui version="45" name="okular_shell" >
+ <MenuBar>
+  <Menu name="file" >
+   <text>&amp;File</text>
+   <DefineGroup append="open_merge" name="file_open" />
+   <DefineGroup append="print_merge" name="file_print" />
+   <Action name="open_from_url" append="open_merge" />
+   <Action name="render_linked_pdf" append="open_merge" />
+   <Action name="review_overview" append="open_merge" />
+   <Action name="agent_notes" append="open_merge" />
+   <Action name="ab_testing" append="open_merge" />
+   <Action name="copy_for_agent" append="open_merge" />
+   <Action name="pdf_sync_details" />
+   <Action name="thoughts_storage" />
+   <Action name="thoughts_logs" />
+   <Action name="thoughts_developer_logs" />
+   <Action name="undo-close-tab" append="open_merge" />
+  </Menu>
+  <!--Menu name="view" >
+   <Action name="fullscreen" />
+  </Menu-->
+  <Menu name="settings" >
+   <text>&amp;Settings</text>
+   <DefineGroup append="show_merge" name="show_merge" />
+   <DefineGroup append="configure_merge" name="configure_merge" />
+  </Menu>
+  <Merge/>
+  <Menu name="help">
+   <text>&amp;Help</text>
+   <Action name="thoughts_check_updates" />
+   <DefineGroup append="about_merge" name="about_merge" />
+  </Menu>
+ </MenuBar>
+ <ToolBar noMerge="1" name="mainToolBar" >
+  <text>Main Toolbar</text>
+  <Action name="window_buttons_space"/>
+  <Action name="sidebar_display"/>
+  <Action name="mouse_textselect"/>
+  <Action name="mouse_select"/>
+  <Action name="mouse_draw"/>
+  <Action name="mouse_text_box"/>
+  <Action name="document_title"/>
+  <Spacer/>
+  <Action name="go_document_back"/>
+  <Action name="page_number"/>
+  <Action name="go_document_forward"/>
+  <Spacer/>
+  <Action name="zoom_to"/>
+  <Action name="pdf_library_status"/>
+  <Action name="comments_overview"/>
+  <Action name="review_overview"/>
+  <Action name="agent_notes"/>
+  <Action name="ab_testing"/>
+ </ToolBar>
+ <ActionProperties scheme="Default">
+ </ActionProperties>
+</gui>

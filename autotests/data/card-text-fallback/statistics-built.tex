@@ -1,0 +1,133 @@
+\begin{document}
+\docTitle{Statistical tests}
+\subsection*{Paired permutation test}
+The theory behind paired permutation test is based on exchangeability under the null hypothesis.
+%
+Suppose we have n paired observations, where each pair consists of two measurements taken under two different conditions, X and Y, while all other relevant factors are kept the same.
+\[
+(X_1, Y_1), (X_2, Y_2), \ldots, (X_n, Y_n)
+\]
+For each pair, compute the difference:
+
+\[
+D_i = Y_i - X_i
+\]
+
+The null hypothesis is usually:
+
+\[
+H_0: \text{there is no systematic difference between } X \text{ and } Y
+\]
+
+In a paired setting, “no systematic difference” means that within each pair, the labels \(X_i\) and \(Y_i\) are arbitrary. In other words, under the null, it should not matter which value is called “before” and which is called “after.”
+
+%
+%
+So for each pair, the observed difference \(D_i\) could just as plausibly have been \(-D_i\). That is the key symmetry assumption:
+
+\[
+D_i \overset{d}{=} -D_i \quad \text{under } H_0
+\]
+
+So the test generates all possible sign flips:
+
+\[
+(D_1, D_2, \ldots, D_n)
+\]
+
+\[
+(\pm D_1, \pm D_2, \ldots, \pm D_n)
+\]
+
+There are \(2^n\) possible sign-flipped datasets. For each one, you compute a test statistic, often the mean difference:
+
+\[
+T = \frac{1}{n}\sum_{i=1}^n D_i
+\]
+
+This gives the exact null distribution of the statistic under the assumption that the signs are arbitrary.
+Let \(T_{\text{obs}}\) be the observed statistic, i.e \[T_{\text{obs}} = \frac{1}{n}\sum_{i=1}^n D_i.\]
+In order to perform this test, you would compare \(T_{\text{obs}}\) to the null distribution.
+The null distribution can be created by considering all possible sign flips of the observed differences. 
+Specifically, for each sign-flipped dataset, \((D_1^*,D_2^*,\ldots,D_n^*)=(s_1D_1,s_2D_2,\ldots,s_nD_n)\), where each \(s_i\) is either \(+1\) or \(-1\), compute the corresponding test statistic \(T_{\text{perm}} = \frac{1}{n}\sum_{i=1}^n D_i^*\).
+The collection of all such values of \(T_{\text{perm}}\) forms the permutation null distribution.
+This distribution represents the values of the test statistic that could have occurred if the null hypothesis were true and the signs of the paired differences were arbitrary.
+Then the observed statistic \(T_{\text{obs}}\) is compared to this null distribution. For a two-sided test, the p-value is
+\[
+p = \Pr\left(|T_{\text{perm}}| \ge |T_{\text{obs}}| \mid H_0\right).
+\]
+
+A small p-value means that the observed mean difference is unusual under the null hypothesis. 
+Therefore, there is evidence against \(H_0\), suggesting a systematic difference between \(X\) and \(Y\).
+\agentProposedEdit[created=2026-10-15T15:41:49.029Z,conversation_id=308253e6-d399-5c89-b3dd-4b6958845ab1]{agent-bda44393-eb3b-4dae-bae1-2d20f06c48ba}{Add the exact McNemar test (as the paired permutation test on binary outcomes), the Holm correction and the paired bootstrap, the three procedures used in the data-preprocessing paper's BasicSkills tables.
+}{}{
+\subsection*{Exact McNemar test}
+The exact McNemar test is the paired permutation test above, applied to binary outcomes.
+Suppose two models A and B answer the same \(n\) questions, and let \(X_i, Y_i \in \{0,1\}\) be 1 when A, respectively B, answers question \(i\) correctly.
+The paired differences then take only three values:
+\[
+D_i = Y_i - X_i \in \{-1, 0, +1\}.
+\]
+The \(n\) questions fall into four counts:
+\[
+\begin{array}{l|cc}
+ & \text{B correct} & \text{B wrong} \\
+\hline
+\text{A correct} & a & b \\
+\text{A wrong} & c & d
+\end{array}
+\]
+The mean difference is exactly the difference in accuracy:
+\[
+T_{\text{obs}} = \frac{1}{n}\sum_{i=1}^n D_i = \frac{c-b}{n} = \text{acc}_B - \text{acc}_A.
+\]
+The \(a+d\) concordant questions, which both models get right or both get wrong, have \(D_i = 0\), and flipping their sign changes nothing.
+So they carry no information about which model is better, and only the \(n_d = b + c\) discordant questions matter.
+Under \(H_0\), the sign of each discordant difference is a fair coin, so the number \(C\) of discordant questions won by B follows
+\[
+C \sim \text{Binomial}\left(b+c, \tfrac12\right) \quad \text{under } H_0.
+\]
+This binomial is the permutation null distribution of the previous section in closed form, so all \(2^n\) sign flips are covered without enumerating them.
+Since \(|T_{\text{perm}}| \ge |T_{\text{obs}}|\) exactly when \(C \le \min(b,c)\) or \(C \ge \max(b,c)\), the two-sided p-value is
+\[
+p = \min\left(1,\; 2\sum_{k=0}^{\min(b,c)} \binom{b+c}{k} 2^{-(b+c)}\right).
+\]
+For example, with \(b = 3\) and \(c = 12\), \(\Pr(C \le 3) = (1 + 15 + 105 + 455)/2^{15} \approx 0.018\), so \(p \approx 0.035\).
+The classical McNemar test replaces the binomial by its large-sample approximation \(\chi^2 = (b-c)^2/(b+c)\) with one degree of freedom; the exact version is preferred when \(b + c\) is small.
+
+Pairing is what makes the test sensitive.
+Comparing the two accuracies as if they came from independent samples would treat the variation in question difficulty as noise, although both models face the same questions.
+In the paired test, a question that is easy or hard for both models lands in \(a\) or \(d\) and drops out, so only the questions on which the models actually disagree decide the result.
+
+\subsection*{Holm correction for multiple tests}
+When \(m\) hypotheses are each tested at level \(\alpha\), the probability of at least one false rejection, the family-wise error rate (FWER), can be much larger than \(\alpha\).
+With \(m = 12\) independent true null hypotheses and \(\alpha = 0.05\), it is \(1 - 0.95^{12} \approx 0.46\).
+The Bonferroni correction rejects \(H_j\) only when \(p_j \le \alpha/m\), which keeps the FWER at most \(\alpha\) by the union bound.
+The Holm correction is a step-down version that rejects at least as much and needs no assumption about how the tests depend on each other.
+Sort the p-values as \(p_{(1)} \le p_{(2)} \le \cdots \le p_{(m)}\) and compare them with increasingly lenient thresholds:
+\[
+\text{for } k = 1, 2, \ldots, m: \quad \text{reject } H_{(k)} \text{ if } p_{(k)} \le \frac{\alpha}{m-k+1}, \text{ otherwise stop and keep } H_{(k)}, \ldots, H_{(m)}.
+\]
+Tables usually report the equivalent Holm-adjusted p-values, which are compared directly with \(\alpha\):
+\[
+\tilde p_{(k)} = \min\left(1,\; \max_{j \le k}\, (m-j+1)\, p_{(j)}\right).
+\]
+Why the FWER stays at most \(\alpha\): let \(m_0\) of the hypotheses be true.
+By the union bound, with probability at least \(1-\alpha\) every true null has \(p > \alpha/m_0\).
+At most \(m - m_0\) false nulls can be ranked before the smallest true-null p-value, so its rank is \(k \le m - m_0 + 1\) and its threshold is \(\alpha/(m-k+1) \le \alpha/m_0\).
+On that event it fails its threshold, the procedure stops there, and no true null is rejected.
+
+\subsection*{Paired bootstrap}
+Some statistics are not a single comparison per question, for example the mean of per-skill accuracies over several skills, where each skill has its own number of questions.
+For such statistics, the paired bootstrap estimates how much the statistic would vary if the questions had been drawn again.
+Let \(\theta\) be the statistic of interest, here the difference between model B's and model A's mean per-skill accuracy, and \(\hat\theta\) its observed value.
+For \(r = 1, \ldots, R\) (typically \(R = 10{,}000\)), draw questions with replacement, within each skill so that every skill keeps its size, keep each question's pair \((X_i, Y_i)\) together, and recompute the statistic \(\hat\theta^*_r\) on the resample.
+The 95\% percentile confidence interval is the range between the 2.5\% and 97.5\% quantiles of \(\hat\theta^*_1, \ldots, \hat\theta^*_R\).
+A common two-sided p-value for \(H_0: \theta = 0\) is
+\[
+p = \min\left(1,\; 2\min\left(\Pr{}^*(\hat\theta^* \le 0),\; \Pr{}^*(\hat\theta^* \ge 0)\right)\right),
+\]
+where \(\Pr^*\) is the fraction of resamples; it is the smallest \(\alpha\) for which the \((1-\alpha)\) percentile interval excludes 0.
+Keeping the pairs together preserves the correlation between the two models' answers, so shared question difficulty cancels as in the McNemar test; resampling the two models independently would give a wider interval.
+Unlike the permutation and McNemar tests, which build the distribution of the statistic under \(H_0\), the bootstrap approximates its sampling distribution around the observed value, so its p-values are approximate rather than exact.
+}\end{document}

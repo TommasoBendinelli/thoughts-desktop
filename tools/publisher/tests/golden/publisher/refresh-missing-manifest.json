@@ -1,0 +1,38 @@
+{
+ "files": {},
+ "runs": [
+  {
+   "arguments": [
+    "refresh-project-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "absent.json",
+    "--project",
+    "docs-a",
+    "--output",
+    "refreshed.json",
+    "--desktop-progress-jsonl"
+   ],
+   "exit": 1,
+   "stderr": [
+    "FileNotFoundError: [Errno 2] No such file or directory: 'absent.json'"
+   ],
+   "stdout": ""
+  },
+  {
+   "arguments": [
+    "migrate-manifest",
+    "--docs-root",
+    "docs",
+    "--manifest",
+    "absent.json"
+   ],
+   "exit": 1,
+   "stderr": [
+    "FileNotFoundError: [Errno 2] No such file or directory: 'absent.json'"
+   ],
+   "stdout": ""
+  }
+ ]
+}

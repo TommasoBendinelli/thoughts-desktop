@@ -1,0 +1,92 @@
+{
+ "final": {
+  "docs": {
+   ".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json": [
+    "2606a110b52783f4",
+    "0o644"
+   ],
+   "docs-paper/tex/source/main.tex": [
+    "73cb3858a687a849",
+    "0o644"
+   ]
+  },
+  "manifest": "{\n  \"schema_version\": 3,\n  \"projects\": [\n    {\n      \"project\": \"docs-paper\",\n      \"targets\": [\n        \"paper_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-paper/tex/source/main.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    }\n  ],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+  "reports": [],
+  "state": null,
+  "state_files": {
+   "source-manifest.json": [
+    "679664ecdc64eb1c",
+    "0o600"
+   ]
+  },
+  "tree": []
+ },
+ "steps": [
+  [
+   "publish --project docs-paper",
+   2,
+   "",
+   "usage: thoughts-publish-sources [-h]\n                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...\nthoughts-publish-sources: error: --project requires --target"
+  ],
+  [
+   "publish --target a.pdf --scope-target b.pdf",
+   2,
+   "",
+   "usage: thoughts-publish-sources [-h]\n                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...\nthoughts-publish-sources: error: --target and --scope-target are mutually exclusive"
+  ],
+  [
+   "publish --force-build",
+   2,
+   "",
+   "usage: thoughts-publish-sources [-h]\n                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...\nthoughts-publish-sources: error: --force-build requires --target"
+  ],
+  [
+   "publish ",
+   2,
+   "",
+   "usage: thoughts-publish-sources [-h]\n                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...\nthoughts-publish-sources: error: --token or THOUGHTS_TOKEN is required"
+  ],
+  [
+   "publish --target nothing.pdf",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"target\":\"nothing.pdf\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"target\":\"nothing.pdf\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: build target has no unique source-linked project: nothing.pdf. The server build was not started.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: build target has no unique source-linked project: nothing.pdf. The server build was not started.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"target\":\"nothing.pdf\",\"type\":\"thoughts_sync_event\"}\nValueError: build target has no unique source-linked project: nothing.pdf"
+  ],
+  [
+   "publish --target a/b.pdf --force-build",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"target\":\"a/b.pdf\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"target\":\"a/b.pdf\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: build target has no unique source-linked project: a/b.pdf. The server build was not started.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: build target has no unique source-linked project: a/b.pdf. The server build was not started.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"target\":\"a/b.pdf\",\"type\":\"thoughts_sync_event\"}\nValueError: build target has no unique source-linked project: a/b.pdf"
+  ],
+  [
+   "publish --scope-target paper_main.pdf --project docs-x",
+   2,
+   "",
+   "usage: thoughts-publish-sources [-h]\n                                {generate-manifest,refresh-project-manifest,migrate-manifest,list-candidates,inspect-build-inputs,inspect-library-build-inputs,once,watch,publish} ...\nthoughts-publish-sources: error: --project requires --target"
+  ],
+  [
+   "publish --path docs-paper/tex/source/missing.tex",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Inspecting the selected managed source identities.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Inspecting the selected managed source identities.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: requested source paths are absent from the manifest and recorded bases: docs-paper/tex/source/missing.tex.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: requested source paths are absent from the manifest and recorded bases: docs-paper/tex/source/missing.tex.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nValueError: requested source paths are absent from the manifest and recorded bases: docs-paper/tex/source/missing.tex"
+  ],
+  [
+   "publish --path ../x",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Inspecting the selected managed source identities.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Inspecting the selected managed source identities.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: unsafe requested source path: '../x'.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: unsafe requested source path: '../x'.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nValueError: unsafe requested source path: '../x'"
+  ],
+  [
+   "publish --frozen-inputs missing/inputs.json",
+   1,
+   "",
+   "[STAMP] Source publication failed: frozen publication inputs are unavailable: [Errno 2] No such file or directory: '<ROOT>/missing'.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: frozen publication inputs are unavailable: [Errno 2] No such file or directory: '<ROOT>/missing'.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nValueError: frozen publication inputs are unavailable: [Errno 2] No such file or directory: '<ROOT>/missing'"
+  ],
+  [
+   "publish --adopt-remote-base docs-paper/tex/source/main.tex",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 2 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 2 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: remote source is unavailable for base adoption: docs-paper/tex/source/main.tex.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"invalid_source_publication\",\"message\":\"Source publication failed: remote source is unavailable for base adoption: docs-paper/tex/source/main.tex.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nValueError: remote source is unavailable for base adoption: docs-paper/tex/source/main.tex"
+  ]
+ ]
+}

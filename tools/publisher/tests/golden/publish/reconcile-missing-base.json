@@ -1,0 +1,57 @@
+{
+ "final": {
+  "docs": {
+   ".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json": [
+    "2606a110b52783f4",
+    "0o644"
+   ],
+   "docs-paper/tex/source/main.tex": [
+    "efb83f2a277e9f49",
+    "0o644"
+   ],
+   "docs-paper/tex/source/second.tex": [
+    "480c2336b410f1ad",
+    "0o644"
+   ]
+  },
+  "manifest": "{\n  \"schema_version\": 3,\n  \"projects\": [\n    {\n      \"project\": \"docs-paper\",\n      \"targets\": [\n        \"paper_main.pdf\"\n      ],\n      \"files\": [\n        {\n          \"path\": \"docs-paper/tex/source/main.tex\",\n          \"role\": \"source\"\n        },\n        {\n          \"path\": \"docs-paper/tex/source/second.tex\",\n          \"role\": \"source\"\n        }\n      ]\n    }\n  ],\n  \"shared_files\": [\n    {\n      \"path\": \".thoughts/projects/e7cc61b9f3c22db6aab9880077825bfef2940d8506f3b34709a25864583c4e86/documents/thoughts-project.json\",\n      \"role\": \"render_manifest\"\n    }\n  ]\n}\n",
+  "reports": [
+   "{\n  \"schema_version\": 1,\n  \"rules_version\": 1,\n  \"checked_frontier\": 2,\n  \"manifest_sha256\": \"329262bd8bc46355136ed2652231b36ee6c974d32d6aea3d7387268254dad011\",\n  \"complete\": false,\n  \"verified\": [\n    {\n      \"path\": \"docs-paper/tex/source/second.tex\",\n      \"revision\": 1,\n      \"sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\",\n      \"object_sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\",\n      \"action\": \"acknowledge\",\n      \"rules_version\": 1,\n      \"exists\": true\n    }\n  ],\n  \"blocked_paths\": [\n    \"docs-paper/tex/source/main.tex\"\n  ],\n  \"pending_paths\": [],\n  \"decisions\": [\n    {\n      \"path\": \"docs-paper/tex/source/main.tex\",\n      \"action\": \"needs_attention\",\n      \"reason\": \"missing_merge_base\"\n    },\n    {\n      \"path\": \"docs-paper/tex/source/second.tex\",\n      \"action\": \"acknowledge\",\n      \"reason\": \"local_matches_remote\"\n    }\n  ],\n  \"hashed_files\": 2,\n  \"downloaded_bytes\": 0,\n  \"reused_objects\": 0,\n  \"installed_files\": 0,\n  \"duration_ms\": N,\n  \"report_path\": \"state/source-reconciliation-reports/TRACE-NS.json\",\n  \"trace_id\": \"TRACE\"\n}\n"
+  ],
+  "state": "{\n  \"authoring_reconciliation\": {\n    \"blocked_paths\": [\n      \"docs-paper/tex/source/main.tex\"\n    ],\n    \"checked_frontier\": 2,\n    \"pending_paths\": []\n  },\n  \"bases\": {\n    \"docs-paper/tex/source/second.tex\": {\n      \"object_sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\",\n      \"revision\": 1,\n      \"sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\"\n    }\n  },\n  \"materialized_sources\": {\n    \"docs-paper/tex/source/second.tex\": {\n      \"action\": \"acknowledge\",\n      \"object_sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\",\n      \"revision\": 1,\n      \"rules_version\": 1,\n      \"sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\"\n    }\n  },\n  \"next_device_sequence\": 1,\n  \"schema_version\": 1\n}\n",
+  "state_files": {
+   "source-manifest.json": [
+    "329262bd8bc46355",
+    "0o600"
+   ]
+  },
+  "tree": [
+   {
+    "deleted": false,
+    "path": "docs-paper/tex/source/main.tex",
+    "revision": 1,
+    "sha256": "7e8dd56c72cd6392506ff101b60b0a2cdf060cda3d93146e9dda58f7a704839a"
+   },
+   {
+    "deleted": false,
+    "path": "docs-paper/tex/source/second.tex",
+    "revision": 1,
+    "sha256": "480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4"
+   }
+  ]
+ },
+ "steps": [
+  [
+   "publish --path docs-paper/tex/source/second.tex",
+   1,
+   "",
+   "[STAMP] Preparing the managed source inventory.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Preparing the managed source inventory.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] The managed source manifest contains 3 path(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"The managed source manifest contains 3 path(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Inspecting the selected managed source identities.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Inspecting the selected managed source identities.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Read 1 managed path(s); 0 path(s) are absent locally.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Read 1 managed path(s); 0 path(s) are absent locally.\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Checking the current server source frontier.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Checking the current server source frontier.\",\"phase\":\"checking_server\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] No source changes need publication.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"No source changes need publication.\",\"phase\":\"checking_server\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Inspecting reproducible build inputs for 1 registered PDF(s).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Inspecting reproducible build inputs for 1 registered PDF(s).\",\"phase\":\"preparing\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Selected 0 exact build object(s) for paper_main.pdf (0 B; asset=0, external_pdf=0, generated=0).\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Selected 0 exact build object(s) for paper_main.pdf (0 B; asset=0, external_pdf=0, generated=0).\",\"phase\":\"preparing\",\"project\":\"docs-paper\",\"schema_version\":1,\"selected_files\":0,\"state\":\"running\",\"total_bytes\":0,\"type\":\"thoughts_sync_event\"}\n[STAMP] Uploading the accepted build-input inventory for paper_main.pdf.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"message\":\"Uploading the accepted build-input inventory for paper_main.pdf.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"running\",\"type\":\"thoughts_sync_event\"}\n[STAMP] Source publication failed: {\"detail\":\"build input snapshot does not match the Library source project\"}.\nTHOUGHTS_SYNC_EVENT {\"at\":\"TIME\",\"error_code\":\"http_409\",\"message\":\"Source publication failed: {\\\"detail\\\":\\\"build input snapshot does not match the Library source project\\\"}.\",\"phase\":\"uploading\",\"schema_version\":1,\"state\":\"failed\",\"type\":\"thoughts_sync_event\"}\nthoughts_server.source_agent.ApiError: {\"detail\":\"build input snapshot does not match the Library source project\"}"
+  ],
+  [
+   "reconcile",
+   0,
+   "{\"schema_version\": 1, \"rules_version\": 1, \"checked_frontier\": 2, \"manifest_sha256\": \"329262bd8bc46355136ed2652231b36ee6c974d32d6aea3d7387268254dad011\", \"complete\": false, \"verified\": [{\"path\": \"docs-paper/tex/source/second.tex\", \"revision\": 1, \"sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\", \"object_sha256\": \"480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4\", \"action\": \"acknowledge\", \"rules_version\": 1, \"exists\": true}], \"blocked_paths\": [\"docs-paper/tex/source/main.tex\"], \"pending_paths\": [], \"decisions\": [{\"path\": \"docs-paper/tex/source/main.tex\", \"action\": \"needs_attention\", \"reason\": \"missing_merge_base\"}, {\"path\": \"docs-paper/tex/source/second.tex\", \"action\": \"acknowledge\", \"reason\": \"local_matches_remote\"}], \"hashed_files\": 2, \"downloaded_bytes\": 0, \"reused_objects\": 0, \"installed_files\": 0, \"duration_ms\": N, \"report_path\": \"state/source-reconciliation-reports/TRACE-NS.json\", \"trace_id\": \"TRACE\"}\n",
+   ""
+  ]
+ ]
+}
