@@ -1218,6 +1218,56 @@ QString joinedSignals(const QList<QPair<QString, QString>> &signals, const QStri
     return tags.join(QLatin1Char('+'));
 }
 
+// Calibration: how sure the user was before seeing the answer (a "Confidence" slider, lowest step
+// first) against how well they turned out to know it. A gap of half the range or more counts as
+// over- or underconfident, as in Lee et al., CHI 2025: predicted minus actual.
+struct CalibrationTally {
+    QStringList overconfident, underconfident;
+    int calibrated = 0;
+
+    static QString group(const SignalGroups &groups)
+    {
+        for (const QString &name : groups.order)
+            if (name.compare(QLatin1String("Confidence"), Qt::CaseInsensitive) == 0 && groups.scaleOf.value(name).size() > 1) return name;
+        return {};
+    }
+    void add(const QList<QPair<QString, QString>> &signals, const QString &level, const QString &question, const SignalGroups &groups)
+    {
+        const QString name = group(groups);
+        if (name.isEmpty() || level == QLatin1String("unreviewed")) return;
+        const QStringList scale = groups.scaleOf.value(name);
+        for (const auto &[signalGroup, tag] : signals) {
+            if (signalGroup != name) continue;
+            const qsizetype step = scale.indexOf(tag);
+            if (step < 0) continue;
+            const double gap = double(step) / double(scale.size() - 1) - levelValue(level);
+            if (gap >= 0.5) overconfident.append(question);
+            else if (gap <= -0.5) underconfident.append(question);
+            else ++calibrated;
+            return;
+        }
+    }
+    int total() const { return int(overconfident.size() + underconfident.size()) + calibrated; }
+    QJsonObject json() const
+    {
+        return QJsonObject{{QStringLiteral("cards"), total()}, {QStringLiteral("calibrated"), calibrated},
+                           {QStringLiteral("overconfident"), QJsonArray::fromStringList(overconfident)},
+                           {QStringLiteral("underconfident"), QJsonArray::fromStringList(underconfident)}};
+    }
+    QStringList lines(int limit) const
+    {
+        if (total() == 0) return {};
+        QStringList result{QStringLiteral("Calibration (confidence before seeing the answer vs. the answer, %1 card%2): %3 overconfident, %4 underconfident, %5 about right.")
+                               .arg(total()).arg(total() == 1 ? QString() : QStringLiteral("s")).arg(overconfident.size()).arg(underconfident.size()).arg(calibrated)};
+        if (!overconfident.isEmpty()) result.append(QStringLiteral("Overconfident on: ") + overconfident.mid(0, limit).join(QStringLiteral("; ")));
+        if (!underconfident.isEmpty()) result.append(QStringLiteral("Underconfident on: ") + underconfident.mid(0, limit).join(QStringLiteral("; ")));
+        return result;
+    }
+};
+
+// How many questions a summary line lists: enough for an agent to see every weak point of a topic.
+constexpr int summaryListLimit = 10;
+
 QString cut(const QString &text, int length)
 {
     const QString line = text.simplified();
@@ -1240,6 +1290,7 @@ QJsonObject learnerOverview(const Library &library, const QList<Entry> &all, con
     QHash<QString, Document> documents;
     QStringList documentOrder;
     SignalTally signals;
+    CalibrationTally calibration;
     struct Example { QDateTime at; QString question; QString document; };
     QList<Example> solid, weak;
     for (const auto &entry : all) {
@@ -1248,6 +1299,7 @@ QJsonObject learnerOverview(const Library &library, const QList<Entry> &all, con
         ++counts[assessment.level];
         const auto cardSignals = signalsOf(card, groups);
         signals.add(cardSignals);
+        calibration.add(cardSignals, assessment.level, shortQuestion(card.question()), groups);
         const QString name = entry.documentName.isEmpty() ? entry.pdfFilename : entry.documentName;
         if (!documents.contains(name)) documentOrder.append(name);
         Document &document = documents[name];
@@ -1336,6 +1388,7 @@ QJsonObject learnerOverview(const Library &library, const QList<Entry> &all, con
                           .arg(counts.value(QStringLiteral("shaky"))).arg(counts.value(QStringLiteral("unknown"))).arg(counts.value(QStringLiteral("unreviewed"))));
         lines->append(QStringLiteral("Studied: ") + documentLines.join(QStringLiteral("; ")));
         for (const QString &line : signals.lines(groups)) lines->append(line);
+        lines->append(calibration.lines(5));
         QStringList knows, struggles;
         for (int i = 0; i < solid.size() && i < 3; ++i) knows.append(solid.at(i).question);
         for (int i = 0; i < weak.size() && i < 3; ++i) struggles.append(weak.at(i).question);
@@ -1346,7 +1399,8 @@ QJsonObject learnerOverview(const Library &library, const QList<Entry> &all, con
                               .arg(disliked).arg(feedbackLines.join(QStringLiteral("; "))));
     }
     return QJsonObject{{QStringLiteral("cards"), total}, {QStringLiteral("counts"), countsJson}, {QStringLiteral("documents"), documentsJson},
-                       {QStringLiteral("signals"), signals.json(groups)}, {QStringLiteral("knows_well"), questionsOf(solid)},
+                       {QStringLiteral("signals"), signals.json(groups)}, {QStringLiteral("calibration"), calibration.json()},
+                       {QStringLiteral("knows_well"), questionsOf(solid)},
                        {QStringLiteral("struggles_with"), questionsOf(weak)},
                        {QStringLiteral("answer_feedback"), QJsonObject{{QStringLiteral("liked"), liked}, {QStringLiteral("disliked"), disliked},
                                                                        {QStringLiteral("latest"), feedbackJson}}}};
@@ -1409,6 +1463,7 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
     QHash<QString, QJsonArray> byClass;
     QHash<QString, QStringList> questions;
     SignalTally topicSignals;
+    CalibrationTally topicCalibration;
     for (const auto &entry : std::as_const(entries)) {
         const ReviewCard &card = *entry.card;
         const Assessment assessment = assess(card, levelOf, now);
@@ -1416,6 +1471,7 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
                          {QStringLiteral("document"), entry.documentName}, {QStringLiteral("reason"), assessment.reason.join(QStringLiteral("; "))}};
         if (!entry.project.isEmpty()) item.insert(QStringLiteral("project"), entry.project);
         const auto cardSignals = signalsOf(card, groups);
+        topicCalibration.add(cardSignals, assessment.level, shortQuestion(card.question()), groups);
         if (!cardSignals.isEmpty()) {
             QJsonObject signalsJson;
             for (const QString &group : groups.order) {
@@ -1447,15 +1503,17 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
         for (const auto &[name, label] : labels) {
             const QStringList shown = questions.value(name);
             if (shown.isEmpty()) continue;
-            QString line = label + QStringLiteral(": ") + shown.mid(0, 3).join(QStringLiteral("; "));
-            if (shown.size() > 3) line += QStringLiteral(" (+%1 more)").arg(shown.size() - 3);
+            QString line = label + QStringLiteral(": ") + shown.mid(0, summaryListLimit).join(QStringLiteral("; "));
+            if (shown.size() > summaryListLimit) line += QStringLiteral(" (+%1 more)").arg(shown.size() - summaryListLimit);
             summary.append(line);
         }
         for (const QString &line : topicSignals.lines(groups)) summary.append(line);
+        summary.append(topicCalibration.lines(summaryListLimit));
     }
     QJsonObject result{{QStringLiteral("schema_version"), 1}, {QStringLiteral("accepted"), true}, {QStringLiteral("topic"), topic},
                        {QStringLiteral("matched"), matched}, {QStringLiteral("counts"), counts}, {QStringLiteral("cards"), cards},
                        {QStringLiteral("index"), indexJson(library)}};
+    if (topicCalibration.total() > 0) result.insert(QStringLiteral("calibration"), topicCalibration.json());
     // Cold start: when few cards cover the topic, what all the cards say about the user as a
     // learner, so an explanation of something new can still build on what they know and like.
     if (learner.value_or(matched < 3)) {
@@ -1485,7 +1543,7 @@ QString agentContext(const QJsonObject &profileResult)
 {
     QStringList lines{
         QStringLiteral("About me as a learner, from my own review cards in Thoughts (cards I made while reading, tagged with how well I understand "
-                       "and remember each answer, how interesting I found it and how I studied it). Use it to pitch your explanation to me; "
+                       "and remember each answer, how sure I was before seeing it, how interesting I found it and how I studied it). Use it to pitch your explanation to me; "
                        "don't repeat it back unless I ask."),
         QString(),
         profileResult.value(QStringLiteral("summary")).toString(),
@@ -1496,6 +1554,7 @@ QString agentContext(const QJsonObject &profileResult)
         QStringLiteral("- \"Not yet reviewed\" means I read it but have not tested myself on it."),
         QStringLiteral("- For something new, connect it to what I know well and to what I find interesting."),
         QStringLiteral("- Where answer feedback is listed, write more like what I liked and less like what I disliked."),
+        QStringLiteral("- Where I was overconfident, don't take my word that I know it: check first, and point me back to the source to fill the gap."),
     };
     return lines.join(QLatin1Char('\n'));
 }

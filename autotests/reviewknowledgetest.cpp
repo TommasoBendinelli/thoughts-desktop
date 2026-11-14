@@ -433,12 +433,14 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
             QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-interest")}, {QStringLiteral("name"), QStringLiteral("Interest")},
                 {QStringLiteral("scale"), QJsonArray{QStringLiteral("Not interesting"), QStringLiteral("Somewhat"), QStringLiteral("Interesting"), QStringLiteral("Very interesting")}}},
             QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-effort")}, {QStringLiteral("name"), QStringLiteral("Effort")},
-                {QStringLiteral("tags"), QJsonArray{QStringLiteral("Skimmed"), QStringLiteral("Studied")}}}}}});
+                {QStringLiteral("tags"), QJsonArray{QStringLiteral("Skimmed"), QStringLiteral("Studied")}}},
+            QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-confidence")}, {QStringLiteral("name"), QStringLiteral("Confidence")},
+                {QStringLiteral("scale"), QJsonArray{QStringLiteral("Guessing"), QStringLiteral("Not sure"), QStringLiteral("Fairly sure"), QStringLiteral("Sure")}}}}}});
     // KL: very interesting and studied; tensor parallelism: not interesting, skimmed.
     projections.insert(QStringLiteral("review_event\nevents\ne6"), answer(QStringLiteral("e6"), kl, 4, 7,
-        QJsonArray{QStringLiteral("I kind of get it"), QStringLiteral("very interesting"), QStringLiteral("Studied")}));
+        QJsonArray{QStringLiteral("I kind of get it"), QStringLiteral("very interesting"), QStringLiteral("Studied"), QStringLiteral("Sure")}));
     projections.insert(QStringLiteral("review_event\nevents\ne4"), answer(QStringLiteral("e4"), tensor, 1, 0.9,
-        QJsonArray{QStringLiteral("wrong"), QStringLiteral("Not interesting"), QStringLiteral("Skimmed")}));
+        QJsonArray{QStringLiteral("wrong"), QStringLiteral("Not interesting"), QStringLiteral("Skimmed"), QStringLiteral("Guessing")}));
     const Library library = libraryFromSnapshot({projections, {}, true}, docs);
     const Levels legacy{{{QStringLiteral("correct"), QStringLiteral("solid")}, {QStringLiteral("Memorized"), QStringLiteral("solid")},
                          {QStringLiteral("Kind of memorized"), QStringLiteral("shaky")}, {QStringLiteral("I kind of get it"), QStringLiteral("shaky")},
@@ -450,8 +452,14 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
     QVERIFY2(topic.value(QStringLiteral("accepted")).toBool(), QJsonDocument(topic).toJson().constData());
     const auto shaky = topic.value(QStringLiteral("cards")).toObject().value(QStringLiteral("shaky")).toArray().at(0).toObject();
     QCOMPARE(shaky.value(QStringLiteral("signals")).toObject(),
-             (QJsonObject{{QStringLiteral("Interest"), QStringLiteral("Very interesting")}, {QStringLiteral("Effort"), QStringLiteral("Studied")}}));
+             (QJsonObject{{QStringLiteral("Interest"), QStringLiteral("Very interesting")}, {QStringLiteral("Effort"), QStringLiteral("Studied")},
+                          {QStringLiteral("Confidence"), QStringLiteral("Sure")}}));
     QVERIFY2(topic.value(QStringLiteral("summary")).toString().contains(QStringLiteral("Interest: typically Very interesting (Interesting 1, Very interesting 1)")),
+             qPrintable(topic.value(QStringLiteral("summary")).toString()));
+    // Sure of a shaky answer is overconfident; guessing at one not understood is about right.
+    QCOMPARE(topic.value(QStringLiteral("calibration")).toObject().value(QStringLiteral("overconfident")).toArray(),
+             QJsonArray{QStringLiteral("Why add a KL penalty to the reward?")});
+    QVERIFY2(topic.value(QStringLiteral("summary")).toString().contains(QStringLiteral("Overconfident on: Why add a KL penalty to the reward?")),
              qPrintable(topic.value(QStringLiteral("summary")).toString()));
     // Enough cards match: no general picture unless asked for.
     QVERIFY(!topic.contains(QStringLiteral("learner")));
@@ -475,6 +483,9 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
     QCOMPARE(learner.value(QStringLiteral("signals")).toObject().value(QStringLiteral("Interest")).toObject().value(QStringLiteral("typical")).toString(),
              QStringLiteral("Interesting"));
     QCOMPARE(learner.value(QStringLiteral("knows_well")).toArray().size(), 2);
+    QCOMPARE(learner.value(QStringLiteral("calibration")).toObject(), (QJsonObject{{QStringLiteral("cards"), 2}, {QStringLiteral("calibrated"), 1},
+        {QStringLiteral("overconfident"), QJsonArray{QStringLiteral("Why add a KL penalty to the reward?")}}, {QStringLiteral("underconfident"), QJsonArray{}}}));
+    QVERIFY(summary.contains(QStringLiteral("Calibration (confidence before seeing the answer vs. the answer, 2 cards): 1 overconfident, 0 underconfident, 1 about right.")));
     QCOMPARE(learner.value(QStringLiteral("answer_feedback")).toObject().value(QStringLiteral("liked")).toInt(), 0);
 
     // The text to paste into a chat app carries the summary.
@@ -482,6 +493,7 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
     QVERIFY(text.startsWith(QStringLiteral("About me as a learner")));
     QVERIFY(text.contains(summary.at(2)));
     QVERIFY(text.contains(QStringLiteral("How to use this:")));
+    QVERIFY(text.contains(QStringLiteral("Where I was overconfident")));
     // An empty Library says there is nothing to go on.
     const Library empty = libraryFromSnapshot({QJsonObject{}, {}, true}, temporary.filePath(QStringLiteral("empty")));
     QVERIFY(profile(empty, {{QStringLiteral("topic"), QStringLiteral("diffusion")}}, legacy, now).value(QStringLiteral("summary")).toString()
