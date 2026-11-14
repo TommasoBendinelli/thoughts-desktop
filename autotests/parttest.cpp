@@ -14264,8 +14264,8 @@ void PartTest::testOpenTexSourceUsesVerifiedPublishedArtifact()
         .pageNumber = 1,
         .x = 100.0,
         .y = 300.0,
-        .pdfPath = pdfPath,
         .selectedText = QStringLiteral("We ran reference evaluations"),
+        .pdfPath = pdfPath,
     });
     QVERIFY2(proposalResult.success, qPrintable(proposalResult.failureReason));
     QCOMPARE(proposalResult.sourceId, sourceId);
@@ -14283,8 +14283,8 @@ void PartTest::testOpenTexSourceUsesVerifiedPublishedArtifact()
         .pageNumber = 1,
         .x = 100.0,
         .y = 300.0,
-        .pdfPath = pdfPath,
         .selectedText = QStringLiteral("We ran reference evaluations"),
+        .pdfPath = pdfPath,
     });
     QVERIFY(!ambiguousResult.success);
     QCOMPARE(ambiguousResult.failureReason, QStringLiteral("the historical source line could not be mapped safely"));

@@ -95,6 +95,12 @@
 #include <algorithm>
 #include <numeric>
 #include <time.h>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -11154,9 +11160,19 @@ void CommentsOverviewTest::testSourceEditReloadsOnlyItsDocuments()
 
 static qint64 mainThreadCpuMicroseconds()
 {
+#ifdef Q_OS_WIN
+    // Windows has no clock_gettime: GetThreadTimes reports kernel and user time in 100 ns units.
+    FILETIME creation {}, exit {}, kernel {}, user {};
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    const auto ticks = [](const FILETIME &t) { return (qint64(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    return (ticks(kernel) + ticks(user)) / 10;
+#else
     timespec time {};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
     return qint64(time.tv_sec) * 1000000 + time.tv_nsec / 1000;
+#endif
 }
 
 // Activity durations recorded at or after `since`, by event name.
