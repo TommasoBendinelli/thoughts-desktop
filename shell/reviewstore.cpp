@@ -3626,6 +3626,65 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
             {QStringLiteral("terminal"), true}, {QStringLiteral("error_code"), code}, {QStringLiteral("message"), message}};
     };
     const QString command = request.value(QStringLiteral("command")).toString();
+    if (command == QLatin1String("answer-review-card")) {
+        // Records an answer the user gave outside the app (e.g. to an agent in chat) as the Review
+        // page's Next button does: the user's own tags and when to review the card again.
+        const QSet<QString> allowed{QStringLiteral("schema_version"), QStringLiteral("command"), QStringLiteral("card_id"),
+            QStringLiteral("request_id"), QStringLiteral("tags"), QStringLiteral("interval_unit"), QStringLiteral("interval_amount")};
+        for (auto it = request.begin(); it != request.end(); ++it)
+            if (!allowed.contains(it.key())) return failure(QStringLiteral("invalid_request"), QStringLiteral("Unexpected field: %1").arg(it.key()));
+        const QString id = request.value(QStringLiteral("card_id")).toString();
+        const QString requestId = request.value(QStringLiteral("request_id")).toString();
+        if (m_readOnly || QUuid(id).isNull() || QUuid(id).toString(QUuid::WithoutBraces) != id || !DocumentIdentityStore::validId(requestId))
+            return failure(QStringLiteral("invalid_request"), QStringLiteral("Provide valid card and request UUIDs."));
+        QStringList tags;
+        for (const auto &value : request.value(QStringLiteral("tags")).toArray()) {
+            const QString tag = ReviewTags::normalize(value.toString());
+            if (!value.isString() || tag.isEmpty()) return failure(QStringLiteral("invalid_request"), QStringLiteral("Tags must be non-empty strings."));
+            tags.append(tag);
+        }
+        const QString unit = request.value(QStringLiteral("interval_unit")).toString();
+        const QStringList units{QStringLiteral("minutes"), QStringLiteral("hours"), QStringLiteral("days"), QStringLiteral("weeks"), QStringLiteral("months")};
+        const double amount = request.value(QStringLiteral("interval_amount")).toDouble(0);
+        if (tags.isEmpty() || tags.size() > 20 || !units.contains(unit) || amount <= 0)
+            return failure(QStringLiteral("invalid_request"), QStringLiteral("Provide 1-20 tags and a positive interval."));
+        if (!QDir().mkpath(rootPath())) return failure(QStringLiteral("write_failed"), QStringLiteral("Cannot prepare local reviews."));
+        QLockFile lock(QDir(rootPath()).filePath(QStringLiteral("card-commands.lock")));
+        if (!lock.tryLock(2000)) return failure(QStringLiteral("busy"), QStringLiteral("Another card action is in progress."));
+        const QString hash = sha256(QJsonDocument(request).toJson(QJsonDocument::Compact));
+        const QString journalPath = QDir(rootPath()).filePath(QStringLiteral("card-commands/%1.json").arg(requestId));
+        if (const auto journal = readObject(journalPath, nullptr); !journal.isEmpty()) {
+            if (journal.value(QStringLiteral("sha256")).toString() != hash)
+                return failure(QStringLiteral("request_conflict"), QStringLiteral("This request ID was already used with different arguments."));
+            auto result = journal.value(QStringLiteral("result")).toObject();
+            result.insert(QStringLiteral("replayed"), true);
+            return result;
+        }
+        const auto snapshot = cards();
+        const auto card = std::find_if(snapshot.cbegin(), snapshot.cend(), [&](const ReviewCard &c) { return c.id() == id; });
+        if (card == snapshot.cend() || card->schedule.deleted || !card->isApproved())
+            return failure(QStringLiteral("card_unavailable"), QStringLiteral("This card is unavailable or already deleted."));
+        auto now = QDateTime::currentDateTimeUtc();
+        for (const auto &prior : card->history) {
+            const auto at = parseUtc(objectString(prior, QStringLiteral("reviewed_at")));
+            if (at.isValid() && at >= now) now = at.addMSecs(1);
+        }
+        ReviewInterval interval;
+        interval.unit = static_cast<ReviewInterval::Unit>(units.indexOf(unit));
+        interval.amount = amount;
+        const auto due = interval.dueAt(now);
+        QString error, eventId;
+        if (!due.isValid() || !recordRating(id, QStringLiteral("custom_interval"), now, &error, due, &eventId, {}, tags, {}, {}, &card->record))
+            return failure(QStringLiteral("write_failed"), error.isEmpty() ? QStringLiteral("Could not record the answer.") : error);
+        const QJsonObject result{{QStringLiteral("schema_version"), 1}, {QStringLiteral("accepted"), true}, {QStringLiteral("terminal"), true},
+            {QStringLiteral("card_id"), id}, {QStringLiteral("event_id"), eventId}, {QStringLiteral("state"), QStringLiteral("answered")},
+            {QStringLiteral("tags"), QJsonArray::fromStringList(tags)}, {QStringLiteral("due_at"), utcString(due)}};
+        if (!writeJson(journalPath, QJsonObject{{QStringLiteral("sha256"), hash}, {QStringLiteral("result"), result}}, &error))
+            return failure(QStringLiteral("write_failed"), error);
+        auto replayed = result;
+        replayed.insert(QStringLiteral("replayed"), false);
+        return replayed;
+    }
     if (command == QLatin1String("delete-review-card") || command == QLatin1String("set-review-card-interval")) {
         const bool deleting = command == QLatin1String("delete-review-card");
         const QSet<QString> allowed{QStringLiteral("schema_version"), QStringLiteral("command"), QStringLiteral("card_id"),
