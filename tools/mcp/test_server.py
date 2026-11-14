@@ -83,6 +83,7 @@ print(json.dumps(result))
                     self.assertEqual({t.name for t in tools}, {'open_document', 'open_agent_notes', 'start_sync', 'create_proposal', 'create_proposals', 'revise_proposal', 'remove_proposal', 'create_review_card', 'move_review_card', 'merge_review_cards', 'create_project', 'import_pdf', 'list_review_cards',
                                                                'search_review_cards', 'knowledge_profile',
                                                                'send_note', 'list_notes', 'list_note_replies', 'get_note_reply', 'get_note', 'link_conversation',
+                                                               'note_rules', 'own_topic', 'release_topic',
                                                                'list_todos', 'add_todo', 'edit_todo'})
                     for name in ('search_review_cards', 'knowledge_profile', 'list_todos'):
                         self.assertTrue(next(t for t in tools if t.name == name).annotations.readOnlyHint)
@@ -443,9 +444,10 @@ class FakeApp(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """Answers thoughtsctl's sync and status commands like the app's command socket."""
     daemon_threads = True
 
-    def __init__(self, path, fail=False, busy_first=False, build_failed=False):
+    def __init__(self, path, fail=False, busy_first=False, build_failed=False, build_failed_as_failed_sync=False):
         self.syncs, self.fail, self.busy_first, self.lock = [], fail, busy_first, threading.Lock()
-        self.build_failed = build_failed
+        self.build_failed = build_failed or build_failed_as_failed_sync
+        self.build_failed_as_failed_sync = build_failed_as_failed_sync
         self.decisions = []
         self.todos = []
 
@@ -475,11 +477,18 @@ class FakeApp(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                     return dict(schema_version=1, accepted=False, state='busy', terminal=False, error_code='busy')
                 self.syncs.append(time.monotonic())
                 return dict(schema_version=1, accepted=True, reused=False, operation_id=f'op-{len(self.syncs)}', state='syncing', terminal=False)
-            if self.build_failed:
-                # As the app reports a Sync whose sources synced but whose PDF build failed.
+            if self.build_failed_as_failed_sync:
+                # As an app from before Sync stopped waiting for the server's builds reported a
+                # Sync whose sources synced but whose PDF build failed: a failed Sync.
                 return dict(schema_version=1, accepted=True, operation_id=request['operation_id'], state='failed', terminal=True,
                             failure_code='pdf_build_failed', sources_synced=True,
                             message='PDF build failed Your changes are synced with the server. The last successful PDF remains available. '
+                                    'renderer exited with 1: paper.pdf — latex_error: Source docs-paper/tex/source/main.tex:3 failed')
+            if self.build_failed:
+                # As the app reports it now: the Sync succeeded, and the failed build is its warning.
+                return dict(schema_version=1, accepted=True, operation_id=request['operation_id'], state='succeeded', terminal=True,
+                            sources_synced=True, message='Completed', warning_code='pdf_build_failed',
+                            warning='PDF build failed\nYour changes are synced with the server. The last successful PDF remains available.\n'
                                     'renderer exited with 1: paper.pdf — latex_error: Source docs-paper/tex/source/main.tex:3 failed')
             state = 'failed' if self.fail else 'succeeded'
             result = dict(schema_version=1, accepted=True, operation_id=request['operation_id'], state=state, terminal=True, message=state,
@@ -558,6 +567,35 @@ class ProposalSyncTest(unittest.TestCase):
         state = json.loads((Path(self.env['HOME']) / 'Library/Application Support/thoughtsctl/proposal-sync.json').read_text())
         self.assertGreater(state['delivered_through_ms'], state['last_write_ms'])
 
+    def test_failed_pdf_build_reported_by_an_earlier_app_does_not_block_proposals(self):
+        # An app from before Sync stopped waiting for builds reports the same as a failed Sync
+        # whose sources synced; thoughtsctl gives the same warning for it.
+        self.library(build_failed_as_failed_sync=True)
+        first = self.propose('Added.\n')
+        self.assertEqual(first['state'], 'proposal_created', first)
+        self.assertNotIn('error_code', first)
+        self.assertEqual(first['sync_before'], 'op-1')
+        self.assertEqual([warning['code'] for warning in first['warnings']], ['pdf_build_failed'], first)
+        self.assertEqual(first['warnings'][0]['sync'], 'before')
+        self.assertIn('latex_error', first['warnings'][0]['message'])
+        self.assertIn('Added.', self.source.read_text())
+
+    def test_sync_says_the_warning_of_a_succeeded_sync(self):
+        # thoughtsctl sync --wait: a Sync that succeeded although a PDF could not be built
+        # exits 0 and names the failed build, as text and as JSON.
+        self.library(build_failed=True)
+        done = subprocess.run([os.environ['THOUGHTS_TEST_CLI'], 'sync', '--wait', '--timeout', '30'], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith('Succeeded: all documents (op-1)'), done.stdout)
+        self.assertIn('PDF build failed Your changes are synced with the server.', done.stdout)
+        self.assertIn('latex_error', done.stdout)
+        self.assertEqual(len(done.stdout.splitlines()), 1, done.stdout)
+        done = subprocess.run([os.environ['THOUGHTS_TEST_CLI'], '--json', 'sync', '--wait', '--timeout', '30'], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = json.loads(done.stdout)
+        self.assertEqual((result['state'], result['warning_code']), ('succeeded', 'pdf_build_failed'), result)
+        self.assertIn('latex_error', result['warning'])
+
     def test_failed_sync_before_writes_nothing(self):
         app = self.library(fail=True)
         original = self.source.read_bytes()
@@ -574,6 +612,8 @@ class DecideProposalTest(ProposalSyncTest):
 
     test_burst_shares_one_sync_before_and_one_after = None
     test_failed_pdf_build_does_not_block_proposals = None
+    test_failed_pdf_build_reported_by_an_earlier_app_does_not_block_proposals = None
+    test_sync_says_the_warning_of_a_succeeded_sync = None
     test_failed_sync_before_writes_nothing = None
 
     def decide(self, request):
@@ -608,6 +648,8 @@ class TodoCommandTest(ProposalSyncTest):
 
     test_burst_shares_one_sync_before_and_one_after = None
     test_failed_pdf_build_does_not_block_proposals = None
+    test_failed_pdf_build_reported_by_an_earlier_app_does_not_block_proposals = None
+    test_sync_says_the_warning_of_a_succeeded_sync = None
     test_failed_sync_before_writes_nothing = None
 
     def test_requests_reach_the_app(self):

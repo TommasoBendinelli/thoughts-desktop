@@ -122,6 +122,9 @@
 #include <QSemaphore>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QHelpEvent>
+#include <QStyleHints>
+#include <QToolTip>
 #include <QSharedPointer>
 #include <QStandardPaths>
 #include <QTabBar>
@@ -517,6 +520,7 @@ private Q_SLOTS:
     void testZoomWithCrop();
     void testReload();
     void testSyncDefersPdfReload();
+    void testEndedBuildAnnouncementIsNotAnAnswer();
     void testUnresolvedThoughtsLinkStaysInsideApplication();
     void testFedoraUpdateHasNoShortcut();
     void testFedoraRepositoryStaysOfflineUntilExplicitAction();
@@ -784,6 +788,7 @@ private Q_SLOTS:
     void testAnnotationSidebarReviewCards();
     void testReviewCardScheduleText();
     void testAnnotationSidebarReviewCardSchedule();
+    void testAnnotationSidebarRetiredCards();
     void testAnnotationSidebarReviewCardsFollowPagePosition();
     void testAnnotationSidebarReviewCardPages();
     void testAnnotationSidebarReviewCardPdfHighlight();
@@ -792,6 +797,7 @@ private Q_SLOTS:
     void testAgentProposalAcceptLatency();
     void testAgentProposalQuickDecisions();
     void testAgentProposalHoverActions();
+    void testAgentProposalCheckMarker();
     void testAgentProposalReviewRecoversFromOverviewSource();
     void testAgentProposalReviewWaitsForUiDelivery();
     void testAgentProposalOverlayPreservesTextSelectionMode();
@@ -986,6 +992,22 @@ void PartTest::testReadAloudSettingsPage()
     if (settings.open(QIODevice::ReadOnly)) {
         QVERIFY(!settings.readAll().contains("sk-or-v1"));
     }
+}
+
+// The repository's news that a PDF build has ended on the server is relayed as
+// a signal of its own: whoever asked checkFedoraRemoteWork must not take it for
+// the answer to its question.
+void PartTest::testEndedBuildAnnouncementIsNotAnAnswer()
+{
+    Part part(nullptr, QVariantList());
+    QVERIFY(part.m_fedoraRepository);
+    QSignalSpy announced(&part, &Part::fedoraRemoteWorkFound);
+    QSignalSpy answered(&part, &Part::fedoraRemoteWorkChecked);
+    QVERIFY(QMetaObject::invokeMethod(part.m_fedoraRepository, "remoteWorkFound", Qt::DirectConnection, Q_ARG(bool, true), Q_ARG(QString, QStringLiteral("301/aa/1"))));
+    QCOMPARE(announced.size(), 1);
+    QVERIFY(announced.first().at(0).toBool());
+    QCOMPARE(announced.first().at(1).toString(), QStringLiteral("301/aa/1"));
+    QCOMPARE(answered.size(), 0);
 }
 
 // Test that Okular doesn't crash after a successful reload
@@ -1748,11 +1770,12 @@ void PartTest::testDocumentSyncScopesPdfLinkOverrides()
 namespace
 {
 // An answer feedback record of @p cardId for the test PDFs (review-card-feedback.md §2).
+// By default given on another PDF version than the one shown (a version the tests never open).
 QJsonObject testFeedback(const QString &cardId, const QString &polarity, const QString &quote, const QString &comment, const QString &createdAt,
-                         const QString &pdfSha256 = QString(64, QLatin1Char('e')))
+                         const QString &pdfSha256 = QString(64, QLatin1Char('e')), const QRectF &line = QRectF(QPointF(0.2, 0.16), QPointF(0.5, 0.17)))
 {
     const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(quote, QString(), QString(), QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"), pdfSha256,
-                                                                    Thoughts::ReviewCardFeedback::regionsJson({{1, QRectF(QPointF(0.2, 0.16), QPointF(0.5, 0.17))}}));
+                                                                    Thoughts::ReviewCardFeedback::regionsJson({{1, line}}));
     return Thoughts::ReviewCardFeedback::create(cardId, polarity, comment, anchor, QStringLiteral("android-pixel"),
                                                 QDateTime::fromString(createdAt, Qt::ISODateWithMs));
 }
@@ -2174,9 +2197,14 @@ void PartTest::testReviewCardFeedbackOnlyWhileTheAnswerIsVisible()
     const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QJsonObject card{{QStringLiteral("card_id"), cardId}, {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}}}};
     const QVariantList regions{QVariantMap{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QVariantList{0.2, 0.15, 0.82, 0.2}}}};
-    const QJsonObject liked = testFeedback(cardId, QStringLiteral("positive"), QStringLiteral("some random text"), QString(), QStringLiteral("2026-10-20T09:00:00.000Z"));
+    // Given on the PDF shown: drawn where they were given. A like or dislike belongs to its version,
+    // so the one given on another version is listed apart, never drawn.
+    const QString shownSha = Thoughts::FeedbackVersion::cachedFileSha256(part.localFilePath());
+    QVERIFY(!shownSha.isEmpty());
+    const QJsonObject liked = testFeedback(cardId, QStringLiteral("positive"), QStringLiteral("some random text"), QString(), QStringLiteral("2026-10-20T09:00:00.000Z"),
+                                           shownSha, QRectF(QPointF(0.29, 0.155), QPointF(0.43, 0.175)));
     const QJsonObject disliked = testFeedback(cardId, QStringLiteral("negative"), QStringLiteral("a bit silly"), QStringLiteral("Not silly at all."),
-                                              QStringLiteral("2026-10-20T10:00:00.000Z"));
+                                              QStringLiteral("2026-10-20T10:00:00.000Z"), shownSha, QRectF(QPointF(0.2, 0.18), QPointF(0.36, 0.2)));
     const QJsonObject missing = testFeedback(cardId, QStringLiteral("negative"), QStringLiteral("a passage that was edited away"), QString(),
                                              QStringLiteral("2026-10-20T11:00:00.000Z"));
     const QJsonObject deleted = Thoughts::ReviewCardFeedback::remove(
@@ -2209,18 +2237,19 @@ void PartTest::testReviewCardFeedbackOnlyWhileTheAnswerIsVisible()
     QTest::qWait(100);
     QCOMPARE(colouredPixels(green), greenBefore);
 
-    // Revealed: the card's own records, by position in the answer, the one not found last.
+    // Revealed: the card's own records, by position in the answer, the earlier version's last.
     const int changes = changed.count();
     part.revealReviewMask();
     QVERIFY(part.m_pageView->reviewFeedbackVisible());
     const QVariantList items = part.reviewFeedbackItems();
     QCOMPARE(items.size(), 3);
     QCOMPARE(items.at(0).toMap().value(QStringLiteral("feedback_id")), liked.value(QStringLiteral("feedback_id")).toVariant());
-    QCOMPARE(items.at(0).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("relocated"));
+    QCOMPARE(items.at(0).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("exact"));
     QCOMPARE(items.at(1).toMap().value(QStringLiteral("feedback_id")), disliked.value(QStringLiteral("feedback_id")).toVariant());
-    QCOMPARE(items.at(2).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("orphaned"));
-    QCOMPARE(part.reviewFeedbackStates().value(missing.value(QStringLiteral("feedback_id")).toString()).toString(), QStringLiteral("orphaned"));
-    QCOMPARE(Thoughts::ReviewFeedbackOverlay::summary(feedback->items()), QStringLiteral("1 liked · 2 disliked (1 not found)"));
+    QCOMPARE(items.at(2).toMap().value(QStringLiteral("state")).toString(), QStringLiteral("earlier"));
+    QCOMPARE(part.reviewFeedbackStates().value(missing.value(QStringLiteral("feedback_id")).toString()).toString(), QStringLiteral("earlier"));
+    QVERIFY(feedback->rectsOf(missing.value(QStringLiteral("feedback_id")).toString()).isEmpty());
+    QCOMPARE(Thoughts::ReviewFeedbackOverlay::summary(feedback->items()), QStringLiteral("1 liked · 1 disliked · 1 from an earlier version"));
     // For the review's feedback panel: where each passage was given (PDF and regions), and the PDF shown.
     const QVariantMap first = items.at(0).toMap();
     const QJsonObject likedPdf = liked.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject();
@@ -2229,7 +2258,7 @@ void PartTest::testReviewCardFeedbackOnlyWhileTheAnswerIsVisible()
     QCOMPARE(first.value(QStringLiteral("displayed_pdf_path")).toString(), part.localFilePath());
     QCOMPARE(first.value(QStringLiteral("displayed_pdf_sha256")).toString(), Thoughts::FeedbackVersion::cachedFileSha256(part.localFilePath()));
     QCOMPARE(first.value(QStringLiteral("revision")).toLongLong(), liked.value(QStringLiteral("revision")).toInteger());
-    // The relocated passage is drawn over its own words: "some random text" on line 1.
+    // The liked passage is drawn where it was given: "some random text" on line 1.
     const auto rects = feedback->rectsOf(liked.value(QStringLiteral("feedback_id")).toString());
     QCOMPARE(rects.size(), 1);
     QVERIFY(rects.first().second.left() > 0.28 && rects.first().second.left() < 0.31);
@@ -2441,12 +2470,12 @@ void PartTest::testReviewCardFeedbackFromTheSelection()
     QVERIFY(!written.last().contains(QStringLiteral("deleted_at")));
     QCOMPARE(part.reviewFeedbackItems().size(), 2);
 
-    // C8: a record whose passage is gone is listed (orphaned) and can still be deleted.
+    // C8: a record given on another PDF version is listed apart, never drawn, and can still be deleted.
     QJsonObject orphan = testFeedback(cardId, QStringLiteral("negative"), QStringLiteral("text that is no longer there"), QString(), QStringLiteral("2026-10-20T12:00:00.000Z"));
     feedback->setRecords(QList<QJsonObject>{written.at(1), written.last(), orphan});
     const QVariantList items = part.reviewFeedbackItems();
     QCOMPARE(items.size(), 3);
-    QCOMPARE(items.last().toMap().value(QStringLiteral("state")).toString(), QStringLiteral("orphaned"));
+    QCOMPARE(items.last().toMap().value(QStringLiteral("state")).toString(), QStringLiteral("earlier"));
     QVERIFY(feedback->rectsOf(orphan.value(QStringLiteral("feedback_id")).toString()).isEmpty());
     QVERIFY(part.m_pageView->deleteReviewFeedback(orphan.value(QStringLiteral("feedback_id")).toString()));
     QVERIFY(written.last().value(QStringLiteral("deleted")).toBool());
@@ -2795,7 +2824,8 @@ void PartTest::testReviewCardFeedbackSharedAcrossCards()
                                                     QDateTime::fromString(createdAt, Qt::ISODateWithMs));
     };
     const QString otherSha(64, QLatin1Char('e'));
-    // Made on card B: on another PDF, its quote in A's answer (shown on A, relocated) ...
+    // Made on card B: on another PDF version, its quote in A's answer (never shown on A: a like
+    // belongs to the version it was given on) ...
     const QJsonObject relocated = onLine(cardB, QStringLiteral("some random text"), otherSha, random, QStringLiteral("2026-10-20T09:00:00.000Z"));
     // ... and its quote only in B's answer (not on A);
     const QJsonObject onlyB = onLine(cardB, QStringLiteral("a bit silly"), otherSha, silly, QStringLiteral("2026-10-20T09:10:00.000Z"));
@@ -2806,7 +2836,7 @@ void PartTest::testReviewCardFeedbackSharedAcrossCards()
     // in another document (not on A).
     const QJsonObject otherDocument = onLine(cardB, QStringLiteral("some random text"), otherSha, random, QStringLiteral("2026-10-20T09:40:00.000Z"),
                                              QStringLiteral("5b0f6c1e-2a47-4d1b-9c35-7e0a4f2b9d13"));
-    // Card A's own record, its passage gone: still listed as not found on A, never on B.
+    // Card A's own record, given on another version: listed apart on A, never on B.
     const QJsonObject orphan = onLine(cardA, QStringLiteral("a passage that was edited away"), otherSha, random, QStringLiteral("2026-10-20T10:00:00.000Z"));
     const auto id = [](const QJsonObject &record) { return record.value(QStringLiteral("feedback_id")).toString(); };
     for (const QJsonObject &record : {relocated, onlyB, exact, outside, otherDocument, orphan})
@@ -2815,56 +2845,53 @@ void PartTest::testReviewCardFeedbackSharedAcrossCards()
     // Card B unknown here (or deleted): its feedback is never shown on A.
     part.setReviewFeedbackCard(cardRecord(cardA), regionsA);
     QVERIFY(part.showReviewMasks(regionsA));
-    QCOMPARE(part.reviewFeedbackStates(), (QVariantMap{{id(orphan), QStringLiteral("orphaned")}}));
+    QCOMPARE(part.reviewFeedbackStates(), (QVariantMap{{id(orphan), QStringLiteral("earlier")}}));
     part.clearReviewMask();
     // Card A, masked: its states (for Copy for agent and its History) already name the shared ones.
     part.setReviewFeedbackHomeCards(QJsonObject{{cardB, cardRecord(cardB)}});
     part.setReviewFeedbackCard(cardRecord(cardA), regionsA);
     QVERIFY(part.showReviewMasks(regionsA));
-    QCOMPARE(part.reviewFeedbackStates(), (QVariantMap{{id(relocated), QStringLiteral("relocated")}, {id(exact), QStringLiteral("exact")},
-                                                       {id(orphan), QStringLiteral("orphaned")}}));
+    QCOMPARE(part.reviewFeedbackStates(), (QVariantMap{{id(exact), QStringLiteral("exact")}, {id(orphan), QStringLiteral("earlier")}}));
     part.revealReviewMask();
     QVariantList items = part.reviewFeedbackItems();
-    QCOMPARE(items.size(), 3);
+    QCOMPARE(items.size(), 2);
     const auto item = [&items](const QString &feedbackId) {
         for (const QVariant &value : std::as_const(items))
             if (value.toMap().value(QStringLiteral("feedback_id")).toString() == feedbackId) return value.toMap();
         return QVariantMap();
     };
-    QCOMPARE(item(id(relocated)).value(QStringLiteral("card_id")).toString(), cardB);
-    QVERIFY(item(id(relocated)).value(QStringLiteral("shared")).toBool());
+    QVERIFY(item(id(relocated)).isEmpty());
+    QCOMPARE(item(id(exact)).value(QStringLiteral("card_id")).toString(), cardB);
     QVERIFY(item(id(exact)).value(QStringLiteral("shared")).toBool());
     QCOMPARE(item(id(orphan)).value(QStringLiteral("card_id")).toString(), cardA);
     QVERIFY(!item(id(orphan)).value(QStringLiteral("shared")).toBool());
-    // The not-found one is the card's own, last.
+    // The one of an earlier version is the card's own, last.
     QCOMPARE(items.last().toMap().value(QStringLiteral("feedback_id")).toString(), id(orphan));
-    QCOMPARE(Thoughts::ReviewFeedbackOverlay::summary(feedback->items()), QStringLiteral("3 liked (1 not found)"));
-    // Drawn where the passage is in A's answer: the relocated quote over "some random text".
-    const auto rects = feedback->rectsOf(id(relocated));
-    QCOMPARE(rects.size(), 1);
-    QVERIFY(rects.first().second.left() > 0.28 && rects.first().second.left() < 0.31);
+    QCOMPARE(Thoughts::ReviewFeedbackOverlay::summary(feedback->items()), QStringLiteral("1 liked · 1 from an earlier version"));
+    // Drawn where it was given on the PDF shown; nothing of another version.
+    QVERIFY(feedback->rectsOf(id(relocated)).isEmpty());
     QCOMPARE(feedback->rectsOf(id(exact)), Thoughts::ReviewCardFeedback::regionsOf(exact));
 
     // Edited from A: the same record (B's), the next revision.
-    auto *editor = part.m_pageView->openReviewFeedbackEditor(id(relocated));
+    auto *editor = part.m_pageView->openReviewFeedbackEditor(id(exact));
     QVERIFY(editor);
     editor->findChild<QPlainTextEdit *>(QStringLiteral("reviewFeedbackComment"))->setPlainText(QStringLiteral("Seen from card A."));
     editor->close();
     QCOMPARE(written.size(), 1);
-    QCOMPARE(id(written.last()), id(relocated));
+    QCOMPARE(id(written.last()), id(exact));
     QCOMPARE(written.last().value(QStringLiteral("card_id")).toString(), cardB);
     QCOMPARE(written.last().value(QStringLiteral("revision")).toInt(), 2);
-    QCOMPARE(written.last().value(QStringLiteral("anchor")), relocated.value(QStringLiteral("anchor")));
-    QCOMPARE(item(id(relocated)).value(QStringLiteral("state")).toString(), QStringLiteral("relocated"));
+    QCOMPARE(written.last().value(QStringLiteral("anchor")), exact.value(QStringLiteral("anchor")));
     items = part.reviewFeedbackItems();
-    QCOMPARE(item(id(relocated)).value(QStringLiteral("comment")).toString(), QStringLiteral("Seen from card A."));
+    QCOMPARE(item(id(exact)).value(QStringLiteral("state")).toString(), QStringLiteral("exact"));
+    QCOMPARE(item(id(exact)).value(QStringLiteral("comment")).toString(), QStringLiteral("Seen from card A."));
     // Deleted from A, then Undo: the same record, sticky delete rules (revision + 1, then + 1).
     QVERIFY(part.m_pageView->deleteReviewFeedback(id(exact)));
     QCOMPARE(written.size(), 2);
     QCOMPARE(id(written.last()), id(exact));
     QCOMPARE(written.last().value(QStringLiteral("card_id")).toString(), cardB);
     QVERIFY(written.last().value(QStringLiteral("deleted")).toBool());
-    QCOMPARE(written.last().value(QStringLiteral("revision")).toInt(), 2);
+    QCOMPARE(written.last().value(QStringLiteral("revision")).toInt(), 3);
     items = part.reviewFeedbackItems();
     QVERIFY(item(id(exact)).isEmpty());
     auto *undo = part.m_pageView->viewport()->findChild<QPushButton *>(QStringLiteral("reviewFeedbackUndoButton"));
@@ -2872,7 +2899,7 @@ void PartTest::testReviewCardFeedbackSharedAcrossCards()
     undo->click();
     QCOMPARE(written.size(), 3);
     QCOMPARE(id(written.last()), id(exact));
-    QCOMPARE(written.last().value(QStringLiteral("revision")).toInt(), 3);
+    QCOMPARE(written.last().value(QStringLiteral("revision")).toInt(), 4);
     QVERIFY(!written.last().value(QStringLiteral("deleted")).toBool());
     QCOMPARE(written.last().value(QStringLiteral("card_id")).toString(), cardB);
     items = part.reviewFeedbackItems();
@@ -2894,7 +2921,7 @@ void PartTest::testReviewCardFeedbackSharedAcrossCards()
         QCOMPARE(item(id(record)).value(QStringLiteral("card_id")).toString(), cardB);
     }
     // The edit made from A shows on B.
-    QCOMPARE(item(id(relocated)).value(QStringLiteral("comment")).toString(), QStringLiteral("Seen from card A."));
+    QCOMPARE(item(id(exact)).value(QStringLiteral("comment")).toString(), QStringLiteral("Seen from card A."));
     QVERIFY(!part.reviewFeedbackStates().contains(id(orphan)));
     part.clearReviewMask();
 }
@@ -4651,7 +4678,11 @@ void PartTest::testManualRenderCheckJournalsConditionalBuild()
     repository->m_cachedRepositoryStateValid = false;
     repository->m_syncCoordinator.state = FedoraRepository::ManualSyncState::Running;
     repository->m_syncCoordinator.phase = FedoraRepository::ManualSyncPhase::RenderCheck;
-    repository->m_syncCoordinator.setTarget(QString());
+    // Since 14 November 2026 only a Sync of one PDF waits for the build (here one whose
+    // publication also affects sibling PDFs, so the check covers all); a Sync of the
+    // whole Library ends without it (syncflowtest).
+    repository->m_syncCoordinator.setTarget(QStringLiteral("paper.pdf"));
+    repository->m_syncCoordinator.requiresGlobalRenderCheck = true;
     repository->m_activeTraceId = QStringLiteral("11111111-1111-4111-8111-111111111111");
     repository->m_syncCoordinator.renderCheckRequestId = repository->m_activeTraceId;
     repository->m_pollingBuild = true;
@@ -4703,6 +4734,7 @@ void PartTest::testManualRenderCheckJournalsConditionalBuild()
     repository->m_syncCoordinator.state = originalState;
     repository->m_syncCoordinator.phase = originalPhase;
     repository->m_syncCoordinator.setTarget(originalTarget);
+    repository->m_syncCoordinator.requiresGlobalRenderCheck = false;
     repository->m_activeTraceId = originalTraceId;
     repository->m_syncCoordinator.renderCheckRequestId = originalRequestId;
     repository->m_targetedBuildTarget = originalTargetedBuild;
@@ -4911,11 +4943,17 @@ void PartTest::testManualConditionalTargetedBuildTerminalFailureFailsAggregate()
     QCOMPARE(repository->m_syncCoordinator.buildFailure, QStringLiteral("targeted reused build failed exactly"));
     QVERIFY(repository->m_targetedBuildTarget.isEmpty());
     QVERIFY(QMetaObject::invokeMethod(repository, "completeManualSync", Qt::DirectConnection, Q_ARG(bool, true)));
-    QCOMPARE(repository->m_syncCoordinator.errorCode, QStringLiteral("pdf_build_failed"));
+    // Since 14 November 2026 the failed build is a warning of a Sync that succeeded: the
+    // changes arrived. (It used to end the Sync failed with error code pdf_build_failed.)
+    QVERIFY2(repository->m_syncCoordinator.state == FedoraRepository::ManualSyncState::Succeeded,
+             qPrintable(QStringLiteral("%1 %2").arg(static_cast<int>(repository->m_syncCoordinator.state)).arg(repository->m_syncCoordinator.message)));
+    QVERIFY(repository->m_syncCoordinator.errorCode.isEmpty());
+    QCOMPARE(repository->manualSyncWarningCode(), QStringLiteral("pdf_build_failed"));
     QCOMPARE(journal.last().at(1).toJsonObject().value(QStringLiteral("metadata")).toObject().value(QStringLiteral("sync_outcome")).toString(), QStringLiteral("changes_synced"));
-    QCOMPARE(repository->m_syncCoordinator.message, QStringLiteral("PDF build failed"));
-    QVERIFY(repository->m_syncCoordinator.details.contains(QStringLiteral("Your changes are synced with the server")));
-    QVERIFY(repository->m_syncCoordinator.details.contains(QStringLiteral("targeted reused build failed exactly")));
+    QVERIFY(repository->m_syncCoordinator.message.isEmpty());
+    QVERIFY(repository->manualSyncWarning().startsWith(QStringLiteral("PDF build failed")));
+    QVERIFY(repository->manualSyncWarning().contains(QStringLiteral("Your changes are synced with the server")));
+    QVERIFY(repository->manualSyncWarning().contains(QStringLiteral("targeted reused build failed exactly")));
     repository->m_syncCoordinator.begin(QString(), true, QString());
     repository->m_syncCoordinator.buildFailure = QStringLiteral("compiler failed");
     repository->m_syncCoordinator.fail(QStringLiteral("download failed"), QString());
@@ -22087,16 +22125,20 @@ void PartTest::testReviewCardScheduleText()
     const auto text = [&](const QJsonObject &schedule) { return AnnotationModel::reviewCardSchedule(schedule, now); };
 
     // Coming due: when, how often, how many times; the last tags apart, the whole schedule in the tooltip.
+    // Farther away its date, soon the exact time: within hours "in 3 h", later today or tomorrow by the clock.
     auto future = text(reviewCard(now.addDays(3)));
-    QCOMPARE(future.line, QStringLiteral("Due in 3 days · every 2 weeks · 3 reviews"));
+    QCOMPARE(future.line, QStringLiteral("Due 15 Nov · every 2 weeks · 3 reviews"));
     QCOMPARE(future.tags, QStringLiteral("last: Correct, my tag"));
     QVERIFY(!future.due);
     QCOMPARE(future.details, QStringLiteral("Due: %1 (in 3 days)\nInterval: 2 weeks\nReviews: 3 · Lapses: 1\nLast reviewed: %2\nLast tags: Correct, my tag")
                                  .arg(local(now.addDays(3)), local(now.addDays(-11))));
-    QCOMPARE(text(reviewCard(now.addDays(1))).line, QStringLiteral("Due tomorrow · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addDays(20))).line, QStringLiteral("Due in 3 weeks · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addDays(100))).line, QStringLiteral("Due in 3 months · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addSecs(5 * 3600))).line, QStringLiteral("Due in 5 hours · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(1))).line, QStringLiteral("Due tomorrow 12:00 · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 13), QTime(8, 15)).toUTC())).line, QStringLiteral("Due tomorrow 08:15 · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(20))).line, QStringLiteral("Due 2 Dec · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(100))).line, QStringLiteral("Due 20 Feb 2027 · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 12), QTime(21, 40)).toUTC())).line, QStringLiteral("Due today 21:40 · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addSecs(3 * 3600 + 600))).line, QStringLiteral("Due in 3 h · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addSecs(25 * 60))).line, QStringLiteral("Due in 25 min · every 2 weeks · 3 reviews"));
 
     // Due: today's "Due now", earlier days overdue by calendar days.
     auto overdue = text(reviewCard(now.addDays(-8)));
@@ -22118,13 +22160,13 @@ void PartTest::testReviewCardScheduleText()
     QVERIFY(text(newCard).due);
     QCOMPARE(text(newCard).details, QStringLiteral("Due: now\nNew: not answered yet\nReviews: 0 · Lapses: 0"));
     const QJsonObject firstDue{{QStringLiteral("state"), QStringLiteral("new")}, {QStringLiteral("due_at"), utc(now.addDays(1))}, {QStringLiteral("due_from"), utc(now.addDays(1))}};
-    QCOMPARE(text(firstDue).line, QStringLiteral("New · due tomorrow"));
+    QCOMPARE(text(firstDue).line, QStringLiteral("New · due tomorrow 12:00"));
     QVERIFY(!text(firstDue).due);
 
     // A learning step: taken 20 minutes early, by its due_from.
     QJsonObject learning{{QStringLiteral("state"), QStringLiteral("learning")}, {QStringLiteral("due_at"), utc(now.addSecs(30 * 60))}, {QStringLiteral("due_from"), utc(now.addSecs(10 * 60))},
                          {QStringLiteral("interval"), QStringLiteral("30 minutes")}, {QStringLiteral("repeats"), true}, {QStringLiteral("reviews"), 1}, {QStringLiteral("answered"), true}};
-    QCOMPARE(text(learning).line, QStringLiteral("Due in 10 minutes · learning · 1 review"));
+    QCOMPARE(text(learning).line, QStringLiteral("Due in 10 min · learning · 1 review"));
     learning.insert(QStringLiteral("due_from"), utc(now.addSecs(-5 * 60)));
     QCOMPARE(text(learning).line, QStringLiteral("Due now · learning · 1 review"));
     QVERIFY(text(learning).due);
@@ -22157,23 +22199,38 @@ void PartTest::testReviewCardScheduleText()
     never.insert(QStringLiteral("interval"), QStringLiteral("Never"));
     never.insert(QStringLiteral("repeats"), false);
     QCOMPARE(text(never).line, QStringLiteral("Never due · 3 reviews"));
+    // Not offered: when it is due all the same, and why it is not offered.
     auto unavailable = retired;
     unavailable.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
-    QCOMPARE(text(unavailable).line, QStringLiteral("Not in review now · 3 reviews"));
+    QCOMPARE(text(unavailable).line, QStringLiteral("Overdue 8 days · not offered now · 3 reviews"));
+    QVERIFY(!text(unavailable).due);
     QVERIFY(text(unavailable).details.contains(QStringLiteral("Due date: %1").arg(local(now.addDays(-8)))));
+    auto placement = reviewCard(now.addDays(-15));
+    placement.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
+    placement.remove(QStringLiteral("due_from"));
+    placement.insert(QStringLiteral("not_offered"), QStringLiteral("placement"));
+    QCOMPARE(text(placement).line, QStringLiteral("Overdue 15 days · waiting for its place in the PDF · 3 reviews"));
+    QVERIFY(text(placement).details.startsWith(QStringLiteral("Not offered for review until its answer is placed in this version of the PDF.\n")));
+    placement.insert(QStringLiteral("due_at"), utc(now.addSecs(-3600)));
+    QCOMPARE(text(placement).line, QStringLiteral("Due now · waiting for its place in the PDF · 3 reviews"));
+    QJsonObject newPlacement{{QStringLiteral("state"), QStringLiteral("unavailable")}, {QStringLiteral("not_offered"), QStringLiteral("placement")}};
+    QCOMPARE(text(newPlacement).line, QStringLiteral("Not offered · waiting for its place in the PDF"));
     // A state the queue would take, but no due_from: the shell found it not in review.
     auto unqueued = reviewCard(now.addDays(-8));
     unqueued.remove(QStringLiteral("due_from"));
-    QCOMPARE(text(unqueued).line, QStringLiteral("Not in review now · 3 reviews"));
+    QCOMPARE(text(unqueued).line, QStringLiteral("Overdue 8 days · not offered now · 3 reviews"));
     QVERIFY(!text(unqueued).due);
-    auto unpublished = unavailable;
+    auto unpublished = reviewCard(QDateTime(QDate(2026, 11, 29), QTime(9, 0)).toUTC());
     unpublished.insert(QStringLiteral("state"), QStringLiteral("unpublished"));
-    QCOMPARE(text(unpublished).line, QStringLiteral("Not reviewed: document unpublished · 3 reviews"));
+    unpublished.remove(QStringLiteral("due_from"));
+    QCOMPARE(text(unpublished).line, QStringLiteral("Due 29 Nov · not offered: document unpublished · 3 reviews"));
+    unpublished.remove(QStringLiteral("due_at"));
+    QCOMPARE(text(unpublished).line, QStringLiteral("Not offered: document unpublished · 3 reviews"));
     // A date chosen as the interval is no repetition.
     auto byDate = reviewCard(now.addDays(3));
     byDate.insert(QStringLiteral("interval"), QStringLiteral("15/11/2026"));
     byDate.insert(QStringLiteral("repeats"), false);
-    QCOMPARE(text(byDate).line, QStringLiteral("Due in 3 days · 3 reviews"));
+    QCOMPARE(text(byDate).line, QStringLiteral("Due 15 Nov · 3 reviews"));
     QVERIFY(text(byDate).details.contains(QStringLiteral("Interval: 15/11/2026")));
     // A card without a schedule (an older shell): nothing to show.
     QVERIFY(text({}).line.isEmpty());
@@ -22236,11 +22293,14 @@ void PartTest::testAnnotationSidebarReviewCardSchedule()
     const auto row = [&](int row) { return view->model()->index(row, 0); };
     // Page order: each row has its schedule under the question, the due one marked.
     QCOMPARE(row(0).data().toString(), QStringLiteral("What does the first page say?"));
-    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Due in 3 days · every 2 weeks · 3 reviews"));
+    // Three days away: its date.
+    const QDate laterDate = now.addDays(3).addSecs(60).toLocalTime().date();
+    const QString laterDue = QStringLiteral("Due ") + QLocale::c().toString(laterDate, laterDate.year() == now.toLocalTime().date().year() ? QStringLiteral("d MMM") : QStringLiteral("d MMM yyyy"));
+    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), laterDue + QStringLiteral(" · every 2 weeks · 3 reviews"));
     QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleTagsRole).toString(), QStringLiteral("last: Correct"));
     // A narrow row shows the first parts that fit whole, the tags last.
     QCOMPARE(row(0).data(AnnotationModel::ReviewCardSchedulePartsRole).toStringList(),
-             (QStringList{QStringLiteral("Due in 3 days"), QStringLiteral("every 2 weeks"), QStringLiteral("3 reviews"), QStringLiteral("last: Correct")}));
+             (QStringList{laterDue, QStringLiteral("every 2 weeks"), QStringLiteral("3 reviews"), QStringLiteral("last: Correct")}));
     QVERIFY(!row(0).data(AnnotationModel::ReviewCardDueRole).toBool());
     QCOMPARE(row(1).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Overdue 8 days · every 2 weeks · 3 reviews"));
     QVERIFY(row(1).data(AnnotationModel::ReviewCardDueRole).toBool());
@@ -22313,9 +22373,130 @@ void PartTest::testAnnotationSidebarReviewCardSchedule()
     otherPrimary.insert(QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('f')));
     otherVersion.insert(QStringLiteral("primary"), otherPrimary);
     part.setSidebarReviewCards({otherVersion});
-    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Not in review now · 3 reviews"));
+    // Still overdue, and why it is not offered.
+    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Overdue 8 days · waiting for its place in the PDF · 3 reviews"));
     QVERIFY(!row(0).data(AnnotationModel::ReviewCardDueRole).toBool());
     QVERIFY(row(0).data(AnnotationModel::ReviewCardStatusRole).toString().contains(QStringLiteral("needs updating")));
+}
+
+// A retired card stays on the PDF version it was on when it was retired (thoughts-server
+// protocol/review-card-retire.md 5). The Library's PDF neither draws nor lists it; the Retired
+// filter lists it, unplaced, without "PDF location needs updating". Its own version, opened
+// from History, lists and draws it. Restored, it waits for its place on the current version.
+void PartTest::testAnnotationSidebarRetiredCards()
+{
+    Okular::Settings::setGroupByAuthor(false);
+    Okular::Settings::setGroupByPage(false);
+    Okular::Settings::setCurrentPageOnly(false);
+    KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Annotation Sidebar"));
+    const bool savedCards = config.readEntry("ShowReviewCards", true);
+    const bool savedRetired = config.readEntry("ShowRetiredCards", false);
+    const auto restore = qScopeGuard([&] {
+        config.writeEntry("ShowReviewCards", savedCards);
+        config.writeEntry("ShowRetiredCards", savedRetired);
+        config.sync();
+    });
+    config.writeEntry("ShowReviewCards", true);
+    config.writeEntry("ShowRetiredCards", false);
+    config.sync();
+    const auto bytesOf = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+    const auto sha = [](const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); };
+    const QString path = QStringLiteral(KDESRCDIR "data/simple-multipage.pdf");
+    const QString current = sha(bytesOf(path));
+    // The version the card was retired on.
+    const QByteArray earlierBytes = bytesOf(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString earlier = sha(earlierBytes);
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const auto utc = [](const QDateTime &at) { return at.toUTC().toString(Qt::ISODateWithMs); };
+    const auto card = [&](const QString &id, const QString &question, const QString &pdfSha256, const QJsonObject &schedule) {
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage")}, {QStringLiteral("pdf_sha256"), pdfSha256},
+                                  {QStringLiteral("question"), question},
+                                  {QStringLiteral("regions"), QJsonArray{QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.1, 0.9, 0.3}}}}}};
+        return QJsonObject{{QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("schema_version"), 4},
+                           {QStringLiteral("primary"), primary}, {QStringLiteral("sidebar_schedule"), schedule}};
+    };
+    const QJsonObject review{{QStringLiteral("state"), QStringLiteral("review")}, {QStringLiteral("due_at"), utc(now.addDays(-2))},
+                             {QStringLiteral("due_from"), utc(now.addDays(-2))}, {QStringLiteral("reviews"), 4}, {QStringLiteral("answered"), true}};
+    QJsonObject retiredSchedule = review;
+    retiredSchedule.insert(QStringLiteral("state"), QStringLiteral("retired"));
+    retiredSchedule.remove(QStringLiteral("due_from"));
+    retiredSchedule.insert(QStringLiteral("retired_at"), utc(now.addDays(-1)));
+    const QJsonObject active = card(QStringLiteral("active"), QStringLiteral("Which card is still reviewed?"), current, review);
+    QJsonObject retired = card(QStringLiteral("retired"), QStringLiteral("Which card was retired?"), earlier, retiredSchedule);
+    // A job queued before it was retired never ran: its placement is the retired one all the same.
+    retired.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("queued")}});
+
+    Okular::Part part(nullptr, {});
+    QVERIFY(openDocument(&part, path));
+    auto *reviews = part.m_reviewsWidget.data();
+    QTRY_VERIFY(!reviews->m_agentProposalWatcher->isRunning());
+    auto *view = reviews->findChild<QTreeView *>();
+    QVERIFY(view);
+    QSignalSpy highlights(reviews, &Reviews::reviewCardHighlightsChanged);
+    part.setSidebarReviewCards({active, retired});
+    const auto row = [&](int row) { return view->model()->index(row, 0); };
+    QCOMPARE(view->model()->rowCount(), 1);
+    QCOMPARE(row(0).data(AnnotationModel::ItemIdRole).toString(), QStringLiteral("active"));
+    QCOMPARE(highlights.last().first().toList().size(), 1);
+    auto *filter = reviews->findChild<QPushButton *>(QStringLiteral("reviewsRetiredCardsFilter"));
+    QVERIFY(filter && !filter->isHidden() && !filter->isChecked());
+    QCOMPARE(filter->text(), QStringLiteral("Retired: 1 card, on the PDF version it was retired on"));
+
+    // The Retired filter: listed with its version, not drawn, nothing to update.
+    filter->click();
+    QCOMPARE(view->model()->rowCount(), 2);
+    QVERIFY(config.readEntry("ShowRetiredCards", false));
+    const QModelIndex retiredRow = row(0).data(AnnotationModel::ItemIdRole).toString() == QLatin1String("retired") ? row(0) : row(1);
+    QCOMPARE(retiredRow.data(AnnotationModel::ItemIdRole).toString(), QStringLiteral("retired"));
+    QCOMPARE(retiredRow.data(AnnotationModel::PageRole).toInt(), -1);
+    QCOMPARE(retiredRow.data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Retired · 4 reviews"));
+    QCOMPARE(retiredRow.data(AnnotationModel::ReviewCardStatusRole).toString(), QStringLiteral("On the PDF version it was retired on"));
+    const QString tooltip = retiredRow.data(Qt::ToolTipRole).toString();
+    QVERIFY2(tooltip.contains(QStringLiteral("stays on the PDF version it was on when it was retired (%1)").arg(earlier.left(12))) && !tooltip.contains(QStringLiteral("needs updating")),
+             qPrintable(tooltip));
+    QCOMPARE(highlights.last().first().toList().size(), 1);
+    filter->click();
+    QCOMPARE(view->model()->rowCount(), 1);
+
+    // Restored to review: back on the current version through the usual placement. Until the
+    // server has placed it there, it waits; once placed, it is drawn again.
+    QJsonObject restored = retired;
+    restored.insert(QStringLiteral("sidebar_schedule"), review);
+    restored.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("queued")}});
+    part.setSidebarReviewCards({active, restored});
+    QCOMPARE(view->model()->rowCount(), 2);
+    QVERIFY(filter->isHidden());
+    const QModelIndex waiting = row(0).data(AnnotationModel::ItemIdRole).toString() == QLatin1String("retired") ? row(0) : row(1);
+    QCOMPARE(waiting.data(AnnotationModel::PageRole).toInt(), -1);
+    QCOMPARE(waiting.data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Overdue 2 days · waiting for its place in the PDF · 4 reviews"));
+    QJsonObject placed = card(QStringLiteral("retired"), QStringLiteral("Which card was retired?"), current, review);
+    part.setSidebarReviewCards({active, placed});
+    QCOMPARE(highlights.last().first().toList().size(), 2);
+
+    // Its own version, opened from History: the card retired on it is listed and drawn there, the others are not.
+    const QString cached = Thoughts::PdfVersions::store(Thoughts::PdfVersions::defaultCacheRoot(), earlier, earlierBytes);
+    QVERIFY(!cached.isEmpty());
+    auto removeCached = qScopeGuard([&cached] {
+        QFile::remove(cached);
+        QFile::remove(cached.chopped(4) + QStringLiteral(".json"));
+    });
+    Okular::Part earlierPart(nullptr, {});
+    QVERIFY(openDocument(&earlierPart, cached));
+    auto *earlierReviews = earlierPart.m_reviewsWidget.data();
+    auto *earlierView = earlierReviews->findChild<QTreeView *>();
+    QSignalSpy earlierHighlights(earlierReviews, &Reviews::reviewCardHighlightsChanged);
+    earlierPart.setSidebarReviewCards({active, retired});
+    QCOMPARE(earlierView->model()->rowCount(), 1);
+    const QModelIndex shown = earlierView->model()->index(0, 0);
+    QCOMPARE(shown.data(AnnotationModel::ItemIdRole).toString(), QStringLiteral("retired"));
+    QCOMPARE(shown.data(AnnotationModel::PageRole).toInt(), 0);
+    QVERIFY(!shown.data(AnnotationModel::ReviewCardStatusRole).toString().contains(QStringLiteral("needs updating")));
+    QCOMPARE(earlierHighlights.last().first().toList().size(), 1);
+    QVERIFY(earlierReviews->findChild<QPushButton *>(QStringLiteral("reviewsRetiredCardsFilter"))->isHidden());
+    earlierPart.closeUrl();
 }
 
 void PartTest::testAnnotationSidebarReviewCardsFollowPagePosition()
@@ -23570,14 +23751,23 @@ void PartTest::testAgentProposalQuickDecisions()
     QSignalSpy overlaysReloaded(part.m_pageView, SIGNAL(agentProposalOverlaysReloaded()));
     QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "refreshAgentProposalOverlays", Qt::DirectConnection));
     QTRY_VERIFY(!overlaysReloaded.isEmpty());
-    // Green proposal bands painted on the page, counted from the top.
-    const auto greenBands = [&part] {
+    // Green proposal bands painted on the page, counted from the top; the green check marks
+    // in the proposals' markers are not bands.
+    const auto greenBands = [&part, &ids] {
         const QImage image = part.m_pageView->viewport()->grab().toImage();
+        const qreal ratio = image.devicePixelRatio();
+        QList<QRect> markers;
+        for (const QString &id : ids) {
+            QRect rect;
+            QMetaObject::invokeMethod(part.m_pageView, "agentProposalMarkerRect", Qt::DirectConnection, Q_RETURN_ARG(QRect, rect), Q_ARG(QString, id));
+            if (!rect.isEmpty()) markers.append(QRect(rect.topLeft() * ratio, rect.size() * ratio));
+        }
         int bands = 0;
         bool previous = false;
         for (int y = 0; y < image.height(); ++y) {
             bool painted = false;
             for (int x = 0; x < image.width() && !painted; ++x) {
+                if (std::any_of(markers.cbegin(), markers.cend(), [x, y](const QRect &marker) { return marker.contains(x, y); })) continue;
                 const QColor pixel = image.pixelColor(x, y);
                 painted = pixel.green() > pixel.red() + 20 && pixel.green() > pixel.blue() + 15;
             }
@@ -23663,6 +23853,237 @@ void PartTest::testAgentProposalQuickDecisions()
 // through the same queue as the proposal window: claims written, source
 // updated, mark gone at once. A proposal that cannot be decided shows the
 // buttons disabled, with the reason in the tooltip.
+void PartTest::testAgentProposalCheckMarker()
+{
+    // The marker of a pending proposal is a check mark: a click accepts it (Undo brings it
+    // back), holding the press shows Open / Accept / Reject, and a drag or a scroll accepts nothing.
+    Okular::Part part(nullptr, {});
+    const QString root = part.m_docsRenderRoot;
+    QVERIFY(!root.isEmpty());
+    const QString relativeSource = QStringLiteral("docs-check/tex/source/main.tex");
+    const QString sourcePath = QDir(root).filePath(relativeSource);
+    const QString pdfPath = QDir(root).filePath(QStringLiteral("current_pdfs/check-marker.pdf"));
+    QVERIFY(QDir().mkpath(QFileInfo(sourcePath).absolutePath()));
+    QVERIFY(QDir().mkpath(QFileInfo(pdfPath).absolutePath()));
+    const QDir bundleRoot(QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/source-bundle")));
+    const QString projectPath = Thoughts::ProjectConfiguration::path(root, QStringLiteral("check-marker"));
+    QJsonObject project = Thoughts::ProjectConfiguration::empty(root, QStringLiteral("check-marker"), QStringLiteral("Check marker"));
+    QJsonArray folders = project.value(QStringLiteral("source_folders")).toArray();
+    folders.append(QJsonObject {{QStringLiteral("folder_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                                {QStringLiteral("path"), QStringLiteral("docs-check")},
+                                {QStringLiteral("document_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}});
+    project.insert(QStringLiteral("source_folders"), folders);
+    QVERIFY(Thoughts::ProjectConfiguration::save(projectPath, project).isEmpty());
+    const auto cleanup = qScopeGuard([root, bundleRoot, projectPath] {
+        QFile::remove(projectPath);
+        QDir(QDir(root).filePath(QStringLiteral("docs-check"))).removeRecursively();
+        QFile::remove(QDir(root).filePath(QStringLiteral("current_pdfs/check-marker.pdf")));
+        QDir(bundleRoot.path()).removeRecursively();
+    });
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file2.pdf"), pdfPath));
+    const auto readFile = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+    const auto writeFile = [](const QString &path, const QByteArray &bytes) {
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(bytes) == bytes.size();
+    };
+    const auto sha = [](const QByteArray &bytes) { return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()); };
+    const auto wrapper = [](const QString &id, const QString &before, const QString &after) {
+        return QStringLiteral("\\agentProposedEdit[created=2026-11-13T10:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]{%1}{Clearer.\n}{%2}{%3}")
+            .arg(id, before, after)
+            .toUtf8();
+    };
+    // Three proposals side by side on one line, a fourth below.
+    const QString idA = QStringLiteral("agent-check-a"), idB = QStringLiteral("agent-check-b"), idC = QStringLiteral("agent-check-c"), idD = QStringLiteral("agent-check-d");
+    const QByteArray wrapperA = wrapper(idA, QStringLiteral("Old A"), QStringLiteral("New A"));
+    const QByteArray wrapperB = wrapper(idB, QStringLiteral("Old B"), QStringLiteral("New B"));
+    const QByteArray wrapperC = wrapper(idC, QStringLiteral("Old C"), QStringLiteral("New C"));
+    const QByteArray wrapperD = wrapper(idD, QStringLiteral("Old D"), QStringLiteral("New D"));
+    const QByteArray original = wrapperA + " " + wrapperB + " " + wrapperC + "\nNext " + wrapperD + "\n";
+    QVERIFY(writeFile(sourcePath, original));
+    const QString pdfSha256 = sha(readFile(pdfPath));
+    QJsonArray proposals;
+    QJsonArray correspondences;
+    const QList<std::pair<QString, QList<double>>> placements {
+        {idA, {0.10, 0.20, 0.12, 0.22}},
+        {idB, {0.125, 0.20, 0.145, 0.22}},
+        {idC, {0.15, 0.20, 0.60, 0.22}},
+        {idD, {0.10, 0.35, 0.60, 0.37}},
+    };
+    for (const auto &[id, region] : placements) {
+        proposals.append(QJsonObject {{QStringLiteral("id"), id},
+                                      {QStringLiteral("source_file"), relativeSource},
+                                      {QStringLiteral("comment"), QStringLiteral("Clearer.")},
+                                      {QStringLiteral("before"), QJsonObject {{QStringLiteral("preview"), QStringLiteral("Old")}}},
+                                      {QStringLiteral("after"), QJsonObject {{QStringLiteral("preview"), QStringLiteral("New")}}},
+                                      {QStringLiteral("kind"), QStringLiteral("edit")},
+                                      {QStringLiteral("line"), id == idD ? 2 : 1},
+                                      {QStringLiteral("source_sha256"), sha(original)}});
+        correspondences.append(QJsonObject {
+            {QStringLiteral("kind"), QStringLiteral("agent_edit")},
+            {QStringLiteral("item_id"), id},
+            {QStringLiteral("locations"),
+             QJsonArray {QJsonObject {{QStringLiteral("pdf_filename"), QFileInfo(pdfPath).fileName()},
+                                      {QStringLiteral("pdf_sha256"), pdfSha256},
+                                      {QStringLiteral("page_index"), 0},
+                                      {QStringLiteral("role"), QStringLiteral("after")},
+                                      {QStringLiteral("regions"), QJsonArray {QJsonValue(QJsonArray {region.at(0), region.at(1), region.at(2), region.at(3)})}}}}}});
+    }
+    const QJsonObject manifest {
+        {QStringLiteral("schema_version"), 1},
+        {QStringLiteral("kind"), QStringLiteral("thoughts-document-source-artifact")},
+        {QStringLiteral("pdf"), QJsonObject {{QStringLiteral("filename"), QFileInfo(pdfPath).fileName()}, {QStringLiteral("pdf_sha256"), pdfSha256}}},
+        {QStringLiteral("sources"), QJsonArray {QJsonObject {{QStringLiteral("path"), relativeSource}, {QStringLiteral("sha256"), sha(original)}}}},
+        {QStringLiteral("agent_proposals"), proposals},
+        {QStringLiteral("review_correspondence_schema_version"), 2},
+        {QStringLiteral("review_correspondences"), correspondences},
+    };
+    const QByteArray manifestContents = QJsonDocument(manifest).toJson(QJsonDocument::Compact);
+    const QString artifactSha256 = sha(manifestContents);
+    QVERIFY(QDir().mkpath(bundleRoot.filePath(QStringLiteral("documents"))));
+    QVERIFY(QDir().mkpath(bundleRoot.filePath(QStringLiteral("objects"))));
+    QVERIFY(writeFile(bundleRoot.filePath(QStringLiteral("objects/%1").arg(artifactSha256)), manifestContents));
+    QVERIFY(writeFile(bundleRoot.filePath(QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())),
+                      QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1}, {QStringLiteral("artifact_sha256"), artifactSha256}}).toJson(QJsonDocument::Compact)));
+
+    QVERIFY(openDocument(&part, pdfPath));
+    QAction *continuous = part.actionCollection()->action(QStringLiteral("view_continuous"));
+    QVERIFY(continuous);
+    const bool wasContinuous = continuous->isChecked();
+    const auto restoreContinuous = qScopeGuard([continuous, wasContinuous] { continuous->setChecked(wasContinuous); });
+    continuous->setChecked(true);
+    part.widget()->resize(1000, 700);
+    part.widget()->show();
+    if (qgetenv("KDECI_CANNOT_CREATE_WINDOWS") == "1") {
+        QSKIP("KDE CI can't create a window on this platform, skipping GUI interaction checks");
+    }
+    QVERIFY(QTest::qWaitForWindowExposed(part.widget()));
+    part.m_document->setViewportPage(0);
+    QTRY_VERIFY(part.m_document->page(0)->hasPixmap(part.m_pageView));
+    auto *model = static_cast<AnnotationModel *>(part.annotationsModel());
+    QVERIFY(model);
+    model->setAgentProposalsVisible(true);
+    QTRY_VERIFY(!part.m_reviewsWidget->m_agentProposalRefreshInFlight && !part.m_reviewsWidget->m_agentProposalRefreshPending && !part.m_reviewsWidget->m_agentProposalRefreshTimer->isActive());
+    for (const QString &id : {idA, idB, idC, idD}) {
+        QTRY_COMPARE(model->agentProposal(id).id, id);
+        QVERIFY(model->agentProposal(id).resolutionError.isEmpty());
+    }
+    QSignalSpy overlaysReloaded(part.m_pageView, SIGNAL(agentProposalOverlaysReloaded()));
+    QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "refreshAgentProposalOverlays", Qt::DirectConnection));
+    QTRY_VERIFY(!overlaysReloaded.isEmpty());
+
+    PageView *view = part.m_pageView;
+    QWidget *viewport = view->viewport();
+    const auto marker = [view](const QString &id) {
+        QRect rect;
+        QMetaObject::invokeMethod(view, "agentProposalMarkerRect", Qt::DirectConnection, Q_RETURN_ARG(QRect, rect), Q_ARG(QString, id));
+        return rect;
+    };
+    for (const QString &id : {idA, idB, idC, idD}) {
+        QTRY_VERIFY2(!marker(id).isEmpty(), qPrintable(id));
+    }
+    // Several proposals on one line: one marker each, side by side.
+    QCOMPARE(marker(idA).top(), marker(idB).top());
+    QCOMPARE(marker(idB).top(), marker(idC).top());
+    QVERIFY(!marker(idA).intersects(marker(idB)) && !marker(idB).intersects(marker(idC)) && !marker(idA).intersects(marker(idC)));
+    const auto hoverBar = [view] { return view->findChild<AgentProposalHoverBar *>(QStringLiteral("AgentProposalHoverBar")); };
+    const auto barShownFor = [&hoverBar](const QString &id) { return hoverBar() && hoverBar()->isVisible() && hoverBar()->proposalId() == id; };
+    const auto barHidden = [&hoverBar] { return !hoverBar() || !hoverBar()->isVisible(); };
+    const QPoint away(viewport->width() - 30, viewport->height() - 30);
+    const auto settle = [&] {
+        QTest::mouseMove(viewport, away);
+        QTest::qWait(400);
+    };
+    const auto pending = [&](const QString &id) { return !marker(id).isEmpty() && model->agentProposal(id).id == id; };
+
+    // The tooltip says what a click and a hold do.
+    settle();
+    {
+        const QPoint at = marker(idA).center();
+        QHelpEvent help(QEvent::ToolTip, at, viewport->mapToGlobal(at));
+        QApplication::sendEvent(viewport, &help);
+        QTRY_COMPARE(QToolTip::text(), QStringLiteral("Click to accept · hold for more"));
+        QToolTip::hideText();
+    }
+
+    // A drag that starts on a marker accepts nothing, even when it ends where it began.
+    settle();
+    QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, marker(idA).center());
+    QTest::mouseMove(viewport, marker(idA).center() + QPoint(0, 40));
+    QTest::mouseMove(viewport, marker(idA).center());
+    QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, marker(idA).center());
+    QTest::qWait(300);
+    QVERIFY(pending(idA));
+    QCOMPARE(readFile(sourcePath), original);
+
+    // A scroll during the press accepts nothing, and neither does a press that stops a scroll.
+    QScrollBar *vertical = view->verticalScrollBar();
+    QVERIFY(vertical->maximum() > 10);
+    settle();
+    const QPoint atB = marker(idB).center();
+    QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, atB);
+    vertical->setValue(vertical->value() + 3);
+    vertical->setValue(vertical->value() - 3);
+    QTRY_COMPARE(marker(idB).center(), atB);
+    QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, atB);
+    QTest::qWait(300);
+    QVERIFY(pending(idB));
+    settle();
+    {
+        // A trackpad's momentum: wheel events still arriving when the press comes.
+        const QPoint at = marker(idB).center();
+        QWheelEvent wheel(at, viewport->mapToGlobal(at), QPoint(0, 0), QPoint(0, 0), Qt::NoButton, Qt::NoModifier, Qt::ScrollMomentum, false);
+        QApplication::sendEvent(viewport, &wheel);
+    }
+    QTest::mouseClick(viewport, Qt::LeftButton, Qt::NoModifier, marker(idB).center());
+    QTest::qWait(300);
+    QVERIFY(pending(idB));
+    QCOMPARE(readFile(sourcePath), original);
+
+    // Press and hold: the bar, and no accept when the button comes up.
+    settle();
+    QVERIFY(barHidden());
+    QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, marker(idC).center());
+    QTest::qWait(QGuiApplication::styleHints()->mousePressAndHoldInterval() / 2);
+    QVERIFY(barHidden());
+    QTRY_VERIFY(barShownFor(idC));
+    QTest::mouseMove(viewport, marker(idC).center() + QPoint(1, 0));
+    QVERIFY(barShownFor(idC));
+    QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, marker(idC).center() + QPoint(1, 0));
+    QTest::qWait(300);
+    QVERIFY(barShownFor(idC));
+    QVERIFY(pending(idC));
+    for (const char *name : {"agentProposalHoverOpen", "agentProposalHoverAccept", "agentProposalHoverReject"})
+        QVERIFY2(hoverBar()->findChild<QToolButton *>(QLatin1String(name))->isEnabled(), name);
+    // (QTest moves the cursor only from where its last move left it.)
+    QTest::mouseMove(viewport, away - QPoint(10, 10));
+    QTRY_VERIFY(barHidden());
+    QCOMPARE(readFile(sourcePath), original);
+
+    // A click accepts at once, only the proposal clicked; Undo brings it back.
+    settle();
+    QTest::mouseClick(viewport, Qt::LeftButton, Qt::NoModifier, marker(idB).center());
+    QTRY_VERIFY(marker(idB).isEmpty());
+    const QByteArray acceptedB = wrapperA + " New B " + wrapperC + "\nNext " + wrapperD + "\n";
+    QTRY_COMPARE(readFile(sourcePath), acceptedB);
+    QTRY_VERIFY(part.m_pendingLiveProposalDecisions.isEmpty());
+    QVERIFY(pending(idA) && pending(idC) && pending(idD));
+    QVERIFY(part.m_agentProposalUndoState.available);
+    QCOMPARE(part.m_agentProposalUndoState.proposalIds, QStringList {idB});
+    QCOMPARE(part.m_agentProposalUndoState.action, QStringLiteral("accept"));
+    QAction *undo = part.actionCollection()->action(QStringLiteral("edit_undo"));
+    QVERIFY(undo);
+    undo->trigger();
+    QTRY_COMPARE(readFile(sourcePath), original);
+    QVERIFY(!part.m_agentProposalUndoState.available);
+    QTRY_VERIFY(!part.m_reviewsWidget->m_agentProposalRefreshInFlight && !part.m_reviewsWidget->m_agentProposalRefreshPending && !part.m_reviewsWidget->m_agentProposalRefreshTimer->isActive());
+    QTRY_VERIFY(pending(idB));
+    QTRY_VERIFY(!marker(idB).isEmpty());
+    for (const QString &id : {idA, idC, idD}) QVERIFY2(pending(id), qPrintable(id));
+}
+
 void PartTest::testAgentProposalHoverActions()
 {
     Okular::Part part(nullptr, {});
@@ -24167,6 +24588,10 @@ void PartTest::testAgentProposalOverlayRendersContinuousLines()
     // The fixture is blank here: green pixels must form one run on the first
     // line and two distant runs on the second, with unpainted rows between.
     const QImage rendered = part.m_pageView->viewport()->grab().toImage();
+    // The proposal's marker holds a green check mark: not part of the highlight.
+    QRect markerBox;
+    QMetaObject::invokeMethod(part.m_pageView, "agentProposalMarkerRect", Qt::DirectConnection, Q_RETURN_ARG(QRect, markerBox), Q_ARG(QString, proposalId));
+    markerBox = QRect(markerBox.topLeft() * rendered.devicePixelRatio(), markerBox.size() * rendered.devicePixelRatio());
     QList<int> bands;
     bool previousRowPainted = false;
     for (int y = 0; y < rendered.height(); ++y) {
@@ -24174,7 +24599,7 @@ void PartTest::testAgentProposalOverlayRendersContinuousLines()
         bool previousPixelPainted = false;
         for (int x = 0; x < rendered.width(); ++x) {
             const QColor pixel = rendered.pixelColor(x, y);
-            const bool painted = pixel.green() > pixel.red() + 20 && pixel.green() > pixel.blue() + 15;
+            const bool painted = !markerBox.contains(x, y) && pixel.green() > pixel.red() + 20 && pixel.green() > pixel.blue() + 15;
             if (painted && !previousPixelPainted) {
                 ++runs;
             }
@@ -24443,11 +24868,18 @@ void PartTest::testAgentProposalMarkerSkipsLaTeXCopies()
         toggle->trigger();
         pencil = QRect();
         highlight = QRect();
+        // The marker's outline first; the green check mark inside it is not the highlight.
         for (int y = 0; y < shown.height(); ++y) {
             for (int x = 0; x < shown.width(); ++x) {
                 const QColor pixel = shown.pixelColor(x, y);
                 if (pixel == hidden.pixelColor(x, y)) continue;
                 if (pixel.blue() > pixel.red() + 30 && pixel.blue() > pixel.green() + 15) pencil |= QRect(x, y, 1, 1);
+            }
+        }
+        for (int y = 0; y < shown.height(); ++y) {
+            for (int x = 0; x < shown.width(); ++x) {
+                const QColor pixel = shown.pixelColor(x, y);
+                if (pixel == hidden.pixelColor(x, y) || pencil.contains(x, y)) continue;
                 if (pixel.green() > pixel.red() + 20 && pixel.green() > pixel.blue() + 15) highlight |= QRect(x, y, 1, 1);
             }
         }

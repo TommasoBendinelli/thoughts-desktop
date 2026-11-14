@@ -13,6 +13,11 @@ note this Mac sent; --conversation ID names the conversation.
 
 It imports agent_notes.py from THOUGHTS_MCP_SCRIPTS, else from its own folder (tools/mcp in the
 repository, the plugin's scripts), else from the Thoughts plugin's scripts (~/plugins/thoughts/scripts).
+
+On a server with topic owners (agent_note_owners_v1) the conversation's feed also holds the replies of the
+topics it owns (own_topic), its polls keep those ownerships alive, and PAGE lines are the pages of those
+topics only: the Thoughts reply agent answers the other pages. It starts by printing the user's answering
+rules (the Library note agent-note-rules.md), which every agent follows when it answers.
 """
 import argparse
 import os
@@ -77,6 +82,42 @@ def replies(client, conversation_id):
             time.sleep(15)
 
 
+def say_rules(client):
+    try:
+        rules = a.answering_rules(client)
+    except Exception as error:  # the rules are a help: the watcher runs without them
+        say(f"ERROR rules {type(error).__name__}: {error}")
+        return
+    if not rules.get("text"):
+        return
+    say(f"RULES the user's answering rules ({rules.get('source_path')}); follow them when you answer a reply or page:")
+    for line in rules["text"].rstrip().split("\n"):
+        say("RULES| " + line)
+
+
+def owned_pages(client, conversation_id):
+    """PAGE lines for the pages of the topics this conversation owns (the reply agent answers the others)."""
+    after = None
+    while after is None:
+        try:
+            after = client.pages().get("cursor") or 0
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+    while True:
+        try:
+            result = client.pages(after=after, wait=50, conversation_id=conversation_id)
+            for note in result.get("notes", []):
+                after = max(after, note.get("sequence", 0))
+                origin = note.get("origin") or {}
+                say(f"PAGE note={note.get('note_id')} title={note.get('title')!r} page={origin.get('page')} "
+                    f"strokes={origin.get('stroke_count')} message={note.get('message')!r}")
+            after = max(after, result.get("cursor") or after)
+        except Exception as error:
+            say(f"ERROR {type(error).__name__}: {error}")
+            time.sleep(15)
+
+
 def pages(client):
     # Study mode: the PDF page on the phone's screen (or in the Thoughts app on this Mac), sent with or
     # without marks. The note list (not the inbox), so this Mac never counts as a phone listening for notes.
@@ -109,7 +150,12 @@ def main(argv=None):
     conversation_id, first_line = conversation_to_hear(args)
     say(first_line)
     client = a.default_client()
-    threading.Thread(target=pages, args=(client,), daemon=True).start()
+    say_rules(client)
+    if a.OWNERS_CAPABILITY in client.capabilities():
+        if conversation_id:
+            threading.Thread(target=owned_pages, args=(client, conversation_id), daemon=True).start()
+    else:  # an older server: every page, as before
+        threading.Thread(target=pages, args=(client,), daemon=True).start()
     replies(client, conversation_id)
 
 

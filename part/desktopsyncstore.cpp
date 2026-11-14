@@ -260,6 +260,25 @@ void forgetAnnouncedChanges(const QString &connectionName)
     announcedChanges.remove(connectionName);
 }
 
+// A transaction that reads and then writes. A deferred BEGIN takes SQLite's
+// write lock only at its first write; in WAL mode that upgrade fails at once
+// with "database is locked" while another connection (the change tracker, a
+// thoughtsctl decision) writes, whatever busy_timeout says. BEGIN IMMEDIATE
+// takes the lock first and waits busy_timeout for it.
+bool beginWriteTransaction(QSqlDatabase &database, QString *failure)
+{
+    if (!database.isValid() || !database.isOpen()) {
+        *failure = QStringLiteral("desktop synchronization store is not open");
+        return false;
+    }
+    QSqlQuery begin(database);
+    if (!begin.exec(QStringLiteral("BEGIN IMMEDIATE"))) {
+        *failure = begin.lastError().text().isEmpty() ? QStringLiteral("the desktop synchronization store could not start a transaction") : begin.lastError().text();
+        return false;
+    }
+    return true;
+}
+
 // Commits and, when the transaction modified rows, tells in-process
 // observers. Consumers learn about Thoughts' own writes from this rather than
 // by watching the database files, and no-op transactions stay silent.
@@ -1384,8 +1403,9 @@ DesktopSyncSnapshot DesktopSyncStore::freezeForPublication(const QString &claimI
         return snapshot;
     }
     QSqlDatabase database = databaseFor(m_connectionName);
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        fail(error, database.lastError().text().isEmpty() ? QStringLiteral("desktop synchronization store is not open") : database.lastError().text());
+    QString busy;
+    if (!beginWriteTransaction(database, &busy)) {
+        fail(error, busy);
         return snapshot;
     }
     bool ok = false;
@@ -1408,8 +1428,9 @@ bool DesktopSyncStore::acknowledge(const DesktopSyncSnapshot &snapshot, QString 
 {
     clearError(error);
     QSqlDatabase database = databaseFor(m_connectionName);
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return fail(error, database.lastError().text().isEmpty() ? QStringLiteral("desktop synchronization store is not open") : database.lastError().text());
+    QString busy;
+    if (!beginWriteTransaction(database, &busy)) {
+        return fail(error, busy);
     }
     QSet<QString> seen;
     QSqlQuery pending(database);
@@ -1483,8 +1504,9 @@ bool DesktopSyncStore::acceptBaselinesAndAcknowledge(const QList<DesktopTrackedP
         return fail(error, QStringLiteral("invalid source publication ID"));
     }
     QSqlDatabase database = databaseFor(m_connectionName);
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return fail(error, database.lastError().text().isEmpty() ? QStringLiteral("desktop synchronization store is not open") : database.lastError().text());
+    QString busy;
+    if (!beginWriteTransaction(database, &busy)) {
+        return fail(error, busy);
     }
 
     QHash<QString, DesktopTrackedPath> accepted;
@@ -1615,8 +1637,9 @@ int DesktopSyncStore::reconcileAppliedSourcePublication(const QJsonObject &publi
     }
 
     QSqlDatabase database = databaseFor(m_connectionName);
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        fail(error, database.lastError().text().isEmpty() ? QStringLiteral("desktop synchronization store is not open") : database.lastError().text());
+    QString busy;
+    if (!beginWriteTransaction(database, &busy)) {
+        fail(error, busy);
         return -1;
     }
     if (metadataValue(database, QStringLiteral("last_handled_source_publication_id")) == publicationId) {

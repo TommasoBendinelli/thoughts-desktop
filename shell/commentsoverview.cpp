@@ -321,6 +321,8 @@ enum DocumentListRole {
     DocumentCompositionIdRole,
     DocumentScopeRole,
     DocumentLibraryProjectRole,
+    // The theme name of a document row's icon (documentRowPresentation).
+    DocumentRowIconRole,
 };
 
 enum DocumentListItemKind {
@@ -753,11 +755,29 @@ QString feedbackKindLabel(const QString &kind)
         : kind == Thoughts::DocumentFeedback::textBox() ? i18n("Text box") : i18n("Comment");
 }
 
+// How many count tooltips are kept (three columns, one per distinct count).
+constexpr int MaximumCountTooltips = 4096;
+
+// Each row of the Library tree has three of these, and the tree has thousands of
+// rows with the same few counts. Formatting a number asks the system for the
+// user's number format every time (macOS creates a number formatter for it):
+// more than half of the time a rebuild of the tree took. Keep the texts.
 QString threadCountTooltip(int column, int count)
 {
-    return column == 1 ? i18np("%1 comment thread", "%1 comment threads", count)
+    static QHash<quint64, QString> texts;
+    const quint64 key = (quint64(quint32(column)) << 32) | quint32(count);
+    const auto known = texts.constFind(key);
+    if (known != texts.cend()) {
+        return *known;
+    }
+    if (texts.size() >= MaximumCountTooltips) {
+        texts.clear();
+    }
+    const QString text = column == 1 ? i18np("%1 comment thread", "%1 comment threads", count)
         : column == 2 ? i18np("%1 pending agent proposal", "%1 pending agent proposals", count)
                       : i18np("%1 to-do", "%1 to-dos", count);
+    texts.insert(key, text);
+    return text;
 }
 
 // A to-do's "visible_from" (ISO date) keeps it out of the To-dos list until that day.
@@ -1011,11 +1031,15 @@ QJsonArray libraryDocumentSegments(const QString &docsRoot, const Thoughts::Trac
         return {};
     }
     if (timing) timing->pointerMs += elapsed.restart();
-    QByteArray bytes;
-    if (!Thoughts::readVerifiedArtifact(bundle.filePath(QStringLiteral("objects/%1").arg(digest)), digest, &bytes)) return {};
+    // The artifact verified and parsed; its bytes are read only when the
+    // parsed artifact is not kept already, and the artifact this PDF had
+    // before is dropped.
+    const QString artifactPath = bundle.filePath(QStringLiteral("objects/%1").arg(digest));
+    const QJsonObject manifest = Thoughts::verifiedSourceArtifactJson(artifactPath, digest, document.libraryFilename);
+    if (manifest.isEmpty()) return {};
     if (timing) {
         timing->artifactReadMs += elapsed.restart();
-        timing->artifactBytes += bytes.size();
+        timing->artifactBytes += QFileInfo(artifactPath).size();
     }
     if (fileContentSha256(document.pdfPath).toHex() != document.librarySha256.toLatin1()) return {};
     if (timing) {
@@ -1023,7 +1047,6 @@ QJsonArray libraryDocumentSegments(const QString &docsRoot, const Thoughts::Trac
         timing->pdfBytes += QFileInfo(document.pdfPath).size();
         ++timing->verifiedDocuments;
     }
-    const QJsonObject manifest = Thoughts::sourceArtifactJson(bytes, digest);
     const QJsonObject pdf = manifest.value(QStringLiteral("pdf")).toObject();
     if (timing) timing->jsonParseMs += elapsed.restart();
     if (manifest.value(QStringLiteral("kind")).toString() != QLatin1String("thoughts-document-source-artifact")
@@ -1413,11 +1436,20 @@ struct BundleLoadTiming {
     int cacheMisses = 0;
 };
 
+// How many PDFs' assembled proposal artifacts are kept in memory.
+constexpr int MaximumKeptProposalArtifacts = 1024;
+
 QList<AgentProposalArtifact> readAgentProposalArtifacts(const QString &docsRoot, const QString &onlyFilename = {},
                                                        BundleLoadTiming *timing = nullptr)
 {
+    // One assembled artifact per PDF: the artifact of a rebuilt PDF replaces
+    // the one before it.
+    struct KeptArtifact {
+        QString key;
+        AgentProposalArtifact artifact;
+    };
     static QMutex cacheMutex;
-    static QCache<QString, AgentProposalArtifact> cache(128 * 1024);
+    static QCache<QString, KeptArtifact> cache(MaximumKeptProposalArtifacts);
     QElapsedTimer elapsed;
     elapsed.start();
     const QDir root = sourceBundleRoot(docsRoot);
@@ -1446,8 +1478,8 @@ QList<AgentProposalArtifact> readAgentProposalArtifacts(const QString &docsRoot,
         bool cacheHit = false;
         {
             QMutexLocker lock(&cacheMutex);
-            if (const auto *cached = cache.object(cacheKey)) {
-                artifacts.append(*cached);
+            if (const auto *cached = cache.object(filename); cached && cached->key == cacheKey) {
+                artifacts.append(cached->artifact);
                 cacheHit = true;
             }
         }
@@ -1457,15 +1489,16 @@ QList<AgentProposalArtifact> readAgentProposalArtifacts(const QString &docsRoot,
             continue;
         }
         if (timing) ++timing->cacheMisses;
-        QByteArray contents;
-        if (!Thoughts::readVerifiedArtifact(root.filePath(QStringLiteral("objects/%1").arg(artifactSha256)), artifactSha256, &contents)) {
+        // Verified and parsed; the artifact's bytes are not kept.
+        const QString artifactPath = root.filePath(QStringLiteral("objects/%1").arg(artifactSha256));
+        const QJsonObject manifest = Thoughts::verifiedSourceArtifactJson(artifactPath, artifactSha256, filename);
+        if (manifest.isEmpty()) {
             continue;
         }
         if (timing) {
             timing->verificationMs += elapsed.restart();
-            timing->objectBytes += contents.size();
+            timing->objectBytes += QFileInfo(artifactPath).size();
         }
-        const QJsonObject manifest = Thoughts::sourceArtifactJson(contents, artifactSha256);
         const QJsonObject artifactPdf = manifest.value(QStringLiteral("pdf")).toObject();
         if (manifest.value(QStringLiteral("kind")).toString() != QLatin1String("thoughts-document-source-artifact")
             || manifest.value(QStringLiteral("filename")).toString() != filename
@@ -1580,7 +1613,7 @@ QList<AgentProposalArtifact> readAgentProposalArtifacts(const QString &docsRoot,
         if (timing) timing->assemblyMs += elapsed.restart();
         {
             QMutexLocker lock(&cacheMutex);
-            cache.insert(cacheKey, new AgentProposalArtifact(artifact), qMax(1, int(contents.size() / 1024)));
+            cache.insert(filename, new KeptArtifact {cacheKey, artifact}, 1);
         }
         if (timing) timing->cacheMs += elapsed.restart();
         artifacts.append(artifact);
@@ -5477,6 +5510,10 @@ void CommentsOverview::updateIdleSyncPresentation()
         m_idlePdfSyncTimestampText = i18n("Last sync: Never");
         m_idlePdfSyncTimestampDetails.clear();
     }
+    if (!m_automaticSyncNotice.isEmpty()) {
+        // Next to when the last Sync failed: when Thoughts may try again by itself.
+        m_idlePdfSyncTimestampText += QStringLiteral(" · ") + m_automaticSyncNotice;
+    }
     if (!m_syncOperationRunning) {
         // Merge needed offers only the merge; its log stays in Sync history.
         m_syncLinkShowsMerge = mergeFiles > 0;
@@ -5529,7 +5566,8 @@ void CommentsOverview::setSyncSnapshot(const QJsonObject &presentations,
                                        const QJsonObject &latestSyncOperation)
 {
     const bool pendingChanged = m_pendingChanges != pendingChanges;
-    const bool documentsChanged = pendingChanged || m_documentSyncPresentations != presentations;
+    const bool presentationsChanged = m_documentSyncPresentations != presentations;
+    const bool documentsChanged = pendingChanged || presentationsChanged;
     const bool monitoringChanged = pendingChanged || m_lastSuccessfulSyncAt != lastSuccessfulSyncAt;
     const QHash<QString, QString> previousBuildWarnings = documentsChanged ? libraryBuildWarnings() : QHash<QString, QString>();
     m_documentSyncPresentations = presentations;
@@ -5552,7 +5590,18 @@ void CommentsOverview::setSyncSnapshot(const QJsonObject &presentations,
         m_syncButton->setEnabled(aggregate.value(QStringLiteral("enabled")).toBool(true));
         m_syncButton->setToolTip(i18n("Publish source edits, synchronize changes, and update only PDFs whose build inputs changed"));
     }
-    if (documentsChanged) { populateDocumentList(selectedDocument()); }
+    // The Library tree shows nothing of the pending changes, and of the Sync
+    // states only each document's tooltip and icon.
+    if (presentationsChanged) { refreshDocumentListSyncPresentations(); }
+}
+
+void CommentsOverview::setAutomaticSyncNotice(const QString &notice)
+{
+    if (m_automaticSyncNotice == notice) {
+        return;
+    }
+    m_automaticSyncNotice = notice;
+    updateIdleSyncPresentation();
 }
 
 void CommentsOverview::beginSyncElapsedPresentation(const QDateTime &startedAt)
@@ -5635,6 +5684,7 @@ void CommentsOverview::syncFinished(bool success, const QString &message, const 
     m_scheduledDocumentReloads.clear();
     m_reloadAgainDocuments.clear();
     m_fullReloadScheduled = false;
+    m_catalogReloadScheduled = false;
     m_syncRefreshPending = true;
     requestReload();
 }
@@ -7803,9 +7853,10 @@ bool CommentsOverview::resolveLiveAgentProposals(const QString &action, QString 
                     : i18np("Rejected in the local source.", "%1 proposals rejected in the local source.", count))
                 : action == QLatin1String("accept")
                     ? i18np("Accepted — saved to TeX. No PDF rebuild needed.", "%1 proposals accepted — saved to TeX. No PDF rebuild needed.", count)
-                    : i18np("Rejected — saved to TeX. Sync manually to update the PDF.", "%1 proposals rejected — saved to TeX. Sync manually to update the PDF.", count);
+                    : i18np("Rejected — saved to TeX. The next Sync updates the PDF.", "%1 proposals rejected — saved to TeX. The next Sync updates the PDF.", count);
             if (failed > 0) summary += QLatin1Char(' ') + i18np("1 other proposal was left undecided: %2", "%1 other proposals were left undecided: %2", failed, failure);
             guard->m_summary->setText(summary);
+            Q_EMIT guard->agentProposalsDecidedLocally();
             // The decision changed sources, so a reload follows and redraws the list's counts
             // here: it shows the outcome again when it ends.
             guard->m_summaryAfterReload = summary;
@@ -7864,6 +7915,9 @@ void CommentsOverview::undoLiveAgentProposalDecision()
             guard->m_summary->setText(message);
             guard->m_summaryAfterReload = message;
             guard->m_summaryAfterReloadDeadline = QDeadlineTimer(10000);
+            if (restored) {
+                Q_EMIT guard->agentProposalsDecidedLocally();
+            }
             guard->startFullReload(false, QStringLiteral("proposal decision undone"));
         }, Qt::QueuedConnection);
     });
@@ -7905,7 +7959,7 @@ void CommentsOverview::completeAgentProposalResolution(const QStringList &propos
         QMessageBox::warning(this, i18n("Agent Proposal"), error.isEmpty() ? i18n("The proposal decision could not be queued.") : error);
         return;
     }
-    m_summary->setText(i18np("Decision saved locally — sync manually to send it to the server.", "%1 decisions saved locally — sync manually to send them to the server.", proposalIds.size()));
+    m_summary->setText(i18np("Decision saved locally — the next Sync sends it to the server.", "%1 decisions saved locally — the next Sync sends them to the server.", proposalIds.size()));
 }
 
 void CommentsOverview::finishAgentProposalResolution(const QStringList &proposalIds,
@@ -7917,7 +7971,7 @@ void CommentsOverview::finishAgentProposalResolution(const QStringList &proposal
         if (action.startsWith(QLatin1String("undo_"))) {
             setOperationPending(true);
         }
-        m_summary->setText(i18np("Decision saved locally — sync manually to send it to the server.", "%1 decisions saved locally — sync manually to send them to the server.", proposalIds.size()));
+        m_summary->setText(i18np("Decision saved locally — the next Sync sends it to the server.", "%1 decisions saved locally — the next Sync sends them to the server.", proposalIds.size()));
         return;
     }
     setOperationPending(false);
@@ -11114,6 +11168,12 @@ void CommentsOverview::startFullReload(bool discoverIncludedSources, const QStri
          {QStringLiteral("already_running"), m_fullReloadRunning}});
     if (m_syncContentDeferred) { m_reloadDeferred = true; return; }
     if (m_fullReloadRunning) {
+        if (reason == QLatin1String("catalog_changed") && !discoverIncludedSources) {
+            // Decided when the running reload finishes: it may have read this catalogue already.
+            m_catalogReloadScheduled = true;
+            m_scheduledCatalogSignature = m_catalogSignature;
+            return;
+        }
         m_fullReloadScheduled = true;
         m_discoveryReloadScheduled |= discoverIncludedSources;
         return;
@@ -11126,12 +11186,13 @@ void CommentsOverview::startFullReload(bool discoverIncludedSources, const QStri
     const QJsonObject fedoraProjections = m_fedoraProjections;
     QPointer<CommentsOverview> guard(this);
     const quint64 generation = m_commentGeneration;
-    const bool establishCatalogBaseline = m_catalogSignature.isEmpty();
-    m_catalogPool->start([guard, docsRoot, fedoraProjections, generation, discoverIncludedSources, establishCatalogBaseline] {
+    m_catalogPool->start([guard, docsRoot, fedoraProjections, generation, discoverIncludedSources] {
         const auto settingsIdentity = ProjectConfiguration::snapshotIdentity(docsRoot);
+        // The catalogue this reload reads, taken before reading it: a change seen later with the
+        // same signature is already read (finishFullReload), and the first baseline.
+        const QByteArray catalogBaseline = commentCatalogSignature(docsRoot);
         bool liveSourcesValid = true;
         const QList<TrackedCommentDocument> documents = loadTrackedCommentDocuments(docsRoot, fedoraProjections, &liveSourcesValid, {}, discoverIncludedSources);
-        const QByteArray catalogBaseline = establishCatalogBaseline ? commentCatalogSignature(docsRoot) : QByteArray();
         if (!guard) {
             return;
         }
@@ -11154,6 +11215,14 @@ void CommentsOverview::finishFullReload(const QList<TrackedCommentDocument> &doc
     const DeveloperActivity activity(QStringLiteral("comments.refresh"), {{QStringLiteral("documents"), documents.size()}});
     m_fullReloadRunning = false;
     if (m_catalogSignature.isEmpty()) m_catalogSignature = catalogBaseline;
+    if (std::exchange(m_catalogReloadScheduled, false)) {
+        const QByteArray seen = std::exchange(m_scheduledCatalogSignature, {});
+        if (!catalogBaseline.isEmpty() && seen == catalogBaseline) {
+            DeveloperLog::record(QStringLiteral("library.reload.covered"), {{QStringLiteral("reason"), QStringLiteral("catalog_changed")}});
+        } else {
+            m_fullReloadScheduled = true;
+        }
+    }
     if (generation && (*generation != m_commentGeneration || settingsIdentity != ProjectConfiguration::snapshotIdentity(m_docsRoot))) {
         // Autosave can clear editorDirty while this older snapshot is in flight.
         // Never publish it, even if the editor currently has no unsaved text.
@@ -11237,6 +11306,94 @@ void CommentsOverview::finishFullReload(const QList<TrackedCommentDocument> &doc
     if (m_reviewCardsWidget && !m_editorDirty) m_reviewCardsWidget->retryPendingMarkerRemovals();
     if (m_fullReloadScheduled && !m_reloadDeferred) {
         m_reloadTimer->start();
+    }
+}
+
+// What a document's row says about the document besides its name and counts:
+// its Library and Sync state as a tooltip, and a warning icon when either needs
+// attention. The only part of the Library tree that depends on the Sync state.
+CommentsOverview::DocumentRowPresentation CommentsOverview::documentRowPresentation(const TrackedCommentDocument &document, bool hasComponents) const
+{
+    const bool sourceLinked = document.state == TrackedCommentDocument::SourceLinked || document.libraryKind == QLatin1String("source_linked");
+    bool warning = false;
+    const QString syncKey = document.libraryFilename.isEmpty() ? QFileInfo(document.pdfPath).fileName() : document.libraryFilename;
+    const QJsonObject syncPresentation = m_documentSyncPresentations.value(syncKey).toObject();
+    const QString syncStatus = syncPresentation.value(QStringLiteral("status")).toString(i18n("Not checked"));
+    QStringList status {i18n("Sync: %1", syncStatus)};
+    const QString syncReason = syncPresentation.value(QStringLiteral("reason")).toString().trimmed();
+    if (!syncReason.isEmpty()) {
+        status.append(syncReason);
+    }
+    if (sourceLinked) {
+        status.append(i18n("Source layout: linked"));
+    } else {
+        status.append(i18n("Source layout: not linked"));
+        status.append(i18n("PDF only: comments are tracked, but source anchoring and targeted refresh are unavailable."));
+    }
+    if (document.libraryFilename.isEmpty()) {
+        status.prepend(i18n("Library: not listed"));
+    } else if (!document.libraryGenerationCurrent) {
+        status.prepend(i18n("Library: listed, but the active publication identity is not verified"));
+        warning = true;
+    } else if (document.libraryPublishedAt.isValid()) {
+        status.prepend(i18n("Library: current · published %1", QLocale().toString(document.libraryPublishedAt.toLocalTime(), QLocale::ShortFormat)));
+    }
+    if (document.libraryPdfStale) {
+        status.prepend(i18n("Library: last-good publication · latest server build failed: %1",
+                           document.libraryLatestBuildMessage.isEmpty() ? i18n("unknown error") : document.libraryLatestBuildMessage));
+        warning = true;
+    }
+    if (!document.error.isEmpty()) {
+        status.append(document.error);
+        warning = true;
+    }
+    const QString syncState = syncPresentation.value(QStringLiteral("state")).toString();
+    if (syncState == QLatin1String("error") || syncState == QLatin1String("attention") || syncState == QLatin1String("conflict")) {
+        warning = true;
+    }
+    if (sourceLinked && !hasComponents) {
+        status.append(i18n("The verified document map is unavailable. All comments remain available at project level."));
+    }
+    return {status.join(QLatin1Char('\n')), warning ? QStringLiteral("dialog-warning") : sourceLinked ? QStringLiteral("folder-documents") : QStringLiteral("application-pdf")};
+}
+
+// The documents' Sync states changed and nothing else: every document's row
+// gets its tooltip and icon in place, in both tabs. Rebuilding the whole tree
+// for this, as a Sync that starts did for every document at once, kept the
+// window from answering.
+void CommentsOverview::refreshDocumentListSyncPresentations()
+{
+    if (m_syncContentDeferred) {
+        return;
+    }
+    QHash<QString, const TrackedCommentDocument *> documents;
+    for (const TrackedCommentDocument &document : std::as_const(m_documents)) {
+        if (!document.sourceProposalOnly && !document.sourceUnselected) {
+            documents.insert(document.stem, &document);
+        }
+    }
+    for (QTreeWidget *tree : {m_commentsBrowser.documentList, m_notesBrowser.documentList}) {
+        if (!tree) {
+            continue;
+        }
+        for (QTreeWidgetItemIterator it(tree); *it; ++it) {
+            QTreeWidgetItem *item = *it;
+            if (item->data(0, DocumentItemKindRole).toInt() != DocumentListEntry) {
+                continue;
+            }
+            const TrackedCommentDocument *document = documents.value(item->data(0, Qt::UserRole).toString());
+            if (!document) {
+                continue;
+            }
+            const DocumentRowPresentation row = documentRowPresentation(*document, item->childCount() > 0);
+            if (item->toolTip(0) != row.toolTip) {
+                item->setToolTip(0, row.toolTip);
+            }
+            if (item->data(0, DocumentRowIconRole).toString() != row.iconName) {
+                item->setIcon(0, QIcon::fromTheme(row.iconName));
+                item->setData(0, DocumentRowIconRole, row.iconName);
+            }
+        }
     }
 }
 
@@ -11371,45 +11528,16 @@ void CommentsOverview::populateDocumentList(const QString &selectedStem)
             const QString documentKey = project->key + QStringLiteral("/document/") + document.stem;
             item->setData(0, DocumentNavigationKeyRole, documentKey);
             item->setData(0, DocumentLibraryProjectRole, project->key);
-            item->setIcon(0, QIcon::fromTheme(sourceLinked ? QStringLiteral("folder-documents") : QStringLiteral("application-pdf")));
-            const QString syncKey = document.libraryFilename.isEmpty() ? QFileInfo(document.pdfPath).fileName() : document.libraryFilename;
-            const QJsonObject syncPresentation = m_documentSyncPresentations.value(syncKey).toObject();
-            const QString syncStatus = syncPresentation.value(QStringLiteral("status")).toString(i18n("Not checked"));
-            QStringList status {i18n("Sync: %1", syncStatus)};
-            const QString syncReason = syncPresentation.value(QStringLiteral("reason")).toString().trimmed();
-            if (!syncReason.isEmpty()) {
-                status.append(syncReason);
-            }
-            if (sourceLinked) {
-                status.append(i18n("Source layout: linked"));
-            } else {
-                status.append(i18n("Source layout: not linked"));
-                status.append(i18n("PDF only: comments are tracked, but source anchoring and targeted refresh are unavailable."));
-            }
-            if (document.libraryFilename.isEmpty()) {
-                status.prepend(i18n("Library: not listed"));
-            } else if (!document.libraryGenerationCurrent) {
-                status.prepend(i18n("Library: listed, but the active publication identity is not verified"));
-                item->setIcon(0, QIcon::fromTheme(QStringLiteral("dialog-warning")));
-            } else if (document.libraryPublishedAt.isValid()) {
-                status.prepend(i18n("Library: current · published %1", QLocale().toString(document.libraryPublishedAt.toLocalTime(), QLocale::ShortFormat)));
-            }
-            if (document.libraryPdfStale) {
-                status.prepend(i18n("Library: last-good publication · latest server build failed: %1",
-                                   document.libraryLatestBuildMessage.isEmpty() ? i18n("unknown error") : document.libraryLatestBuildMessage));
-                item->setIcon(0, QIcon::fromTheme(QStringLiteral("dialog-warning")));
-            }
-            if (!document.error.isEmpty()) {
-                status.append(document.error);
-                item->setIcon(0, QIcon::fromTheme(QStringLiteral("dialog-warning")));
-            }
-            const QString syncState = syncPresentation.value(QStringLiteral("state")).toString();
-            if (syncState == QLatin1String("error") || syncState == QLatin1String("attention") || syncState == QLatin1String("conflict")) {
-                item->setIcon(0, QIcon::fromTheme(QStringLiteral("dialog-warning")));
-            }
 
             const auto absoluteSource = [&](const QString &source) {
                 return source.isEmpty() ? QString() : document.navigationSourcePaths.value(source, QDir::cleanPath(QDir(m_docsRoot).absoluteFilePath(source)));
+            };
+            // The user's titles are read once per document, and the title a
+            // component gets without one only where none was given.
+            const QJsonObject titles = document.navigationOptions.value(QStringLiteral("titles")).toObject();
+            const auto titleOf = [&titles](const QString &id, const QJsonObject &segment) {
+                const QJsonValue given = titles.value(id);
+                return given.isString() ? given.toString() : librarySegmentTitle(segment);
             };
             QList<Component> components;
             QSet<QString> componentKeys;
@@ -11424,7 +11552,7 @@ void CommentsOverview::populateDocumentList(const QString &selectedStem)
                 componentKeys.insert(key);
                 Component component;
                 component.key = key;
-                component.title = document.navigationOptions.value(QStringLiteral("titles")).toObject().value(sourceId).toString(librarySegmentTitle(segment));
+                component.title = titleOf(sourceId, segment);
                 component.source = absoluteSource(segment.value(QStringLiteral("primary_source_file")).toString(sourceId));
                 component.sources.insert(component.source);
                 for (const QJsonValue &input : segment.value(QStringLiteral("inputs")).toArray()) {
@@ -11447,7 +11575,7 @@ void CommentsOverview::populateDocumentList(const QString &selectedStem)
                     }
                     Component component;
                     component.key = entryId;
-                    component.title = document.navigationOptions.value(QStringLiteral("titles")).toObject().value(entryId).toString(librarySegmentTitle(QJsonObject {{QStringLiteral("source_id"), entryId}}));
+                    component.title = titleOf(entryId, QJsonObject {{QStringLiteral("source_id"), entryId}});
                     component.source = source;
                     component.sources.insert(source);
                     components.append(component);
@@ -11520,10 +11648,10 @@ void CommentsOverview::populateDocumentList(const QString &selectedStem)
             allComments += comments;
             allProposals += proposals;
             allNotes += notes;
-            if (sourceLinked && components.isEmpty()) {
-                status.append(i18n("The verified document map is unavailable. All comments remain available at project level."));
-            }
-            item->setToolTip(0, status.join(QLatin1Char('\n')));
+            const DocumentRowPresentation row = documentRowPresentation(document, !components.isEmpty());
+            item->setIcon(0, QIcon::fromTheme(row.iconName));
+            item->setData(0, DocumentRowIconRole, row.iconName);
+            item->setToolTip(0, row.toolTip);
             if (!components.isEmpty() && !unassigned.threadIds.isEmpty()) {
                 components.append(unassigned);
             }
@@ -13246,7 +13374,10 @@ void CommentsOverview::showLibraryBuildFailure(const QString &name, const QStrin
     box->setTextInteractionFlags(Qt::TextSelectableByMouse);
     auto *logs = box->addButton(SyncStatusLabels::showLogs(), QMessageBox::ActionRole);
     logs->setObjectName(QStringLiteral("libraryBuildErrorShowLogs"));
-    const QString operationId = m_latestSyncOperation.value(QStringLiteral("last_error_code")).toString() == QLatin1String("pdf_build_failed")
+    // The Sync that reported it: one that succeeded with the failed build as
+    // its warning, or (an earlier run) one that failed with it.
+    const QString operationId = (m_latestSyncOperation.value(QStringLiteral("warning_code")).toString() == QLatin1String("pdf_build_failed")
+                                 || m_latestSyncOperation.value(QStringLiteral("last_error_code")).toString() == QLatin1String("pdf_build_failed"))
         ? m_latestSyncOperation.value(QStringLiteral("id")).toString() : QString();
     connect(logs, &QAbstractButton::clicked, this, [this, operationId] {
         if (operationId.isEmpty()) Q_EMIT syncOperationsRequested();

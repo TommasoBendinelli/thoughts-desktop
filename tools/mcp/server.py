@@ -113,6 +113,12 @@ mcp = FastMCP(
     "then call get_note_reply to see what they drew on it. "
     "The user may reply after your turn ends: before you end a turn that sent a note, start thoughts-watch-replies as a background monitor "
     "(once per conversation; one line per reply or page), or the phone tells the user that no agent is listening for their reply. "
+    "While you run, you answer the replies to your own notes and the pages of topics you own: get_note_reply and get_note claim the reply "
+    "or page for this conversation (the first agent to claim it answers it, so nobody answers twice) and hand you the user's answering "
+    "rules (also note_rules); follow those rules whenever you answer a reply or page. A reply or page another agent covers is not yours "
+    "to answer; the Thoughts reply agent on the server answers what no running agent covers, and after 10 minutes what a covering agent "
+    "left unanswered. When the user makes this conversation responsible for a topic (documents, cards or a title tag such as "
+    "[Reading group]), call own_topic; it lasts while thoughts-watch-replies runs here, and release_topic ends it. "
     "When a conversation starts working on a Thoughts Library Project (reading, explaining, studying or editing its documents), "
     "call link_conversation once for that Project with a short title, so the user finds this conversation under the Project's Agent conversations; "
     "Thoughts tools that change a Project's documents also link it automatically. "
@@ -1097,6 +1103,8 @@ async def send_note(
       PDF: <a href="<Library filename>.pdf#page=53">p. 53</a> (the page as printed, 1-based; #page=N
       alone means document_filename's PDF); a paper or web page: <a href="https://arxiv.org/abs/…">.
       Links inside <svg> work too. Other links are dropped with a warning.
+    When the note answers a reply or a page, follow the user's answering rules (get_note_reply and
+    get_note hand them over with the reply or page; note_rules shows them).
     Attach the note to a review card
     (review_card_id; the server then fills document_id and the card's question) or a document,
     so the user finds it again from that card or document. The note records this conversation
@@ -1159,6 +1167,27 @@ async def list_note_replies(
     return tool_result(await agent_note_call(agent_notes.list_replies, note_id=note_id, after=after))
 
 
+def this_conversation_id() -> str | None:
+    """The calling conversation's ID (Claude Code session or Codex thread), or None when unknown."""
+    try:
+        conversation = current_conversation(None)
+    except Exception:  # noqa: BLE001 - claims then go out as this Mac's device-wide agent
+        return None
+    return conversation.get("conversation_id") if conversation else None
+
+
+def handling_for(item_id: str) -> dict:
+    """Claim a reply or page for this conversation (only when it covers it) and add the answering rules."""
+    handling = agent_notes.claim_item(item_id, this_conversation_id())
+    added = {"handling": handling}
+    if handling["state"] in ("yours", "unknown"):
+        rules = agent_notes.answering_rules()
+        added["answering_rules"] = rules.get("text") or f"(not available: {rules.get('missing')})"
+    if handling.get("next_step"):
+        added["next_step"] = handling["next_step"]
+    return added
+
+
 def reply_result(note_id: str, entry: dict | None, waited: float) -> CallToolResult:
     if entry is None:
         result = {"note_id": note_id, "status": "no_reply_yet", "error_code": "no_reply_yet", "waited_seconds": waited,
@@ -1193,14 +1222,17 @@ def reply_result(note_id: str, entry: dict | None, waited: float) -> CallToolRes
 async def get_note(note_id: NoteId) -> CallToolResult:
     """A page the user sent: in study mode the phone (or the Thoughts app on the Mac) sends the PDF page on screen, marked up or as it is.
 
-    The thoughts-watch-replies monitor announces each one as a PAGE line. Returns its title, the user's
-    comment (message), document_id, document_filename, document_name, page and pages, stroke_count,
-    review_card_id and review_question when a card was open, image_path (written to the notes folder)
-    and the image itself (when <= 4 MB). Grade it like a capture and answer with send_note on the same
-    document (and card).
+    The thoughts-watch-replies monitor announces each page of a topic this conversation owns as a PAGE
+    line. Returns its title, the user's comment (message), document_id, document_filename,
+    document_name, page and pages, stroke_count, review_card_id and review_question when a card was
+    open, image_path (written to the notes folder) and the image itself (when <= 4 MB). It also
+    claims the page for this conversation when this conversation covers it: handling.state is
+    "yours" (answer it with send_note on the same document and card, following answering_rules),
+    "taken" (another agent answers it) or "not_yours".
     """
     try:
         entry = await run_blocking(agent_notes.get_page, note_id)
+        entry.update(await run_blocking(handling_for, note_id))
     except agent_notes.AgentNoteError as error:
         return tool_result(error.as_dict())
     extra = []
@@ -1229,17 +1261,76 @@ async def get_note_reply(
     glasses), it comes as a second image: act on their words with that picture.
     When nothing arrived in time the result is not an error: status and error_code are
     no_reply_yet; call again later. Keep wait_seconds below the client's tool timeout.
+    A reply it returns is claimed for this conversation when this conversation covers it (its
+    note, or a topic it owns): handling.state "yours" means answer it, following
+    answering_rules; "taken" means another agent (the reply agent, another session) answers it;
+    "not_yours" means read it but leave the answer to the agent that covers it.
     """
     loop = asyncio.get_running_loop()
     started = loop.time()
     try:
         entry = await run_blocking(agent_notes.wait_for_reply, note_id, wait_seconds)
+        if entry is not None and entry.get("reply_id"):
+            entry = {**entry, **await run_blocking(handling_for, entry["reply_id"])}
     except agent_notes.AgentNoteError as error:
         return tool_result(error.as_dict())
     finally:
         with contextlib.suppress(Exception):
             ensure_reply_watcher()
     return reply_result(note_id, entry, round(loop.time() - started, 1))
+
+
+@mcp.tool(annotations=ToolAnnotations(title="The user's answering rules", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def note_rules() -> CallToolResult:
+    """The user's rules for answering their replies, pages and glasses captures, the same for every agent on every
+    computer: the Library note agent-note-rules.md as the user accepted it, served by the Thoughts server. Follow
+    them whenever you answer a reply or a page. The user changes them by editing that note."""
+    try:
+        rules = await run_blocking(agent_notes.answering_rules)
+    except agent_notes.AgentNoteError as error:
+        return tool_result(error.as_dict())
+    return tool_result(rules, is_error=False)
+
+
+TopicList = Annotated[list[str] | None, Field(max_length=200)]
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Become responsible for a topic's notes", readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def own_topic(
+    label: Annotated[str, Field(min_length=1, max_length=200, description="What the topic is, as the user named it, e.g. Reading group.")],
+    document_ids: Annotated[TopicList, Field(description="Library document IDs whose notes, replies and pages are this topic.")] = None,
+    review_card_ids: Annotated[TopicList, Field(description="Review card IDs whose notes are this topic.")] = None,
+    title_tags: Annotated[TopicList, Field(description="A note is in the topic when its title contains one of these (any case), e.g. [Reading group].")] = None,
+    captures: Annotated[bool, Field(description="This conversation also answers the glasses captures (the reply agent then leaves them to the owners).")] = False,
+) -> CallToolResult:
+    """Only when the user makes this conversation responsible for the agent notes of a topic: replies to notes in the
+    topic (whoever sent them) and pages the user sends on it then come to this conversation, and the Thoughts reply
+    agent steps aside while it listens (it answers after 10 minutes what is left unanswered). The ownership lasts while
+    thoughts-watch-replies runs in this conversation (it prints the topic's replies and PAGE lines); release_topic ends
+    it. Answer them following the user's answering rules."""
+    conversation_id = this_conversation_id()
+    if not conversation_id:
+        return tool_result({"error_code": "no_conversation", "detail": "This conversation could not be identified, so it cannot own a topic."})
+    try:
+        owner = await run_blocking(agent_notes.own_topic, conversation_id, label, document_ids, review_card_ids, title_tags, captures)
+    except agent_notes.AgentNoteError as error:
+        return tool_result(error.as_dict())
+    owner["next_step"] = ("Keep thoughts-watch-replies running in this conversation (start it as a background monitor if it "
+                          "does not run): the ownership lasts while it listens.")
+    return tool_result(owner, is_error=False)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Stop being responsible for a topic", readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def release_topic(
+    owner_id: Annotated[str | None, Field(pattern=r"^[0-9a-f]{24}$", description="The topic's owner_id from own_topic; leave it out to release every topic this conversation owns.")] = None,
+) -> CallToolResult:
+    """When the user takes a topic back from this conversation (or hands it to another agent): ends the ownership,
+    so the Thoughts reply agent answers the topic's replies and pages again."""
+    try:
+        released = await run_blocking(agent_notes.release_topic, owner_id, this_conversation_id())
+    except agent_notes.AgentNoteError as error:
+        return tool_result(error.as_dict())
+    return tool_result(released, is_error=False)
 
 
 if __name__ == "__main__":

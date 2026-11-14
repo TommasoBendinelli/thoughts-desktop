@@ -2845,8 +2845,60 @@ bool externallyOpenGenerationDirectories(const QString &docsRoot, QSet<QString> 
     return true;
 }
 
+// What kind of failure a failed request is, for whoever decides about trying again:
+// "transient" (no answer, a timeout, a gateway or availability error: asking again may
+// work), "needs_user" (the server refuses this computer or this app until the user acts)
+// or "bug" (the server refused the request or failed on it; asking again changes nothing).
+QString replyFailureKind(QNetworkReply *reply)
+{
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (status == 0 || status == 408 || status == 429 || status == 502 || status == 503 || status == 504) {
+        return QStringLiteral("transient");
+    }
+    if (status == 401 || status == 403 || status == 426) {
+        return QStringLiteral("needs_user");
+    }
+    return QStringLiteral("bug");
+}
+
+bool transientReplyFailure(QNetworkReply *reply)
+{
+    return reply->error() != QNetworkReply::NoError && replyFailureKind(reply) == QLatin1String("transient");
+}
+
+// The same from the text a failed publisher or installer process left on stderr.
+QString processFailureKind(const QString &detail)
+{
+    static const QRegularExpression transient(QStringLiteral("urlopen error|timed out|HTTP Error (?:408|429|502|503|504)\\b|Remote end closed|Connection refused|Temporary failure"), QRegularExpression::CaseInsensitiveOption);
+    if (detail.contains(QLatin1String("source conflict was preserved")) || detail.contains(QLatin1String("HTTP Error 401")) || detail.contains(QLatin1String("HTTP Error 403"))) {
+        return QStringLiteral("needs_user");
+    }
+    return transient.match(detail).hasMatch() ? QStringLiteral("transient") : QStringLiteral("bug");
+}
+
+// The kind of the request failure that was read last, for the failManualSync that follows
+// it in the same handler.
+struct ReplyFailureNote {
+    QString kind;
+    QElapsedTimer age;
+};
+ReplyFailureNote &lastReplyFailure()
+{
+    static ReplyFailureNote note;
+    return note;
+}
+
+void noteReplyFailure(QNetworkReply *reply)
+{
+    if (reply->error() != QNetworkReply::NoError) {
+        lastReplyFailure().kind = replyFailureKind(reply);
+        lastReplyFailure().age.start();
+    }
+}
+
 Thoughts::SyncErrorInfo replyErrorInfo(QNetworkReply *reply, const QList<QJsonObject> &operations = {})
 {
+    noteReplyFailure(reply);
     const QByteArray body = reply->readAll();
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     return Thoughts::SyncClient::parseErrorResponse(body, reply->errorString(), status, operations);
@@ -3257,7 +3309,12 @@ void FedoraRepository::SyncCoordinator::begin(const QString &filename, bool chec
     message.clear();
     details.clear();
     errorCode.clear();
+    failureKind.clear();
     buildFailure.clear();
+    warningCode.clear();
+    warning.clear();
+    buildFailureDocuments = {};
+    pendingBuildDocuments.clear();
     // The operation trace identifies the Desktop journal.  The render request
     // has a separate idempotency identity and must never double as a trace
     // owned by another Fedora device.
@@ -6120,8 +6177,7 @@ void FedoraRepository::requestReaderSyncPlan(const QString &target, std::functio
     }
     m_readerPlanPulling = true;
     const QJsonObject request = readerSyncPlanRequest(target);
-    QNetworkReply *planReply = m_client->syncPlan(request);
-    connect(planReply, &QNetworkReply::finished, this, [this, planReply, target, request, completion = std::move(completion)]() mutable {
+    retryingRequest([this, request] { return m_client->syncPlan(request); }, [this, target, request, completion = std::move(completion)](QNetworkReply *planReply) mutable {
         m_readerPlanPulling = false;
         if (planReply->error() != QNetworkReply::NoError) {
             const int status = planReply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -6495,7 +6551,7 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
     m_activeReaderTransferPlanId.clear();
     m_syncCoordinator.begin(target, conditionalRenderCheck, m_activeTraceId);
     if (!QDir(QDir(m_docsRoot).filePath(QStringLiteral("reviews/source-transactions"))).entryList({QStringLiteral("*.json")}, QDir::Files).isEmpty()) {
-        failManualSync(QStringLiteral("An interrupted review source edit needs recovery. Open Reviews before retrying Sync."));
+        failManualSync(QStringLiteral("An interrupted review source edit needs recovery. Open Reviews before retrying Sync."), QString(), QStringLiteral("needs_user"));
         return;
     }
     m_projectSyncReady = false;
@@ -6646,8 +6702,7 @@ void FedoraRepository::synchronizeLibraryProjects()
     const auto send = [this, operation, fail, active] {
         if (!active()) return;
         QJsonObject payload = Thoughts::SourceDocumentMove::serverPayload(operation); payload.remove(QStringLiteral("local_path")); payload.remove(QStringLiteral("size_bytes"));
-        auto *reply = operation.isEmpty() ? m_client->libraryProjects() : m_client->editLibraryProject(payload);
-        connect(reply, &QNetworkReply::finished, this, [this, reply, operation, fail, active] {
+        const auto finished = [this, operation, fail, active](QNetworkReply *reply) {
             if (!active()) { reply->deleteLater(); return; }
             if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) {
                 reply->deleteLater();
@@ -6723,7 +6778,15 @@ void FedoraRepository::synchronizeLibraryProjects()
             schedulePendingChangesRefresh();
             if (operation.isEmpty()) { m_projectSyncReady = true; continueManualSyncAfterOverleaf(); }
             else synchronizeLibraryProjects();
-        });
+        };
+        if (operation.isEmpty()) {
+            // Reading the catalogue is the first request of every Sync of the whole Library
+            // and changes nothing: a transient failure is asked again. A change is sent once.
+            retryingRequest([this] { return m_client->libraryProjects(); }, finished);
+        } else {
+            QNetworkReply *reply = m_client->editLibraryProject(payload);
+            connect(reply, &QNetworkReply::finished, this, [reply, finished] { finished(reply); });
+        }
     };
     const QString path = operation.value(QStringLiteral("local_path")).toString();
     if (path.isEmpty()) { send(); return; }
@@ -7138,8 +7201,7 @@ void FedoraRepository::checkManualServerState()
     requestTimer.start();
     // The state endpoint is itself the capability check. Avoid a separate
     // /ready round trip on every unchanged synchronization.
-    QNetworkReply *stateReply = m_client->syncState();
-    connect(stateReply, &QNetworkReply::finished, this, [this, stateReply, requestTimer] {
+    retryingRequest([this] { return m_client->syncState(); }, [this, requestTimer](QNetworkReply *stateReply) {
         m_pulling = false;
         const qint64 requestMs = requestTimer.elapsed();
         if (stateReply->error() != QNetworkReply::NoError) {
@@ -7147,7 +7209,7 @@ void FedoraRepository::checkManualServerState()
             const Thoughts::SyncErrorInfo error = replyErrorInfo(stateReply);
             stateReply->deleteLater();
             if (status == 404 || status == 426) {
-                failManualSync(QStringLiteral("The server does not support the required sync state v2 contract."), error.details);
+                failManualSync(QStringLiteral("The server does not support the required sync state v2 contract."), error.details, QStringLiteral("needs_user"));
             } else {
                 failManualSync(error.summary, error.details);
             }
@@ -7248,7 +7310,7 @@ bool FedoraRepository::applyManualServerState(const QJsonObject &serverState)
             // unchecked generation.
             emitSyncProgress(QStringLiteral("checking_server"), 0, 0, QStringLiteral("Sources on the server changed; checking affected PDFs"));
             if (++m_syncCoordinator.discoveryReentries > maximumDiscoveryReentries) {
-                failManualSync(QStringLiteral("Sync stopped because sources on the server kept changing during %1 checks. Sync again when other devices finish.").arg(maximumDiscoveryReentries));
+                failManualSync(QStringLiteral("Sync stopped because sources on the server kept changing during %1 checks. Sync again when other devices finish.").arg(maximumDiscoveryReentries), QString(), QStringLiteral("transient"));
                 return true;
             }
             return applyManualServerState(serverState);
@@ -7429,7 +7491,7 @@ void FedoraRepository::startManualAuthoringReconciliation(qint64 through)
 {
     const QByteArray token = sourcePublisherToken();
     if (token.isEmpty() && !m_sourcePublisherTokenWithheld.isEmpty()) {
-        failManualSync(QStringLiteral("The source-publisher token belongs to another server."), m_sourcePublisherTokenWithheld);
+        failManualSync(QStringLiteral("The source-publisher token belongs to another server."), m_sourcePublisherTokenWithheld, QStringLiteral("needs_user"));
         return;
     }
     const QString executable = sourcePublisherExecutable();
@@ -7467,7 +7529,7 @@ void FedoraRepository::startManualAuthoringReconciliation(qint64 through)
         if (!m_syncCoordinator.running() || m_syncCoordinator.phase != ManualSyncPhase::AuthoringReconciliation) return;
         const QJsonObject report = QJsonDocument::fromJson(output).object();
         if (status != QProcess::NormalExit || exitCode != 0 || report.value(QStringLiteral("schema_version")).toInt() != 1 || report.value(QStringLiteral("checked_frontier")).toInteger(-1) < through) {
-            failManualSync(QStringLiteral("Editable-source synchronization needs attention."), detail);
+            failManualSync(QStringLiteral("Editable-source synchronization needs attention."), detail, processFailureKind(detail));
             return;
         }
         const qint64 downloaded = report.value(QStringLiteral("downloaded_bytes")).toInteger(-1);
@@ -7610,6 +7672,46 @@ void FedoraRepository::startManualAuthoringReconciliation(qint64 through)
     process->start();
 }
 
+void FedoraRepository::noteVerifiedSourcePublication(const QJsonObject &publication)
+{
+    // After its own publication the Sync used to run the editable-source installer a
+    // second time (about 2 s and one more reading of the server's source tree), which
+    // found only what had just been sent. The publisher now says when the server's tree
+    // after the publication is the tree the installer checked plus exactly that
+    // publication. Then the installer's check holds through the new frontier.
+    const QJsonObject verified = publication.value(QStringLiteral("source_tree_verified")).toObject();
+    const qint64 from = verified.value(QStringLiteral("from")).toInteger(-1);
+    const qint64 through = verified.value(QStringLiteral("through")).toInteger(-1);
+    if (from < 0 || through < from || m_syncCoordinator.authoringCheckedSourceFrontier != from) {
+        return;
+    }
+    QString error;
+    Thoughts::DesktopSyncStore *const store = desktopSyncStore(&error);
+    if (!store || !error.isEmpty()) {
+        return;
+    }
+    Thoughts::DesktopSyncFrontier frontier = store->frontier(&error);
+    if (!error.isEmpty()) {
+        return;
+    }
+    // Only a complete installation of this very manifest carries over: a manifest that
+    // the publication changed may name folders the installer has not looked at.
+    const QJsonObject materializedManifest = frontier.metadata.value(QStringLiteral("materialized_source_manifest")).toObject();
+    const QJsonObject manifest = sourceManifestFileIdentity(m_sourceManifestPath, true, &error);
+    if (!error.isEmpty() || frontier.metadata.value(QStringLiteral("materialized_source_frontier")).toInteger(-1) != from
+        || !manifest.value(QStringLiteral("exists")).toBool() || manifest.value(QStringLiteral("sha256")).toString().isEmpty()
+        || manifest.value(QStringLiteral("sha256")) != materializedManifest.value(QStringLiteral("sha256"))) {
+        return;
+    }
+    frontier.metadata.insert(QStringLiteral("materialized_source_manifest"), manifest);
+    frontier.metadata.insert(QStringLiteral("materialized_source_frontier"), through);
+    if (!store->setFrontier(frontier, &error)) {
+        return;
+    }
+    m_syncCoordinator.authoringCheckedSourceFrontier = through;
+    emitSyncTiming(QStringLiteral("source_install_skipped"), QStringLiteral("editable sources verified through %1 by the publication; no second installer pass").arg(through));
+}
+
 void FedoraRepository::beginManualReaderStateRecheck()
 {
     if (!m_syncCoordinator.running()) {
@@ -7632,7 +7734,8 @@ void FedoraRepository::resumeManualSyncAfterSourceReconciliation()
             >= manualLocalReconciliationTimeoutMs) {
         failManualSync(
             QStringLiteral("Local source monitoring did not settle; nothing was uploaded."),
-            QStringLiteral("The local source check remained active for 60 seconds. Your changes remain safely stored on this computer."));
+            QStringLiteral("The local source check remained active for 60 seconds. Your changes remain safely stored on this computer."),
+            QStringLiteral("transient"));
         return;
     }
     // A file created while Thoughts was closed is first seen by this scan and
@@ -7684,7 +7787,7 @@ qint64 FedoraRepository::manualExpectedSourceFrontier(QString *error)
     return std::max({durable.sourceFrontier, m_syncCoordinator.publishedSourceFrontier, m_syncCoordinator.renderCheckedSourceFrontier});
 }
 
-bool FedoraRepository::manualReaderArtifactsCurrent(const QJsonObject &serverState)
+bool FedoraRepository::manualReaderArtifactsRecorded(const QJsonObject &serverState, QList<QJsonObject> *receipts)
 {
     const QString revision = serverState.value(QStringLiteral("library_revision")).toString();
     const QJsonObject state = readRepositoryState();
@@ -7702,24 +7805,55 @@ bool FedoraRepository::manualReaderArtifactsCurrent(const QJsonObject &serverSta
     if (!error.isEmpty() || frontier.metadata.value(QStringLiteral("reader_cache_revision")).toString() != revision || !frontier.metadata.value(QStringLiteral("reader_cache_objects")).isArray()) {
         return false;
     }
+    if (objects.isEmpty()) {
+        return true;
+    }
+    // One query for every receipt instead of one per object.
+    const QHash<QString, Thoughts::DesktopVerifiedObject> known = store->verifiedObjects(&error);
+    if (!error.isEmpty()) {
+        return false;
+    }
     for (const QJsonValue &value : objects) {
-        const QString sha256 = value.toString();
-        const std::optional<Thoughts::DesktopVerifiedObject> object = store->verifiedObject(sha256, &error);
-        if (!object || !error.isEmpty() || object->sizeBytes < 0 || !sameReaderFileMetadata(object->metadata, readerFileMetadata(object->metadata.value(QStringLiteral("local_path")).toString()))) {
+        const auto object = known.constFind(value.toString());
+        if (object == known.cend() || object->sizeBytes < 0) {
             return false;
         }
+        receipts->append(object->metadata);
     }
     return true;
 }
 
+bool FedoraRepository::readerArtifactFilesUnchanged(const QList<QJsonObject> &receipts)
+{
+    // One stat per cached object. On a folder a File Provider serves this can take
+    // seconds (10.7 s in one freeze report), so the periodic check runs it on a worker.
+    return std::all_of(receipts.cbegin(), receipts.cend(), [](const QJsonObject &receipt) {
+        return sameReaderFileMetadata(receipt, readerFileMetadata(receipt.value(QStringLiteral("local_path")).toString()));
+    });
+}
+
+bool FedoraRepository::manualReaderArtifactsCurrent(const QJsonObject &serverState)
+{
+    QList<QJsonObject> receipts;
+    return manualReaderArtifactsRecorded(serverState, &receipts) && readerArtifactFilesUnchanged(receipts);
+}
+
 void FedoraRepository::checkRemoteWork(std::function<void(bool pending, const QString &stateKey)> done)
+{
+    // The watch of the builds a Sync left running stops with its client or at a restart; the
+    // periodic check starts it again.
+    watchPendingServerBuilds();
+    evaluateRemoteWork(true, std::move(done));
+}
+
+void FedoraRepository::evaluateRemoteWork(bool whileBuildsPending, std::function<void(bool pending, const QString &stateKey)> done)
 {
     if (!m_client || !m_outbox || m_syncCoordinator.running()) {
         done(false, QString());
         return;
     }
     QNetworkReply *reply = m_client->syncState();
-    connect(reply, &QNetworkReply::finished, this, [this, reply, done = std::move(done)]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, whileBuildsPending, done = std::move(done)]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             done(false, QString());
@@ -7735,7 +7869,324 @@ void FedoraRepository::checkRemoteWork(std::function<void(bool pending, const QS
             return;
         }
         const QString key = QStringLiteral("%1/%2/%3").arg(latest).arg(revision).arg(state.value(QStringLiteral("source_frontier")).toInteger(-1));
-        done(m_outbox->cursor() != latest || !manualReaderArtifactsCurrent(state), key);
+        if (m_outbox->cursor() != latest) {
+            done(true, key);
+            return;
+        }
+        // A running build changes the Library revision as it progresses. A Sync started for
+        // that would only find the build still running; its end is announced by the watch.
+        if (whileBuildsPending && pendingServerBuildsSuppressRevisionChanges()) {
+            done(false, key);
+            return;
+        }
+        // What this computer recorded is read here; whether the files still are the
+        // recorded ones is looked at on a worker thread, so that this check, which runs
+        // every 20 s, never holds the window.
+        QList<QJsonObject> receipts;
+        if (!manualReaderArtifactsRecorded(state, &receipts)) {
+            done(true, key);
+            return;
+        }
+        if (receipts.isEmpty()) {
+            done(false, key);
+            return;
+        }
+        if (m_readerArtifactCheckRunning) {
+            // The previous look at the files has not returned (a stalled volume): nothing
+            // is known, and no second worker waits beside it.
+            done(false, QString());
+            return;
+        }
+        m_readerArtifactCheckRunning = true;
+        const QPointer<FedoraRepository> repository(this);
+        QThreadPool::globalInstance()->start([repository, receipts, key, done] {
+            const bool unchanged = readerArtifactFilesUnchanged(receipts);
+            const Qt::HANDLE worker = QThread::currentThreadId();
+            QMetaObject::invokeMethod(
+                repository,
+                [repository, unchanged, worker, key, done] {
+                    if (!repository) {
+                        return;
+                    }
+                    repository->m_readerArtifactCheckRunning = false;
+                    repository->m_readerArtifactCheckThread = worker;
+                    if (repository->m_syncCoordinator.running()) {
+                        done(false, QString());
+                        return;
+                    }
+                    done(!unchanged, key);
+                },
+                Qt::QueuedConnection);
+        });
+    });
+}
+
+QJsonArray FedoraRepository::pendingServerBuilds() const
+{
+    return readRepositoryState().value(QStringLiteral("pending_server_builds")).toArray();
+}
+
+QString FedoraRepository::manualSyncFailureKind() const
+{
+    return m_syncCoordinator.state == ManualSyncState::Failed ? m_syncCoordinator.failureKind : QString();
+}
+
+void FedoraRepository::retryingRequest(std::function<QNetworkReply *()> send, std::function<void(QNetworkReply *)> finished, int attempt)
+{
+    QNetworkReply *reply = send();
+    const QString trace = m_activeTraceId;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, send, finished, attempt, trace] {
+        const bool sameSync = m_syncCoordinator.running() && m_activeTraceId == trace;
+        if (!sameSync || attempt >= m_retryDelaysMs.size() || !transientReplyFailure(reply)) {
+            noteReplyFailure(reply);
+            finished(reply);
+            return;
+        }
+        // No answer, a timeout or 502/503/504: the request changes nothing on the server
+        // when it is repeated, so it is asked again after 1, 2 and 4 s before the Sync
+        // gives up. What the server refused (4xx) is never asked again.
+        const int delayMs = m_retryDelaysMs.at(attempt);
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (!m_activeTraceId.isEmpty()) {
+            Q_EMIT syncJournalEvent(m_activeTraceId,
+                                    QJsonObject {{QStringLiteral("at_ms"), QDateTime::currentMSecsSinceEpoch()},
+                                                 {QStringLiteral("state"), QStringLiteral("running")},
+                                                 {QStringLiteral("message"),
+                                                  status > 0 ? QStringLiteral("The server answered %1; asking again in %2 s.").arg(status).arg(delayMs / 1000.0)
+                                                             : QStringLiteral("The server did not answer (%1); asking again in %2 s.").arg(reply->errorString()).arg(delayMs / 1000.0)},
+                                                 {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("retry_attempt"), attempt + 1}, {QStringLiteral("retry_in_ms"), delayMs}}}});
+        }
+        const QPointer<QNetworkReply> failed(reply);
+        QTimer::singleShot(delayMs, this, [this, failed, send, finished, attempt, trace] {
+            if (!failed) {
+                return; // The client went away with its replies; nobody waits for this one.
+            }
+            if (!m_client || !m_syncCoordinator.running() || m_activeTraceId != trace) {
+                // The Sync ended meanwhile: its handler still gets the answer it waits for.
+                noteReplyFailure(failed);
+                finished(failed);
+                return;
+            }
+            failed->deleteLater();
+            retryingRequest(send, finished, attempt + 1);
+        });
+    });
+}
+
+QString FedoraRepository::manualSyncWarningCode() const
+{
+    return m_syncCoordinator.state == ManualSyncState::Succeeded ? m_syncCoordinator.warningCode : QString();
+}
+
+QString FedoraRepository::manualSyncWarning() const
+{
+    return m_syncCoordinator.state == ManualSyncState::Succeeded ? m_syncCoordinator.warning : QString();
+}
+
+bool FedoraRepository::pendingServerBuildsSuppressRevisionChanges() const
+{
+    // Only while the watch keeps hearing from the server that a build still runs: a watch
+    // that stopped must not hold back the Sync that fetches the finished PDF.
+    constexpr qint64 confirmationLifetimeMs = 90000;
+    return m_pendingBuildConfirmedAtMs >= 0 && QDateTime::currentMSecsSinceEpoch() - m_pendingBuildConfirmedAtMs < confirmationLifetimeMs && !pendingServerBuilds().isEmpty();
+}
+
+void FedoraRepository::recordPendingServerBuild(const QJsonObject &build, const QStringList &documents, bool wholeLibrary)
+{
+    QJsonObject state = readRepositoryState();
+    const QJsonArray previous = state.value(QStringLiteral("pending_server_builds")).toArray();
+    const QString buildId = build.value(QStringLiteral("id")).toString();
+    QJsonArray next;
+    QJsonObject recorded;
+    for (const QJsonValue &value : previous) {
+        if (value.toObject().value(QStringLiteral("id")).toString() == buildId) {
+            recorded = value.toObject();
+        } else if (!wholeLibrary) {
+            next.append(value);
+        }
+    }
+    if (safeComponent(buildId)) {
+        const QJsonArray names = QJsonArray::fromStringList(documents);
+        if (recorded.value(QStringLiteral("documents")).toArray() != names || recorded.value(QStringLiteral("target")) != build.value(QStringLiteral("target"))) {
+            recorded = QJsonObject {{QStringLiteral("id"), buildId},
+                                    {QStringLiteral("target"), build.value(QStringLiteral("target"))},
+                                    {QStringLiteral("documents"), names},
+                                    {QStringLiteral("recorded_at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}};
+        }
+        next.append(recorded);
+        m_pendingBuildConfirmedAtMs = QDateTime::currentMSecsSinceEpoch();
+    }
+    if (next == previous) {
+        return;
+    }
+    if (next.isEmpty()) {
+        state.remove(QStringLiteral("pending_server_builds"));
+    } else {
+        state.insert(QStringLiteral("pending_server_builds"), next);
+    }
+    writeRepositoryState(state);
+}
+
+void FedoraRepository::watchPendingServerBuilds()
+{
+    if (!m_client || m_pendingBuildReply) {
+        return;
+    }
+    const QJsonArray pending = pendingServerBuilds();
+    if (pending.isEmpty()) {
+        return;
+    }
+    const QString buildId = pending.first().toObject().value(QStringLiteral("id")).toString();
+    if (!safeComponent(buildId)) {
+        finishPendingServerBuild(buildId, {});
+        return;
+    }
+    // One request the server answers when the build ends (or after the wait): the end is
+    // noticed at once instead of at the next periodic check, and nothing waits on it.
+    QNetworkReply *reply = m_client->build(buildId, m_pendingBuildWaitMs);
+    m_pendingBuildReply = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, buildId] {
+        reply->deleteLater();
+        if (m_pendingBuildReply == reply) {
+            m_pendingBuildReply.clear();
+        }
+        if (reply->error() != QNetworkReply::NoError) {
+            if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) {
+                // The server no longer knows this build; the periodic check decides the rest.
+                finishPendingServerBuild(buildId, {});
+                return;
+            }
+            // Losing the connection changes nothing about the server's build. Ask again,
+            // slowly after three attempts.
+            static constexpr int backoffMs[] {1000, 2000, 4000};
+            const int attempt = ++m_pendingBuildWatchFailures;
+            QTimer::singleShot(attempt <= 3 ? backoffMs[attempt - 1] : 30000, this, &FedoraRepository::watchPendingServerBuilds);
+            return;
+        }
+        m_pendingBuildWatchFailures = 0;
+        const QJsonObject build = QJsonDocument::fromJson(reply->readAll()).object();
+        const QString status = Internal::authoritativeBuildStatus(build);
+        if (status == QLatin1String("succeeded") || status == QLatin1String("attention") || status == QLatin1String("failed") || status == QLatin1String("cancelled")) {
+            finishPendingServerBuild(buildId, build);
+            return;
+        }
+        if (status == QLatin1String("queued") || status == QLatin1String("running")) {
+            m_pendingBuildConfirmedAtMs = QDateTime::currentMSecsSinceEpoch();
+            // After a restart the saved "building" status is only a memory; the server has
+            // just confirmed it.
+            for (const QJsonValue &value : pendingServerBuilds()) {
+                if (value.toObject().value(QStringLiteral("id")).toString() != buildId) {
+                    continue;
+                }
+                for (const QJsonValue &document : value.toObject().value(QStringLiteral("documents")).toArray()) {
+                    const QString filename = document.toString();
+                    if (m_restoredTransientRenderStatuses.contains(filename) && m_renderStatuses.value(filename).value(QStringLiteral("status")).toString() == QLatin1String("building")) {
+                        m_restoredTransientRenderStatuses.remove(filename);
+                        Q_EMIT renderStatusChanged(filename, m_renderStatuses.value(filename));
+                    }
+                }
+            }
+        }
+        // An answer that names no known status is not asked for again at once.
+        QTimer::singleShot(status == QLatin1String("queued") || status == QLatin1String("running") ? 0 : 5000, this, &FedoraRepository::watchPendingServerBuilds);
+    });
+}
+
+void FedoraRepository::finishPendingServerBuild(const QString &buildId, const QJsonObject &build)
+{
+    QJsonObject state = readRepositoryState();
+    QJsonArray retained;
+    QJsonObject finished;
+    for (const QJsonValue &value : state.value(QStringLiteral("pending_server_builds")).toArray()) {
+        if (value.toObject().value(QStringLiteral("id")).toString() == buildId) {
+            finished = value.toObject();
+        } else {
+            retained.append(value);
+        }
+    }
+    if (retained.isEmpty()) {
+        state.remove(QStringLiteral("pending_server_builds"));
+        m_pendingBuildConfirmedAtMs = -1;
+    } else {
+        state.insert(QStringLiteral("pending_server_builds"), retained);
+    }
+    // Each ended build is forgotten before its Sync is announced, so a Sync that fails does
+    // not start another one for it.
+    writeRepositoryState(state);
+
+    const QString status = Internal::authoritativeBuildStatus(build);
+    if (status == QLatin1String("attention") || status == QLatin1String("failed") || status == QLatin1String("cancelled")) {
+        // The Sync that left this build running succeeded; the failure belongs to the PDF.
+        const QString buildError = build.value(QStringLiteral("error")).toString().trimmed();
+        QHash<QString, QString> failures;
+        for (const QJsonValue &value : build.value(QStringLiteral("result")).toObject().value(QStringLiteral("failed_documents")).toArray()) {
+            const QJsonObject failure = value.toObject();
+            const QString filename = failure.value(QStringLiteral("pdf_filename")).toString(failure.value(QStringLiteral("filename")).toString());
+            if (safePdfFilename(filename)) {
+                failures.insert(filename, failure.value(QStringLiteral("message")).toString(failure.value(QStringLiteral("error")).toString()).trimmed());
+            }
+        }
+        if (failures.isEmpty()) {
+            for (const QJsonValue &value : finished.value(QStringLiteral("documents")).toArray()) {
+                if (safePdfFilename(value.toString())) {
+                    failures.insert(value.toString(), QString());
+                }
+            }
+            const QString target = build.value(QStringLiteral("target")).toString();
+            if (failures.isEmpty() && safePdfFilename(target)) {
+                failures.insert(target, QString());
+            }
+        }
+        QHash<QString, QJsonObject> failedStatuses;
+        for (auto failure = failures.cbegin(); failure != failures.cend(); ++failure) {
+            QJsonObject failed = m_renderStatuses.value(failure.key());
+            QString reason = failure.value().isEmpty() ? buildError : failure.value();
+            if (reason.isEmpty()) {
+                reason = QStringLiteral("The server could not build this PDF; the last PDF that built stays in the Library.");
+            }
+            failed.insert(QStringLiteral("status"), status == QLatin1String("attention") ? QStringLiteral("attention") : QStringLiteral("error"));
+            failed.insert(QStringLiteral("reason"), reason);
+            failed.insert(QStringLiteral("build"), build);
+            failed.insert(QStringLiteral("checking"), false);
+            failedStatuses.insert(failure.key(), failed);
+        }
+        storeRenderStatuses(failedStatuses);
+    }
+    // The other PDFs of this build are built: until the announced Sync fetches them they
+    // wait for Sync instead of staying "updating" should that Sync not run.
+    QHash<QString, QJsonObject> builtStatuses;
+    for (const QJsonValue &value : finished.value(QStringLiteral("documents")).toArray()) {
+        const QString filename = value.toString();
+        QJsonObject built = m_renderStatuses.value(filename);
+        if (status.isEmpty() || built.value(QStringLiteral("status")).toString() != QLatin1String("building")
+            || built.value(QStringLiteral("build")).toObject().value(QStringLiteral("id")).toString() != buildId) {
+            continue;
+        }
+        built.insert(QStringLiteral("status"), QStringLiteral("synced"));
+        built.insert(QStringLiteral("local_state"), QStringLiteral("sync_pending"));
+        built.insert(QStringLiteral("reason"), QStringLiteral("The server finished updating this PDF. Sync brings it to this computer."));
+        built.insert(QStringLiteral("build"), build);
+        builtStatuses.insert(filename, built);
+    }
+    storeRenderStatuses(builtStatuses);
+    announceRemoteWorkAfterPendingBuild();
+    if (!retained.isEmpty()) {
+        QTimer::singleShot(0, this, &FedoraRepository::watchPendingServerBuilds);
+    }
+}
+
+void FedoraRepository::announceRemoteWorkAfterPendingBuild()
+{
+    if (m_syncCoordinator.running()) {
+        // The running Sync may already fetch the new PDF; ask once it is over.
+        m_pendingBuildAnnouncementDue = true;
+        return;
+    }
+    m_pendingBuildAnnouncementDue = false;
+    evaluateRemoteWork(false, [this](bool pending, const QString &stateKey) {
+        if (pending && !stateKey.isEmpty()) {
+            Q_EMIT remoteWorkFound(true, stateKey);
+        }
     });
 }
 
@@ -8383,13 +8834,13 @@ void FedoraRepository::startManualSourcePublication()
     const QString batchLabel = batch.size() > 1 ? QStringLiteral("%1 documents").arg(batch.size()) : scopeTarget;
     const QByteArray token = sourcePublisherToken();
     if (token.isEmpty() && !m_sourcePublisherTokenWithheld.isEmpty()) {
-        failManualSync(QStringLiteral("The source-publisher token belongs to another server."), m_sourcePublisherTokenWithheld);
+        failManualSync(QStringLiteral("The source-publisher token belongs to another server."), m_sourcePublisherTokenWithheld, QStringLiteral("needs_user"));
         return;
     }
     const QString executable = sourcePublisherExecutable();
     const QString manifest = m_sourceManifestPath;
     if (token.isEmpty() || !QFileInfo::exists(executable) || (!scopeTarget.isEmpty() && !QFileInfo::exists(manifest))) {
-        failManualSync(QStringLiteral("The source publisher installed with Thoughts is missing; reinstall Thoughts."));
+        failManualSync(QStringLiteral("The source publisher installed with Thoughts is missing; reinstall Thoughts."), QString(), QStringLiteral("needs_user"));
         return;
     }
 
@@ -8584,7 +9035,7 @@ void FedoraRepository::startManualSourcePublication()
         process->deleteLater();
         if (status != QProcess::NormalExit || exitCode != 0) {
             rollbackManualTransferTotals(sourceTransferId);
-            failManualSync(QStringLiteral("The local source changes could not be published to the server."), detail);
+            failManualSync(QStringLiteral("The local source changes could not be published to the server."), detail, processFailureKind(detail));
             return;
         }
         const QJsonDocument document = QJsonDocument::fromJson(output);
@@ -8637,6 +9088,7 @@ void FedoraRepository::startManualSourcePublication()
                                                           .arg(discoveryMs).arg(publisherMs).arg(publisherTimer.elapsed() - publisherMs));
         m_syncCoordinator.publishedSourceFrontier = frontier;
         m_syncCoordinator.pendingAuthoringPaths.clear();
+        noteVerifiedSourcePublication(publication);
         if (batch.isEmpty()) {
             m_syncCoordinator.completeSourcePublication(QString());
         }
@@ -8831,8 +9283,7 @@ void FedoraRepository::pullDocumentSnapshot()
     m_pulling = true;
     // A target reader plan models the full compact document snapshot.  An ETag
     // shortcut would transfer a different body and is therefore forbidden.
-    QNetworkReply *reply = m_client->documentSync(target);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, target] {
+    retryingRequest([this, target] { return m_client->documentSync(target); }, [this, target](QNetworkReply *reply) {
         m_pulling = false;
         if (reply->error() != QNetworkReply::NoError) {
             const Thoughts::SyncErrorInfo error = replyErrorInfo(reply);
@@ -9891,8 +10342,7 @@ void FedoraRepository::pullManualProjectionSnapshot()
         return;
     }
     m_pulling = true;
-    QNetworkReply *reply = m_client->projections();
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    retryingRequest([this] { return m_client->projections(); }, [this](QNetworkReply *reply) {
         m_pulling = false;
         if (reply->error() != QNetworkReply::NoError) {
             const Thoughts::SyncErrorInfo error = replyErrorInfo(reply);
@@ -9925,8 +10375,7 @@ void FedoraRepository::pullManualChangePage()
     }
     const qint64 cursor = m_outbox->cursor();
     m_pulling = true;
-    QNetworkReply *reply = m_client->changes(cursor);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, cursor] {
+    retryingRequest([this, cursor] { return m_client->changes(cursor); }, [this, cursor](QNetworkReply *reply) {
         m_pulling = false;
         if (reply->error() != QNetworkReply::NoError) {
             const Thoughts::SyncErrorInfo error = replyErrorInfo(reply);
@@ -9970,8 +10419,7 @@ void FedoraRepository::pullPlanlessManualChangePage()
         return;
     }
     m_pulling = true;
-    QNetworkReply *reply = m_client->changes(cursor);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, cursor, expectedLatest] {
+    retryingRequest([this, cursor] { return m_client->changes(cursor); }, [this, cursor, expectedLatest](QNetworkReply *reply) {
         m_pulling = false;
         if (reply->error() != QNetworkReply::NoError) {
             const Thoughts::SyncErrorInfo error = replyErrorInfo(reply);
@@ -10026,8 +10474,7 @@ void FedoraRepository::startManualRenderCheck()
     }
     emitSyncProgress(QStringLiteral("checking"), 0, 0, QStringLiteral("Checking whether the server needs to update any PDFs"));
     m_pulling = true;
-    QNetworkReply *reply = m_client->renderCheck(target, m_syncCoordinator.renderCheckRequestId);
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    retryingRequest([this, target] { return m_client->renderCheck(target, m_syncCoordinator.renderCheckRequestId); }, [this](QNetworkReply *reply) {
         m_pulling = false;
         if (reply->error() != QNetworkReply::NoError) {
             const Thoughts::SyncErrorInfo error = replyErrorInfo(reply);
@@ -10076,6 +10523,18 @@ bool FedoraRepository::applyManualRenderCheckResponse(const QJsonObject &respons
         return false;
     }
     m_syncCoordinator.renderCheckedSourceFrontier = libraryRevision;
+    // A Sync of the whole Library asked about every PDF: what it saw replaces the builds an
+    // earlier Sync left running. A Sync of one PDF keeps waiting for that PDF's build.
+    const bool wholeLibrary = !m_syncCoordinator.isDocument();
+    QStringList buildingDocuments;
+    for (const QJsonValue &value : response.value(QStringLiteral("documents")).toArray()) {
+        const QJsonObject document = value.toObject();
+        const QString state = document.value(QStringLiteral("state")).toString();
+        const QString filename = document.value(QStringLiteral("filename")).toString();
+        if ((state == QLatin1String("queued") || state == QLatin1String("building")) && safePdfFilename(filename) && !buildingDocuments.contains(filename)) {
+            buildingDocuments.append(filename);
+        }
+    }
 
     const auto failureMessage = [&response](const QJsonObject &build) {
         const QString buildError = build.value(QStringLiteral("error")).toString().trimmed();
@@ -10122,8 +10581,27 @@ bool FedoraRepository::applyManualRenderCheckResponse(const QJsonObject &respons
         }
         return message.isEmpty() ? QStringLiteral("The server could not update the required PDFs; the last-good Library PDFs remain active.") : message;
     };
+    // The PDFs that need attention, for the Sync summary: a failed build is a warning of a
+    // Sync whose changes arrived, and the Library status may not list it yet.
+    const auto failedDocuments = [&response](const QJsonObject &build) {
+        QJsonArray failed;
+        for (const QJsonValue &value : response.value(QStringLiteral("documents")).toArray()) {
+            const QJsonObject document = value.toObject();
+            const QString filename = document.value(QStringLiteral("filename")).toString();
+            if (document.value(QStringLiteral("state")).toString() != QLatin1String("attention") || !safePdfFilename(filename)) {
+                continue;
+            }
+            failed.append(QJsonObject {{QStringLiteral("filename"), filename},
+                                       {QStringLiteral("reason"), document.value(QStringLiteral("reason")).toString().trimmed()},
+                                       {QStringLiteral("build_id"), build.value(QStringLiteral("id")).toString()}});
+        }
+        return failed;
+    };
 
     if (status == QLatin1String("current")) {
+        if (wholeLibrary) {
+            recordPendingServerBuild({}, {}, true);
+        }
         m_syncCoordinator.buildFailure.clear();
         if (safePdfFilename(m_syncCoordinator.target) && m_restoredTransientRenderStatuses.contains(m_syncCoordinator.target)) {
             QJsonObject refreshed = m_renderStatuses.value(m_syncCoordinator.target);
@@ -10145,7 +10623,10 @@ bool FedoraRepository::applyManualRenderCheckResponse(const QJsonObject &respons
     }
 
     if (status == QLatin1String("attention")) {
-        deferManualBuildFailure(build, failureMessage(build));
+        if (wholeLibrary) {
+            recordPendingServerBuild({}, {}, true);
+        }
+        deferManualBuildFailure(build, failureMessage(build), failedDocuments(build));
         return true;
     }
 
@@ -10154,13 +10635,59 @@ bool FedoraRepository::applyManualRenderCheckResponse(const QJsonObject &respons
         return false;
     }
     if (buildStatus == QLatin1String("succeeded")) {
+        if (wholeLibrary) {
+            recordPendingServerBuild({}, {}, true);
+        }
         m_syncCoordinator.buildFailure.clear();
         emitSyncProgress(QStringLiteral("building"), 0, 0, QStringLiteral("The server already completed the required PDF update"));
         resumeManualSyncAfterRenderCheck();
         return true;
     }
     if (buildStatus == QLatin1String("attention") || buildStatus == QLatin1String("failed") || buildStatus == QLatin1String("cancelled")) {
-        deferManualBuildFailure(build, failureMessage(build));
+        if (wholeLibrary) {
+            recordPendingServerBuild({}, {}, true);
+        }
+        deferManualBuildFailure(build, failureMessage(build), failedDocuments(build));
+        return true;
+    }
+
+    if (wholeLibrary) {
+        // The server is still building. Everything else this Sync exchanges does not depend
+        // on that build, so it goes on and ends without the new PDF: the PDF this computer
+        // has stays, and the follow-up Sync that watchPendingServerBuilds announces fetches
+        // the new one. (13 November 2026: the median Sync waited 30 s here.)
+        if (buildingDocuments.isEmpty() && safePdfFilename(buildTarget)) {
+            buildingDocuments.append(buildTarget);
+        }
+        recordPendingServerBuild(build, buildingDocuments, true);
+        m_syncCoordinator.pendingBuildDocuments = buildingDocuments;
+        m_syncCoordinator.buildFailure.clear();
+        QHash<QString, QJsonObject> buildingStatuses;
+        for (const QString &filename : std::as_const(buildingDocuments)) {
+            QJsonObject building = m_renderStatuses.value(filename);
+            building.insert(QStringLiteral("status"), QStringLiteral("building"));
+            building.insert(QStringLiteral("reason"), QStringLiteral("The server is updating this PDF. The PDF on this computer stays until the new one arrives."));
+            building.insert(QStringLiteral("build"), build);
+            building.insert(QStringLiteral("checking"), false);
+            building.remove(QStringLiteral("refresh_error"));
+            buildingStatuses.insert(filename, building);
+        }
+        storeRenderStatuses(buildingStatuses);
+        const QString pendingMessage = buildingDocuments.size() == 1
+            ? QStringLiteral("The server is still updating 1 PDF; Sync continues without waiting for it.")
+            : QStringLiteral("The server is still updating %1 PDFs; Sync continues without waiting for them.").arg(qMax<qsizetype>(buildingDocuments.size(), 1));
+        emitSyncProgress(QStringLiteral("checking"), 0, 0, pendingMessage);
+        if (!m_activeTraceId.isEmpty()) {
+            Q_EMIT syncJournalEvent(m_activeTraceId,
+                                    QJsonObject {{QStringLiteral("at_ms"), QDateTime::currentMSecsSinceEpoch()},
+                                                 {QStringLiteral("phase"), QStringLiteral("checking")},
+                                                 {QStringLiteral("state"), QStringLiteral("running")},
+                                                 {QStringLiteral("message"), pendingMessage},
+                                                 {QStringLiteral("build_id"), buildId},
+                                                 {QStringLiteral("target"), buildTarget},
+                                                 {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("pending_build_documents"), QJsonArray::fromStringList(buildingDocuments)}}}});
+        }
+        resumeManualSyncAfterRenderCheck();
         return true;
     }
 
@@ -10279,9 +10806,10 @@ bool FedoraRepository::applyManualConditionalBuildTerminalResult(const QJsonObje
     return true;
 }
 
-void FedoraRepository::deferManualBuildFailure(const QJsonObject &build, const QString &message)
+void FedoraRepository::deferManualBuildFailure(const QJsonObject &build, const QString &message, const QJsonArray &failedDocuments)
 {
     m_syncCoordinator.buildFailure = message;
+    m_syncCoordinator.buildFailureDocuments = failedDocuments;
     Q_EMIT syncJournalEvent(m_activeTraceId,
                             QJsonObject {{QStringLiteral("phase"), QStringLiteral("downloading")},
                                          {QStringLiteral("state"), QStringLiteral("running")},
@@ -10292,14 +10820,24 @@ void FedoraRepository::deferManualBuildFailure(const QJsonObject &build, const Q
     resumeManualSyncAfterRenderCheck();
 }
 
-void FedoraRepository::failManualSync(const QString &message, const QString &details)
+void FedoraRepository::failManualSync(const QString &message, const QString &details, const QString &kind)
 {
+    // The failure of the request that was just read, unless the caller knows better.
+    ReplyFailureNote &note = lastReplyFailure();
+    const QString replyKind = note.age.isValid() && note.age.elapsed() < 100 ? note.kind : QString();
+    note.kind.clear();
+    note.age.invalidate();
     if (!m_syncCoordinator.running()) {
         return;
     }
     m_syncCoordinator.fail(message, details);
+    m_syncCoordinator.failureKind = !kind.isEmpty() ? kind : !replyKind.isEmpty() ? replyKind : QStringLiteral("bug");
     emitReaderTransferSnapshot(true);
     Q_EMIT manualSyncStateChanged(m_syncCoordinator.state, m_syncCoordinator.message, m_syncCoordinator.details);
+    QTimer::singleShot(0, this, &FedoraRepository::watchPendingServerBuilds);
+    if (m_pendingBuildAnnouncementDue) {
+        QTimer::singleShot(0, this, [this] { announceRemoteWorkAfterPendingBuild(); });
+    }
 }
 
 void FedoraRepository::completeManualSync(bool skipRenderStateRefresh)
@@ -10332,34 +10870,53 @@ void FedoraRepository::completeManualSync(bool skipRenderStateRefresh)
                 {QStringLiteral("reason"), it.value().value(QStringLiteral("reason"))},
                 {QStringLiteral("build_id"), it.value().value(QStringLiteral("build_id")).toString(it.value().value(QStringLiteral("build")).toObject().value(QStringLiteral("id")).toString())}});
         }
+        // The PDFs this Sync's own check found failed: the Library status above is refreshed
+        // only after the Sync and may not name them yet.
+        for (const QJsonValue &value : std::as_const(m_syncCoordinator.buildFailureDocuments)) {
+            const QString filename = value.toObject().value(QStringLiteral("filename")).toString();
+            const bool listed = std::any_of(failedDocuments.cbegin(), failedDocuments.cend(), [&filename](const QJsonValue &known) {
+                return known.toObject().value(QStringLiteral("filename")).toString() == filename;
+            });
+            if (!listed && (!m_syncCoordinator.isDocument() || filename == m_syncCoordinator.target)) {
+                failedDocuments.append(value);
+            }
+        }
         const bool allChangesSynced = m_syncCoordinator.blockedAuthoringPaths.isEmpty() && m_syncCoordinator.providerErrors.isEmpty();
         emitReaderStepTiming(QStringLiteral("done"));
         m_readerPhaseClock.invalidate();
+        QJsonObject completion {{QStringLiteral("failed_documents"), failedDocuments},
+                                {QStringLiteral("sync_outcome"), allChangesSynced ? QStringLiteral("changes_synced") : QStringLiteral("available_updates_synced")}};
+        if (!m_syncCoordinator.pendingBuildDocuments.isEmpty()) {
+            completion.insert(QStringLiteral("pending_build_documents"), QJsonArray::fromStringList(m_syncCoordinator.pendingBuildDocuments));
+        }
         Q_EMIT syncJournalEvent(m_activeTraceId,
             QJsonObject {{QStringLiteral("phase"), QStringLiteral("downloading_updates")},
                          {QStringLiteral("state"), QStringLiteral("running")},
                          {QStringLiteral("message"), QStringLiteral("Available updates synchronized with the server.")},
-                         {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("failed_documents"), failedDocuments}, {QStringLiteral("sync_outcome"), allChangesSynced
-                             ? QStringLiteral("changes_synced") : QStringLiteral("available_updates_synced")}}}});
+                         {QStringLiteral("metadata"), completion}});
     }
     const bool refreshRenderState = !m_syncCoordinator.isDocument() && !skipRenderStateRefresh;
     if (!m_syncCoordinator.blockedAuthoringPaths.isEmpty() || !m_syncCoordinator.providerErrors.isEmpty()) {
         const QStringList problems = m_syncCoordinator.blockedAuthoringPaths + m_syncCoordinator.providerErrors;
-        failManualSync(QStringLiteral("Available updates were synchronized; some documents need attention."), problems.join(QLatin1Char('\n')));
+        failManualSync(QStringLiteral("Available updates were synchronized; some documents need attention."), problems.join(QLatin1Char('\n')), QStringLiteral("needs_user"));
         return;
     }
-    if (!m_syncCoordinator.buildFailure.isEmpty()) {
-        m_syncCoordinator.fail(Thoughts::SyncStatusLabels::pdfBuildFailed(),
-                               QStringLiteral("Your changes are synced with the server. The last successful PDF remains available.\n") + m_syncCoordinator.buildFailure);
-        m_syncCoordinator.errorCode = QStringLiteral("pdf_build_failed");
-        Q_EMIT manualSyncStateChanged(m_syncCoordinator.state, m_syncCoordinator.message, m_syncCoordinator.details);
-        if (refreshRenderState) refreshRenderStateAfterExplicitOperation();
-        return;
-    }
+    // A PDF the server could not build does not undo a Sync whose changes arrived: the Sync
+    // succeeded, with a warning; the document itself reports the failed build.
+    const QString buildFailure = m_syncCoordinator.buildFailure;
     m_syncCoordinator.succeed();
+    if (!buildFailure.isEmpty()) {
+        m_syncCoordinator.warningCode = QStringLiteral("pdf_build_failed");
+        m_syncCoordinator.warning = Thoughts::SyncStatusLabels::pdfBuildFailed() + QStringLiteral("\nYour changes are synced with the server. The last successful PDF remains available.\n") + buildFailure;
+    }
     Q_EMIT manualSyncStateChanged(m_syncCoordinator.state, QString(), QString());
-    if (refreshRenderState) {
+    // An earlier Sync's failure may have marked the PDF; a skipped refresh would keep that.
+    if (refreshRenderState || (!buildFailure.isEmpty() && !m_syncCoordinator.isDocument())) {
         refreshRenderStateAfterExplicitOperation();
+    }
+    QTimer::singleShot(0, this, &FedoraRepository::watchPendingServerBuilds);
+    if (m_pendingBuildAnnouncementDue) {
+        QTimer::singleShot(0, this, [this] { announceRemoteWorkAfterPendingBuild(); });
     }
 }
 
@@ -10493,8 +11050,7 @@ void FedoraRepository::pullLibraryWithReaderPlan()
         return;
     }
     emitReaderStepTiming(QStringLiteral("change_pages"));
-    QNetworkReply *reply = m_client->library();
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    retryingRequest([this] { return m_client->library(); }, [this](QNetworkReply *reply) {
         emitReaderStepTiming(QStringLiteral("library_received"));
         if (reply->error() != QNetworkReply::NoError) {
             m_libraryPulling = false;
@@ -10565,16 +11121,24 @@ void FedoraRepository::supersedeGlobalReaderPlan(const QString &message)
     m_libraryPulling = false;
     m_libraryReaderPlan = {};
     m_libraryReaderMetadataBytes = 0;
-    if (m_libraryReaderPlanRetries++ < 1) {
+    // The server's Library changed between the plan and what was read under it. Since Sync
+    // no longer waits for the server's builds, it often reads while a build that just ended
+    // still publishes its results one after the other. Planning again changes nothing on
+    // the server: plan again at once, then after a short pause, before giving up.
+    static constexpr int replanDelaysMs[] {0, 500, 1500};
+    if (m_libraryReaderPlanRetries < int(std::size(replanDelaysMs))) {
+        const int delayMs = m_readerReplanDelayScale * replanDelaysMs[m_libraryReaderPlanRetries++];
         m_syncCoordinator.phase = ManualSyncPhase::Library;
         m_syncCoordinator.libraryRefreshState = SyncCoordinator::LibraryRefreshState::Waiting;
-        QTimer::singleShot(0, this, &FedoraRepository::refreshLibrary);
+        QTimer::singleShot(delayMs, this, &FedoraRepository::refreshLibrary);
         return;
     }
     m_libraryReaderPlanRetries = 0;
+    lastReplyFailure().kind = QStringLiteral("transient");
+    lastReplyFailure().age.start();
     Q_EMIT connectionStateChanged(false, message);
     if (m_syncCoordinator.running()) {
-        failManualSync(message);
+        failManualSync(message, QString(), QStringLiteral("transient"));
     }
 }
 
@@ -12041,6 +12605,7 @@ void FedoraRepository::projectNextPdf()
         const QString message = reply->errorString();
         const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const bool networkSuccess = reply->error() == QNetworkReply::NoError;
+        noteReplyFailure(reply);
         QByteArray content = networkSuccess ? reply->readAll() : QByteArray();
         reply->deleteLater();
         if (m_libraryReaderPlan.value(QStringLiteral("plan_id")).toString() != requestedPlanId) {
@@ -12288,6 +12853,7 @@ void FedoraRepository::startBuildTraceStream(const QString &buildId, const QStri
     connect(reply, &QNetworkReply::finished, this, [this, reply, consume, cursor, buildId, target, streamTraceId, operationTraceId] {
         consume(true);
         const bool terminal = m_terminalTraceBuilds.contains(buildId);
+        const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QString error = reply->error() == QNetworkReply::NoError ? QString() : replyError(reply);
         reply->deleteLater();
         m_buildTraceReply.clear();
@@ -12302,6 +12868,20 @@ void FedoraRepository::startBuildTraceStream(const QString &buildId, const QStri
             run.insert(QStringLiteral("server_state"), cursor->value(QStringLiteral("server_state")));
             run.insert(QStringLiteral("server_terminal"), cursor->value(QStringLiteral("server_terminal")));
             run.insert(QStringLiteral("transient_attempts"), 0);
+        }
+        if (!terminal && httpStatus == 404) {
+            // The server has no such trace: waiting does not create one (the three retries
+            // cost 7 s before the build was first asked about). Ask about the build itself
+            // at once; pollBuilds returns to the stream only if the build names this trace.
+            run.insert(QStringLiteral("trace_stream_missing"), true);
+            run.insert(QStringLiteral("stream_state"), QStringLiteral("offline"));
+            runs.insert(target, run);
+            state.insert(QStringLiteral("build_runs"), runs);
+            m_cachedRepositoryStateValid = false; // The cache already holds the streamed run; compare against the file.
+            if (writeRepositoryState(state)) QFile::remove(buildTraceCursorPath(m_stateRoot, streamTraceId));
+            Q_EMIT syncJournalEvent(operationTraceId, QJsonObject {{QStringLiteral("stream_state"), QStringLiteral("offline")}});
+            QTimer::singleShot(0, this, &FedoraRepository::pollBuilds);
+            return;
         }
         if (!terminal) {
             const int attempt = run.value(QStringLiteral("transient_attempts")).toInt() + 1;
@@ -12384,14 +12964,17 @@ void FedoraRepository::pollBuilds()
         return;
     }
     const bool fetchTerminalBuild = m_terminalTraceBuilds.remove(buildId);
-    if (m_traceEventsSupported && !fetchTerminalBuild && !activeRun.value(QStringLiteral("trace_stream_disabled")).toBool()) {
+    // The stream answered 404: this one request is not a long poll, so the build's own
+    // answer decides at once between the stream and waiting on the build.
+    const bool streamMissing = activeRun.value(QStringLiteral("trace_stream_missing")).toBool();
+    if (m_traceEventsSupported && !fetchTerminalBuild && !streamMissing && !activeRun.value(QStringLiteral("trace_stream_disabled")).toBool()) {
         startBuildTraceStream(buildId, target, operationTraceId, operationTraceId, activeRun.value(QStringLiteral("last_server_sequence")).toVariant().toLongLong());
         return;
     }
     emitSyncProgress(QStringLiteral("building"), 0, 0, QStringLiteral("Waiting for the server build"));
     m_pollingBuild = true;
-    QNetworkReply *reply = m_client->build(buildId, fetchTerminalBuild ? 0 : 30000);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, buildId, target] {
+    QNetworkReply *reply = m_client->build(buildId, fetchTerminalBuild || streamMissing ? 0 : 30000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, buildId, target, operationTraceId] {
         m_pollingBuild = false;
         if (reply->error() != QNetworkReply::NoError) {
             const QString error = replyError(reply);
@@ -12478,6 +13061,20 @@ void FedoraRepository::pollBuilds()
             }
             QTimer::singleShot(0, this, &FedoraRepository::pollBuilds);
         } else {
+            if (build.isEmpty()) {
+                // An answer that is no build record cannot send the stream question again
+                // at once: from here the build is waited on with long polls.
+                QJsonObject state = readRepositoryState();
+                QJsonObject runs = state.value(QStringLiteral("build_runs")).toObject();
+                QJsonObject activeRun = runs.value(target).toObject();
+                if (activeRun.value(QStringLiteral("trace_stream_missing")).toBool()) {
+                    activeRun.remove(QStringLiteral("trace_stream_missing"));
+                    activeRun.insert(QStringLiteral("trace_stream_disabled"), true);
+                    runs.insert(target, activeRun);
+                    state.insert(QStringLiteral("build_runs"), runs);
+                    writeRepositoryState(state);
+                }
+            }
             if (!build.isEmpty()) {
                 QJsonObject state = readRepositoryState();
                 QJsonObject runs = state.value(QStringLiteral("build_runs")).toObject();
@@ -12485,7 +13082,19 @@ void FedoraRepository::pollBuilds()
                 if (!activeRun.isEmpty()) {
                     const QString nextStatus = build.value(QStringLiteral("status")).toString();
                     const QJsonObject nextProgress = build.value(QStringLiteral("progress")).toObject();
-                    if (activeRun.value(QStringLiteral("status")).toString() != nextStatus || activeRun.value(QStringLiteral("progress")).toObject() != nextProgress || activeRun.value(QStringLiteral("transient_attempts")).toInt() != 0) {
+                    const bool streamMissing = activeRun.value(QStringLiteral("trace_stream_missing")).toBool();
+                    if (streamMissing) {
+                        // Back to the stream once, and only if the build names the trace
+                        // that was asked for; otherwise the build is waited on directly.
+                        activeRun.remove(QStringLiteral("trace_stream_missing"));
+                        const bool buildNamesTrace = !operationTraceId.isEmpty() && build.value(QStringLiteral("trace_id")).toString() == operationTraceId;
+                        if (buildNamesTrace && !activeRun.value(QStringLiteral("trace_stream_retried")).toBool()) {
+                            activeRun.insert(QStringLiteral("trace_stream_retried"), true);
+                        } else {
+                            activeRun.insert(QStringLiteral("trace_stream_disabled"), true);
+                        }
+                    }
+                    if (streamMissing || activeRun.value(QStringLiteral("status")).toString() != nextStatus || activeRun.value(QStringLiteral("progress")).toObject() != nextProgress || activeRun.value(QStringLiteral("transient_attempts")).toInt() != 0) {
                         activeRun.insert(QStringLiteral("status"), nextStatus);
                         activeRun.insert(QStringLiteral("progress"), nextProgress);
                         activeRun.insert(QStringLiteral("transient_attempts"), 0);
@@ -13133,6 +13742,32 @@ void FedoraRepository::storeRenderStatus(const QString &target, const QJsonObjec
     state.insert(QStringLiteral("render_statuses"), statuses);
     writeRepositoryState(state);
     Q_EMIT renderStatusChanged(target, storedStatus);
+}
+
+void FedoraRepository::storeRenderStatuses(const QHash<QString, QJsonObject> &statusesByTarget)
+{
+    // One write for a build that covers many PDFs (a shared file changed).
+    QJsonObject state = readRepositoryState();
+    QJsonObject statuses = state.value(QStringLiteral("render_statuses")).toObject();
+    QStringList changed;
+    for (auto status = statusesByTarget.cbegin(); status != statusesByTarget.cend(); ++status) {
+        if (!safePdfFilename(status.key())) {
+            continue;
+        }
+        QJsonObject storedStatus = status.value();
+        storedStatus.remove(QStringLiteral("restored_from_cache"));
+        setLiveRenderStatus(status.key(), storedStatus);
+        statuses.insert(status.key(), storedStatus);
+        changed.append(status.key());
+    }
+    if (changed.isEmpty()) {
+        return;
+    }
+    state.insert(QStringLiteral("render_statuses"), statuses);
+    writeRepositoryState(state);
+    for (const QString &target : std::as_const(changed)) {
+        Q_EMIT renderStatusChanged(target, m_renderStatuses.value(target));
+    }
 }
 
 void FedoraRepository::failTargetedBuildActivation(const QString &message, const QString &explicitTarget)

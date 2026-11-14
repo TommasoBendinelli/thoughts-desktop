@@ -140,6 +140,11 @@ public:
     QList<QJsonObject> bodies;  // of the POSTs, in order
     QByteArray token = "secret";
     int listStatus = 200;
+    // Set: the list carries an ETag and an unchanged list is answered 304, as a server with
+    // conditional lists does. notModified counts those answers; listBytes what the lists weighed.
+    bool listVersions = false;
+    int notModified = 0;
+    qint64 listBytes = 0;
     int writeStatus = 0;  // set: every POST and DELETE answers it
     // note id -> "listening" / "not_listening" (GET …/listening, and the answer to a reply); a note
     // without an entry answers 404, as a server before agent_note_listening_v1.
@@ -175,6 +180,7 @@ private:
         requests.append(method + QLatin1Char(' ') + target.toString());
         int code = 404;
         QByteArray body;
+        QByteArray extraHeaders;
         QByteArray type = "application/json";
         if (!request.contains(QByteArray(QByteArray("Authorization: Bearer ") + token))) {
             code = 401;
@@ -195,6 +201,17 @@ private:
                 page.append(value);
             }
             body = QJsonDocument(QJsonObject{{QStringLiteral("notes"), page}}).toJson(QJsonDocument::Compact);
+            if (listVersions && code == 200) {
+                const QByteArray version = QByteArray("\"") + QCryptographicHash::hash(body, QCryptographicHash::Sha256).toHex() + QByteArray("\"");
+                const QByteArray condition = QByteArray("If-None-Match: ") + version + QByteArray("\r\n");
+                if (request.contains(condition)) {
+                    code = 304;
+                    body.clear();
+                    ++notModified;
+                }
+                extraHeaders = QByteArray("ETag: ") + version + QByteArray("\r\n");
+            }
+            listBytes += body.size();
         } else if (method == QLatin1String("GET") && target.path().endsWith(QLatin1String("/listening"))) {
             const QString id = target.path().section(QLatin1Char('/'), -2, -2);
             if (listening.contains(id)) {
@@ -276,7 +293,7 @@ private:
             }
         }
         socket->write("HTTP/1.1 " + QByteArray::number(code) + " X\r\nContent-Type: " + type + "\r\nContent-Length: " + QByteArray::number(body.size())
-                      + "\r\nConnection: close\r\n\r\n" + body);
+                      + "\r\n" + extraHeaders + "Connection: close\r\n\r\n" + body);
         socket->disconnectFromHost();
     }
 
@@ -321,6 +338,9 @@ private Q_SLOTS:
     void sidebarOpensNotesInPlace();
     void sidebarShowsARequestedNoteOnceListed();
     void centerWatchesWhileAnyViewDoes();
+    void listComesBackEmptyWhenTheServerSaysItIsUnchanged();
+    void centerSlowsDownWhileNothingChanges();
+    void centerPollsSlowlyBehindAnotherApplication();
     void drawingMatchesThePhone();
     void textReplySendsThePictureAsItIs();
     void drawnReplySendsTheComposite();
@@ -1165,6 +1185,186 @@ void AgentNotesTest::sidebarShowsARequestedNoteOnceListed()
     QCOMPARE(center.unreadCount(), 1);
     sidebar.show();
     QVERIFY(waitFor([&] { return center.unreadCount() == 0; }));
+}
+
+// A server that names a version of its list (an ETag) is told the version this Mac has, and
+// answers an unchanged list without its notes. A server that names none is asked as before.
+void AgentNotesTest::listComesBackEmptyWhenTheServerSaysItIsUnchanged()
+{
+    FakeServer server;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    for (int index = 0; index < 20; ++index) {
+        QJsonObject record = noteRecord(QStringLiteral("n%1").arg(index), 100 - index, now.addSecs(-3600 - index), QStringLiteral("Note %1").arg(index));
+        // As long as a real note's message.
+        record.insert(QStringLiteral("message"), QString(2000, QLatin1Char('x')));
+        server.notes.append(record);
+    }
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    QList<Client::Result> results;
+    const auto list = [&](int limit) {
+        const qsizetype before = results.size();
+        client.list(limit, &client, [&results](const Client::Result &result) { results.append(result); });
+        return waitFor([&] { return results.size() == before + 1; });
+    };
+
+    // No versions: every answer carries the notes.
+    QVERIFY(list(20));
+    QVERIFY(list(20));
+    QCOMPARE(results.at(1).notes.size(), 20);
+    QVERIFY(!results.at(1).notModified);
+    QCOMPARE(server.notModified, 0);
+    const qint64 fullListBytes = server.listBytes / 2;
+    QVERIFY(fullListBytes > 20 * 2000);
+
+    server.listVersions = true;
+    server.listBytes = 0;
+    QVERIFY(list(20));
+    QCOMPARE(results.last().notes.size(), 20);
+    QVERIFY(!results.last().notModified);
+    QCOMPARE(server.listBytes, fullListBytes);
+    // The same list again: no notes, no failure, nothing to read.
+    QVERIFY(list(20));
+    QVERIFY(results.last().notModified);
+    QVERIFY(results.last().notes.isEmpty());
+    QCOMPARE(results.last().failure, Client::Failure::None);
+    QCOMPARE(server.notModified, 1);
+    QCOMPARE(server.listBytes, fullListBytes);
+    // Another list (more notes) has a version of its own.
+    QVERIFY(list(100));
+    QVERIFY(!results.last().notModified);
+    QVERIFY(list(100));
+    QVERIFY(results.last().notModified);
+    QCOMPARE(server.notModified, 2);
+    // A note changed: the list comes in full again.
+    QJsonObject *changed = server.noteRecordOf(QStringLiteral("n3"));
+    QVERIFY(changed);
+    changed->insert(QStringLiteral("title"), QStringLiteral("Changed"));
+    server.storeScratch();
+    QVERIFY(list(20));
+    QVERIFY(!results.last().notModified);
+    QCOMPARE(results.last().notes.size(), 20);
+    QCOMPARE(server.notModified, 2);
+    // After a failure the version is forgotten: the next answer must carry the notes.
+    server.listStatus = 500;
+    QVERIFY(list(20));
+    QCOMPARE(results.last().failure, Client::Failure::Failed);
+    server.listStatus = 200;
+    QVERIFY(list(20));
+    QVERIFY(!results.last().notModified);
+    QCOMPARE(results.last().notes.size(), 20);
+}
+
+// While polls find the list as it was, the next one comes later and later; a change, or the
+// user asking, brings the pace back.
+void AgentNotesTest::centerSlowsDownWhileNothingChanges()
+{
+    FakeServer server;
+    server.listVersions = true;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, now.addSecs(-3600), QStringLiteral("First")));
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    QSignalSpy changed(&center, &Center::notesChanged);
+    const auto lists = [&] { return server.requests.filter(QStringLiteral("/v1/agent-notes?limit=")).size(); };
+    const auto poll = [&] {
+        const int before = lists();
+        center.pollNow();
+        return waitFor([&] { return lists() == before + 1 && !center.isRefreshing(); });
+    };
+    QCOMPARE(center.nextPollDelayMs(), -1);
+    center.start(0);
+    QVERIFY(waitFor([&] { return center.hasListed() && !center.isRefreshing(); }));
+    QCOMPARE(changed.count(), 1);
+    // Nobody watches: once a minute, then less and less often, down to every five minutes.
+    QCOMPARE(center.nextPollDelayMs(), Center::IdleIntervalMs);
+    QList<int> paces;
+    for (int index = 0; index < 6; ++index) {
+        QVERIFY(poll());
+        paces.append(center.nextPollDelayMs());
+    }
+    QCOMPARE(paces, (QList<int> {60000, 120000, 120000, 120000, 120000, 120000}));
+    QCOMPARE(Center::IdleMaximumIntervalMs, 120000);
+    // The unchanged lists came back without their notes, and the notes stayed.
+    QCOMPARE(server.notModified, 6);
+    QCOMPARE(center.notes().size(), 1);
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(center.lastFailure(), Client::Failure::None);
+
+    // A new note: back to once a minute.
+    server.notes.prepend(noteRecord(QStringLiteral("n2"), 2, now.addSecs(-1800), QStringLiteral("Second")));
+    QVERIFY(poll());
+    QCOMPARE(center.notes().size(), 2);
+    QCOMPARE(changed.count(), 2);
+    QCOMPARE(center.nextPollDelayMs(), Center::IdleIntervalMs);
+
+    // A view on screen: every 15 seconds, then down to once a minute. (The list asked for as
+    // the view opened held nothing new, which is the first poll of the row.)
+    QObject view;
+    center.setWatching(&view, true);
+    QVERIFY(waitFor([&] { return !center.isRefreshing() && server.requests.last().endsWith(QStringLiteral("limit=%1").arg(Center::WatchingLimit)); }));
+    paces = {center.nextPollDelayMs()};
+    for (int index = 0; index < 5; ++index) {
+        QVERIFY(poll());
+        paces.append(center.nextPollDelayMs());
+    }
+    QCOMPARE(paces, (QList<int> {15000, 30000, 30000, 30000, 30000, 30000}));
+    QCOMPARE(Center::WatchingMaximumIntervalMs, 30000);
+    // The user asks (Refresh, a reply sent): the pace starts over.
+    center.refresh();
+    QVERIFY(waitFor([&] { return !center.isRefreshing(); }));
+    QCOMPARE(center.nextPollDelayMs(), Center::WatchingIntervalMs);
+    center.setWatching(&view, false);
+}
+
+// Behind another application nobody looks at the notes: the list is asked for at the slow pace
+// and without the extra notes, whatever view is open. Back in front, it is asked for at once.
+void AgentNotesTest::centerPollsSlowlyBehindAnotherApplication()
+{
+    FakeServer server;
+    QDateTime now = QDateTime::currentDateTimeUtc();
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, now.addSecs(-3600), QStringLiteral("First")));
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath(), [&now] { return now; });
+    QVERIFY(center.isForeground());
+    const auto lists = [&] { return server.requests.filter(QStringLiteral("/v1/agent-notes?limit=")).size(); };
+    QObject sidebar;
+    center.setWatching(&sidebar, true);
+    QVERIFY(waitFor([&] { return lists() == 1 && !center.isRefreshing(); }));
+    QCOMPARE(server.requests.last(), QStringLiteral("GET /v1/agent-notes?limit=%1").arg(Center::WatchingLimit));
+    QCOMPARE(center.nextPollDelayMs(), Center::WatchingIntervalMs);
+
+    // Another application comes to the front. The view stays open; the next poll is an idle one.
+    center.setForeground(false);
+    QVERIFY(center.isWatching());
+    center.pollNow();
+    QVERIFY(waitFor([&] { return lists() == 2 && !center.isRefreshing(); }));
+    QCOMPARE(server.requests.last(), QStringLiteral("GET /v1/agent-notes?limit=%1").arg(Center::IdleLimit));
+    QCOMPARE(center.nextPollDelayMs(), Center::IdleIntervalMs);
+
+    // Back within seconds: nothing is asked, the fast pace resumes.
+    now = now.addSecs(5);
+    center.setForeground(true);
+    QTest::qWait(50);
+    QCOMPARE(lists(), 2);
+    QCOMPARE(center.nextPollDelayMs(), Center::WatchingIntervalMs);
+    // Back after a while: the list is asked for at once, with the notes a view shows.
+    center.setForeground(false);
+    now = now.addSecs(600);
+    center.setForeground(true);
+    QVERIFY(waitFor([&] { return lists() == 3 && !center.isRefreshing(); }));
+    QCOMPARE(server.requests.last(), QStringLiteral("GET /v1/agent-notes?limit=%1").arg(Center::WatchingLimit));
+    QCOMPARE(center.nextPollDelayMs(), Center::WatchingIntervalMs);
+    // With no view open, coming to the front asks nothing.
+    center.setWatching(&sidebar, false);
+    QVERIFY(waitFor([&] { return !center.isWatching(); }));
+    center.setForeground(false);
+    now = now.addSecs(600);
+    center.setForeground(true);
+    QTest::qWait(50);
+    QCOMPARE(lists(), 3);
 }
 
 // The window and the sidebars of every tab: polled often while any is on screen.

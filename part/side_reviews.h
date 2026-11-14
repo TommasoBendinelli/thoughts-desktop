@@ -160,6 +160,8 @@ private:
     void clearActiveReviewCard();
     void updateTypeFilter();
     void revealRow(const QModelIndex &viewIndex);
+    // The Cards list and highlights from m_reviewCardRecords.
+    void rebuildReviewCards();
 
     // data fields (GUI)
     QLabel *m_sourceLinkIndicator;
@@ -172,6 +174,8 @@ private:
     QHash<QString, QJsonObject> m_feedbackRecords;
     QPushButton *m_proposalsFilter;
     QPushButton *m_reviewCardsFilter;
+    // Lists the document's retired cards, which stay on the PDF version they were retired on.
+    QPushButton *m_retiredCardsFilter = nullptr;
     QHash<QString, QJsonObject> m_reviewCards;
     QJsonArray m_reviewCardRecords;
     QString m_reviewPdfSha256;

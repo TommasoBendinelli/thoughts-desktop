@@ -500,7 +500,8 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         m_listeningTimer = new QTimer(this);
         m_listeningTimer->setInterval(20 * 1000);
         connect(m_listeningTimer, &QTimer::timeout, this, [this] {
-            if (m_center && readsNow() && !m_shownNoteId.isEmpty() && m_replyBox->isVisibleTo(m_detail)) m_center->checkListening(m_shownNoteId);
+            // Only while Thoughts is in front: behind another application nobody waits for the answer.
+            if (m_center && m_center->isForeground() && readsNow() && !m_shownNoteId.isEmpty() && m_replyBox->isVisibleTo(m_detail)) m_center->checkListening(m_shownNoteId);
         });
         connect(m_center, &AgentNotes::Center::seenChanged, this, [this] {
             updateUnreadMarks();

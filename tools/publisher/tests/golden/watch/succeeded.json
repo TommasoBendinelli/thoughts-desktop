@@ -33,11 +33,6 @@
   ],
   [
    "GET",
-   "/v1/builds/b1",
-   ""
-  ],
-  [
-   "GET",
    "/v1/builds/b1/output?offset=30",
    ""
   ],
@@ -52,6 +47,6 @@
    ""
   ]
  ],
- "stderr": "[T] Build connection interrupted; retrying: HTTP Error 502: Bad Gateway\n",
- "stdout": "[T] Build ID: b1\n[T] PDF: m.pdf\n[T] Server renderer command is not available.\n\n[T] [queued]\n[T] [running] — Compiling\n[T] line one\n[T] prog 50%\r[T] prog 100%\n[T] [succeeded]\n[T] partial\r\n\n[T] final  [T]  sep\f[T] ff\n[T] tail without newline\n[T] Build timings: renderer 4m 57.7s, total 5m 02.3s.\n[T] Build succeeded.\n"
+ "stderr": "",
+ "stdout": "[T] Build ID: b1\n[T] PDF: m.pdf\n[T] Server renderer command is not available.\n\n[T] [queued]\n[T] [running] — Compiling\n[T] line one\n[T] prog 50%\r[T] prog 100%\n[T] partial\r\n\n[T] final  [T]  sep\f[T] ff\n[T] [succeeded]\n[T] tail without newline\n[T] Build timings: renderer 4m 57.7s, total 5m 02.3s.\n[T] Build succeeded.\n"
 }

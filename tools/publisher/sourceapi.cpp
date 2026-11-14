@@ -14,6 +14,7 @@
 #include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QThread>
 #include <QUrl>
 
 namespace Thoughts::Publisher
@@ -144,8 +145,60 @@ void SourceApi::recordPayloadUpload(const QString &category, const Json &payload
     notifyTransferProgress(QStringLiteral("upload"));
 }
 
+namespace
+{
+// Made on first use: a test may set the pauses before any other static of this file exists.
+QList<int> &retryDelaysMs()
+{
+    static QList<int> delays{1000, 2000, 4000};
+    return delays;
+}
+
+// Repeating these changes nothing: an object is stored under its digest, a publication
+// and a render check are answered again under their identity, a build-input snapshot is
+// the same snapshot.
+bool repeatable(const QByteArray &method, const QString &path)
+{
+    if (method == "GET" || method == "HEAD") {
+        return true;
+    }
+    static const QStringList identified{QStringLiteral("/v1/objects"), QStringLiteral("/v1/source-publications"), QStringLiteral("/v1/build-input-snapshots"),
+                                        QStringLiteral("/v1/render-checks")};
+    return method == "POST" && identified.contains(path);
+}
+}
+
+void SourceApi::setRetryDelays(const QList<int> &milliseconds)
+{
+    retryDelaysMs() = milliseconds;
+}
+
+bool SourceApi::transientFailure(const Py::Exception &error)
+{
+    if (error.type != Py::apiErrorType) {
+        return false;
+    }
+    // Status 0 is also used for answers that fail a check; only "no answer" is transient.
+    return error.status == 502 || error.status == 503 || error.status == 504 || (error.status == 0 && error.message.startsWith(QLatin1String("<urlopen error")));
+}
+
 SourceApi::Response SourceApi::request(const QByteArray &method, const QString &path, const std::optional<Json> &payload,
                                        const std::optional<QByteArray> &content, const QList<QPair<QByteArray, QByteArray>> &headers)
+{
+    for (qsizetype attempt = 0;; ++attempt) {
+        try {
+            return requestOnce(method, path, payload, content, headers);
+        } catch (const Py::Exception &error) {
+            if (attempt >= retryDelaysMs().size() || !repeatable(method, path) || !transientFailure(error)) {
+                throw;
+            }
+        }
+        QThread::msleep(static_cast<unsigned long>(qMax(0, retryDelaysMs().at(attempt))));
+    }
+}
+
+SourceApi::Response SourceApi::requestOnce(const QByteArray &method, const QString &path, const std::optional<Json> &payload,
+                                           const std::optional<QByteArray> &content, const QList<QPair<QByteArray, QByteArray>> &headers)
 {
     QList<QPair<QByteArray, QByteArray>> outgoing{{"Authorization", "Bearer " + m_token.toUtf8()}, {"Accept", "application/json"}};
     for (const auto &header : headers) {
@@ -290,6 +343,11 @@ QByteArray SourceApi::download(const QString &digest)
 Json SourceApi::sourceTree()
 {
     return Py::loadsBytes(request("GET", QStringLiteral("/v1/sources")).body);
+}
+
+Json SourceApi::syncState()
+{
+    return Py::loadsBytes(request("GET", QStringLiteral("/v2/sync/state")).body);
 }
 
 QSet<QString> SourceApi::resolvedConflictIds()

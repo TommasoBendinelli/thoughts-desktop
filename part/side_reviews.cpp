@@ -1,3 +1,4 @@
+#include "pdfversions.h"
 #include "projectreadingcontext.h"
 #include "thoughtsplatform.h"
 /*
@@ -869,6 +870,23 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
     m_earlierFeedback->hide();
     connect(m_earlierFeedback, &QPushButton::clicked, this, &Reviews::earlierFeedbackToggled);
     vLayout->addWidget(m_earlierFeedback);
+    // The Retired filter: retired cards stay on the PDF version they were retired on, so this
+    // version lists them only when asked, unplaced; that version (from History) draws them.
+    m_retiredCardsFilter = new QPushButton(this);
+    m_retiredCardsFilter->setObjectName(QStringLiteral("reviewsRetiredCardsFilter"));
+    m_retiredCardsFilter->setFlat(true);
+    m_retiredCardsFilter->setCheckable(true);
+    m_retiredCardsFilter->setChecked(filterConfig.readEntry("ShowRetiredCards", false));
+    m_retiredCardsFilter->setToolTip(i18n("Retired cards are not reviewed. Each stays on the PDF version it was on when it was retired: open that version "
+                                          "from the card’s History to see it there."));
+    m_retiredCardsFilter->hide();
+    connect(m_retiredCardsFilter, &QPushButton::toggled, this, [this](bool on) {
+        KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Annotation Sidebar"));
+        config.writeEntry("ShowRetiredCards", on);
+        config.sync();
+        rebuildReviewCards();
+    });
+    vLayout->addWidget(m_retiredCardsFilter);
     updateTypeFilter();
     vLayout->addWidget(toolBar);
 
@@ -1796,7 +1814,6 @@ void Reviews::setReviewCards(const QJsonArray &cards)
 {
     if (!m_document->isOpened() || !m_document->currentDocument().isLocalFile()) return;
     const QFileInfo pdf(m_document->currentDocument().toLocalFile());
-    const auto reading = Thoughts::ProjectReadingContext::load(pdf.absoluteFilePath());
     if (m_reviewPdfSha256.isEmpty()) {
         QFile file(pdf.absoluteFilePath());
         if (file.open(QIODevice::ReadOnly)) {
@@ -1805,29 +1822,53 @@ void Reviews::setReviewCards(const QJsonArray &cards)
         }
     }
     if (cards == m_reviewCardRecords) return;
-    clearActiveReviewCard();
     m_reviewCardRecords = cards;
+    rebuildReviewCards();
+}
+
+void Reviews::rebuildReviewCards()
+{
+    if (!m_document->isOpened() || !m_document->currentDocument().isLocalFile()) return;
+    const QFileInfo pdf(m_document->currentDocument().toLocalFile());
+    const auto reading = Thoughts::ProjectReadingContext::load(pdf.absoluteFilePath());
+    // An earlier version opened from History lists the cards retired on it, and draws them.
+    const bool earlierVersion = Thoughts::PdfVersions::isCachedVersion(pdf.absoluteFilePath());
+    clearActiveReviewCard();
     m_reviewCards.clear();
     QList<ReviewCardSidebarEntry> entries;
     QHash<QString, std::pair<double, double>> positions;
     QVariantList highlights;
-    for (const QJsonValue &value : cards) {
+    int retiredElsewhere = 0;
+    for (const QJsonValue &value : std::as_const(m_reviewCardRecords)) {
         const QJsonObject card = value.toObject();
         const QJsonObject primary = card.value(QStringLiteral("primary")).toObject();
         const QString id = card.value(QStringLiteral("card_id")).toString();
         const QString status = card.value(QStringLiteral("status")).toString();
         const QString question = primary.value(QStringLiteral("question")).toString().trimmed();
+        const QString cardPdfSha256 = primary.value(QStringLiteral("pdf_sha256")).toString();
+        const bool retired = card.value(QStringLiteral("sidebar_schedule")).toObject().value(QStringLiteral("state")).toString() == QLatin1String("retired");
         const auto *child = reading ? reading->forStem(primary.value(QStringLiteral("pdf_stem")).toString()) : nullptr;
-        if (id.isEmpty() || question.isEmpty() || m_reviewCards.contains(id) || (reading ? !child : primary.value(QStringLiteral("pdf_stem")).toString() != pdf.completeBaseName())
-            || (status != QLatin1String("approved") && status != QLatin1String("needs_reanchor")) || card.value(QStringLiteral("sidebar_deleted")).toBool() || card.value(QStringLiteral("deleted")).toBool()) continue;
+        if (id.isEmpty() || question.isEmpty() || m_reviewCards.contains(id) || card.value(QStringLiteral("sidebar_deleted")).toBool() || card.value(QStringLiteral("deleted")).toBool()) continue;
+        if (earlierVersion) {
+            if (!retired || m_reviewPdfSha256.isEmpty() || cardPdfSha256 != m_reviewPdfSha256) continue;
+        } else if ((reading ? !child : primary.value(QStringLiteral("pdf_stem")).toString() != pdf.completeBaseName())
+                   || (status != QLatin1String("approved") && status != QLatin1String("needs_reanchor"))) {
+            continue;
+        }
+        // On the Library's PDF a retired card is neither drawn nor listed, unless the Retired filter asks.
+        if (retired && !earlierVersion) {
+            ++retiredElsewhere;
+            if (!m_retiredCardsFilter->isChecked()) continue;
+        }
         QJsonArray regions;
         for (const auto &value : Thoughts::effectiveReviewCardRegions(primary, card.value(QStringLiteral("schema_version")).toInt())) {
             regions.append(Thoughts::offsetCommentPages(value.toObject(), child ? child->document.firstPage : 0));
         }
-        bool valid = !regions.isEmpty() && !m_reviewPdfSha256.isEmpty() && primary.value(QStringLiteral("pdf_sha256")).toString() == (child ? child->document.pdfSha256 : m_reviewPdfSha256)
-            && (status == QLatin1String("approved"));
         const QString state = card.value(QStringLiteral("reanchor")).toObject().value(QStringLiteral("state")).toString();
-        valid = valid && (state.isEmpty() || state == QLatin1String("succeeded"));
+        const bool placedHere = !regions.isEmpty() && !m_reviewPdfSha256.isEmpty() && cardPdfSha256 == (child ? child->document.pdfSha256 : m_reviewPdfSha256);
+        // A retired card keeps the placement it had when it was retired: valid on its own version only.
+        bool valid = retired ? earlierVersion && placedHere
+                             : placedHere && status == QLatin1String("approved") && (state.isEmpty() || state == QLatin1String("succeeded"));
         QList<int> pages;
         for (const QJsonValue &regionValue : regions) {
             const QJsonObject region = regionValue.toObject();
@@ -1855,17 +1896,32 @@ void Reviews::setReviewCards(const QJsonArray &cards)
         QJsonObject schedule = card.value(QStringLiteral("sidebar_schedule")).toObject();
         const QString shownSha256 = child ? child->document.pdfSha256 : m_reviewPdfSha256;
         const QString scheduleState = schedule.value(QStringLiteral("state")).toString();
-        if (!shownSha256.isEmpty() && !Thoughts::isHtmlAttachmentCard(card) && primary.value(QStringLiteral("pdf_sha256")).toString() != shownSha256
+        const bool placementPending = !valid || status == QLatin1String("needs_reanchor")
+            || (!state.isEmpty() && state != QLatin1String("succeeded"));
+        if (!retired && !shownSha256.isEmpty() && !Thoughts::isHtmlAttachmentCard(card) && cardPdfSha256 != shownSha256
             && (scheduleState == QLatin1String("new") || scheduleState == QLatin1String("learning") || scheduleState == QLatin1String("review"))) {
             schedule.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
             schedule.remove(QStringLiteral("due_from"));
         }
-        entries.append({id, question, valid ? pages.first() : -1, valid ? pages : QList<int>(), QCryptographicHash::hash(QJsonDocument(entry).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256), status == QLatin1String("candidate"),
-                        primary.value(QStringLiteral("scope")).toString() == QLatin1String("document"), schedule});
+        // Why the queue does not offer it (AnnotationModel::reviewCardSchedule words it).
+        if (schedule.value(QStringLiteral("state")).toString() == QLatin1String("unavailable") && placementPending && !Thoughts::isHtmlAttachmentCard(card))
+            schedule.insert(QStringLiteral("not_offered"), QStringLiteral("placement"));
+        ReviewCardSidebarEntry sidebarEntry{id, question, valid ? pages.first() : -1, valid ? pages : QList<int>(),
+                                            QCryptographicHash::hash(QJsonDocument(entry).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256),
+                                            status == QLatin1String("candidate"), primary.value(QStringLiteral("scope")).toString() == QLatin1String("document"), schedule};
+        sidebarEntry.retired = retired;
+        sidebarEntry.pdfSha256 = cardPdfSha256;
+        entries.append(sidebarEntry);
     }
     std::sort(entries.begin(), entries.end(), [&positions](const auto &a, const auto &b) {
         return std::tuple(a.page, positions.value(a.id), a.id) < std::tuple(b.page, positions.value(b.id), b.id);
     });
+    const bool showingRetired = m_retiredCardsFilter->isChecked();
+    m_retiredCardsFilter->setText(showingRetired ? i18np("Retired: 1 card shown, unplaced: it stays on the PDF version it was retired on",
+                                                         "Retired: %1 cards shown, unplaced: each stays on the PDF version it was retired on", retiredElsewhere)
+                                                 : i18np("Retired: 1 card, on the PDF version it was retired on", "Retired: %1 cards, on the PDF versions they were retired on",
+                                                         retiredElsewhere));
+    m_retiredCardsFilter->setVisible(retiredElsewhere > 0);
     m_model->setReviewCards(entries);
     Q_EMIT reviewCardHighlightsChanged(highlights);
     m_searchLine->updateSearch(m_searchLine->text());

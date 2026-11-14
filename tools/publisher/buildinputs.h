@@ -42,6 +42,21 @@ QList<ProjectAttachment> projectAttachments(const Py::Path &project);
 // registered_source_project_targets: every selected document of every
 // installed folder.
 QList<SourceTarget> registeredSourceProjectTargets(const Py::Path &docsRoot);
+// While one is alive, registeredSourceProjectTargets reads the Project files
+// of a docs root once and answers from that. One publication asks it for
+// every PDF it covers, twice (27 PDFs sharing a changed file: 54 scans of
+// every Project of the Library, 6 to 16 s on 13 November 2026). Keep one
+// alive only across code that does not change Project files; scopes nest.
+class RegisteredSourceTargetsScope
+{
+public:
+    RegisteredSourceTargetsScope();
+    ~RegisteredSourceTargetsScope();
+    RegisteredSourceTargetsScope(const RegisteredSourceTargetsScope &) = delete;
+    RegisteredSourceTargetsScope &operator=(const RegisteredSourceTargetsScope &) = delete;
+    // How often the Project files of a docs root were actually read, in this process.
+    static qint64 scans();
+};
 // _target_project: the folder name and resolved folder that build target.
 QPair<QString, Py::Path> targetProject(const Py::Path &docsRoot, const QString &target, const std::optional<QString> &projectOverride,
                                        bool allowMissingDocumentInputs);

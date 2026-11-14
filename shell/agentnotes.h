@@ -177,6 +177,9 @@ public:
         QList<Note> notes;
         Failure failure = Failure::None;
         QString error;
+        // The server answered that its list is the one it sent last time (304 to
+        // If-None-Match): `notes` is empty and the caller keeps what it has.
+        bool notModified = false;
     };
 
     // @p cacheRoot keeps downloaded pictures by their sha256 (they never change).
@@ -189,6 +192,8 @@ public:
     bool ensureServer(QString *error = nullptr);
 
     // The newest notes; with @p documentId only that document's (the server's own filter).
+    // When the server named a version of the list (an ETag) the last time this same list was
+    // asked for, the request says so and an unchanged list comes back without its notes.
     void list(int limit, QObject *context, std::function<void(const Result &)> done, const QString &documentId = {});
 
     // A write: POST (with a JSON body) or DELETE. @p status is the HTTP status (0 when the
@@ -222,6 +227,8 @@ private:
     bool m_explicitServer = false;
     QNetworkAccessManager *m_network = nullptr;
     int m_downloadsSincePrune = 0;
+    // The ETag of the last answer to each list request (by its query).
+    QHash<QString, QByteArray> m_listVersions;
 };
 
 // The notes of this process (one for all windows): polls the list, counts unread notes and
@@ -261,6 +268,15 @@ public:
     // notes while any is. Each view says so for itself.
     void setWatching(const QObject *viewer, bool watching);
     bool isWatching() const { return m_watching; }
+    // Whether Thoughts is the application in front. Behind another application nobody looks at
+    // its views: the list is then asked for at the slow pace, whatever is open.
+    void setForeground(bool foreground);
+    bool isForeground() const { return m_foreground; }
+    // The pace of the next poll, in milliseconds, or -1 when none is scheduled. Each poll that
+    // finds the list unchanged doubles it, up to the maximum of its kind.
+    int nextPollDelayMs() const;
+    // What the timer does when it fires (tests call it instead of waiting).
+    void pollNow();
     // Asks the server now (the window's Refresh, or the window opening).
     void refresh();
 
@@ -317,8 +333,9 @@ public:
     void deleteNote(const QString &noteId, std::function<void(bool ok, const QString &error)> done = {});
 
     // Applies one list answer; @p complete when it holds every note the server has above its
-    // lowest sequence (always, for the newest-first list). Public for tests.
-    void apply(const QList<Note> &fetched);
+    // lowest sequence (always, for the newest-first list). Public for tests. True when the
+    // list changed.
+    bool apply(const QList<Note> &fetched);
     // Adds or updates notes from a partial answer (one document's), removing none.
     void merge(const QList<Note> &fetched);
     // Lists these documents' notes too, older ones included (a filtered view asks; at most 20
@@ -329,6 +346,11 @@ public:
     static constexpr int NotifyWithinSeconds = 10 * 60;
     static constexpr int IdleIntervalMs = 60 * 1000;
     static constexpr int WatchingIntervalMs = 15 * 1000;
+    // While polls find the list unchanged the pace doubles, up to these.
+    // An unchanged list costs the server nothing (304), so the pace stays short enough for a
+    // new note to show within two minutes even when Thoughts is behind another application.
+    static constexpr int IdleMaximumIntervalMs = 2 * 60 * 1000;
+    static constexpr int WatchingMaximumIntervalMs = 30 * 1000;
     static constexpr int IdleLimit = 20;
     static constexpr int WatchingLimit = 100;
 
@@ -349,6 +371,9 @@ Q_SIGNALS:
 private:
     void poll();
     void schedule(int ms);
+    // A view is on screen and Thoughts is in front.
+    bool watchingNow() const { return m_watching && m_foreground; }
+    int pollInterval() const;
     void finished(const Client::Result &result);
     void decideNotifications();
     void emitUnreadIfChanged();
@@ -363,6 +388,9 @@ private:
     QList<Note> m_notes;
     bool m_started = false;
     bool m_watching = false;
+    bool m_foreground = true;
+    // Polls in a row that found the list as it was.
+    int m_unchangedPolls = 0;
     QSet<const QObject *> m_watchers;
     bool m_inFlight = false;
     bool m_refreshAgain = false;

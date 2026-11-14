@@ -51,6 +51,18 @@ static QString documentSyncStatusId(DocumentSyncStatus status)
     return QStringLiteral("sync_needed");
 }
 
+QString pdfUpdatingOnServerLabel()
+{
+    return i18n("PDF updating on the server");
+}
+
+QString pdfsStillUpdatingOnServerMessage(int pdfs)
+{
+    return i18np("1 PDF is still updating on the server. The PDF on this computer stays until the new one arrives.",
+                 "%1 PDFs are still updating on the server. The PDFs on this computer stay until the new ones arrive.",
+                 pdfs);
+}
+
 static QString documentSyncStatusLabel(DocumentSyncStatus status)
 {
     switch (status) {
@@ -170,6 +182,15 @@ DocumentSyncPresentation documentSyncPresentation(const DocumentSyncState &state
         setDocumentSyncStatus(result, DocumentSyncStatus::Building);
         result.reason = remoteReason.isEmpty() ? i18n("The server is building this PDF. Click to open its live output in Terminal.") : remoteReason + QLatin1Char('\n') + i18n("Click to open its live output in Terminal.");
         result.actionLabel = i18n("Sync in progress — click for output");
+        if (!state.buildActivity.value(QStringLiteral("active")).toBool()) {
+            // No Sync or build of this computer is waiting for it: Sync ended and left the
+            // server building. The PDF here stays until a Sync brings the new one.
+            result.status = pdfUpdatingOnServerLabel();
+            if (remoteReason.isEmpty()) {
+                result.reason = i18n("The server is updating this PDF. The PDF on this computer stays until the new one arrives. Click to open the build's live output in Terminal.");
+            }
+            result.actionLabel = i18n("PDF updating on the server — click for output");
+        }
         result.actionId = QStringLiteral("build-active");
         result.iconName = QStringLiteral("system-run");
         result.action = DocumentSyncAction::OpenBuild;
@@ -687,6 +708,8 @@ SyncOutcomePresentation syncOperationOutcome(const QJsonObject &operation)
             }
         }
     }
+    // Sync ends without waiting for the PDFs the server is still building.
+    const int pendingBuildDocuments = int(finalBuildSnapshot.value(QStringLiteral("pending_build_documents")).toArray().size());
     // The completion checkpoint reflects the installed Library. An earlier
     // aggregate build can still contain failures superseded by targeted builds.
     // Keep those events as diagnostics, but do not union them into the outcome.
@@ -818,6 +841,9 @@ SyncOutcomePresentation syncOperationOutcome(const QJsonObject &operation)
             : lifecycle == SyncOperationState::Interrupted ? i18n("This Sync was interrupted before it completed. Your changes remain saved on this device. Run Sync to try again.")
             : preparationFailed ? i18n("This attempt stopped while preparing source files, before upload and download could complete. Your changes remain saved on this device.")
             : i18n("This attempt did not complete Sync. Your changes remain saved on this device. Run Sync to try again.");
+    }
+    if (!buildOnly && pendingBuildDocuments > 0 && (synced || available)) {
+        result.message += (result.message.isEmpty() ? QString() : QStringLiteral("\n\n")) + pdfsStillUpdatingOnServerMessage(pendingBuildDocuments);
     }
     if (!buildOnly && lifecycle != SyncOperationState::Running && syncOperationReportsPreservedConflict(operation)) {
         result.title = SyncStatusLabels::mergeNeeded();

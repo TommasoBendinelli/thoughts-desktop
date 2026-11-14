@@ -94,6 +94,11 @@ public:
         qint64 deleted = 0;
         Py::Json sourceFrontier = Py::Json(0);
         Py::Json publicationId = Py::Json(QString());
+        // Set when the server's source tree after the publication (frontier second) is the
+        // tree the publication was compared against (frontier first) with exactly this
+        // publication's accepted changes: no other source changed in between, so nothing is
+        // left for the editable-source installer to find up to the second frontier.
+        std::optional<QPair<qint64, qint64>> sourceTreeVerified;
     };
     using LocalSources = QList<QPair<QString, std::optional<QByteArray>>>;
 
@@ -104,6 +109,16 @@ public:
 
     Report publishOnce();
     qint64 adoptRemoteBases(const QSet<QString> &paths);
+    // The server's source tree (GET /v1/sources; 781 KB on 13 November 2026, read four
+    // times per Sync). A tree read from the server is kept beside the state; while the
+    // server's source frontier (GET /v2/sync/state, a few bytes) is still that tree's, the
+    // kept tree is the server's. A kept tree older than `atLeast` is not asked about.
+    Py::Json currentSourceTree(const std::optional<qint64> &atLeast = std::nullopt);
+    // Keeps a tree just read from the server.
+    void keepSourceTree(const Py::Json &tree);
+    // Whether the source tree `after` (GET /v1/sources) is the tree `before` changed only
+    // by the accepted `mutations` of the publication answer `result`.
+    static bool onlyOwnChanges(const Py::Json &before, const Py::Json &after, const QList<Py::Json> &mutations, const Py::Json &result);
 
     // Shared with the editable-source installer.
     QStringList paths() const;
@@ -113,6 +128,11 @@ public:
     void report(const QString &message, const ProgressFields &fields = {});
     // Fedora's conflict lists, read at most once per run (followSupersededConflict).
     SourceConflictListings &conflictListings();
+    // A base of `path` this state no longer records, which Desktop's own
+    // record may still name (state["superseded_bases"]; not written here).
+    void recordSupersededBase(const QString &path, const QString &sha256);
+    QStringList supersededBases(const QString &path) const;
+    void forgetSupersededBases(const QString &path);
 
     Py::Path root;
     Py::Path manifestPath;
@@ -135,6 +155,11 @@ private:
     void checkManifestRetirement(const QString &path) const;
     void activateCleanRemote(const QString &path, const QByteArray &content);
     void activatePublicationResults(const Py::Json &result, const QHash<QString, QString> &frozenSha256ByPath);
+    // Fedora's merged or applied result of a frozen source replaces the file
+    // (into `installed` when it differs from the frozen bytes), unless the
+    // file changed after Desktop froze it: false then.
+    bool activateMergedResult(const QString &path, const QString &frozenSha256, const Py::Json &canonicalSha256, const Py::Json &canonicalObject,
+                              std::optional<QByteArray> *installed = nullptr);
     void recordBases(const std::optional<Py::Json> &snapshot = std::nullopt);
     qint64 pruneRetiredManifestPaths();
     Py::Json newMutation(const QString &action, const QString &path, const Py::Json &current, const std::optional<QByteArray> &content);
@@ -146,8 +171,35 @@ private:
     // Sends the stored pending publication, renumbering it when Fedora proves another
     // operation owns one of its sequences (bounded; the IDs stay the same).
     Py::Json publishPending(Py::Json publication);
+    // Sends one source alone (/v1/sources/apply), renumbering it like
+    // publishPending; the stored pending apply follows the new number.
     Py::Json applyMutation(Py::Json mutation);
     void ensureEmptyBase(const QList<Py::Json> &mutations);
+    // A frozen copy declared on `desktopBase`, a superseded base of the path:
+    // the recorded base when the file holds every change made since
+    // `desktopBase`, else `desktopBase` itself as the merge base.
+    Py::Json laggingFrozenBase(const QString &path, const QByteArray &content, const Py::Json &recordedBase, const QString &desktopBase);
+    // The upsert of `content` against `base` sent alone, kept in the state
+    // before it is sent: an unanswered one of the same content and base is
+    // sent again as it was, so Fedora answers it from its record instead of
+    // committing the change twice.
+    Py::Json sourceApplyMutation(const QString &path, const Py::Json &base, const QByteArray &content);
+    void storePendingApply(const Py::Json &mutation);
+    // Without writing the state.
+    void forgetPendingApplies(const QSet<QString> &paths);
+    struct SettledApply {
+        // The base the path keeps; none when it has none.
+        std::optional<Py::Json> base;
+        // Fedora's result, installed as the local file.
+        std::optional<QByteArray> installed;
+    };
+    // Fedora's answer to a source sent alone: when Fedora merged or applied
+    // it (or did before, for a repeated one), installs Fedora's result,
+    // records its base and returns what was settled; nothing for any other
+    // outcome. `previousBase` stays the base when the file changed after
+    // Desktop froze it.
+    std::optional<SettledApply> settleMergedApply(const QString &path, const QByteArray &content, const Py::Json &result,
+                                                  const std::optional<Py::Json> &previousBase);
 };
 
 // adopt_review_source_bases(publisher, heads, paths)

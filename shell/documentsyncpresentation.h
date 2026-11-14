@@ -94,6 +94,10 @@ struct SyncOutcomePresentation {
 };
 
 SyncOutcomePresentation syncOperationOutcome(const QJsonObject &operation);
+// A document whose new PDF the server is still building after Sync ended.
+QString pdfUpdatingOnServerLabel();
+// The Sync summary's line for the PDFs a finished Sync left building on the server.
+QString pdfsStillUpdatingOnServerMessage(int pdfs);
 
 enum class SyncLocalChangeKind {
     Added,

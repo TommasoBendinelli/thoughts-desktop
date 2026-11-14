@@ -29,6 +29,8 @@
 #include <QPainter>
 #include <poppler-qt6.h>
 #include "../shell/reviewdocumenttools.h"
+#include "../shell/agentproposalparser.h"
+#include <functional>
 #include <QUuid>
 
 #include <algorithm>
@@ -231,6 +233,7 @@ private Q_SLOTS:
     void multiPageAnswerRegions();
     void manualAnswerEditsPreserveSourcesAndHistory();
     void sourceScanReplacesLegacyRangesBeforePdfBuild();
+    void retiredCardKeepsItsPassageAndPlacement();
     void severalPassagesAndOlderCardsStayAvailable();
     void schedulesRatings();
     void synchronizedSkipsPreserveSchedulingAndUndo();
@@ -280,10 +283,15 @@ private Q_SLOTS:
     void interruptedMergeIsRecovered();
     void mergeCommandIsOneRequestWithAReceipt();
     void mergeOfARealSourceCopy();
+    void mergingCardsKeepsPendingProposalsInsideTheirPassages();
+    void mergingCardsRefusesAProposalThatHoldsACardMarker();
+    void mergingCardsWhosePassageHoldsADefinition();
+    void mergeRefusalsNameTheLineAndTheProblem();
     void cardWithoutLocalSourceMapWaitsForTheServer();
     void htmlCardHasNoPdfGeometryAndWaitsForTheServer();
     void htmlAttachmentCardIsFoundByItsText();
     void areaOfAProposalAcceptedSinceTheBuildIsPlacedByText();
+    void areasIgnoreRunningHeadersFootersAndPageNumbers();
     void wordOnTwoNearbyLinesIsPlacedByTheAreasText();
     void mathAreaIsPlacedByItsProse();
     void figureLabelsInAnAreaAreSkipped();
@@ -725,6 +733,58 @@ void ReviewStoreTest::sourceScanReplacesLegacyRangesBeforePdfBuild()
     DesktopSyncOutbox outbox(sync.filePath(QStringLiteral("desktop-sync.sqlite")));
     QCOMPARE(outbox.operations().size(), 0);
     QCOMPARE(projection.value(QStringLiteral("review_card\ncards\n") + id).toObject(), card);
+}
+
+// A retired card stays on the PDF version, and with the passage, it was retired with: a changed
+// passage in the source does not ask for its placement again, until it is restored.
+void ReviewStoreTest::retiredCardKeepsItsPassageAndPlacement()
+{
+    QTemporaryDir root;
+    QTemporaryDir sync;
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString path = root.filePath(relative);
+    QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::WriteOnly));
+    const QByteArray text = QStringLiteral("\\ReviewCardMaskStart{%1}{0}%\nAn answer edited since.\n\\ReviewCardMaskEnd{%1}{0}%\n").arg(id).toUtf8();
+    QCOMPARE(source.write(text), text.size());
+    source.close();
+    auto card = reviewCard(id, QStringLiteral("paper"), QString(64, QLatin1Char('a')));
+    auto primary = card.value(QStringLiteral("primary")).toObject();
+    const QJsonObject retiredAnchor{{QStringLiteral("version"), 2}, {QStringLiteral("kind"), QStringLiteral("source_markers")},
+                                    {QStringLiteral("segments"), QJsonArray{QJsonObject{{QStringLiteral("segment_id"), QStringLiteral("0")},
+                                                                                        {QStringLiteral("source_file"), relative},
+                                                                                        {QStringLiteral("content_sha256"), QString(64, QLatin1Char('f'))}}}}};
+    primary.insert(QStringLiteral("source_anchor"), retiredAnchor);
+    card.insert(QStringLiteral("primary"), primary);
+    card.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("succeeded")}});
+    auto scanned = Okular::DocsCommentSynchronizer::sourceCommentFileIndex(path, {});
+    QVERIFY(scanned.value(QStringLiteral("valid")).toBool());
+    scanned.insert(QStringLiteral("project"), QStringLiteral("docs-test"));
+    const QJsonObject files{{relative, scanned}};
+    Thoughts::installSourceLocationIndex(root.path(), {{QStringLiteral("schema_version"), 1},
+        {QStringLiteral("files"), files}, {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), true}}}}, files);
+    const auto event = [&id](const QString &action, const QString &at) {
+        return QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                           {QStringLiteral("card_id"), id}, {QStringLiteral("queue_action"), action}, {QStringLiteral("reviewed_at"), at}};
+    };
+    const QJsonObject retire = event(QStringLiteral("retire"), QStringLiteral("2026-11-10T10:00:00.000Z"));
+    QJsonObject projection{{QStringLiteral("review_card\ncards\n") + id, card},
+                           {QStringLiteral("review_event\nevents\n") + retire.value(QStringLiteral("event_id")).toString(), retire}};
+    ReviewStore store(root.path(), [&projection]() { return projection; }, sync.path());
+    auto current = store.cards();
+    QCOMPARE(current.size(), 1);
+    QVERIFY(current.first().schedule.retired);
+    QCOMPARE(current.first().record.value(QStringLiteral("primary")).toObject().value(QStringLiteral("source_anchor")).toObject(), retiredAnchor);
+    QCOMPARE(current.first().record.value(QStringLiteral("reanchor")).toObject().value(QStringLiteral("state")).toString(), QStringLiteral("succeeded"));
+    // Restored to review: its changed passage waits for its place in the PDF again.
+    const QJsonObject restore = event(QStringLiteral("restore"), QStringLiteral("2026-11-11T10:00:00.000Z"));
+    projection.insert(QStringLiteral("review_event\nevents\n") + restore.value(QStringLiteral("event_id")).toString(), restore);
+    current = store.cards();
+    QVERIFY(!current.first().schedule.retired);
+    QVERIFY(current.first().record.value(QStringLiteral("primary")).toObject().value(QStringLiteral("source_anchor")).toObject() != retiredAnchor);
+    QCOMPARE(current.first().record.value(QStringLiteral("reanchor")).toObject().value(QStringLiteral("reason")).toString(), QStringLiteral("pdf_placement_pending"));
 }
 
 void ReviewStoreTest::severalPassagesAndOlderCardsStayAvailable()
@@ -4824,6 +4884,59 @@ const QList<QList<LinkedDocument::Line>> fourParagraphPages {
     {{QStringLiteral("Golf hotel india."), 7, 100}, {QStringLiteral("Juliet kilo lima."), 9, 200}}};
 }
 
+void ReviewStoreTest::areasIgnoreRunningHeadersFootersAndPageNumbers()
+{
+    // Every page shows a running header and a page number from the page layout. SyncTeX ties
+    // them to the line TeX was reading at the page break; one header word ("Closing") even
+    // occurs on that line of page 2. They are not the answer's text.
+    const QByteArray source("\\documentclass{article}\n\\begin{document}\nOpening sentence of the note.\nThe card starts on this line.\n"
+                            "The card ends on the next page.\nClosing sentence after the card.\n\\end{document}\n");
+    const QString header = QStringLiteral("Notes | Closing words | notes.tex November 13, 2026");
+    const QList<QList<LinkedDocument::Line>> pages {
+        {{header, 5, 40}, {QStringLiteral("Opening sentence of the note."), 3, 300}, {QStringLiteral("The card starts on this line."), 4, 320},
+         {QStringLiteral("1"), 5, 800}},
+        {{header, 6, 40}, {QStringLiteral("The card ends on the next page."), 5, 100}, {QStringLiteral("Closing sentence after the card."), 6, 120},
+         {QStringLiteral("2"), 7, 800}},
+        {{header, 7, 40}, {QStringLiteral("3"), 7, 800}}};
+    QTemporaryDir dir;
+    LinkedDocument doc;
+    QVERIFY(doc.build(dir.path(), source, pages));
+    const auto span = [](double from, double to) { return QRectF(QPointF(0.0, from / 842.0), QPointF(1.0, to / 842.0)); };
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // Across the page break: the bottom of page 1 with its page number, the top of page 2 with its header.
+    auto plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, span(302, 812)}, {2, span(22, 108)}}, id);
+    QVERIFY2(plan.error.isEmpty(), qPrintable(plan.error));
+    QCOMPARE(plan.replacement, markReviewSourceRanges(doc.sourceId, source, {{4, 4}, {5, 5}}, id).replacement);
+    QCOMPARE(plan.regions.size(), 2);
+    const QString answer = plan.answerAnchor.value(QStringLiteral("normalized_text")).toString();
+    QVERIFY2(answer.contains(QStringLiteral("The card starts on this line.")) && answer.contains(QStringLiteral("The card ends on the next page."))
+                 && !answer.contains(QStringLiteral("November")) && !answer.contains(QStringLiteral("Notes")), qPrintable(answer));
+    // One area that also takes in the header above its first line.
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{2, span(22, 128)}}, id);
+    QVERIFY2(plan.error.isEmpty(), qPrintable(plan.error));
+    QCOMPARE(plan.replacement, markReviewSourceRanges(doc.sourceId, source, {{5, 6}}, id).replacement);
+    // One area that also takes in the page number below its last line.
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, span(282, 812)}}, id);
+    QVERIFY2(plan.error.isEmpty(), qPrintable(plan.error));
+    QCOMPARE(plan.replacement, markReviewSourceRanges(doc.sourceId, source, {{3, 4}}, id).replacement);
+    // Only the header: nothing of the note to link, and the message says why.
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{2, span(22, 48)}}, id);
+    QVERIFY2(plan.error.contains(QStringLiteral("it holds only the page's running header, footer or page number (“Notes | Closing words | notes.tex November 13, 2026”)")),
+             qPrintable(plan.error));
+    QCOMPARE(plan.failedArea, 0);
+    QVERIFY(plan.replacement.isEmpty());
+    // Text the neighbouring pages do not repeat is the note's, even at the top of a page: an
+    // unmappable first line keeps its refusal.
+    const QList<QList<LinkedDocument::Line>> once {
+        {{QStringLiteral("Opening sentence of the note."), 3, 40}, {QStringLiteral("The card starts on this line."), 4, 60}},
+        {{QStringLiteral("Unrelated words nowhere in the source."), 5, 40}, {QStringLiteral("Closing sentence after the card."), 6, 60}}};
+    QTemporaryDir otherDir;
+    LinkedDocument other;
+    QVERIFY(other.build(otherDir.path(), source, once));
+    plan = planReviewSourceAnchors(otherDir.path(), other.bundle, other.pdfPath, other.pdfSha, {{2, span(22, 68)}}, id);
+    QVERIFY2(plan.error.contains(QStringLiteral("could not be mapped safely")), qPrintable(plan.error));
+}
+
 void ReviewStoreTest::severalAreasOnTwoPagesMarkOneSegmentEach()
 {
     QTemporaryDir dir;
@@ -5101,7 +5214,8 @@ struct MergeFixture {
         primary.insert(QStringLiteral("page_visual_sha256"), pageVisual);
         primary.insert(QStringLiteral("answer_anchor"), QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("normalized_text"), answer},
             {QStringLiteral("text_sha256"), QString::fromLatin1(QCryptographicHash::hash(answer.toUtf8(), QCryptographicHash::Sha256).toHex())}});
-        primary.insert(QStringLiteral("source_anchor"), readReviewSourceAnchor(relative, source, id).anchor);
+        // Read as the server reads it, pending proposals in the passages included.
+        primary.insert(QStringLiteral("source_anchor"), readReviewSourceAnchor(relative, source, id, true).anchor);
         record.insert(QStringLiteral("primary"), primary);
         projection.insert(QStringLiteral("review_card\ncards\n") + id, record);
     }
@@ -5567,6 +5681,272 @@ void ReviewStoreTest::mergeOfARealSourceCopy()
     QFile output(path + QStringLiteral(".merged"));
     QVERIFY(output.open(QIODevice::WriteOnly));
     output.write(plan.replacement);
+}
+
+// ---------------------------------------------------------------- merging around pending proposals
+namespace {
+// Two cards: lines 4-7 and 9-11 of the plain note.
+const QByteArray proposalNote(
+    "\\documentclass{article}\n" // 1
+    "\\begin{document}\n"        // 2
+    "Opening line.\n"            // 3
+    "First claim.\n"             // 4
+    "Second claim.\n"            // 5
+    "Third claim.\n"             // 6
+    "Fourth claim.\n"            // 7
+    "Middle paragraph.\n"        // 8
+    "Other answer.\n"            // 9
+    "Another answer line.\n"     // 10
+    "Last answer line.\n"        // 11
+    "Closing.\n"                 // 12
+    "\\end{document}\n");        // 13
+
+// A pending agent proposal as the writers write it.
+QByteArray pendingWrapper(const QString &id, const QString &original, const QString &replacement, bool markdown = false)
+{
+    AgentProposedEdit proposal;
+    proposal.id = id;
+    proposal.createdAt = QStringLiteral("2026-11-13T10:00:00.000Z");
+    proposal.conversationId = QStringLiteral("0b6c5b7e-1d2a-4c3b-9f8e-112233445566");
+    proposal.explanation = QStringLiteral("Clearer.");
+    proposal.original = original;
+    proposal.replacement = replacement;
+    return (markdown ? formatMarkdownAgentProposal(proposal) : formatLatexAgentProposal(proposal)).toUtf8();
+}
+
+QString decided(const QString &path, const QByteArray &source, const QStringList &ids, const QString &action)
+{
+    QString result, code;
+    if (!decideAgentProposals(path, QString::fromUtf8(source), ids, action, &result, &code)) return QStringLiteral("refused:") + code;
+    return result;
+}
+
+bool markerLinesAlone(const QByteArray &source)
+{
+    static const QRegularExpression tex(QStringLiteral(R"(^\\ReviewCardMask(Start|End)\{[^}]+\}\{[0-9]+\}%$)"));
+    static const QRegularExpression markdown(QStringLiteral(R"(^<!-- thoughts:v1:(start|end) review:[0-9a-f-]+:answer:[0-9]+ -->$)"));
+    for (const QString &line : QString::fromUtf8(source).split(QLatin1Char('\n'))) {
+        if (line.contains(QLatin1String("ReviewCardMask")) && !tex.match(line).hasMatch()) return false;
+        if (line.contains(QLatin1String("thoughts:v1:")) && !markdown.match(line).hasMatch()) return false;
+    }
+    return true;
+}
+
+// The source without any card marker line: what the merge must leave alone.
+QByteArray withoutMarkerLines(const QByteArray &source)
+{
+    QList<QByteArray> kept;
+    for (const QByteArray &line : source.split('\n'))
+        if (!line.startsWith("\\ReviewCardMask") && !line.startsWith("<!-- thoughts:v1:")) kept.append(line);
+    return kept.join('\n');
+}
+
+struct ProposalMerge {
+    QString first, second;
+    QByteArray pending, merged;
+    QString error;
+};
+
+// Marks the two cards of @p note (first on @p firstLines, second on @p secondLines), makes the
+// edits @p edits of the marked source (each text must occur once), and merges the cards, keeping the first.
+ProposalMerge mergeAroundProposals(const QString &directory, const QString &relative, const QByteArray &note, QPair<int, int> firstLines,
+                                   QPair<int, int> secondLines, const QList<std::function<QByteArray(const QString &, const QString &, const QByteArray &)>> &edits)
+{
+    ProposalMerge result;
+    MergeFixture doc;
+    if (!doc.start(directory, relative, note)) return result;
+    result.first = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    result.second = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (!doc.mark(result.second, {secondLines}) || !doc.mark(result.first, {firstLines})) return result;
+    for (const auto &edit : edits) doc.source = edit(result.first, result.second, doc.source);
+    result.pending = doc.source;
+    if (!doc.save()) return result;
+    // The records as the server keeps them while the proposals are pending: placed on this version.
+    doc.card(result.first, QStringLiteral("First?"), mergeRegions({0.1}), QString(64, QLatin1Char('c')), QStringLiteral("First"));
+    doc.card(result.second, QStringLiteral("Second?"), mergeRegions({0.5}), QString(64, QLatin1Char('d')), QStringLiteral("Second"));
+    auto store = doc.store();
+    const auto cards = store->cards();
+    if (!store->mergeCards({cardWithId(cards, result.first), cardWithId(cards, result.second)}, result.first, QStringLiteral("Both?"), {}, &result.error))
+        return result;
+    result.merged = doc.current();
+    return result;
+}
+
+// Replaces the one occurrence of @p from.
+std::function<QByteArray(const QString &, const QString &, const QByteArray &)> replacing(const QByteArray &from, const QByteArray &to)
+{
+    return [from, to](const QString &, const QString &, const QByteArray &source) {
+        return source.count(from) == 1 ? QByteArray(source).replace(from, to) : QByteArray("edit not found: " + from);
+    };
+}
+}
+
+void ReviewStoreTest::mergingCardsKeepsPendingProposalsInsideTheirPassages()
+{
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString edit = QStringLiteral("agent-11111111-2222-4333-8444-555555555555");
+    const QString tail = QStringLiteral("agent-22222222-3333-4444-8555-666666666666");
+    const QString drop = QStringLiteral("agent-33333333-4444-4555-8666-777777777777");
+    const QString added = QStringLiteral("agent-44444444-5555-4666-8777-888888888888");
+    struct Case { const char *name; QList<std::function<QByteArray(const QString &, const QString &, const QByteArray &)>> edits; QStringList ids; };
+    const QList<Case> cases {
+        // A replacement in the middle of the first card.
+        {"replacement inside", {replacing("Second claim.\n", pendingWrapper(edit, QStringLiteral("Second claim.\n"), QStringLiteral("Sharper second claim.\n")))}, {edit}},
+        // Both cards: the first card's last line replaced and the second card's last line deleted,
+        // laid out beside their end markers (the line break outside the wrapper).
+        {"both cards, beside the end markers",
+         {replacing("Fourth claim.\n", pendingWrapper(tail, QStringLiteral("Fourth claim."), QStringLiteral("Sharper fourth claim.")) + "\n"),
+          replacing("Another answer line.\nLast answer line.\n",
+                    "Another answer line." + pendingWrapper(drop, QStringLiteral("\nLast answer line."), QString()) + "\n")},
+         {tail, drop}},
+        // An insertion before the first card's end marker, and a replacement in it.
+        {"insertion beside the end marker",
+         {replacing("Fourth claim.\n", "Fourth claim." + pendingWrapper(added, QString(), QStringLiteral("\nFifth claim.")) + "\n"),
+          replacing("Second claim.\n", pendingWrapper(edit, QStringLiteral("Second claim.\n"), QStringLiteral("Sharper second claim.\n")))},
+         {added, edit}},
+    };
+    for (const Case &test : cases) {
+        QTemporaryDir dir;
+        const auto merge = mergeAroundProposals(dir.path(), relative, proposalNote, {4, 7}, {9, 11}, test.edits);
+        QVERIFY2(!merge.pending.contains("edit not found"), test.name);
+        QVERIFY2(merge.error.isEmpty() && !merge.merged.isEmpty(), qPrintable(QStringLiteral("%1: %2").arg(QLatin1String(test.name), merge.error)));
+        // Only marker lines changed; every wrapper is there, byte for byte, and still pending.
+        QCOMPARE(withoutMarkerLines(merge.merged), withoutMarkerLines(merge.pending));
+        const auto before = parseAgentProposals(relative, QString::fromUtf8(merge.pending));
+        const auto after = parseAgentProposals(relative, QString::fromUtf8(merge.merged));
+        QCOMPARE(after.proposals.size(), test.ids.size());
+        QVERIFY(after.issues.isEmpty());
+        for (const auto &proposal : before.proposals)
+            QCOMPARE(merge.merged.count(merge.pending.mid(QString::fromUtf8(merge.pending).left(proposal.offset).toUtf8().size(),
+                                                          QString::fromUtf8(merge.pending).mid(proposal.offset, proposal.length).toUtf8().size())), 1);
+        QVERIFY2(markerLinesAlone(merge.merged), merge.merged.constData());
+        QVERIFY(!merge.merged.contains(merge.second.toUtf8()));
+        QCOMPARE(merge.merged.count(QByteArray("\\ReviewCardMaskStart{" + merge.first.toUtf8() + "}")), 2);
+        // Deciding a proposal after the merge gives what deciding it before would have, merged.
+        const QHash<QString, QSet<QString>> segments {{merge.first, {QStringLiteral("0")}}, {merge.second, {QStringLiteral("0")}}};
+        for (const QString &id : test.ids) {
+            for (const QString action : {QStringLiteral("accept"), QStringLiteral("reject")}) {
+                const QString beforeMerge = decided(relative, merge.pending, {id}, action);
+                const auto expected = planReviewCardMergeSource(relative, beforeMerge.toUtf8(), merge.first, {merge.second}, segments);
+                QVERIFY2(expected.error.isEmpty(), qPrintable(expected.error));
+                QCOMPARE(decided(relative, merge.merged, {id}, action).toUtf8(), expected.replacement);
+            }
+        }
+        // All decided: an ordinary card with two passages.
+        for (const QString action : {QStringLiteral("accept"), QStringLiteral("reject")}) {
+            const QByteArray settled = decided(relative, merge.merged, test.ids, action).toUtf8();
+            const auto anchor = readReviewSourceAnchor(relative, settled, merge.first);
+            QVERIFY2(anchor.error.isEmpty(), qPrintable(anchor.error));
+            QCOMPARE(anchor.anchor.value(QStringLiteral("segments")).toArray().size(), 2);
+            QCOMPARE(settled, planReviewCardMergeSource(relative, decided(relative, merge.pending, test.ids, action).toUtf8(), merge.first, {merge.second}, segments).replacement);
+        }
+    }
+    // Markdown: a pending proposal block inside the second card's passage.
+    QTemporaryDir dir;
+    const QByteArray note("# Title\n\nFirst answer paragraph.\n\nMiddle paragraph.\n\nSecond answer paragraph.\n\nEnd.\n");
+    const auto merge = mergeAroundProposals(dir.path(), QStringLiteral("docs-test/notes.md"), note, {3, 3}, {7, 7},
+        {replacing("Second answer paragraph.\n", pendingWrapper(edit, QStringLiteral("Second answer paragraph.\n"), QStringLiteral("Sharper paragraph.\n"), true))});
+    QVERIFY2(merge.error.isEmpty() && !merge.merged.isEmpty(), qPrintable(merge.error));
+    QCOMPARE(withoutMarkerLines(merge.merged), withoutMarkerLines(merge.pending));
+    QVERIFY(markerLinesAlone(merge.merged));
+    QCOMPARE(parseAgentProposals(QStringLiteral("docs-test/notes.md"), QString::fromUtf8(merge.merged)).proposals.size(), 1);
+}
+
+void ReviewStoreTest::mergingCardsRefusesAProposalThatHoldsACardMarker()
+{
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString id = QStringLiteral("agent-55555555-6666-4777-8888-999999999999");
+    const QString first = QUuid::createUuid().toString(QUuid::WithoutBraces), second = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QByteArray marked = markReviewSourceRanges(relative, proposalNote, {{9, 11}}, second).replacement;
+    marked = markReviewSourceRanges(relative, marked, {{4, 7}}, first).replacement;
+    const QHash<QString, QSet<QString>> segments {{first, {QStringLiteral("0")}}, {second, {QStringLiteral("0")}}};
+    const QHash<QString, QString> names {{first, QStringLiteral("First?")}, {second, QStringLiteral("Second?")}};
+    const QByteArray end = "\\ReviewCardMaskEnd{" + first.toUtf8() + "}{0}%\n";
+    // A proposal over the first card's last line and its end marker: it starts inside the passage and ends outside it.
+    const QByteArray held = "Fourth claim.\n" + end + "Middle paragraph.\n";
+    QVERIFY(marked.count(held) == 1);
+    const QByteArray straddle = QByteArray(marked).replace(held, pendingWrapper(id, QString::fromUtf8(held),
+        QStringLiteral("Fourth claim, rewritten.\n") + QString::fromUtf8(end) + QStringLiteral("Middle paragraph.\n")));
+    auto plan = planReviewCardMergeSource(relative, straddle, first, {second}, segments, names);
+    // Line 10: the wrapper's explanation takes a line of its own before the end marker.
+    QVERIFY2(plan.error.contains(QStringLiteral("The marker of card “First?” on line 10 of %1 lies inside the pending proposal %2 (lines 8-15)").arg(relative, id))
+                 && plan.error.contains(QStringLiteral("Decide or withdraw that proposal first")), qPrintable(plan.error));
+    QVERIFY(plan.replacement.isEmpty());
+    // The end marker only in the proposed text: rejecting would drop it, so this is refused too.
+    // (The server's merge goes ahead here and leaves the marker inside the proposal.)
+    const QByteArray ending = "Fourth claim.\n" + end;
+    const QByteArray inReplacement = QByteArray(marked).replace(ending, pendingWrapper(id, QStringLiteral("Fourth claim.\n"),
+        QStringLiteral("Rewritten.\n") + QString::fromUtf8(end)));
+    plan = planReviewCardMergeSource(relative, inReplacement, first, {second}, segments, names);
+    QVERIFY2(plan.error.contains(QStringLiteral("lies inside the pending proposal %1").arg(id)), qPrintable(plan.error));
+    // A wrapper written before 13 November, whose closing brace sits on the end marker's line.
+    const QByteArray shared = QByteArray(marked).replace("Fourth claim.\n", pendingWrapper(id, QStringLiteral("Fourth claim.\n"), QStringLiteral("Sharper fourth claim.\n")));
+    plan = planReviewCardMergeSource(relative, shared, first, {second}, segments, names);
+    QVERIFY2(plan.error.contains(QStringLiteral("The marker of card “First?” on line 11 of %1 shares its line with the pending proposal %2").arg(relative, id)),
+             qPrintable(plan.error));
+    // The same proposal laid out as it is now leaves the marker alone, and the cards merge.
+    const QByteArray beside = QByteArray(marked).replace("Fourth claim.\n", QByteArray(pendingWrapper(id, QStringLiteral("Fourth claim."), QStringLiteral("Sharper fourth claim.")) + "\n"));
+    plan = planReviewCardMergeSource(relative, beside, first, {second}, segments, names);
+    QVERIFY2(plan.error.isEmpty(), qPrintable(plan.error));
+    QCOMPARE(withoutMarkerLines(plan.replacement), withoutMarkerLines(beside));
+}
+
+void ReviewStoreTest::mergingCardsWhosePassageHoldsADefinition()
+{
+    // A card's passage holds a definition an agent added for a figure: the card exists and builds,
+    // and a merge only moves markers, so it is no obstacle. A new card may not start on it.
+    QTemporaryDir dir;
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    const QByteArray definition = "\\providecommand{\\captionlabel}[1]{\\expandafter\\def\\csname @captype\\endcsname{#1}\\caption}\n";
+    const QByteArray note = QByteArray(proposalNote).replace("Third claim.\n", QByteArray("Third claim.\n" + definition));
+    QCOMPARE(note.count(definition), 1);
+    const auto created = markReviewSourceRanges(relative, note, {{4, 8}}, QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QCOMPARE(created.error, QStringLiteral("Line 7 holds a definition (\\providecommand), which the PDF does not show; select the passage without it."));
+    for (const char *other : {"\\DeclareRobustCommand{\\shortname}{x}\n", "\\newcommand{\\shortname}{x}\n", "\\def\\shortname{x}\n"}) {
+        const QByteArray text = QByteArray(proposalNote).replace("Third claim.\n", QByteArray(QByteArray("Third claim.\n") + other));
+        QVERIFY2(markReviewSourceRanges(relative, text, {{4, 8}}, QUuid::createUuid().toString(QUuid::WithoutBraces)).error.contains(QStringLiteral("holds a definition")), other);
+    }
+    // The cards exist already (marked before the line was added); merging them moves only markers.
+    const auto merge = mergeAroundProposals(dir.path(), relative, proposalNote, {4, 7}, {9, 11},
+                                            {replacing("Third claim.\n", QByteArray("Third claim.\n" + definition))});
+    QVERIFY2(merge.error.isEmpty() && !merge.merged.isEmpty(), qPrintable(merge.error));
+    QCOMPARE(withoutMarkerLines(merge.merged), withoutMarkerLines(merge.pending));
+    QVERIFY(merge.merged.contains(QByteArray("Third claim.\n" + definition + "Fourth claim.\n\\ReviewCardMaskEnd{" + merge.first.toUtf8() + "}{0}%\n")));
+    const auto anchor = readReviewSourceAnchor(relative, merge.merged, merge.first);
+    QVERIFY2(anchor.error.isEmpty(), qPrintable(anchor.error));
+    QCOMPARE(anchor.anchor.value(QStringLiteral("segments")).toArray().size(), 2);
+}
+
+void ReviewStoreTest::mergeRefusalsNameTheLineAndTheProblem()
+{
+    const QString path = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString card = QStringLiteral("6f1c2a0e-3b4d-4c5e-8f60-718293a4b5c6");
+    const QString other = QStringLiteral("7a2d3b1f-4c5e-4d6f-9a71-8293a4b5c6d7");
+    const auto start = [&card](int n) { return QStringLiteral("\\ReviewCardMaskStart{%1}{%2}%").arg(card).arg(n); };
+    const auto end = [&card](int n) { return QStringLiteral("\\ReviewCardMaskEnd{%1}{%2}%").arg(card).arg(n); };
+    const auto problem = [&](const QStringList &lines) { return reviewCardMarkerProblem(path, lines.join(QLatin1Char('\n')).toUtf8() + "\n", card, QStringLiteral("What is it?")); };
+    QCOMPARE(problem({QStringLiteral("Intro."), start(0), QStringLiteral("Answer."), end(0)}), QString());
+    QString text = problem({QStringLiteral("Intro."), start(0), QStringLiteral("Answer.")});
+    QVERIFY2(text.contains(QStringLiteral("Line 2 of %1 starts passage 0 of card “What is it?”, which has no end marker").arg(path)), qPrintable(text));
+    text = problem({start(0), QStringLiteral("Answer."), start(1), QStringLiteral("More."), end(1), end(0)});
+    QVERIFY2(text.contains(QStringLiteral("Line 3")) && text.contains(QStringLiteral("inside its passage 0, which opens on line 1")), qPrintable(text));
+    text = problem({QStringLiteral("Answer."), end(0)});
+    QVERIFY2(text.contains(QStringLiteral("Line 2")) && text.contains(QStringLiteral("no start marker")), qPrintable(text));
+    text = problem({start(0), QStringLiteral("Answer. ") + end(0)});
+    QVERIFY2(text.contains(QStringLiteral("line 2")) && text.contains(QStringLiteral("shares its line with other text")), qPrintable(text));
+    text = problem({start(1), QStringLiteral("Answer."), end(1)});
+    QVERIFY2(text.contains(QStringLiteral("numbered 0, 1")), qPrintable(text));
+    text = problem({start(0), QStringLiteral(""), end(0)});
+    QVERIFY2(text.contains(QStringLiteral("is empty")), qPrintable(text));
+    text = problem({QStringLiteral("%% see ") + card, start(0), QStringLiteral("Answer."), end(0)});
+    QVERIFY2(text.contains(QStringLiteral("Line 1")) && text.contains(QStringLiteral("outside its markers")), qPrintable(text));
+    QVERIFY(problem({QStringLiteral("Intro.")}).contains(QStringLiteral("are not in")));
+    // The planner names the card by its question and the problem precisely.
+    const QByteArray broken = (QStringList{start(0), QStringLiteral("Answer."), QStringLiteral("\\ReviewCardMaskStart{%1}{0}%").arg(other), QStringLiteral("Other."),
+                                           QStringLiteral("\\ReviewCardMaskEnd{%1}{0}%").arg(other)}.join(QLatin1Char('\n')) + QStringLiteral("\n")).toUtf8();
+    const auto plan = planReviewCardMergeSource(path, broken, card, {other}, {{card, {QStringLiteral("0")}}, {other, {QStringLiteral("0")}}},
+                                                {{card, QStringLiteral("What is it?")}, {other, QStringLiteral("And this?")}});
+    QVERIFY2(plan.error.contains(QStringLiteral("Line 1 of %1 starts passage 0 of card “What is it?”, which has no end marker").arg(path)), qPrintable(plan.error));
 }
 
 void ReviewStoreTest::htmlCardHasNoPdfGeometryAndWaitsForTheServer()

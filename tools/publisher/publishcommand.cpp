@@ -349,6 +349,11 @@ int publish(const ArgParse::Arguments &arguments, std::unique_ptr<ProgressReport
     }
     const FrozenInputs *frozenInputs = frozen ? &*frozen : nullptr;
 
+    // Which folder builds which PDF is asked for every PDF of this run, twice, and each
+    // answer read every Project file of the Library. Nothing up to the publication changes
+    // those files, so they are read once; they are read again after it (see below).
+    std::optional<RegisteredSourceTargetsScope> registry;
+    registry.emplace();
     progress.report(QStringLiteral("Preparing the managed source inventory."), phase(QStringLiteral("preparing")));
     qsizetype manifestCount;
     if (frozenInputs) {
@@ -477,10 +482,14 @@ int publish(const ArgParse::Arguments &arguments, std::unique_ptr<ProgressReport
         const qint64 count = publisher.adoptRemoteBases(QSet<QString>(adopted.cbegin(), adopted.cend()));
         progress.report(QStringLiteral("Adopted %1 explicit server source base(s).").arg(count), phase(QStringLiteral("preparing")));
     }
+    // The publication can install Project files the server changed.
+    registry.reset();
     const SourcePublisher::Report report = publisher.publishOnce();
     // The folders' HTML pages (protocol/html-pages.md 4): a page this computer added or changed goes to
     // Fedora's list, one Fedora added is installed before the build inputs below are read.
     const HtmlPageSync pages = syncHtmlPages(api, Py::resolve(root), statePath, htmlPageFolders(publisher.paths()));
+    // From here the sources on disk are final for this run.
+    registry.emplace();
     if (pages.changed() || !pages.errors.isEmpty()) {
         progress.report(QStringLiteral("HTML pages: %1 installed, %2 sent, %3 removed, %4 need attention.")
                             .arg(pages.installed.size()).arg(pages.uploaded.size()).arg(pages.removed.size()).arg(pages.errors.size()),
@@ -493,6 +502,10 @@ int publish(const ArgParse::Arguments &arguments, std::unique_ptr<ProgressReport
                                 {QStringLiteral("publication_id"), report.publicationId}});
     if (pages.reportable()) {
         output.insert(QStringLiteral("html_pages"), pages.toJson());
+    }
+    if (report.sourceTreeVerified) {
+        output.insert(QStringLiteral("source_tree_verified"),
+                      Json::object({{QStringLiteral("from"), Json(report.sourceTreeVerified->first)}, {QStringLiteral("through"), Json(report.sourceTreeVerified->second)}}));
     }
     QSet<QString> processedTargets;
     if (!targetText.isEmpty()) {

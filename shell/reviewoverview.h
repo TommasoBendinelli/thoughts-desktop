@@ -174,6 +174,15 @@ private:
     // the History is shown (it reads the PDF's text).
     void refreshBrowseHistory(const ReviewBrowserCard *item);
     void openHistoryVersion(int index);
+    // The answer still in effect listed at @p viewportPos of the History, if any.
+    QString historyAnswerAt(const QPoint &viewportPos) const;
+    // The History's right-click menu: its usual actions and, on an answer still in effect,
+    // "Take back this answer…".
+    void showHistoryMenu(const QPoint &viewportPos);
+    // Takes back the answer @p eventId of the History's card once confirmed: the retraction Undo
+    // writes (ReviewStore::retractRating), so the card's schedule and tags come from its other
+    // answers and every device agrees after Sync.
+    void takeBackHistoryAnswer(const QString &eventId);
     const ReviewBrowserCard *selectedBrowseCard() const;
     bool saveBrowseQuestion(bool reportFailure = true);
     void updateCachedBrowseQuestion(const QString &cardId, const QString &question);
@@ -255,6 +264,7 @@ private:
     };
     QList<HistoryVersion> m_browseHistoryVersions;
     QString m_browseHistoryCardId; // The card the History shows.
+    QStringList m_browseHistoryAnswers; // Per item of the History's list: the answer it can take back, or nothing.
     PdfVersions::Fetcher *m_versionFetcher = nullptr;
     quint64 m_versionRequest = 0; // A newer request (or another card) supersedes an older one.
     // feedback_ids not found in the answer of the current PDF, by card, PDF hash and records.
@@ -435,8 +445,29 @@ private:
     // and, when only the scan defers it, retry the reload until the scan finishes.
     void applyDeferredState();
     void buildUi();
-    void reloadDocumentFilter();
+    // The document filter lists @p stems (the documents with cards), keeping the one chosen.
+    void applyDocumentStems(QStringList stems);
+    // The dashboard's counts from the queue loaded here, the unavailable cards as last counted; a
+    // background refresh (requestQueueRefresh) brings the rest.
     void updateDueSummary();
+    // The review queue, the document filter and the counts are rebuilt off the GUI thread, from
+    // one reading of every card: Sync's refresh and the Library's reloads after it froze the
+    // window about 3 s each when this ran on it (13 Nov). Requests within a moment, or while one
+    // runs, become one; a result made for another card under review or another filter is not
+    // applied (the next one is).
+    struct QueueRefresh {
+        QString filter; // The document filter it was made for.
+        QString sessionCardId; // The card under review when it was asked for; empty outside a review.
+        QStringList stems;
+        QList<ReviewCard> due;
+        int unavailable = 0;
+        int cards = 0; // Read in the background, in durationMs.
+        qint64 durationMs = 0;
+    };
+    void requestQueueRefresh();
+    void startQueueRefresh();
+    void applyQueueRefresh(const QueueRefresh &result);
+    void displayQueueCounts(const QList<ReviewCard> &due, int unavailable);
     void showCurrentCard();
     void setSessionControlsVisible(bool visible);
     void attachSessionPanel();
@@ -500,6 +531,10 @@ private:
     bool m_countsShown = false;
     int m_displayedDue = 0;
     bool m_deferredRetryScheduled = false;
+    QTimer *m_queueRefreshTimer = nullptr;
+    bool m_queueRefreshRunning = false;
+    bool m_queueRefreshPending = false; // Asked for again while one ran.
+    int m_unavailableCount = 0; // As the last background refresh counted them.
     QString m_docsRoot;
     ReviewStore m_store;
     DocumentProvider m_documentProvider;
@@ -603,12 +638,29 @@ private:
         // A group was asked before the answer (a slider of a group asked before): only then is the
         // panel shown and the answer recorded in two steps, as on the phone.
         bool shown = false;
+        // Opened again with the pencil after the answer was shown (the phone's "Back to before
+        // step"), until the answer is shown again; answerShownAt keeps the first time.
+        bool reopened = false;
+        bool locked() const { return answerShownAt.isValid() && !reopened; }
     };
+    // showCurrentCard(), keeping @p kept when it is the before step of the card shown: the same
+    // card shown again (after Edit), or the step carried into the card a merge made of it.
+    void showCurrentCard(const BeforeStep &kept);
+    // The pencil by the before line: the answer is covered again and the before rows open on the
+    // picks made, until the answer is shown again (the phone's "Before: … · Tap to change").
+    void reopenBeforeStep();
+    // The before line as wide as the bar lets it be, on one line; its whole text is the tooltip.
+    void elideBeforeSummary();
     BeforeStep m_before;
     QWidget *m_beforePanel = nullptr;
     QWidget *m_beforeGroups = nullptr; // The groups' sliders, rebuilt with the groups.
     QPlainTextEdit *m_beforeNote = nullptr;
-    QLabel *m_beforeSummary = nullptr; // "Before: Meh · Partly recalled — note", once locked.
+    // Once the answer is shown, the bar's line under the question: "Recall: Partly recalled ·
+    // Feeling: OK — note…" ("Before: not rated" without picks), then the pencil.
+    QWidget *m_beforeSummaryRow = nullptr;
+    QLabel *m_beforeSummary = nullptr;
+    QString m_beforeSummaryText; // m_beforeSummary's text before it is elided.
+    QToolButton *m_beforeEditButton = nullptr;
     QLabel *m_predictionLine = nullptr; // "Agent predicted: …", once locked.
     // The agent's recall predictions of this due session, by card ID: asked once per card.
     struct RecallPrediction {

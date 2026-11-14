@@ -167,6 +167,36 @@ void ThoughtsCommandProtocolTest::separatesBuildFailureFromSourceSync()
     QCOMPARE(warning.value(QStringLiteral("operation_id")).toString(), QStringLiteral("operation"));
     QVERIFY(!warning.value(QStringLiteral("message")).toString().isEmpty());
 
+    // Since Sync no longer waits for the server's builds, the same situation is a
+    // succeeded Sync with a warning. The proposal commands get the same warning from it.
+    QJsonObject warned = operation(QStringLiteral("succeeded"), QString());
+    warned.insert(QStringLiteral("warning_code"), QStringLiteral("pdf_build_failed"));
+    warned.insert(QStringLiteral("warning_message"), QStringLiteral("PDF build failed\nYour changes are synced with the server.\npaper.pdf: latex_error"));
+    const QJsonObject succeededWithWarning = Thoughts::syncCommandOperationResult(warned);
+    QCOMPARE(succeededWithWarning.value(QStringLiteral("state")).toString(), QStringLiteral("succeeded"));
+    QVERIFY(succeededWithWarning.value(QStringLiteral("terminal")).toBool());
+    QVERIFY(!succeededWithWarning.contains(QStringLiteral("failure_code")));
+    QVERIFY(!succeededWithWarning.contains(QStringLiteral("error_code")));
+    QCOMPARE(succeededWithWarning.value(QStringLiteral("warning_code")).toString(), QStringLiteral("pdf_build_failed"));
+    QVERIFY(succeededWithWarning.value(QStringLiteral("warning")).toString().contains(QStringLiteral("latex_error")));
+    QVERIFY(Thoughts::syncCommandSourcesSynced(succeededWithWarning));
+    QCOMPARE(Thoughts::syncCommandExitCode(succeededWithWarning), 0);
+    const QJsonObject succeededWarning = Thoughts::syncCommandBuildWarning(succeededWithWarning, QStringLiteral("before"));
+    QCOMPARE(succeededWarning.value(QStringLiteral("code")).toString(), QStringLiteral("pdf_build_failed"));
+    QCOMPARE(succeededWarning.value(QStringLiteral("sync")).toString(), QStringLiteral("before"));
+    QCOMPARE(succeededWarning.value(QStringLiteral("operation_id")).toString(), QStringLiteral("operation"));
+    QVERIFY(succeededWarning.value(QStringLiteral("message")).toString().contains(QStringLiteral("latex_error")));
+    // The same keys as the warning of the failed form.
+    QCOMPARE(succeededWarning.keys(), warning.keys());
+    // A warning belongs to a Sync that succeeded: a failed or running one reports none.
+    for (const QString &status : {QStringLiteral("failed"), QStringLiteral("running")}) {
+        QJsonObject other = warned;
+        other.insert(QStringLiteral("status"), status);
+        other.insert(QStringLiteral("phase"), status);
+        QVERIFY(!Thoughts::syncCommandOperationResult(other).contains(QStringLiteral("warning_code")));
+        QVERIFY(Thoughts::syncCommandBuildWarning(Thoughts::syncCommandOperationResult(other), QStringLiteral("before")).isEmpty());
+    }
+
     for (const QString &code : {QStringLiteral("sync_failed"), QString()}) {
         const QJsonObject failed = Thoughts::syncCommandOperationResult(operation(QStringLiteral("failed"), code));
         QVERIFY(!failed.value(QStringLiteral("sources_synced")).toBool());

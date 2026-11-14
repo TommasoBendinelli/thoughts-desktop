@@ -32,6 +32,7 @@ set(okular_SRCS
    reviewcardmerge.cpp
    shell.cpp
    shellutils.cpp
+   syncjournal.cpp
    thoughtscommandprotocol.cpp
    todocommands.cpp
    updatecheck.cpp

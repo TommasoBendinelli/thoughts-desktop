@@ -24,6 +24,8 @@
 
 #include <QCryptographicHash>
 #include <QDir>
+#include <QThread>
+#include <atomic>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
@@ -288,14 +290,23 @@ bool writeJson(const QString &path, const QJsonObject &object, QString *error)
     return true;
 }
 
+// The parsed JSON files kept in memory, by the memory they take. One entry per
+// file: a file that is written again replaces its earlier version here instead
+// of leaving it behind (the source index is rewritten with every Sync).
+constexpr qint64 KeptObjectBytesLimit = 16 * 1024 * 1024;
+
 QJsonObject readObject(const QString &path, QString *error)
 {
+    struct KeptObject {
+        QString identity;
+        QJsonObject object;
+    };
     static QMutex mutex;
-    static QCache<QString, QJsonObject> cache(16 * 1024);
+    static QCache<QString, KeptObject> cache(KeptObjectBytesLimit);
     const QString identity = artifactFileIdentity(path);
     {
         QMutexLocker lock(&mutex);
-        if (const auto *cached = cache.object(identity)) return *cached;
+        if (const auto *cached = cache.object(path); cached && !identity.isEmpty() && cached->identity == identity) return cached->object;
     }
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -315,7 +326,7 @@ QJsonObject readObject(const QString &path, QString *error)
     const QJsonObject result = document.object();
     if (!identity.isEmpty() && artifactFileIdentity(path) == identity) {
         QMutexLocker lock(&mutex);
-        cache.insert(identity, new QJsonObject(result), qMax(1, int(file.size() / 1024)));
+        cache.insert(path, new KeptObject {identity, result}, qMax<qsizetype>(1, file.size() * ParsedJsonHeapFactor));
     }
     return result;
 }
@@ -2157,8 +2168,10 @@ QHash<QString, QJsonObject> ReviewStore::feedbackHomeCards(const QString &cardId
     }
     QHash<QString, QJsonObject> result;
     if (homes.isEmpty()) return result;
-    for (const ReviewCard &card : cards()) {
-        if (homes.contains(card.id()) && feedbackCardExists(card)) result.insert(card.id(), card.record);
+    // Only those cards are built: building every card took a second each time a review card was
+    // shown (13 Nov).
+    for (const ReviewCard &card : cardsWithIds(homes)) {
+        if (feedbackCardExists(card)) result.insert(card.id(), card.record);
     }
     return result;
 }
@@ -2493,9 +2506,32 @@ ReviewSchedule ReviewStore::nextSchedule(const ReviewSchedule &previous,
     return reviewSchedule(reviewInterval(rating));
 }
 
+namespace
+{
+std::atomic<quint64> guiThreadFullCardLoads{0};
+}
+
+quint64 ReviewStore::guiThreadFullLoads()
+{
+    return guiThreadFullCardLoads.load();
+}
+
 QList<ReviewCard> ReviewStore::cards(QStringList *errors, const QString &pdfStem) const
 {
-    const QList<QJsonObject> cardRecords = records(QStringLiteral("review_card"), QStringLiteral("cards"), QStringLiteral("card_id"), errors, pdfStem);
+    if (pdfStem.isEmpty() && QThread::isMainThread()) ++guiThreadFullCardLoads;
+    return loadCards(errors, pdfStem, nullptr);
+}
+
+QList<ReviewCard> ReviewStore::cardsWithIds(const QSet<QString> &cardIds, QStringList *errors) const
+{
+    if (cardIds.isEmpty()) return {};
+    return loadCards(errors, {}, &cardIds);
+}
+
+QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdfStem, const QSet<QString> *onlyIds) const
+{
+    QList<QJsonObject> cardRecords = records(QStringLiteral("review_card"), QStringLiteral("cards"), QStringLiteral("card_id"), errors, pdfStem);
+    if (onlyIds) cardRecords.removeIf([onlyIds](const QJsonObject &record) { return !onlyIds->contains(objectString(record, QStringLiteral("card_id"))); });
     QSet<QString> cardIds;
     for (const auto &record : cardRecords) cardIds.insert(objectString(record, QStringLiteral("card_id")));
     // Events and tag merges come from one snapshot; each provider call rebuilds every projection.
@@ -2503,7 +2539,7 @@ QList<ReviewCard> ReviewStore::cards(QStringList *errors, const QString &pdfStem
     const QJsonObject *shared = m_projectionProvider ? &snapshot : nullptr;
     QList<QJsonObject> allEvents = records(QStringLiteral("review_event"), QStringLiteral("events"), QStringLiteral("event_id"), errors, {}, shared);
     allEvents.removeIf(isInferredSourceDeletion);
-    if (!pdfStem.isEmpty()) allEvents.removeIf([&](const QJsonObject &event) {
+    if (!pdfStem.isEmpty() || onlyIds) allEvents.removeIf([&](const QJsonObject &event) {
         return !cardIds.contains(objectString(event, QStringLiteral("card_id")));
     });
     // History includes queue actions; scheduling deliberately folds only review marks.
@@ -2537,11 +2573,14 @@ QList<ReviewCard> ReviewStore::cards(QStringList *errors, const QString &pdfStem
             continue;
         }
         if (record.value(QStringLiteral("deleted")).toBool() || objectString(record, QStringLiteral("status")) == QLatin1String("candidate")) continue;
+        // A retired card stays on the PDF version it was retired on, with its passage
+        // as it was then: no source scan moves it (thoughts-server protocol/review-card-retire.md 5).
+        const bool retired = retirements.value(id).retired;
         const auto savedAnchor = primaryObject(record).value(QStringLiteral("source_anchor")).toObject();
         const auto link = record.value(QStringLiteral("source_link")).toObject();
         const QString failedSource = savedAnchor.isEmpty() && link.value(QStringLiteral("state")).toString() == QLatin1String("linking_failed")
             ? link.value(QStringLiteral("source_file")).toString() : QString();
-        const auto currentAnchor = currentReviewSourceAnchor(m_docsRoot, id, savedAnchor, failedSource);
+        const auto currentAnchor = retired ? QJsonObject() : currentReviewSourceAnchor(m_docsRoot, id, savedAnchor, failedSource);
         if (!currentAnchor.isEmpty() && currentAnchor != savedAnchor) {
             auto primary = primaryObject(record);
             primary.insert(QStringLiteral("source_anchor"), currentAnchor);
@@ -2629,7 +2668,8 @@ QList<ReviewCard> ReviewStore::cards(QStringList *errors, const QString &pdfStem
                 if (locationState == QLatin1String("linked") && !verifiedPendingSource) {
                     changed = !sameReviewPassages(segments, reviewSourceEvidence(m_docsRoot, id, SourceOwner::of(relative), relative));
                 } else if (locationState == QLatin1String("ambiguous") && segments.size() == 1) changed = true;
-                if (changed) card.record.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("needs_attention")},
+                // A retired card keeps the passage it was retired with: nothing to place again.
+                if (changed && !card.schedule.retired) card.record.insert(QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("needs_attention")},
                     {QStringLiteral("reason"), QStringLiteral("source_content_changed_or_unavailable")}});
             }
         }
@@ -2933,11 +2973,16 @@ QList<ReviewCard> ReviewStore::candidateCards(QStringList *errors) const
 
 QList<ReviewBrowserCard> ReviewStore::browserCards(const QDateTime &now, QStringList *errors) const
 {
+    return browserCardsOf(cards(errors), now, errors);
+}
+
+QList<ReviewBrowserCard> ReviewStore::browserCardsOf(const QList<ReviewCard> &cards, const QDateTime &now, QStringList *errors) const
+{
     const QList<QJsonObject> currentExclusions = exclusions(errors);
     const QHash<QString, QString> canonicalHashes = m_projectionProvider ? canonicalPdfHashes(errors) : QHash<QString, QString>();
     const QSet<QString> unpublished = ProjectConfiguration::unpublishedDocumentIds(m_docsRoot);
     QList<ReviewBrowserCard> output;
-    for (const ReviewCard &card : cards(errors)) {
+    for (const ReviewCard &card : cards) {
         if (card.schedule.deleted) continue;
         bool excluded = false;
         for (const QJsonObject &exclusion : currentExclusions) {
@@ -3042,9 +3087,14 @@ QDateTime ReviewStore::dueFrom(const ReviewCard &card)
 
 QList<ReviewCard> ReviewStore::dueCards(const QDateTime &now, const QString &pdfStemFilter, QStringList *errors) const
 {
+    return dueCardsOf(cards(errors, pdfStemFilter), now, pdfStemFilter, errors);
+}
+
+QList<ReviewCard> ReviewStore::dueCardsOf(const QList<ReviewCard> &cards, const QDateTime &now, const QString &pdfStemFilter, QStringList *errors) const
+{
     QList<ReviewCard> output;
     const QDateTime utcNow = now.toUTC();
-    for (const ReviewCard &card : activeCards(errors, pdfStemFilter)) {
+    for (const ReviewCard &card : activeOf(cards, errors)) {
         if (!pdfStemFilter.isEmpty() && card.pdfStem() != pdfStemFilter) {
             continue;
         }
@@ -4589,6 +4639,23 @@ bool ReviewStore::retractRating(const QString &cardId, const QString &eventId, c
     return writeServerJson(QStringLiteral("events/mac-okular/%1.json").arg(retractionId), event, error);
 }
 
+bool ReviewStore::answerInEffect(const ReviewCard &card, const QString &eventId)
+{
+    if (eventId.isEmpty() || card.schedule.deleted) return false;
+    const auto answer = std::find_if(card.history.cbegin(), card.history.cend(), [&eventId](const QJsonObject &event) {
+        return objectString(event, QStringLiteral("event_id")) == eventId;
+    });
+    if (answer == card.history.cend() || objectString(*answer, QStringLiteral("card_id")) != card.id()) return false;
+    const QString rating = objectString(*answer, QStringLiteral("rating"));
+    if (!reviewRating(rating) || rating == QLatin1String("delete") || !objectString(*answer, QStringLiteral("queue_action")).isEmpty()
+        || !objectString(*answer, QStringLiteral("interval_action")).isEmpty() || !objectString(*answer, QStringLiteral("retracted_event_id")).isEmpty())
+        return false;
+    // Taken back already (Undo, or here), on any device.
+    return std::none_of(card.history.cbegin(), card.history.cend(), [&eventId, &card](const QJsonObject &event) {
+        return objectString(event, QStringLiteral("retracted_event_id")) == eventId && objectString(event, QStringLiteral("card_id")) == card.id();
+    });
+}
+
 bool ReviewStore::updateCardContent(const ReviewCard &expected, const QVariantList &rect, const QString &question, QString *error)
 {
     const QJsonArray region = QJsonArray::fromVariantList(rect);
@@ -4837,7 +4904,9 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
     const QString provisional = keptId.isEmpty() ? ids.first() : keptId;
     QStringList others = ids;
     others.removeAll(provisional);
-    auto merge = planReviewCardMergeSource(relative, source, provisional, others, segmentIds);
+    QHash<QString, QString> names;
+    for (const ReviewCard &card : std::as_const(plan->cards)) names.insert(card.id(), mergeCardLabel(card));
+    auto merge = planReviewCardMergeSource(relative, source, provisional, others, segmentIds, names);
     if (!merge.error.isEmpty()) return merge.error;
     QStringList order;
     for (const QStringList &origin : std::as_const(merge.origins))
@@ -4849,7 +4918,7 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
     QStringList deletions = order;
     deletions.removeAll(keptId);
     if (keptId != provisional || deletions != others) {
-        merge = planReviewCardMergeSource(relative, source, keptId, deletions, segmentIds);
+        merge = planReviewCardMergeSource(relative, source, keptId, deletions, segmentIds, names);
         if (!merge.error.isEmpty()) return merge.error;
     }
     plan->keptId = keptId;

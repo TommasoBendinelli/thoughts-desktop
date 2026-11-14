@@ -1094,6 +1094,9 @@ Part::Part(QObject *parent, const QVariantList &args)
         }
         Q_EMIT fedoraManualSyncStateChanged(static_cast<int>(state), message, details);
     });
+    // A build that a Sync left running on the server has ended: what checkFedoraRemoteWork would
+    // answer, said without having been asked.
+    connect(m_fedoraRepository, &FedoraRepository::remoteWorkFound, this, &Part::fedoraRemoteWorkFound);
     connect(m_fedoraRepository, &FedoraRepository::syncProgressChanged, this, &Part::syncProgressChanged);
     connect(m_fedoraRepository, &FedoraRepository::syncTransferProgressChanged, this, &Part::syncTransferProgressChanged);
     connect(m_fedoraRepository, &FedoraRepository::syncJournalEvent, this, &Part::syncJournalEvent);
@@ -2418,7 +2421,8 @@ bool Part::openFile()
     }
     // The tab's title says which version; this says it is not the Library's PDF.
     if (ok && m_pageView && Thoughts::PdfVersions::isCachedVersion(localFilePath()))
-        m_pageView->displayMessage(i18n("An earlier version of this PDF, for reading only: comments and review cards stay with the current version."));
+        m_pageView->displayMessage(i18n("An earlier version of this PDF, for reading only: comments and review cards stay with the current version, "
+                                        "except the cards retired on this one."));
 
     if (ok) {
         auto refreshMessage = [this]() {
@@ -7555,10 +7559,16 @@ QJsonObject Part::effectiveFedoraProjections() const
 void Part::setSidebarReviewCards(const QJsonArray &cards)
 {
     m_reviewsWidget->setReviewCards(cards);
-    if (m_htmlReader) m_htmlReader->setCards(cards);
+    // A retired card stays on the PDF version it was retired on: the HTML view and the
+    // attachments show the current one, so they leave it out.
+    QJsonArray current;
+    for (const QJsonValue &card : cards) {
+        if (card.toObject().value(QStringLiteral("sidebar_schedule")).toObject().value(QStringLiteral("state")).toString() != QLatin1String("retired")) current.append(card);
+    }
+    if (m_htmlReader) m_htmlReader->setCards(current);
     // Cards made in HTML attachments of this document: highlighted in their page.
-    m_sidebarCardRecords = cards;
-    if (m_attachmentReader) m_attachmentReader->setCards(cards);
+    m_sidebarCardRecords = current;
+    if (m_attachmentReader) m_attachmentReader->setCards(current);
 }
 
 bool Part::focusSidebarReviewCard(const QString &cardId)
@@ -8057,8 +8067,8 @@ void Part::resolveAgentProposalFromCard(const QString &proposalId, const QString
         if (operationId.isEmpty()) {
             error = i18n("The proposal decision could not be written to the durable server queue.");
         } else {
-            m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — sync manually to send it to the server."));
-            showAgentProposalStatus(i18n("Decision saved locally — sync manually to send it to the server."), KMessageWidget::Information, false);
+            m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — the next Sync sends it to the server."));
+            showAgentProposalStatus(i18n("Decision saved locally — the next Sync sends it to the server."), KMessageWidget::Information, false);
             return;
         }
     } else {
@@ -8136,9 +8146,9 @@ void Part::resolveAgentProposalsFromSidebar(const QStringList &proposalIds, cons
             continue;
         }
         for (const QString &proposalId : bundle.value()) {
-            m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — sync manually to send it to the server."));
+            m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — the next Sync sends it to the server."));
         }
-        showAgentProposalStatus(i18n("Decision saved locally — sync manually to send it to the server."), KMessageWidget::Information, false);
+        showAgentProposalStatus(i18n("Decision saved locally — the next Sync sends it to the server."), KMessageWidget::Information, false);
     }
     if (refused > 0) {
         showAgentProposalStatus(i18np("%1 proposal was not decided: %2", "%1 proposals were not decided: %2", refused, reason), KMessageWidget::Warning, false);
@@ -8254,11 +8264,11 @@ void Part::handleAgentProposalResolutionStatus(const QString &operationId, const
         if (!pending.undo) {
             for (const QString &proposalId : pending.proposalIds) {
                 if (m_pageView) {
-                    m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — sync manually to send it to the server."));
+                    m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — the next Sync sends it to the server."));
                 }
             }
         }
-        showAgentProposalStatus(i18n("Decision saved locally — sync manually to send it to the server."), KMessageWidget::Information, false);
+        showAgentProposalStatus(i18n("Decision saved locally — the next Sync sends it to the server."), KMessageWidget::Information, false);
         Q_EMIT agentProposalResolutionStatusChanged(operationId,
                                                     pending.proposalIds,
                                                     pending.undo ? QStringLiteral("undo_") + pending.action : pending.action,
@@ -8401,7 +8411,7 @@ void Part::undoLastAgentProposalResolution()
             return;
         }
         m_pendingAgentProposalResolutions.insert(undoOperationId, {undo.proposalIds, undo.action, true});
-        showAgentProposalStatus(i18n("Decision saved locally — sync manually to send it to the server."), KMessageWidget::Information, false);
+        showAgentProposalStatus(i18n("Decision saved locally — the next Sync sends it to the server."), KMessageWidget::Information, false);
         return;
     }
 
@@ -8420,7 +8430,7 @@ void Part::undoLastAgentProposalResolution()
     m_agentProposalUndoState = {};
     const QString success = undo.action == QLatin1String("accept")
         ? i18n("Acceptance undone — proposal restored. No PDF rebuild needed.")
-        : i18n("Rejection undone — proposal restored. Sync manually to update the PDF.");
+        : i18n("Rejection undone — proposal restored. The next Sync updates the PDF.");
     hideAgentProposalStatus(false);
     Q_EMIT agentProposalResolutionStatusChanged({},
                                                 undo.proposalIds,
@@ -8445,7 +8455,10 @@ QVariantMap Part::fedoraManualSyncState() const
                        {QStringLiteral("operation_id"), m_fedoraRepository->manualSyncOperationId()},
                        {QStringLiteral("message"), m_fedoraRepository->manualSyncMessage()},
                        {QStringLiteral("details"), m_fedoraRepository->manualSyncDetails()},
-                       {QStringLiteral("error_code"), m_fedoraRepository->manualSyncErrorCode()}}
+                       {QStringLiteral("error_code"), m_fedoraRepository->manualSyncErrorCode()},
+                       {QStringLiteral("failure_kind"), m_fedoraRepository->manualSyncFailureKind()},
+                       {QStringLiteral("warning_code"), m_fedoraRepository->manualSyncWarningCode()},
+                       {QStringLiteral("warning"), m_fedoraRepository->manualSyncWarning()}}
         : QVariantMap {{QStringLiteral("state"), static_cast<int>(FedoraRepository::ManualSyncState::Failed)},
                        {QStringLiteral("message"), QStringLiteral("The server is unavailable.")},
                        {QStringLiteral("details"), QString()}};

@@ -431,8 +431,12 @@ def _(ids):
     return [("setup", setup), publish(), ("call", ignore), publish(), publish("--path", "docs-paper/notes.md")]
 
 
-def frozen_bundle(name, sources, targets=None, base_from_state=True):
-    """A desktop-style frozen bundle of the given local paths."""
+def frozen_bundle(name, sources, targets=None, base_from_state=True, bases_behind=None):
+    """A desktop-style frozen bundle of the given local paths.
+
+    bases_behind names, by path, the base Desktop's own record still holds
+    when it has not caught up with the publisher's state.
+    """
     def build(d):
         bundle = d / "state/frozen" / name
         objects = bundle / "objects"
@@ -443,6 +447,8 @@ def frozen_bundle(name, sources, targets=None, base_from_state=True):
         for path in sources:
             local = d / "docs" / path
             base = bases.get(path, {}).get("sha256", EMPTY) if base_from_state else EMPTY
+            if bases_behind and path in bases_behind:
+                base = bases_behind[path]
             if local.is_file():
                 data = local.read_bytes()
                 digest = hashlib.sha256(data).hexdigest()
@@ -513,6 +519,70 @@ def _(ids):
             ("write", "docs-paper/tex/source/main.tex", "mac edit\n"),
             ("call", frozen_bundle("c", ["docs-paper/tex/source/main.tex"])),
             ("publish", [*PUBLISH[:2], *frozen, *PUBLISH[4:]], {}), publish()]
+
+
+@scenario("frozen-fedora-merges-adjacent")
+def _(ids):
+    # Edits on adjacent lines conflict in git merge-file, so the frozen source
+    # goes to Fedora alone, and Fedora's merge joins them. Its answer "merged"
+    # is installed and becomes the base, and the next Syncs send nothing
+    # (2026-11-13: it was refused as inconsistent and sent again every Sync).
+    def setup(d):
+        project(ids, d / "docs")
+        write(d / "docs/docs-paper/tex/source/main.tex", "a\nb\nc\n")
+    frozen = ["--manifest", "state/frozen/m/source-manifest.json", "--frozen-inputs", "state/frozen/m/inputs.json"]
+    return [("setup", setup), publish(), ("remote", "docs-paper/tex/source/main.tex", "A\nb\nc\n"),
+            ("write", "docs-paper/tex/source/main.tex", "a\nB\nc\n"),
+            ("call", frozen_bundle("m", ["docs-paper/tex/source/main.tex"])),
+            ("publish", [*PUBLISH[:2], *frozen, *PUBLISH[4:]], {}), publish(),
+            ("call", frozen_bundle("m", ["docs-paper/tex/source/main.tex"])),
+            ("publish", [*PUBLISH[:2], *frozen, *PUBLISH[4:]], {})]
+
+
+def _desktop_base_behind(ids, edit_after_install, remote_later=None, local_before=None):
+    # 13 Nov: the installer moved the publisher's base to Fedora's revision (an
+    # install, or a merge with a local edit) and Desktop kept its older base: it
+    # could not record the new one (database is locked) or the file changed
+    # before it could. Every frozen Sync was then refused with "frozen Desktop
+    # source has no matching authoring or Fedora base".
+    path = "docs-paper/tex/source/main.tex"
+    first = "a\nb\nc\nd\ne\nf\ng\nh\n"
+    def setup(d):
+        project(ids, d / "docs")
+        write(d / "docs" / path, first)
+    behind = {path: hashlib.sha256(first.encode()).hexdigest()}
+    frozen = ["--manifest", "state/frozen/b/source-manifest.json", "--frozen-inputs", "state/frozen/b/inputs.json"]
+    steps = [("setup", setup), publish(), ("remote", path, "A\nb\nc\nd\ne\nf\ng\nh\n")]
+    if local_before:
+        steps.append(("write", path, local_before))
+    steps += [("reconcile", 0), ("write", path, edit_after_install)]
+    if remote_later:
+        steps.append(("remote", path, remote_later))
+    return [*steps, ("call", frozen_bundle("b", [path], bases_behind=behind)),
+            ("publish", [*PUBLISH[:2], *frozen, *PUBLISH[4:]], {}), publish()]
+
+
+@scenario("frozen-desktop-base-behind-merge")
+def _(ids):
+    # Merged with a local edit, then edited again (an agent's proposal) while
+    # Fedora moved on: the file holds the merge, so it is published against
+    # the new base and Fedora's later change merges in.
+    return _desktop_base_behind(ids, "A\nb\nc\nD\ne\nf\ng\nH\n", remote_later="A\nb\nc\nd\ne\nF\ng\nh\n",
+                                local_before="a\nb\nc\nd\ne\nf\ng\nH\n")
+
+
+@scenario("frozen-desktop-base-behind-install")
+def _(ids):
+    # Installed, Desktop did not record it, then edited.
+    return _desktop_base_behind(ids, "A\nb\nc\nD\ne\nf\ng\nh\n")
+
+
+@scenario("frozen-desktop-base-behind-stale-copy")
+def _(ids):
+    # An editor saved its copy from before the merge over it: Fedora's change
+    # ("A") is missing from the file, so it is merged against Desktop's older
+    # base and Fedora keeps the change.
+    return _desktop_base_behind(ids, "a\nb\nc\nD\ne\nf\ng\nH\n", local_before="a\nb\nc\nd\ne\nf\ng\nH\n")
 
 
 @scenario("frozen-errors")
@@ -686,6 +756,42 @@ def _add_pdf(position):
         value.setdefault("rendering", {})[pdf["document_id"]] = {"sha256": "a" * 64}
         value.setdefault("document_names", {})[pdf["document_id"]] = "submitted"
     return change
+
+
+@scenario("frozen-desktop-base-behind-project-file")
+def _(ids):
+    # The 13 Nov Project file: the installer merged Fedora's rename with a PDF
+    # added here and Desktop could not record it (database is locked); the
+    # next change to the file was refused until the publisher merged it.
+    configured = {}
+    behind = {}
+    def setup(d):
+        configured["value"] = project(ids, d / "docs")
+        configured["path"] = d / "docs/.thoughts/projects" / project_hash(configured["value"]["id"]) / "documents/thoughts-project.json"
+        configured["pdf"] = {"document_id": ids(), "format": "pdf", "included": True,
+                             "source": {"folder_id": configured["value"]["default_folder_id"], "path": "submitted.pdf"}}
+        write(d / "docs/docs-paper/tex/source/main.tex", "main\n")
+    def relative(d):
+        return configured["path"].relative_to(d / "docs").as_posix()
+    def remember(d):
+        behind[relative(d)] = hashlib.sha256(configured["path"].read_bytes()).hexdigest()
+    def remote(d):
+        value = json.loads(json.dumps(configured["value"]))
+        value["name"] = "Renamed on Fedora"
+        return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    def add(d):
+        value = json.loads(configured["path"].read_text())
+        _add_pdf(None)(value, configured["pdf"])
+        configured["path"].write_text(json.dumps(value, indent=4, sort_keys=True))
+    def rename_pdf(d):
+        value = json.loads(configured["path"].read_text())
+        value["document_names"][configured["pdf"]["document_id"]] = "submitted, revised"
+        configured["path"].write_text(json.dumps(value, indent=4, sort_keys=True))
+    def bundle(d):
+        frozen_bundle("p", [relative(d)], bases_behind=behind)(d)
+    frozen = ["--manifest", "state/frozen/p/source-manifest.json", "--frozen-inputs", "state/frozen/p/inputs.json"]
+    return [("setup", setup), publish(), ("call", remember), ("remote", relative, remote), ("call", add), ("reconcile", 0),
+            ("call", rename_pdf), ("call", bundle), ("publish", [*PUBLISH[:2], *frozen, *PUBLISH[4:]], {}), publish()]
 
 
 @scenario("reconcile-project-same-document-added")
@@ -874,7 +980,9 @@ def run_scenario(name, build, args, base):
             # A resolved conflict's preserved copy is named by its conflict ID.
             "state_files": {normalize(k): v for k, v in snapshot_files(directory / "state").items()
                             if not k.startswith("frozen/") and not k.endswith(".lock") and k != "source-publication.json"
-                            and not k.startswith("source-reconciliation-reports/") and k != "authoring-reconciliation.json"},
+                            and not k.startswith("source-reconciliation-reports/") and k != "authoring-reconciliation.json"
+                            # The server's source tree, kept between runs: a copy of "tree" below.
+                            and k != "source-tree-cache.json"},
             "reports": sorted(normalize(re.sub(r'"duration_ms": \d+', '"duration_ms": N',
                                                re.sub(r'-\d+\.json"', '-NS.json"', p.read_text())).replace(str(directory), "<ROOT>")
                                         .replace('state\\\\source-reconciliation-reports\\\\', "state/source-reconciliation-reports/"))

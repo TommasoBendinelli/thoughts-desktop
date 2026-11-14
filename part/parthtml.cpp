@@ -403,7 +403,7 @@ void Part::refreshHtmlFeedback()
     QList<QJsonObject> records;
     const auto items = overlay->items();
     for (const auto &item : items) {
-        if (item.state != QLatin1String("orphaned")) records.append(item.record);
+        if (item.state != QLatin1String("orphaned") && item.state != QLatin1String("earlier")) records.append(item.record);
     }
     m_htmlReader->setFeedback(records);
 }

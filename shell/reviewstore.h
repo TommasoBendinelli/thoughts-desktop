@@ -493,6 +493,12 @@ public:
 
     QString rootPath() const;
     QList<ReviewCard> cards(QStringList *errors = nullptr, const QString &pdfStem = {}) const;
+    // The cards of @p cardIds only (deleted ones too, as cards() has them), read as cards() reads
+    // them but without building every other card: for one card's refresh or its feedback's homes.
+    QList<ReviewCard> cardsWithIds(const QSet<QString> &cardIds, QStringList *errors = nullptr) const;
+    // How many times every card was built on the GUI thread (cards() without a document or IDs):
+    // the work a refresh must keep off it (a Library of a few hundred cards takes about a second).
+    static quint64 guiThreadFullLoads();
     QList<ReviewCard> activeCards(QStringList *errors = nullptr, const QString &pdfStem = {}) const;
     // The cards of @p cards that activeCards() returns, without reading the cards again. With
     // @p compareLibraryPdfs false a card made on another PDF than the Library's current one is
@@ -501,7 +507,11 @@ public:
     QList<ReviewCard> activeOf(const QList<ReviewCard> &cards, QStringList *errors = nullptr, bool compareLibraryPdfs = true) const;
     QList<ReviewCard> candidateCards(QStringList *errors = nullptr) const;
     QList<ReviewBrowserCard> browserCards(const QDateTime &now = QDateTime::currentDateTimeUtc(), QStringList *errors = nullptr) const;
+    // browserCards() of @p cards, as cards() gave them, without reading them again.
+    QList<ReviewBrowserCard> browserCardsOf(const QList<ReviewCard> &cards, const QDateTime &now = QDateTime::currentDateTimeUtc(), QStringList *errors = nullptr) const;
     QList<ReviewCard> dueCards(const QDateTime &now = QDateTime::currentDateTimeUtc(), const QString &pdfStemFilter = QString(), QStringList *errors = nullptr) const;
+    // dueCards() of @p cards, as cards() gave them, without reading them again.
+    QList<ReviewCard> dueCardsOf(const QList<ReviewCard> &cards, const QDateTime &now, const QString &pdfStemFilter = QString(), QStringList *errors = nullptr) const;
     // Whether an active card belongs in the review queue at @p now (the queue's own rule).
     static bool isDueNow(const ReviewCard &card, const QDateTime &now);
     // From when isDueNow() holds for @p card (UTC): isDueNow(card, now) is now >= dueFrom(card).
@@ -586,6 +596,10 @@ public:
     bool setInterval(const QString &cardId, const ReviewInterval &interval, bool never,
                      const QDateTime &selectedAt = QDateTime::currentDateTimeUtc(), QString *error = nullptr);
     bool retractRating(const QString &cardId, const QString &eventId, const QDateTime &retractedAt, QString *error) const;
+    // Whether @p eventId is an answer of @p card still in effect, which its History can take back
+    // with retractRating as Undo does: a rating (not a deletion, skip, interval or retire) that no
+    // retraction of the card names, of a card that is not deleted. The fold reads it the same way.
+    static bool answerInEffect(const ReviewCard &card, const QString &eventId);
     bool updateCardContent(const ReviewCard &expected, const QVariantList &rect, const QString &question, QString *error = nullptr);
     bool updateCardAnswer(const ReviewCard &expected, const QVariantList &regions, const QString &question, int pageCount, QString *error = nullptr);
     // Moves a card to new answer areas of the PDF @p pdfSha256: removes its markers from the
@@ -670,6 +684,8 @@ public:
                                        const QDateTime &scheduledDueAt = {});
     static QHash<QString, ReviewSchedule> foldEvents(const QList<QJsonObject> &events, QStringList *errors = nullptr);
 private:
+    // cards(), of @p pdfStem's cards or of @p cardIds' when given.
+    QList<ReviewCard> loadCards(QStringList *errors, const QString &pdfStem, const QSet<QString> *cardIds) const;
     void migrateLegacyStore();
     void recoverSourceTransactions();
     bool saveQueueActions(const QList<QJsonObject> &actions, QString *error);

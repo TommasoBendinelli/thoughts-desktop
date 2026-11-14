@@ -85,6 +85,8 @@ int main(int argc, char **argv)
     QCoreApplication::setAttribute(Qt::AA_CompressTabletEvents);
 
     QApplication app(argc, argv);
+    // After the application object exists: Qt sets the platform's default then.
+    Shell::applyMenuIconPolicy();
 
     /**
      * Install event filter to handle macOS file opening.

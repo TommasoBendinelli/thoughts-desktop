@@ -19,6 +19,10 @@ struct PaperWebsite {
     QString error;
     static PaperWebsite resolve(const QString &input);
 };
+// One line: line breaks, tabs and runs of other whitespace become single spaces.
+QString singleLineName(const QString &text);
+// Why `name` (already on one line) cannot name an imported document, or nothing.
+QString documentNameProblem(const QString &name);
 QString usablePaperTitle(const QString &raw);
 QString paperMetadataTitle(const QByteArray &body, bool json);
 

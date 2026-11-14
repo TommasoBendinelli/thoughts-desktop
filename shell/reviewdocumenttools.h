@@ -115,18 +115,35 @@ struct ReviewCardMergeSource {
     QList<QStringList> origins;
 };
 // @p segmentIds: each card's passages as its record lists them (segment IDs), the kept card's
-// included. @p path is the source's Library path (it names the file in the anchor).
+// included. @p path is the source's Library path (it names the file in the anchor). @p cardNames
+// name the cards in refusals (a card's question), by ID; a card without one is named by its ID.
+// A pending agent proposal inside a passage stays as it is, byte for byte (only marker lines
+// move), so deciding it afterwards gives what deciding it before would have, plus the merge's
+// markers; a proposal that holds a card's marker is refused.
 ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByteArray &source, const QString &keptId,
-                                                const QStringList &mergedIds, const QHash<QString, QSet<QString>> &segmentIds);
+                                                const QStringList &mergedIds, const QHash<QString, QSet<QString>> &segmentIds,
+                                                const QHash<QString, QString> &cardNames = {});
+// Why the markers of @p cardId in a TeX or Markdown source are not complete passages, said
+// precisely (which line, what is wrong: a marker without its end or start, nested or misnumbered
+// passages, a marker that shares its line or lies in a pending proposal, an empty passage, a
+// mention of the card outside its markers); empty when they are. @p cardName names the card.
+QString reviewCardMarkerProblem(const QString &path, const QByteArray &source, const QString &cardId, const QString &cardName = {});
 // Marks each one-based inclusive line range as one segment (0..n-1 in file order) of a TeX or
 // Markdown source. On failure *failedRange is the index of the range at fault, or -1.
+// A new passage holds no definition (\def, \newcommand, \renewcommand, \providecommand,
+// \DeclareRobustCommand), other card's marker or pending proposal. @p existingPassages: the
+// ranges already are a card's passages (a merge moves their markers), so definitions in them and
+// pending agent proposals they hold whole are no obstacle; a proposal held only in part still is.
 ReviewAnchorPlan markReviewSourceRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
-                                        const QString &cardId, int *failedRange = nullptr);
+                                        const QString &cardId, int *failedRange = nullptr, bool existingPassages = false);
 QJsonObject reviewPdfComponentOrigin(const QString &bundleRoot, const QString &pdfPath,
                                      const QString &pdfSha256, int page);
 ReviewAnchorPlan markReviewSourceLines(const QString &path, const QByteArray &source, const QList<int> &lines, const QString &cardId);
 ReviewAnchorPlan markReviewSourceSelection(const QString &path, const QByteArray &source, int firstLine, int endLine, const QString &cardId);
-ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &source, const QString &cardId);
+// The card's passages as its markers in the source give them. The card exists, so definitions in
+// its passages are no obstacle; @p aroundPendingProposals also reads passages that hold pending
+// agent proposals whole, as a merge does.
+ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &source, const QString &cardId, bool aroundPendingProposals = false);
 
 // What "Copy for agent" on a review card needs; the same text as on the phone.
 struct ReviewCardAgentInput {

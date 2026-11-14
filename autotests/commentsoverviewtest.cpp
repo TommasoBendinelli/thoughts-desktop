@@ -59,6 +59,7 @@
 #include <QPainter>
 #include <QTreeWidgetItemIterator>
 #include <QProgressBar>
+#include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -625,6 +626,7 @@ private Q_SLOTS:
     void testOverviewTabs();
     void testReviewCardsRefreshWhenSourceLocationsChange();
     void testPersistentBrowsersKeepState();
+    void testSyncStateChangeUpdatesDocumentRowsInPlace();
     void testTabSwitchScales_data();
     void testTabSwitchScales();
     void testTrackedLayoutLoading();
@@ -706,6 +708,7 @@ private Q_SLOTS:
     void testReloadPreservesScrollPosition();
     void testStartupCombinesLibraryLoads();
     void testSourceEditReloadsOnlyItsDocuments();
+    void testCatalogueChangeDuringAFullReloadOfIt();
     void testSourceEditRebuildsLibraryTreeOnce();
     void testLibraryChangeBurstRebuildsTreeOnce();
     void testLibraryMarksFailedDocuments();
@@ -1053,6 +1056,149 @@ void CommentsOverviewTest::testReviewCardsRefreshWhenSourceLocationsChange()
     overview.setFedoraProjections({});
     QTRY_VERIFY(!refreshed.isEmpty());
     QCOMPARE(overview.m_reviewSourceLocationIndex, sourceLocations);
+}
+
+// A Sync that starts or ends changes the Sync state of every document at once.
+// The Library tree then changes its rows' tooltips and icons where they are; it
+// is not rebuilt, which kept the window from answering.
+void CommentsOverviewTest::testSyncStateChangeUpdatesDocumentRowsInPlace()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QVERIFY(QDir(root.path()).mkpath(QStringLiteral(".runtime")));
+    Thoughts::CommentsOverview overview(root.path());
+    overview.show();
+    QTRY_VERIFY(!overview.m_fullReloadRunning);
+    overview.m_catalogPollTimer->stop();
+    constexpr int documentCount = 150;
+    constexpr int segmentCount = 12;
+    QList<Thoughts::TrackedCommentDocument> documents;
+    for (int index = 0; index < documentCount; ++index) {
+        Thoughts::TrackedCommentDocument document;
+        document.stem = QStringLiteral("paper-%1").arg(index);
+        document.displayName = QStringLiteral("Paper %1").arg(index);
+        document.libraryFilename = document.stem + QStringLiteral(".pdf");
+        document.pdfPath = QDir(root.path()).filePath(QStringLiteral("current_pdfs/") + document.libraryFilename);
+        const bool sourceLinked = index % 3 != 0;
+        document.state = sourceLinked ? Thoughts::TrackedCommentDocument::SourceLinked : Thoughts::TrackedCommentDocument::PdfOnly;
+        document.libraryKind = sourceLinked ? QStringLiteral("source_linked") : QStringLiteral("pdf_only");
+        document.libraryGenerationCurrent = true;
+        document.navigationProjectId = QStringLiteral("project-%1").arg(index % 10);
+        document.navigationProjectName = QStringLiteral("Project %1").arg(index % 10);
+        for (int segment = 0; sourceLinked && segment < segmentCount; ++segment) {
+            document.librarySegments.append(QJsonObject {{QStringLiteral("source_id"), QStringLiteral("docs-sam/tex/source/%1/part-%2.tex").arg(document.stem).arg(segment)},
+                                                         {QStringLiteral("title"), QStringLiteral("Part %1").arg(segment)},
+                                                         {QStringLiteral("start_page"), 1 + segment * 4},
+                                                         {QStringLiteral("page_count"), 4}});
+        }
+        for (int thread = 0; thread < 20; ++thread) {
+            Thoughts::TrackedComment comment;
+            comment.id = comment.threadRootId = QStringLiteral("%1-thread-%2").arg(document.stem).arg(thread);
+            comment.documentStem = document.stem;
+            comment.pdfPath = document.pdfPath;
+            comment.contents = QStringLiteral("Comment %1").arg(thread);
+            comment.logicalComment = true;
+            comment.page = 1 + thread * 2;
+            document.comments.append(comment);
+        }
+        documents.append(document);
+    }
+    overview.m_documents = documents;
+    QElapsedTimer timer;
+    timer.start();
+    overview.populateDocumentList(QString());
+    const qint64 firstBuildMs = timer.restart();
+    overview.populateDocumentList(QString());
+    const qint64 rebuildMs = timer.elapsed();
+
+    QTreeWidget *tree = overview.m_commentsBrowser.documentList;
+    QTreeWidget *otherTree = overview.m_notesBrowser.documentList;
+    const auto rowOf = [](QTreeWidget *widget, const QString &stem) -> QTreeWidgetItem * {
+        for (QTreeWidgetItemIterator it(widget); *it; ++it) {
+            // A document's own row, not one of its components.
+            if ((*it)->data(0, Qt::UserRole).toString() == stem && (*it)->parent() && !(*it)->parent()->parent()) {
+                return *it;
+            }
+        }
+        return nullptr;
+    };
+    const auto snapshotOf = [](QTreeWidget *widget) {
+        QStringList rows;
+        for (QTreeWidgetItemIterator it(widget); *it; ++it) {
+            rows.append(QStringLiteral("%1|%2|%3|%4|%5").arg((*it)->text(0), (*it)->text(1), (*it)->toolTip(0), (*it)->toolTip(1), (*it)->icon(0).isNull() ? QStringLiteral("-") : QStringLiteral("icon")));
+        }
+        return rows;
+    };
+    int rows = 0;
+    for (QTreeWidgetItemIterator it(tree); *it; ++it) {
+        ++rows;
+    }
+    qInfo("Library tree of %d documents (%d rows): first build %lld ms, rebuild %lld ms", documentCount, rows, firstBuildMs, rebuildMs);
+    QVERIFY(rows > documentCount * 8);
+    QTreeWidgetItem *linked = rowOf(tree, QStringLiteral("paper-1"));
+    QTreeWidgetItem *pdfOnly = rowOf(tree, QStringLiteral("paper-3"));
+    QVERIFY(linked);
+    QVERIFY(pdfOnly);
+    QCOMPARE(linked->childCount(), segmentCount);
+    QVERIFY(linked->toolTip(0).contains(QStringLiteral("Sync: Not checked")));
+    QCOMPARE(linked->text(1), QStringLiteral("20"));
+    QCOMPARE(linked->toolTip(1), QStringLiteral("20 comment threads"));
+    QCOMPARE(linked->child(0)->toolTip(1), QStringLiteral("2 comment threads"));
+    QCOMPARE(linked->child(segmentCount - 1)->toolTip(1), QStringLiteral("0 comment threads"));
+
+    // A Sync starts: every document changes state.
+    QSignalSpy resets(tree->model(), &QAbstractItemModel::modelReset);
+    QSignalSpy otherResets(otherTree->model(), &QAbstractItemModel::modelReset);
+    QJsonObject syncing;
+    for (const Thoughts::TrackedCommentDocument &document : std::as_const(documents)) {
+        syncing.insert(document.libraryFilename, QJsonObject {{QStringLiteral("status"), QStringLiteral("Syncing…")}, {QStringLiteral("state"), QStringLiteral("syncing")}});
+    }
+    const QJsonObject clean {{QStringLiteral("available"), true}, {QStringLiteral("total"), 0}};
+    timer.restart();
+    overview.setSyncSnapshot(syncing, {}, clean, {});
+    const qint64 changeMs = timer.elapsed();
+    qInfo("Sync state of %d documents changed: %lld ms", documentCount, changeMs);
+    QCOMPARE(resets.count(), 0);
+    QCOMPARE(otherResets.count(), 0);
+    QCOMPARE(rowOf(tree, QStringLiteral("paper-1")), linked);
+    QVERIFY(linked->toolTip(0).contains(QStringLiteral("Sync: Syncing…")));
+    QVERIFY(pdfOnly->toolTip(0).contains(QStringLiteral("Sync: Syncing…")));
+    QVERIFY(pdfOnly->toolTip(0).contains(QStringLiteral("Source layout: not linked")));
+    QVERIFY(rowOf(otherTree, QStringLiteral("paper-1"))->toolTip(0).contains(QStringLiteral("Sync: Syncing…")));
+
+    // One document fails; the others are up to date. Pending changes alone change no row.
+    QJsonObject ended;
+    for (const Thoughts::TrackedCommentDocument &document : std::as_const(documents)) {
+        ended.insert(document.libraryFilename, QJsonObject {{QStringLiteral("status"), QStringLiteral("Up to date")}, {QStringLiteral("state"), QStringLiteral("current")}});
+    }
+    ended.insert(QStringLiteral("paper-1.pdf"), QJsonObject {{QStringLiteral("status"), QStringLiteral("PDF build failed")}, {QStringLiteral("state"), QStringLiteral("error")},
+                                                             {QStringLiteral("reason"), QStringLiteral("An undefined control sequence in part-2.tex.")}});
+    overview.setSyncSnapshot(ended, {}, clean, {});
+    QVERIFY(linked->toolTip(0).contains(QStringLiteral("Sync: PDF build failed\nAn undefined control sequence in part-2.tex.")));
+    QVERIFY(pdfOnly->toolTip(0).contains(QStringLiteral("Sync: Up to date")));
+    const QStringList afterChange = snapshotOf(tree);
+    const QStringList otherAfterChange = snapshotOf(otherTree);
+    overview.setSyncSnapshot(ended, {}, QJsonObject {{QStringLiteral("available"), true}, {QStringLiteral("total"), 3}}, {});
+    QCOMPARE(snapshotOf(tree), afterChange);
+    QCOMPARE(resets.count(), 0);
+    QCOMPARE(otherResets.count(), 0);
+
+    // A rebuild shows exactly what the rows were changed to.
+    overview.populateDocumentList(QString());
+    QCOMPARE(resets.count(), 1);
+    QCOMPARE(snapshotOf(tree), afterChange);
+    QCOMPARE(snapshotOf(otherTree), otherAfterChange);
+    linked = rowOf(tree, QStringLiteral("paper-1"));
+    QVERIFY(linked);
+
+    // While a Sync runs the tree waits, as before.
+    overview.syncStarted();
+    overview.setSyncSnapshot(syncing, {}, clean, {});
+    QVERIFY(linked->toolTip(0).contains(QStringLiteral("Sync: PDF build failed")));
+    QCOMPARE(resets.count(), 1);
+    // Generous guards; the reported times are the stricter local check.
+    QVERIFY2(changeMs < 500, "A change of the documents' Sync state must not rebuild the Library tree");
+    QVERIFY2(rebuildMs < 3000, "Rebuilding the Library tree took too long");
 }
 
 void CommentsOverviewTest::testPersistentBrowsersKeepState()
@@ -8786,7 +8932,9 @@ void CommentsOverviewTest::testDocumentSyncPresentationAggregation()
 
     cachedBuild.renderStatus.remove(QStringLiteral("restored_from_cache"));
     const Thoughts::DocumentSyncPresentation liveBuildPresentation = Thoughts::documentSyncPresentation(cachedBuild);
-    QCOMPARE(liveBuildPresentation.status, QStringLiteral("Syncing…"));
+    // Since 14 November 2026 Sync ends without waiting for the server's build: a PDF the
+    // server is building, with no Sync or build of this computer waiting for it, says so.
+    QCOMPARE(liveBuildPresentation.status, QStringLiteral("PDF updating on the server"));
     QVERIFY(!liveBuildPresentation.requiresSync());
 
     const Thoughts::AggregateSyncPresentation empty = Thoughts::aggregateSyncPresentation({});
@@ -10893,6 +11041,62 @@ void CommentsOverviewTest::testStartupCombinesLibraryLoads()
     }());
 }
 
+// After Sync the Library reloads with discovery, and the catalogue check that runs meanwhile sees
+// the files Sync wrote (changed since its last baseline): it asked for a second full reload of the
+// same catalogue, 3 to 12 s more each Sync (13 Nov). The reload that started from that catalogue
+// already reads it, so none follows; a catalogue changed after it started still gets one.
+void CommentsOverviewTest::testCatalogueChangeDuringAFullReloadOfIt()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.path();
+    Thoughts::DeveloperLog::Options options;
+    options.directory = temporary.filePath(QStringLiteral("logs"));
+    options.captureStacks = false;
+    Thoughts::DeveloperLog log(options);
+    const auto eventCount = [](const QString &name) {
+        int count = 0;
+        for (const QJsonValue &value : Thoughts::DeveloperLog::performanceEvents()) {
+            if (value.toObject().value(QStringLiteral("event")).toString() == name) ++count;
+        }
+        return count;
+    };
+    QVERIFY(writeFile(root + QStringLiteral("/current_pdfs/paper.pdf"), QByteArrayLiteral("%PDF-paper")));
+    QVERIFY(writeReviewCommentBundle(root, QStringLiteral("paper.pdf"), QJsonArray()));
+    Thoughts::CommentsOverview overview(root);
+    overview.show();
+    const auto settled = [&overview] {
+        return !overview.m_fullReloadRunning && !overview.m_reloadTimer->isActive() && !overview.m_catalogSignatureCheckRunning
+            && !overview.m_catalogPollTimer->isActive() && !overview.m_catalogSignature.isEmpty();
+    };
+    QTRY_VERIFY(settled());
+    const QByteArray signature = overview.m_catalogSignature;
+    const int loads = eventCount(QStringLiteral("library.reload.queued"));
+
+    // Sync's end: a full reload with discovery; the check, against an older baseline, then reports
+    // the catalogue that reload started from.
+    overview.m_syncRefreshPending = true;
+    overview.requestReload();
+    QVERIFY(overview.m_fullReloadRunning);
+    overview.m_catalogSignature = signature;
+    overview.startFullReload(false, QStringLiteral("catalog_changed"));
+    QTRY_VERIFY(settled());
+    QTest::qWait(200);
+    QCOMPARE(eventCount(QStringLiteral("library.reload.queued")), loads + 1);
+    QCOMPARE(eventCount(QStringLiteral("library.reload.covered")), 1);
+    QVERIFY(!overview.m_syncRefreshPending);
+
+    // A catalogue changed after the reload started: read again.
+    overview.m_syncRefreshPending = true;
+    overview.requestReload();
+    QVERIFY(overview.m_fullReloadRunning);
+    overview.m_catalogSignature = QByteArrayLiteral("changed after the reload started");
+    overview.startFullReload(false, QStringLiteral("catalog_changed"));
+    QTRY_COMPARE(eventCount(QStringLiteral("library.reload.queued")), loads + 3);
+    QCOMPARE(eventCount(QStringLiteral("library.reload.covered")), 1);
+    QTRY_VERIFY(!overview.m_fullReloadRunning);
+}
+
 void CommentsOverviewTest::testSourceEditReloadsOnlyItsDocuments()
 {
     QTemporaryDir temporary;
@@ -11276,6 +11480,20 @@ void CommentsOverviewTest::testLibraryMarksFailedDocuments()
     showLogs->click();
     QCOMPARE(logs.size(), 1);
     QCOMPARE(logs.first().at(0).toString(), QStringLiteral("sync-with-failure"));
+    // A Sync that succeeded and reports the failed build as its warning leads to its log too.
+    QPointer<QMessageBox> closed(box);
+    QTRY_VERIFY(!closed);
+    overview.m_latestSyncOperation = {{QStringLiteral("id"), QStringLiteral("sync-with-warning")}, {QStringLiteral("state"), QStringLiteral("succeeded")},
+                                      {QStringLiteral("warning_code"), QStringLiteral("pdf_build_failed")}};
+    overview.showLibraryBuildFailure(QStringLiteral("moe"), failure);
+    box = overview.findChild<QMessageBox *>(QStringLiteral("libraryBuildErrorBox"));
+    QVERIFY(box);
+    QTRY_VERIFY(box->isVisible());
+    showLogs = box->findChild<QAbstractButton *>(QStringLiteral("libraryBuildErrorShowLogs"));
+    QVERIFY(showLogs);
+    showLogs->click();
+    QCOMPARE(logs.size(), 2);
+    QCOMPARE(logs.last().at(0).toString(), QStringLiteral("sync-with-warning"));
 }
 
 void CommentsOverviewTest::testLibraryBuildWarningsKeepRebuildCost()

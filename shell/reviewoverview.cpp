@@ -107,6 +107,9 @@
 #include <QStackedWidget>
 #include <QTextBrowser>
 #include <QTextDocument>
+#include <QTextBlock>
+#include <QTextList>
+#include <QAbstractTextDocumentLayout>
 #include <QToolButton>
 #include <QToolTip>
 #include <QMouseEvent>
@@ -2657,6 +2660,7 @@ struct HistoryEntry {
     QVariantList regions; // Answer feedback: its passage in that version.
     QJsonObject feedback; // Answer feedback: its record.
     bool cardEvent = false; // Created or approved: not made on a version.
+    QString answerEventId = {}; // An answer still in effect, which "Take back this answer…" retracts.
 };
 
 QString historyTime(const QDateTime &at)
@@ -2751,7 +2755,8 @@ QList<HistoryEntry> reviewHistoryEntries(const ReviewCard &card, const QList<Rev
             for (const QString &line : ReviewTags::groupNoteLines(notes, groups, i18n("Other"), i18n("Note"), i18n("Before note")))
                 html += QStringLiteral("<br>") + line.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>"));
         }
-        entries.append({at, html, version, card.page(), {}, {}, false});
+        const QString eventId = event.value(QStringLiteral("event_id")).toString();
+        entries.append({at, html, version, card.page(), {}, {}, false, ReviewStore::answerInEffect(card, eventId) ? eventId : QString()});
     }
     return entries;
 }
@@ -2820,13 +2825,16 @@ QList<HistoryEntry> mergedHistory(const QList<HistoryEntry> &review, QList<Histo
 
 // The History of @p card. With @p versions, entries that name the PDF version they were made on
 // link to it (thoughts-version:<index into versions>); @p currentSha256 is the card's PDF now.
+// @p answers: for each item of the list, in order, the answer it can take back (or nothing).
 QString cardHistoryHtml(const ReviewCard &card, const QList<ReviewTags::TagGroup> &groups = {}, const QList<QJsonObject> &feedback = {},
                         const QSet<QString> &notFound = {}, const QString &currentSha256 = {}, QList<HistoryEntry> *versions = nullptr,
-                        const QHash<QString, QString> &homeQuestions = {})
+                        const QHash<QString, QString> &homeQuestions = {}, QStringList *answers = nullptr)
 {
     const QList<HistoryEntry> entries = mergedHistory(reviewHistoryEntries(card, groups), feedbackHistoryEntries(feedback, notFound, card.id(), homeQuestions));
     QStringList items;
+    if (answers) answers->clear();
     for (const HistoryEntry &entry : entries) {
+        if (answers) answers->append(entry.answerEventId);
         QString html = entry.html;
         if (versions && !entry.versionSha256.isEmpty()) {
             const bool current = entry.versionSha256 == currentSha256;
@@ -3713,35 +3721,8 @@ QList<ReviewFeedbackPanel::Version> documentHistoryVersions(const ReviewStore &s
                 entry.cardQuestion = card.question();
                 version->entries.append(entry);
             }
-            // Feedback given on an earlier version whose passage the reader still finds in the
-            // answer now is listed here too, marked carried.
-            if (!cardVersion.current || card.isWholeDocument()) continue;
-            QList<QJsonObject> earlier;
-            for (const QJsonObject &record : std::as_const(own)) {
-                if (record.value(QStringLiteral("deleted")).toBool()) continue;
-                if (record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject().value(QStringLiteral("pdf_sha256")).toString() != currentSha256)
-                    earlier.append(record);
-            }
-            if (earlier.isEmpty()) continue;
-            const std::optional<QString> answer = pdfAnswerText(currentPdfPath, ReviewCardFeedback::regionsFromVariant(card.regions()));
-            if (!answer) continue;
-            for (const QJsonObject &record : std::as_const(earlier)) {
-                const QString state = ReviewCardFeedback::resolve(record, *answer, currentSha256).state;
-                if (state == QLatin1String("orphaned")) continue;
-                ReviewFeedbackPanel::Entry carried;
-                carried.at = QDateTime::fromString(record.value(QStringLiteral("created_at")).toString(), Qt::ISODateWithMs);
-                carried.cardId = card.id();
-                carried.cardQuestion = card.question();
-                carried.feedback = QVariantMap{
-                    {QStringLiteral("feedback_id"), record.value(QStringLiteral("feedback_id")).toString()},
-                    {QStringLiteral("polarity"), record.value(QStringLiteral("polarity")).toString()},
-                    {QStringLiteral("comment"), record.value(QStringLiteral("comment")).toString()},
-                    {QStringLiteral("quote"), record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString()},
-                    {QStringLiteral("state"), state},
-                    {QStringLiteral("carried"), true},
-                };
-                version->entries.append(carried);
-            }
+            // Feedback given on an earlier version stays with that version:
+            // it is listed under the version it was given on, never carried to the current one.
         }
     }
     std::stable_sort(versions.begin(), versions.end(), historyOrder);
@@ -4183,6 +4164,8 @@ void ReviewCardsWidget::buildUi()
     m_browseHistory->setMaximumHeight(240);
     // Its links open PDF versions (openHistoryVersion), not URLs.
     m_browseHistory->setOpenLinks(false);
+    m_browseHistory->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_browseHistory, &QWidget::customContextMenuRequested, this, &ReviewCardsWidget::showHistoryMenu);
     historyLayout->addWidget(m_browseHistory);
     m_browseHistoryStatus = new QLabel(m_browseHistoryPanel);
     m_browseHistoryStatus->setObjectName(QStringLiteral("reviewBrowseHistoryStatus"));
@@ -5083,13 +5066,14 @@ void ReviewCardsWidget::refreshBrowseHistory(const ReviewBrowserCard *item)
         m_browseHistoryStatus->hide();
     }
     if (!item) {
+        m_browseHistoryAnswers.clear();
         m_browseHistory->clear();
         return;
     }
     const ReviewCard &card = item->card;
     if (m_browseHistoryPanel->isHidden()) {
         // Feedback, versions and the PDF's hash are read when the History is shown.
-        m_browseHistory->setHtml(cardHistoryHtml(card, m_tagGroups));
+        m_browseHistory->setHtml(cardHistoryHtml(card, m_tagGroups, {}, {}, {}, nullptr, {}, &m_browseHistoryAnswers));
         return;
     }
     QList<QJsonObject> feedback = m_store.cardFeedback(card.id(), true);
@@ -5114,7 +5098,7 @@ void ReviewCardsWidget::refreshBrowseHistory(const ReviewBrowserCard *item)
     }
     feedback += shared;
     QList<HistoryEntry> versions;
-    m_browseHistory->setHtml(cardHistoryHtml(card, m_tagGroups, feedback, notFound, currentSha256, &versions, questionsOf(homeCards)));
+    m_browseHistory->setHtml(cardHistoryHtml(card, m_tagGroups, feedback, notFound, currentSha256, &versions, questionsOf(homeCards), &m_browseHistoryAnswers));
     const QString document = reviewCardDocumentName(m_docsRoot, card);
     const QString documentTitle = document.isEmpty() ? card.pdfStem() : document;
     for (const HistoryEntry &entry : std::as_const(versions)) {
@@ -5123,6 +5107,88 @@ void ReviewCardsWidget::refreshBrowseHistory(const ReviewBrowserCard *item)
                                         when.isEmpty() ? i18n("%1 — earlier version", documentTitle) : i18n("%1 — version of %2", documentTitle, when),
                                         entry.page > 0 ? entry.page : card.page(), entry.regions, entry.versionSha256 == currentSha256});
     }
+}
+
+QString ReviewCardsWidget::historyAnswerAt(const QPoint &viewportPos) const
+{
+    // One list item per History entry (cardHistoryHtml), its lines in one block.
+    const QTextBlock block = m_browseHistory->cursorForPosition(viewportPos).block();
+    const QTextList *list = block.textList();
+    if (!list) return {};
+    // Only on the entry itself, not on the empty space under the list.
+    const QRectF bounds = m_browseHistory->document()->documentLayout()->blockBoundingRect(block);
+    const qreal y = viewportPos.y() + m_browseHistory->verticalScrollBar()->value();
+    if (y < bounds.top() || y > bounds.bottom()) return {};
+    const int item = list->itemNumber(block);
+    return item >= 0 && item < m_browseHistoryAnswers.size() ? m_browseHistoryAnswers.at(item) : QString();
+}
+
+void ReviewCardsWidget::showHistoryMenu(const QPoint &viewportPos)
+{
+    QMenu *menu = m_browseHistory->createStandardContextMenu();
+    menu->setObjectName(QStringLiteral("reviewHistoryMenu"));
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    if (const QString eventId = historyAnswerAt(viewportPos); !eventId.isEmpty() && !m_mutating) {
+        QAction *first = menu->actions().value(0);
+        auto *takeBack = new QAction(i18n("Take back this answer…"), menu);
+        takeBack->setObjectName(QStringLiteral("reviewHistoryTakeBackAction"));
+        takeBack->setToolTip(i18n("Remove this answer, as Undo does: the card's schedule and tags come from its other answers again"));
+        menu->insertAction(first, takeBack);
+        menu->insertSeparator(first);
+        connect(takeBack, &QAction::triggered, this, [this, eventId] { takeBackHistoryAnswer(eventId); });
+    }
+    menu->popup(m_browseHistory->viewport()->mapToGlobal(viewportPos));
+}
+
+void ReviewCardsWidget::takeBackHistoryAnswer(const QString &eventId)
+{
+    const ReviewBrowserCard *item = selectedBrowseCard();
+    if (!item || item->card.id() != m_browseHistoryCardId || m_mutating) return;
+    // The card as stored now: another device or window may have taken the answer back already.
+    ReviewStore store(m_docsRoot, m_projectionProvider);
+    const QString cardId = item->card.id();
+    ReviewCard card;
+    for (const ReviewCard &candidate : store.cards(nullptr, item->card.pdfStem()))
+        if (candidate.id() == cardId) card = candidate;
+    const QString title = i18n("Take Back Answer");
+    if (!ReviewStore::answerInEffect(card, eventId)) {
+        KMessageBox::information(this, i18n("This answer was already taken back, or its card was deleted."), title);
+        reload();
+        return;
+    }
+    // What will be removed, as the History words it: when, its tags and interval, its notes.
+    QString removed;
+    for (const HistoryEntry &entry : reviewHistoryEntries(card, m_tagGroups)) {
+        if (entry.answerEventId != eventId) continue;
+        QTextDocument text;
+        text.setHtml(entry.html);
+        removed = text.toPlainText().replace(QChar::LineSeparator, QLatin1Char('\n'));
+    }
+    const QString question = card.question().simplified();
+    const QString text = i18n("Take back this answer to “%1”?\n\n%2\n\nThe card's schedule and tags then come from its other answers, as after Undo. "
+                              "The History keeps the answer and lists “Undo review”; your other devices follow at the next Sync.",
+                              question.size() > 120 ? question.left(119) + QStringLiteral("…") : question, removed);
+    if (KMessageBox::warningContinueCancel(this, text, title, KGuiItem(i18n("Take Back"), QStringLiteral("edit-undo")), KStandardGuiItem::cancel(), {},
+                                           KMessageBox::Notify | KMessageBox::Dangerous)
+        != KMessageBox::Continue)
+        return;
+    QString error;
+    if (!store.retractRating(cardId, eventId, QDateTime::currentDateTimeUtc(), &error)) {
+        KMessageBox::error(this, error, i18n("Cannot Take Back the Answer"));
+        return;
+    }
+    DeveloperLog::record(QStringLiteral("review.answer.taken_back"), {{QStringLiteral("card_id"), cardId}, {QStringLiteral("event_id"), eventId}});
+    ++m_revision;
+    // Shown at once; the reload below brings the card's new schedule to the list.
+    for (const ReviewCard &candidate : store.cards(nullptr, card.pdfStem())) {
+        if (candidate.id() != cardId) continue;
+        for (auto &listed : m_browseCards)
+            if (listed.card.id() == cardId) listed.card = candidate;
+        for (auto &listed : m_visibleBrowseCards)
+            if (listed.card.id() == cardId) listed.card = candidate;
+    }
+    refreshBrowseHistory(selectedBrowseCard());
+    reload();
 }
 
 void ReviewCardsWidget::openHistoryVersion(int index)
@@ -5704,6 +5770,10 @@ ReviewOverview::ReviewOverview(const QString &docsRoot,
     setModal(false);
     resize(760, 430);
     buildUi();
+    m_queueRefreshTimer = new QTimer(this);
+    m_queueRefreshTimer->setSingleShot(true);
+    m_queueRefreshTimer->setInterval(150);
+    connect(m_queueRefreshTimer, &QTimer::timeout, this, &ReviewOverview::startQueueRefresh);
     restoreVerifiedCounts();
     loadBarDrafts();
     reload();
@@ -5748,6 +5818,7 @@ bool ReviewOverview::eventFilter(QObject *watched, QEvent *event)
     // The Tags window belongs to the answer bar: it goes when the bar does.
     if (watched == m_ratingPanel && event->type() == QEvent::Hide) closeTagsDialog();
     if (watched == m_conversationLine && event->type() == QEvent::Resize) elideConversationTitle();
+    if (watched == m_beforeSummaryRow && event->type() == QEvent::Resize) elideBeforeSummary();
     if (watched == m_sessionHost
         && (event->type() == QEvent::Resize || event->type() == QEvent::Show || event->type() == QEvent::LayoutRequest)) {
         positionSessionPanel();
@@ -5990,21 +6061,50 @@ void ReviewOverview::buildUi()
                 m_beforeNote->moveCursor(QTextCursor::End);
             }
             // Typing after the answer was shown is not "before": the box is hidden by then.
-            if (!m_before.answerShownAt.isValid()) m_before.note = text;
+            if (!m_before.locked()) m_before.note = text;
         });
         before->addWidget(m_beforeNote);
-        for (QLabel **label : {&m_beforeSummary, &m_predictionLine}) {
-            *label = new QLabel(m_beforePanel);
-            (*label)->setWordWrap(true);
-            (*label)->setTextFormat(Qt::PlainText);
-            QPalette secondary = (*label)->palette();
-            secondary.setColor(QPalette::WindowText, secondary.color(QPalette::PlaceholderText));
-            (*label)->setPalette(secondary);
-            (*label)->hide();
-            before->addWidget(*label);
-        }
+        // Locked: one line with the picks, as high as its text, and the pencil that opens them again.
+        m_beforeSummaryRow = new QWidget(m_beforePanel);
+        m_beforeSummaryRow->setObjectName(QStringLiteral("reviewBeforeSummaryRow"));
+        auto *summaryRow = new QHBoxLayout(m_beforeSummaryRow);
+        summaryRow->setContentsMargins(0, 0, 0, 0);
+        summaryRow->setSpacing(4);
+        m_beforeSummary = new QLabel(m_beforeSummaryRow);
         m_beforeSummary->setObjectName(QStringLiteral("reviewBeforeSummary"));
+        m_beforeSummary->setTextFormat(Qt::PlainText);
+        // Elided to the bar's width (elideBeforeSummary), never wrapped: the bar keeps its height.
+        m_beforeSummary->setMinimumWidth(1);
+        summaryRow->addWidget(m_beforeSummary, 0, Qt::AlignVCenter);
+        m_beforeEditButton = new QToolButton(m_beforeSummaryRow);
+        m_beforeEditButton->setObjectName(QStringLiteral("reviewBeforeEditButton"));
+        const QIcon pencil = QIcon::fromTheme(QStringLiteral("document-edit"));
+        if (pencil.isNull()) m_beforeEditButton->setText(QStringLiteral("✏\uFE0E"));
+        else m_beforeEditButton->setIcon(pencil);
+        m_beforeEditButton->setAutoRaise(true);
+        m_beforeEditButton->setFocusPolicy(Qt::TabFocus);
+        m_beforeEditButton->setToolTip(i18n("Change what you picked before seeing the answer"));
+        m_beforeEditButton->setAccessibleName(m_beforeEditButton->toolTip());
+        const int line = m_beforeSummary->fontMetrics().height();
+        m_beforeEditButton->setIconSize(QSize(line - 2, line - 2));
+        m_beforeEditButton->setFixedSize(line + 4, line);
+        connect(m_beforeEditButton, &QToolButton::clicked, this, &ReviewOverview::reopenBeforeStep);
+        summaryRow->addWidget(m_beforeEditButton, 0, Qt::AlignVCenter);
+        summaryRow->addStretch(1);
+        m_beforeSummaryRow->installEventFilter(this);
+        m_beforeSummaryRow->hide();
+        before->addWidget(m_beforeSummaryRow);
+        m_predictionLine = new QLabel(m_beforePanel);
         m_predictionLine->setObjectName(QStringLiteral("reviewAgentPrediction"));
+        m_predictionLine->setWordWrap(true);
+        for (QLabel *label : {m_beforeSummary, m_predictionLine}) {
+            label->setTextFormat(Qt::PlainText);
+            QPalette secondary = label->palette();
+            secondary.setColor(QPalette::WindowText, secondary.color(QPalette::PlaceholderText));
+            label->setPalette(secondary);
+        }
+        m_predictionLine->hide();
+        before->addWidget(m_predictionLine);
     }
     m_beforePanel->hide();
     sessionLayout->addWidget(m_beforePanel);
@@ -6196,6 +6296,8 @@ void ReviewOverview::restoreVerifiedCounts()
         if (!stem.isEmpty() && m_documentFilter->findData(stem) < 0) m_documentFilter->addItem(stem, stem);
     }
     displayCounts(counts[0].toInt(), counts[1].toInt(), counts[2].toInt(), counts[3].toInt());
+    // Shown with the queue loaded here until the background refresh counts them again.
+    m_unavailableCount = counts[3].toInt();
     if (refreshDeferred()) applyDeferredState();
 }
 
@@ -6353,8 +6455,14 @@ void ReviewOverview::reload()
         return;
     }
     convertWholeDocumentCards();
-    reloadDocumentFilter();
-    refreshDueQueue();
+    // During a review the card shown stays the one reviewed (or the card a merge made of it): a
+    // new queue taken by position would put another card under the bar (Merge cards, 13 Nov).
+    if (!m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size()) {
+        reloadFromProjections();
+        return;
+    }
+    // The queue, the document filter and the counts: built off the GUI thread.
+    requestQueueRefresh();
 }
 
 void ReviewOverview::showBrowseCards()
@@ -6655,6 +6763,7 @@ void ReviewOverview::updateSessionMessage(const QString &message)
     m_sessionComplete = true;
     m_reviewHidden = false;
     m_reviewQuestion->setText(message);
+    m_reviewQuestion->setToolTip({});
     m_reviewStatus->hide();
     m_answerPeeked = false;
     m_ratingPanel->hide();
@@ -6667,7 +6776,8 @@ void ReviewOverview::updateSessionMessage(const QString &message)
 
 void ReviewOverview::reviewCard(const QString &cardId)
 {
-    const QList<ReviewBrowserCard> cards = m_store.browserCards();
+    // Only that card is read (its state as Cards shows it).
+    const QList<ReviewBrowserCard> cards = m_store.browserCardsOf(m_store.cardsWithIds({cardId}));
     const auto selected = std::find_if(cards.cbegin(), cards.cend(), [&cardId](const ReviewBrowserCard &item) {
         return item.card.id() == cardId && item.canReview();
     });
@@ -6692,21 +6802,17 @@ void ReviewOverview::reviewCard(const QString &cardId)
     if (m_currentReview >= 0) Q_EMIT reviewStarted();
 }
 
-void ReviewOverview::reloadDocumentFilter()
+void ReviewOverview::applyDocumentStems(QStringList stems)
 {
     const QString previous = m_documentFilter->currentData().toString();
-    QSet<QString> stems;
-    for (const ReviewCard &card : m_store.cards()) {
-        if ((card.status() == QLatin1String("approved") || card.status() == QLatin1String("needs_reanchor")) && !card.schedule.deleted) {
-            stems.insert(card.pdfStem());
-        }
-    }
+    stems.sort(Qt::CaseInsensitive);
+    QStringList listed;
+    for (int index = 1; index < m_documentFilter->count(); ++index) listed.append(m_documentFilter->itemData(index).toString());
+    if (listed == stems) return;
     m_documentFilter->blockSignals(true);
     m_documentFilter->clear();
     m_documentFilter->addItem(i18n("All documents"), QString());
-    QStringList ordered = stems.values();
-    ordered.sort(Qt::CaseInsensitive);
-    for (const QString &stem : std::as_const(ordered)) {
+    for (const QString &stem : std::as_const(stems)) {
         m_documentFilter->addItem(stem, stem);
     }
     const int restored = m_documentFilter->findData(previous);
@@ -6714,6 +6820,38 @@ void ReviewOverview::reloadDocumentFilter()
         m_documentFilter->setCurrentIndex(restored);
     }
     m_documentFilter->blockSignals(false);
+}
+
+namespace
+{
+// The card @p cardId became when it was merged into another (Merge cards, thoughtsctl
+// merge-review-cards, or the server's merge): the card its newest deletion names in merged_into,
+// followed through later merges to a card that still exists. Empty when it was not merged away.
+// The cards of the way are read from @p store as needed, into @p cards.
+QString mergedIntoCard(const ReviewStore &store, QList<ReviewCard> *cards, QString cardId)
+{
+    for (int hop = 0; hop < 8; ++hop) {
+        const auto find = [cards, &cardId] {
+            return std::find_if(cards->cbegin(), cards->cend(), [&cardId](const ReviewCard &item) { return item.id() == cardId; });
+        };
+        auto card = find();
+        if (card == cards->cend()) {
+            *cards += store.cardsWithIds({cardId});
+            card = find();
+        }
+        if (card == cards->cend()) return {};
+        if (!card->schedule.deleted) return hop > 0 ? cardId : QString();
+        QString next;
+        for (auto event = card->history.crbegin(); event != card->history.crend(); ++event) {
+            if (event->value(QStringLiteral("rating")).toString() != QLatin1String("delete")) continue;
+            next = event->value(QStringLiteral("merged_into")).toString();
+            break;
+        }
+        if (next.isEmpty() || next == cardId) return {};
+        cardId = next;
+    }
+    return {};
+}
 }
 
 void ReviewOverview::reloadFromProjections()
@@ -6728,40 +6866,50 @@ void ReviewOverview::reloadFromProjections()
     }
 
     const QString currentCardId = m_dueCards.at(m_currentReview).id();
+    const QVariantList placesShown = m_dueCards.at(m_currentReview).regions();
+    const QString pdfShown = m_dueCards.at(m_currentReview).pdfSha256();
     const bool answerRevealed = !m_ratingPanel->isHidden();
-    reloadDocumentFilter();
     const QDateTime now = QDateTime::currentDateTimeUtc();
-    QList<ReviewCard> refreshed = m_store.dueCards(now, m_documentFilter->currentData().toString());
-    auto current = std::find_if(refreshed.cbegin(), refreshed.cend(), [&currentCardId](const ReviewCard &card) {
-        return card.id() == currentCardId;
-    });
-    if (current == refreshed.cend()) {
-        // Editing a card's source rebuilds its PDF and re-places the card, which
-        // hides it from the due queue until that finishes. It is still the same
-        // card and still due: keep reviewing it rather than ending the session.
-        // A card deleted or already reviewed elsewhere still ends it below.
-        const QList<ReviewCard> all = m_store.cards(nullptr, m_dueCards.at(m_currentReview).pdfStem());
-        const auto same = std::find_if(all.cbegin(), all.cend(), [&currentCardId](const ReviewCard &card) {
-            return card.id() == currentCardId;
-        });
-        if (same != all.cend() && same->isApproved() && !same->schedule.deleted && !same->schedule.retained && ReviewStore::isDueNow(*same, now)) {
-            refreshed.prepend(*same);
-            current = refreshed.cbegin();
+    // Only the card under review is read here; the rest of the queue, the document filter and the
+    // counts come from a background refresh (updateDueSummary). Editing a card's source rebuilds
+    // its PDF and re-places the card, which hides it from the due queue until that finishes: it
+    // is still the same card and still due, so the review goes on. Review now also shows a card
+    // that is not due (as reviewCard() lets it). A card deleted or reviewed elsewhere ends it.
+    QList<ReviewCard> read = m_store.cardsWithIds({currentCardId});
+    const auto same = std::find_if(read.cbegin(), read.cend(), [&currentCardId](const ReviewCard &card) { return card.id() == currentCardId; });
+    const bool reviewable = same != read.cend() && same->isApproved() && !same->schedule.deleted
+        && (m_singleCardSession ? !same->schedule.retired : !same->schedule.retained && ReviewStore::isDueNow(*same, now));
+    if (!reviewable) {
+        if (const QString keptId = mergedIntoCard(m_store, &read, currentCardId); !keptId.isEmpty()) {
+            // Merged into another card (Merge cards here, thoughtsctl or another device): the review
+            // goes on with the card it became, masked, from its own before step. The picks and note
+            // made for this one carry over while its answer was not shown yet.
+            const auto kept = std::find_if(read.cbegin(), read.cend(), [&keptId](const ReviewCard &card) { return card.id() == keptId; });
+            if (kept != read.cend() && kept->isApproved() && !kept->schedule.retired) {
+                QList<ReviewCard> queue = m_singleCardSession ? QList<ReviewCard>{} : m_dueCards.mid(m_currentReview + 1);
+                queue.removeIf([&](const ReviewCard &card) { return card.id() == keptId || card.id() == currentCardId; });
+                queue.prepend(*kept);
+                BeforeStep carried;
+                if (m_before.cardId == currentCardId && !m_before.answerShownAt.isValid())
+                    carried = {keptId, m_before.tags, m_before.note, {}, false};
+                m_dueCards = std::move(queue);
+                m_currentReview = 0;
+                DeveloperLog::record(QStringLiteral("review.current_card.merged"),
+                                     {{QStringLiteral("card_id"), currentCardId}, {QStringLiteral("kept_card_id"), keptId},
+                                      {QStringLiteral("before_carried"), !carried.cardId.isEmpty()}});
+                showCurrentCard(carried);
+                updateDueSummary();
+                return;
+            }
         }
-    }
-    if (current == refreshed.cend()) {
         m_maskClearer();
-        m_dueCards = std::move(refreshed);
+        m_dueCards.removeIf([&currentCardId](const ReviewCard &card) { return card.id() == currentCardId; });
         m_currentReview = -1;
         updateDueSummary();
         updateSessionMessage(i18n("The current review card changed in another window or during synchronization. Return to Today to start again with the updated queue."));
         return;
     }
-
-    m_dueCards = std::move(refreshed);
-    m_currentReview = int(std::distance(m_dueCards.cbegin(), std::find_if(m_dueCards.cbegin(), m_dueCards.cend(), [&currentCardId](const ReviewCard &card) {
-        return card.id() == currentCardId;
-    })));
+    m_dueCards[m_currentReview] = *same;
     const ReviewCard &card = m_dueCards.at(m_currentReview);
     m_reviewQuestion->setText(card.question());
     showAnswerPages(card);
@@ -6770,14 +6918,16 @@ void ReviewOverview::reloadFromProjections()
     const auto groupsShown = m_barTagGroups;
     updateRatingLabels(card);
     // The before panel follows groups changed elsewhere until it is locked.
-    if (m_barTagGroups != groupsShown && !m_before.answerShownAt.isValid()) rebuildBeforePanel();
+    if (m_barTagGroups != groupsShown && !m_before.locked()) rebuildBeforePanel();
     updateAnswerControls();
     // Projection refreshes update content without presenting or moving windows, except to give
-    // back a presentation a reload of the PDF took away (the card's places on it came with them).
+    // back a presentation a reload of the PDF took away (the card's places on it came with them),
+    // or to cover places the card gained on the PDF shown (another card merged into it).
     updateCardMenu();
     updateSessionExtras();
     updateDueSummary();
     if (!m_lostPresentationCardId.isEmpty()) restoreReviewPresentation(m_lostPresentationCardId);
+    else if (card.pdfSha256() == pdfShown && card.regions() != placesShown) restoreReviewPresentation(currentCardId);
 }
 
 QString ReviewOverview::currentPdfPath(const ReviewCard &card) const
@@ -6828,12 +6978,20 @@ void ReviewOverview::refreshDueQueue()
 void ReviewOverview::updateDueSummary()
 {
     if (refreshDeferred()) return;
-    const QString selectedStem = m_documentFilter->currentData().toString();
+    // During a review the queue still holds the cards answered: the background refresh counts.
+    const bool reviewing = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
+    if (!reviewing) displayQueueCounts(m_dueCards, m_unavailableCount);
+    m_documentFilter->setEnabled(true);
+    m_startButton->setEnabled(m_currentReview < 0 && !m_dueCards.isEmpty());
+    requestQueueRefresh();
+}
+
+void ReviewOverview::displayQueueCounts(const QList<ReviewCard> &due, int unavailable)
+{
     int newCards = 0;
     int learningCards = 0;
     int reviewCards = 0;
-    int unavailable = 0;
-    for (const ReviewCard &card : std::as_const(m_dueCards)) {
+    for (const ReviewCard &card : due) {
         if (!card.schedule.reviewed) {
             ++newCards;
         } else if (card.schedule.intervalDays == 0) {
@@ -6842,15 +7000,98 @@ void ReviewOverview::updateDueSummary()
             ++reviewCards;
         }
     }
-    for (const ReviewBrowserCard &item : m_store.browserCards()) {
-        if ((selectedStem.isEmpty() || item.card.pdfStem() == selectedStem) && item.hasIssues) {
-            ++unavailable;
-        }
-    }
     displayCounts(newCards, learningCards, reviewCards, unavailable);
     saveVerifiedCounts(newCards, learningCards, reviewCards, unavailable);
-    m_documentFilter->setEnabled(true);
-    m_startButton->setEnabled(m_currentReview < 0 && !m_dueCards.isEmpty());
+}
+
+void ReviewOverview::requestQueueRefresh()
+{
+    // Requests within a moment (Sync's end and its projections, an answer and the reload after
+    // it) start one refresh.
+    if (m_queueRefreshTimer && !m_queueRefreshTimer->isActive()) m_queueRefreshTimer->start();
+}
+
+void ReviewOverview::startQueueRefresh()
+{
+    // Sync freezes the dashboard; its end refreshes again (setSyncInProgress).
+    if (refreshDeferred()) return;
+    if (m_queueRefreshRunning) {
+        m_queueRefreshPending = true;
+        return;
+    }
+    m_queueRefreshRunning = true;
+    QueueRefresh request;
+    request.filter = m_documentFilter->currentData().toString();
+    if (!m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size()) request.sessionCardId = m_dueCards.at(m_currentReview).id();
+    // Providers run on the GUI thread only: the worker reads a snapshot of the projections.
+    ReviewStore::ProjectionProvider snapshot;
+    if (m_conversationProjections) {
+        const QJsonObject projections = m_conversationProjections();
+        snapshot = [projections] { return projections; };
+    }
+    const QString root = m_docsRoot;
+    QPointer<ReviewOverview> guard(this);
+    QThreadPool::globalInstance()->start([guard, root, snapshot, request]() mutable {
+        QElapsedTimer elapsed;
+        elapsed.start();
+        const ReviewStore store(root, snapshot, {}, true);
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        const QList<ReviewCard> cards = store.cards();
+        request.cards = int(cards.size());
+        QSet<QString> stems;
+        for (const ReviewCard &card : cards) {
+            if ((card.status() == QLatin1String("approved") || card.status() == QLatin1String("needs_reanchor")) && !card.schedule.deleted) stems.insert(card.pdfStem());
+        }
+        request.stems = stems.values();
+        request.due = store.dueCardsOf(cards, now, request.filter);
+        for (const ReviewBrowserCard &item : store.browserCardsOf(cards, now)) {
+            if ((request.filter.isEmpty() || item.card.pdfStem() == request.filter) && item.hasIssues) ++request.unavailable;
+        }
+        request.durationMs = elapsed.elapsed();
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard.data(), [guard, request] {
+            if (guard) guard->applyQueueRefresh(request);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void ReviewOverview::applyQueueRefresh(const QueueRefresh &result)
+{
+    m_queueRefreshRunning = false;
+    bool again = std::exchange(m_queueRefreshPending, false);
+    DeveloperLog::record(QStringLiteral("review.queue_refresh"), {{QStringLiteral("duration_ms"), result.durationMs}, {QStringLiteral("cards"), result.cards},
+                                                                  {QStringLiteral("due"), result.due.size()}, {QStringLiteral("reviewing"), !result.sessionCardId.isEmpty()}});
+    // Sync began meanwhile: the counts stay frozen and its end refreshes again.
+    if (refreshDeferred()) return;
+    applyDocumentStems(result.stems);
+    const bool reviewing = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
+    const QString shown = reviewing ? m_dueCards.at(m_currentReview).id() : QString();
+    if (result.filter != m_documentFilter->currentData().toString() || result.sessionCardId != shown) {
+        // Made for another document or another card under review (answered, skipped or merged
+        // meanwhile): not applied; a new one is.
+        again = true;
+    } else {
+        m_unavailableCount = result.unavailable;
+        if (reviewing) {
+            // The card under review stays where the bar has it, as it was last read; the queue
+            // around it is the new one.
+            if (!m_singleCardSession) {
+                QList<ReviewCard> queue = result.due;
+                const auto at = std::find_if(queue.cbegin(), queue.cend(), [&shown](const ReviewCard &card) { return card.id() == shown; });
+                const int index = at == queue.cend() ? 0 : int(std::distance(queue.cbegin(), at));
+                queue.removeIf([&shown](const ReviewCard &card) { return card.id() == shown; });
+                queue.insert(index, m_dueCards.at(m_currentReview));
+                m_dueCards = std::move(queue);
+                m_currentReview = index;
+            }
+        } else {
+            m_dueCards = result.due;
+        }
+        displayQueueCounts(result.due, result.unavailable);
+        m_documentFilter->setEnabled(true);
+        m_startButton->setEnabled(m_currentReview < 0 && !m_dueCards.isEmpty());
+    }
+    if (again) requestQueueRefresh();
 }
 
 void ReviewOverview::displayCounts(int newCards, int learningCards, int reviewCards, int unavailable)
@@ -6930,7 +7171,7 @@ bool ReviewOverview::ensureCurrentGeometry(ReviewCard *card, QString *error)
         m_store.markNeedsReanchor(card->id());
         return false;
     }
-    const QList<ReviewCard> reloaded = m_store.cards();
+    const QList<ReviewCard> reloaded = m_store.cardsWithIds({card->id()});
     for (const ReviewCard &candidate : reloaded) {
         if (candidate.id() == card->id()) {
             *card = candidate;
@@ -6941,6 +7182,11 @@ bool ReviewOverview::ensureCurrentGeometry(ReviewCard *card, QString *error)
 }
 
 void ReviewOverview::showCurrentCard()
+{
+    showCurrentCard(BeforeStep{});
+}
+
+void ReviewOverview::showCurrentCard(const BeforeStep &kept)
 {
     closeTagsDialog();
     m_lostPresentationCardId.clear();
@@ -6967,11 +7213,13 @@ void ReviewOverview::showCurrentCard()
         m_barCardId.clear();
         m_answerArea = 0;
         updateRatingLabels(card);
-        // The before step starts empty for every card shown: nothing carries over into a prediction.
-        m_before = {card.id(), {}, {}, {}, false};
+        // The before step starts empty for every card shown: nothing carries over into a prediction,
+        // except the step kept for this very card (shown again after Edit, or made of the card
+        // under review by a merge).
+        m_before = kept.cardId == card.id() ? kept : BeforeStep{card.id(), {}, {}, {}, false};
         {
             const QSignalBlocker blocker(m_beforeNote);
-            m_beforeNote->clear();
+            m_beforeNote->setPlainText(m_before.note);
         }
         rebuildBeforePanel();
         requestRecallPrediction(card);
@@ -6991,13 +7239,14 @@ void ReviewOverview::showCurrentCard()
     setSessionControlsVisible(true);
 }
 
-// As on the phone, only an answer spread over several pages says where it is.
+// As on the phone, only an answer spread over several pages says where it is: in the question's
+// tooltip, so the bar keeps its line under the question for the before step's picks.
 void ReviewOverview::showAnswerPages(const ReviewCard &card)
 {
     const QString pages = card.pagesLabel();
-    const bool multiPage = pages.contains(QLatin1Char(','));
-    m_reviewStatus->setText(multiPage ? i18n("Answer on pages %1", pages) : QString());
-    m_reviewStatus->setVisible(multiPage);
+    m_reviewQuestion->setToolTip(pages.contains(QLatin1Char(',')) ? i18n("Answer on pages %1", pages) : QString());
+    m_reviewStatus->clear();
+    m_reviewStatus->hide();
 }
 
 void ReviewOverview::setMaskFlipped(bool flipped)
@@ -7328,7 +7577,7 @@ void ReviewOverview::rebuildBeforePanel()
         scale->setSelection(chosen);
         const QStringList steps = group.scale;
         scale->onChanged = [this, steps](int value) {
-            if (m_before.answerShownAt.isValid()) return;
+            if (m_before.locked()) return;
             for (const QString &step : steps) m_before.tags.removeAll(step);
             if (value >= 0) m_before.tags.append(steps.at(value));
             // In group order (Feeling, then Recall), as the phone records them.
@@ -7346,7 +7595,7 @@ void ReviewOverview::rebuildBeforePanel()
     // A layout shows a widget added to a visible window only later; show the new list at once.
     list->show();
     // Without a group asked before, there is no before step: no panel, an answer as before.
-    if (asked > 0 && !m_before.answerShownAt.isValid()) m_before.shown = true;
+    if (asked > 0 && !m_before.locked()) m_before.shown = true;
     updateBeforePanel();
 }
 
@@ -7357,22 +7606,38 @@ void ReviewOverview::updateBeforePanel()
         && m_dueCards.at(m_currentReview).id() == m_before.cardId && m_before.shown;
     m_beforePanel->setVisible(current);
     if (!current) return;
-    const bool locked = m_before.answerShownAt.isValid();
+    const bool locked = m_before.locked();
     m_beforeGroups->setVisible(!locked);
     m_beforeNote->setVisible(!locked);
     const QString note = m_before.note.simplified();
-    // Locked: "Before: Meh · Partly recalled — note…".
+    // Locked: "Recall: Partly recalled · Feeling: OK · Setup: Mac — note…", each group with the
+    // step picked, in the groups' order ("Before: not rated" without a pick).
     QString summary;
+    QString whole;
     if (locked) {
         QStringList picked;
-        for (const QString &tag : m_before.tags) picked.append(ReviewTags::shortLabel(reviewTagLabel(tag)));
-        summary = picked.isEmpty() ? i18n("Not rated") : picked.join(QStringLiteral(" · "));
-        if (!note.isEmpty()) summary += QStringLiteral(" — ") + (note.size() > 80 ? note.left(79).trimmed() + QStringLiteral("…") : note);
-        summary = i18n("Before: %1", summary);
+        QStringList named;
+        for (const ReviewTags::TagGroup &group : std::as_const(m_barTagGroups)) {
+            for (const QString &step : group.scale) {
+                if (!m_before.tags.contains(step) || named.contains(step)) continue;
+                named.append(step);
+                picked.append(i18nc("@info a group asked before the answer and the step picked in it", "%1: %2", group.name,
+                                    ReviewTags::shortLabel(reviewTagLabel(step))));
+                break;
+            }
+        }
+        // A pick whose group is gone (the layout changed since) is still named, alone.
+        for (const QString &tag : std::as_const(m_before.tags)) {
+            if (!named.contains(tag)) picked.append(ReviewTags::shortLabel(reviewTagLabel(tag)));
+        }
+        summary = picked.isEmpty() ? i18n("Before: not rated") : picked.join(QStringLiteral(" · "));
+        whole = note.isEmpty() ? summary : summary + QStringLiteral(" — ") + note;
+        if (!note.isEmpty()) summary += QStringLiteral(" — ") + (note.size() > 60 ? note.left(59).trimmed() + QStringLiteral("…") : note);
     }
-    m_beforeSummary->setText(summary);
-    m_beforeSummary->setToolTip(note);
-    m_beforeSummary->setVisible(!summary.isEmpty());
+    m_beforeSummaryText = summary;
+    m_beforeSummary->setToolTip(whole);
+    m_beforeSummaryRow->setVisible(!summary.isEmpty());
+    elideBeforeSummary();
     // The agent's prediction shows only once the answer is shown, after the person's own pick.
     QString prediction;
     const auto found = m_predictions.constFind(m_before.cardId);
@@ -7389,11 +7654,25 @@ void ReviewOverview::updateBeforePanel()
     m_predictionLine->setVisible(!prediction.isEmpty());
 }
 
+void ReviewOverview::elideBeforeSummary()
+{
+    if (!m_beforeSummary) return;
+    // Before the first layout the row has no width yet: the whole line, elided once it is placed.
+    const int available = m_beforeSummaryRow->width() - m_beforeEditButton->width() - m_beforeSummaryRow->layout()->spacing();
+    const QString text = m_beforeSummaryRow->width() > 0 && available > 0
+        ? m_beforeSummary->fontMetrics().elidedText(m_beforeSummaryText, Qt::ElideRight, available)
+        : m_beforeSummaryText;
+    if (m_beforeSummary->text() != text) m_beforeSummary->setText(text);
+}
+
 void ReviewOverview::lockBeforeStep()
 {
     if (m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
-    if (m_before.cardId != m_dueCards.at(m_currentReview).id() || !m_before.shown || m_before.answerShownAt.isValid()) return;
-    m_before.answerShownAt = QDateTime::currentDateTimeUtc();
+    if (m_before.cardId != m_dueCards.at(m_currentReview).id() || !m_before.shown || m_before.locked()) return;
+    // Shown again after the pencil, the answer keeps the time it was first shown (as on the phone):
+    // the picks may have changed since, the moment the answer was seen did not.
+    if (!m_before.answerShownAt.isValid()) m_before.answerShownAt = QDateTime::currentDateTimeUtc();
+    m_before.reopened = false;
     // The after step asks each group asked before and after again, from the step predicted;
     // without a prediction it starts as the bar has it.
     for (const ReviewTags::TagGroup &group : std::as_const(m_barTagGroups)) {
@@ -7404,6 +7683,32 @@ void ReviewOverview::lockBeforeStep()
         m_selectedTags.append(*predicted);
     }
     refreshBarLabels();
+}
+
+// The phone's "Before: … · Tap to change" (its card menu's "Back to before step"), with the same
+// data: the answer is covered again, the rows open on the picks and the note, and showing the
+// answer again (Reveal or Set knowledge) locks the changed picks; the answer records them with
+// the time it was first shown, and nothing marks the change.
+void ReviewOverview::reopenBeforeStep()
+{
+    if (m_sessionComplete || m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
+    if (m_before.cardId != m_dueCards.at(m_currentReview).id() || !m_before.shown || !m_before.locked()) return;
+    if (m_answerPeeked || !m_ratingPanel->isHidden()) {
+        hideAnswer();
+        // The reader could not cover it again: the picks stay as they were.
+        if (m_answerPeeked || !m_ratingPanel->isHidden()) return;
+    }
+    m_before.reopened = true;
+    {
+        const QSignalBlocker blocker(m_beforeNote);
+        m_beforeNote->setPlainText(m_before.note);
+    }
+    rebuildBeforePanel();
+    updateAnswerControls();
+    // The pencil is gone with the line: the keyboard goes on in the first row.
+    if (auto *list = m_beforeGroups->findChild<QWidget *>(QStringLiteral("reviewBeforeGroupList"), Qt::FindDirectChildrenOnly)) {
+        if (auto *first = list->findChild<QWidget *>(QStringLiteral("reviewBeforeTagScale"))) first->setFocus(Qt::OtherFocusReason);
+    }
 }
 
 bool ReviewOverview::beforeOnlyTag(const QString &tag) const
@@ -7875,7 +8180,7 @@ void ReviewOverview::undoSkip()
     m_lastActionWasSkip = false;
     m_singleCardSession = m_skippedSingleCardSession;
     m_dueCards = m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString());
-    const auto cards = m_store.cards();
+    const auto cards = m_store.cardsWithIds({id});
     const auto selected = std::find_if(cards.cbegin(), cards.cend(), [&](const auto &card) { return card.id() == id; });
     if (selected != cards.cend() && selected->isApproved() && !selected->schedule.deleted && !selected->schedule.retained && !selected->schedule.retired
         && (!selected->skippedUntil.isValid() || selected->skippedUntil <= QDateTime::currentDateTimeUtc())) {
@@ -8283,14 +8588,15 @@ void ReviewOverview::editCurrentCard()
     if (m_currentReview < 0 || m_currentReview >= m_dueCards.size() || m_dueCards.at(m_currentReview).id() != card.id()) {
         return;
     }
-    const auto cards = m_store.cards();
+    const auto cards = m_store.cardsWithIds({card.id()});
     for (const auto &updated : cards) {
         if (updated.id() == card.id()) {
             m_dueCards[m_currentReview] = updated;
             break;
         }
     }
-    showCurrentCard();
+    // Still the same card: what was picked before its answer (and when that was shown) stays.
+    showCurrentCard(BeforeStep(m_before));
     if (revealed && m_currentReview >= 0 && m_dueCards.at(m_currentReview).id() == card.id()) {
         revealAnswer();
     }
@@ -8303,7 +8609,7 @@ void ReviewOverview::previousQuestion()
     }
     m_tagUsage.reset(); // Recount after the undone answer is retracted.
     const auto entry = m_reviewHistory.constLast();
-    const auto cards = m_store.cards();
+    const auto cards = m_store.cardsWithIds({entry.first});
     auto previous = std::find_if(cards.cbegin(), cards.cend(), [&entry](const ReviewCard &card) { return card.id() == entry.first && card.isApproved() && !card.schedule.deleted; });
     if (previous == cards.cend()) {
         KMessageBox::error(m_sessionPage, i18n("The previous question is no longer available."), i18n("Cannot Open Previous Question"));
@@ -8342,7 +8648,7 @@ void ReviewOverview::previousQuestion()
     QList<ReviewCard> remaining = m_currentReview >= 0 ? m_dueCards.mid(m_currentReview) : m_dueCards;
     if (m_singleCardSession) remaining.clear();
     remaining.removeIf([&entry](const ReviewCard &item) { return item.id() == entry.first; });
-    const auto refreshed = m_store.cards();
+    const auto refreshed = m_store.cardsWithIds({entry.first});
     for (const auto &item : refreshed) {
         if (item.id() == entry.first) {
             card = item;

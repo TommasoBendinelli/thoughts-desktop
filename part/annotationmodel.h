@@ -70,6 +70,10 @@ struct ReviewCardSidebarEntry
     bool candidate = false;
     bool wholeDocument = false;
     QJsonObject schedule; // "sidebar_schedule" of its record (Thoughts::sidebarReviewSchedule in the shell).
+    // Retired: it stays on the PDF version it was on when it was retired (pdfSha256), and is
+    // drawn only there; on another version it is listed (the Retired filter) but not placed.
+    bool retired = false;
+    QString pdfSha256;
     bool operator==(const ReviewCardSidebarEntry &) const = default;
 };
 

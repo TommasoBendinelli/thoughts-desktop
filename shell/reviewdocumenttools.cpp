@@ -22,6 +22,7 @@
 #include <QSet>
 #include <QStandardPaths>
 #include <QUuid>
+#include <limits>
 #include <QtEndian>
 #include <algorithm>
 #include <numeric>
@@ -230,8 +231,23 @@ QVariantMap locateReviewPage(const QString &pdfPath, const QString &wanted) {
 // Marks each inclusive line range as one segment, in file order. Only complete, visible
 // top-level source lines are marked: never a macro argument, proposal, comment, preamble, or
 // table cell.
+// How markTexRanges treats what TeX does not show inside a range. A new card's passage (the
+// default) holds no definition, no other card's marker and no pending proposal. A passage that
+// already is a card's (ExistingPassage: reading a card's markers, a merge moving them) may hold
+// definitions: the card exists and builds, and its markers expand to nothing. With
+// HeldProposals it may also hold pending agent proposals whole.
+enum TexMarkMode { NewPassage = 0, ExistingPassage = 1, HeldProposals = 2 };
+// The definitions a new card's passage must not hold (whole command names; \def also as the
+// start of a longer name, as before).
+static const QRegularExpression &texDefinition()
+{
+    static const QRegularExpression pattern(QStringLiteral(R"(\\(def[A-Za-z@]*|newcommand|renewcommand|providecommand|DeclareRobustCommand)(?![A-Za-z@]))"));
+    return pattern;
+}
+// @p lineNumbers: the line of the caller's source shown for each line of @p source (one-based), when they differ.
 static ReviewAnchorPlan markTexRanges(const QString &path, const QByteArray &source, QList<QPair<int, int>> ranges,
-                                      const QString &cardId, int *failedRange) {
+                                      const QString &cardId, int *failedRange, int mode = NewPassage, const QList<int> &lineNumbers = {}) {
+    const bool aroundPendingProposals = mode & HeldProposals;
     ReviewAnchorPlan plan;
     if (failedRange) *failedRange = -1;
     const auto fail = [&plan, failedRange](const QString &error, int range = -1) {
@@ -258,17 +274,33 @@ static ReviewAnchorPlan markTexRanges(const QString &path, const QByteArray &sou
     // wrapper's hidden part (keeping line breaks), and never mark inside it.
     QString scanText = text;
     QSet<int> inProposal;
+    const auto lineOfOffset = [&text](int offset) { return int(QStringView(text).left(offset).count(QLatin1Char('\n'))) + 1; };
     for (const auto &[from, to] : latexAgentProposalHiddenRanges(text)) {
-        const int firstLine = int(QStringView(text).left(from).count(QLatin1Char('\n'))) + 1;
-        const int lastLine = int(QStringView(text).left(to).count(QLatin1Char('\n'))) + 1;
-        for (int line = firstLine; line <= lastLine; ++line) inProposal.insert(line);
+        for (int line = lineOfOffset(from); line <= lineOfOffset(to); ++line) inProposal.insert(line);
         for (int k = from; k < to; ++k)
             if (scanText.at(k) != QLatin1Char('\n')) scanText[k] = QLatin1Char(' ');
+    }
+    // A merge re-marks passages that hold pending proposals: the lines of a valid proposal that
+    // one range holds whole are no obstacle, since markers go on lines of their own outside it.
+    // A broken one, or one a range holds only in part, still is.
+    if (aroundPendingProposals && !inProposal.isEmpty()) {
+        const AgentProposalParse parsed = parseAgentProposals(path, text);
+        QSet<int> broken;
+        for (const auto &issue : parsed.issues)
+            for (int line = lineOfOffset(issue.offset); line <= lineOfOffset(issue.offset + issue.length); ++line) broken.insert(line);
+        for (const auto &proposal : parsed.proposals) {
+            const int first = lineOfOffset(proposal.offset), last = lineOfOffset(proposal.offset + proposal.length);
+            const bool held = std::any_of(ranges.cbegin(), ranges.cend(), [&](const auto &range) { return range.first <= first && last <= range.second; });
+            if (!held) continue;
+            for (int line = first; line <= last; ++line)
+                if (!broken.contains(line)) inProposal.remove(line);
+        }
     }
     const auto scanLines = scanText.toUtf8().split('\n');
     int depth = 0; bool visible = !scanText.contains(QStringLiteral("\\begin{document}"));
     QStringList environments;
-    QSet<int> safeBefore, safeAfter, hidden;
+    QSet<int> safeBefore, safeAfter;
+    QHash<int, QString> hidden;  // line -> why TeX does not show it
     const QSet<QString> allowed {QStringLiteral("document"), QStringLiteral("itemize"), QStringLiteral("enumerate"), QStringLiteral("description")};
     for (int index = 0; index < scanLines.size(); ++index) {
         const auto line = scanLines[index];
@@ -294,8 +326,17 @@ static ReviewAnchorPlan markTexRanges(const QString &path, const QByteArray &sou
         bool after = depth == 0 && visible;
         for (const auto &env : environments) after = after && allowed.contains(env);
         if (after) safeAfter.insert(index + 1);
-        if (active.contains("\\def") || active.contains("\\newcommand") || active.contains("\\renewcommand")
-            || active.contains("\\ReviewCardMask") || inProposal.contains(index + 1)) hidden.insert(index + 1);
+        const QString activeText = QString::fromUtf8(active);
+        if (activeText.contains(QLatin1String("\\ReviewCardMask")))
+            hidden.insert(index + 1, QStringLiteral("holds another review card's marker; cards cannot be nested"));
+        else if (inProposal.contains(index + 1))
+            hidden.insert(index + 1, mode & ExistingPassage
+                ? QStringLiteral("holds part of a pending agent proposal that runs past the passage; decide or withdraw it first")
+                : QStringLiteral("holds a pending agent proposal; resolve it before creating a card from this passage"));
+        else if (!(mode & ExistingPassage))
+            if (const auto definition = texDefinition().match(activeText); definition.hasMatch())
+                hidden.insert(index + 1, QStringLiteral("holds a definition (\\%1), which the PDF does not show; select the passage without it")
+                                             .arg(definition.captured(1)));
         if (depth < 0) return fail(QStringLiteral("The source braces are not balanced."));
     }
     for (const int index : std::as_const(order)) {
@@ -303,7 +344,8 @@ static ReviewAnchorPlan markTexRanges(const QString &path, const QByteArray &sou
         if (!safeBefore.contains(range.first) || !safeAfter.contains(range.second))
             return fail(QStringLiteral("Select a complete source passage, including its surrounding equation or figure structure."), index);
         for (int line = range.first; line <= range.second; ++line)
-            if (hidden.contains(line)) return fail(QStringLiteral("The selection contains hidden definitions or existing review markers."), index);
+            if (hidden.contains(line))
+                return fail(QStringLiteral("Line %1 %2.").arg(QString::number(lineNumbers.value(line - 1, line)), hidden.value(line)), index);
     }
     QByteArray output; QJsonArray segments; int range = 0;
     for (int index = 0; index < lines.size(); ++index) {
@@ -367,7 +409,8 @@ ReviewAnchorPlan markReviewSourceLines(const QString &path, const QByteArray &so
 // Why lines [first, end) of a source cannot become one answer passage of @p cardId, or empty:
 // a pending or broken proposal or another card's markers in it, or for Markdown a boundary
 // that is not between complete top-level blocks.
-static QString sourceSelectionError(const QString &path, const QByteArray &source, int first, int end, const QString &cardId) {
+static QString sourceSelectionError(const QString &path, const QByteArray &source, int first, int end, const QString &cardId,
+                                   bool aroundPendingProposals = false) {
     const QString text = QString::fromUtf8(source);
     const auto lines = source.split('\n');
     const int lineCount = lines.size() - int(source.endsWith('\n'));
@@ -382,9 +425,15 @@ static QString sourceSelectionError(const QString &path, const QByteArray &sourc
     if (text.mid(startOffset, endOffset - startOffset).trimmed().isEmpty()) return QStringLiteral("Select an answer passage.");
     // Broken proposals occupy their span too; elsewhere they do not block a card.
     const AgentProposalParse parsed = parseAgentProposals(path, text);
-    for (const auto &p : parsed.proposals)
-        if (startOffset < p.offset + p.length && p.offset < endOffset)
-            return QStringLiteral("Resolve the pending proposal before creating a card from this passage.");
+    // A merge re-marks passages that hold pending proposals whole (aroundPendingProposals).
+    QList<QPair<int, int>> heldProposals;
+    for (const auto &p : parsed.proposals) {
+        if (!(startOffset < p.offset + p.length && p.offset < endOffset)) continue;
+        if (!aroundPendingProposals) return QStringLiteral("Resolve the pending proposal before creating a card from this passage.");
+        if (p.offset < startOffset || p.offset + p.length > endOffset)
+            return QStringLiteral("The pending proposal on line %1 starts inside this passage and ends outside it, or the other way round. Decide or withdraw it first.").arg(p.line);
+        heldProposals.append({p.offset, p.offset + p.length});
+    }
     for (const auto &issue : parsed.issues)
         if (startOffset < issue.offset + issue.length && issue.offset < endOffset)
             return QStringLiteral("Fix or remove the broken proposal before creating a card from this passage: %1").arg(agentProposalIssueMessage(issue));
@@ -429,7 +478,12 @@ static QString sourceSelectionError(const QString &path, const QByteArray &sourc
         return QStringLiteral("Select complete Markdown blocks, including the full paragraph, list, table, or code block.");
     // Boundaries inside HTML blocks, front matter, nested lists and blockquotes
     // cannot be proven neutral by this local editor path.
+    int lineOffset = startOffset;
     for (int i = first - 1; i < end - 1; ++i) {
+        const int at = lineOffset;
+        lineOffset += int(textLines[i].size()) + 1;
+        // A pending proposal held whole is a block of its own; its marker lines are not HTML.
+        if (std::any_of(heldProposals.cbegin(), heldProposals.cend(), [at](const auto &span) { return span.first <= at && at < span.second; })) continue;
         const auto trimmed = lines[i].trimmed();
         if (trimmed.startsWith('<') || trimmed.startsWith('>') || (i == 0 && (trimmed == "---" || trimmed == "+++")))
             return QStringLiteral("Select rendered Markdown content outside HTML, front matter, and blockquotes.");
@@ -451,7 +505,7 @@ static bool isMarkdownPath(const QString &path) {
 }
 // Inclusive line ranges, each wrapped in its own answer:n marker pair (n in file order).
 static ReviewAnchorPlan markMarkdownRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
-                                           const QString &cardId, int *failedRange) {
+                                           const QString &cardId, int *failedRange, bool aroundPendingProposals = false) {
     ReviewAnchorPlan invalid;
     if (failedRange) *failedRange = -1;
     const auto fail = [&](const QString &message, int range = -1) {
@@ -469,7 +523,7 @@ static ReviewAnchorPlan markMarkdownRanges(const QString &path, const QByteArray
         const auto &range = ranges[order[i]];
         if (range.first > range.second || (i > 0 && range.first <= ranges[order[i - 1]].second))
             return fail(QStringLiteral("The source line range is invalid."), order[i]);
-        const QString error = sourceSelectionError(path, source, range.first, range.second + 1, cardId);
+        const QString error = sourceSelectionError(path, source, range.first, range.second + 1, cardId, aroundPendingProposals);
         if (!error.isEmpty()) return fail(error, order[i]);
     }
     const QString text = QString::fromUtf8(source);
@@ -502,15 +556,15 @@ static ReviewAnchorPlan markMarkdownRanges(const QString &path, const QByteArray
     return plan;
 }
 ReviewAnchorPlan markReviewSourceRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
-                                        const QString &cardId, int *failedRange) {
-    if (isMarkdownPath(path)) return markMarkdownRanges(path, source, ranges, cardId, failedRange);
+                                        const QString &cardId, int *failedRange, bool existingPassages) {
+    if (isMarkdownPath(path)) return markMarkdownRanges(path, source, ranges, cardId, failedRange, existingPassages);
     if (!path.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) {
         if (failedRange) *failedRange = -1;
         ReviewAnchorPlan invalid;
         invalid.error = QStringLiteral("Choose a LaTeX or Markdown source file.");
         return invalid;
     }
-    return markTexRanges(path, source, ranges, cardId, failedRange);
+    return markTexRanges(path, source, ranges, cardId, failedRange, existingPassages ? ExistingPassage | HeldProposals : NewPassage);
 }
 ReviewAnchorPlan markReviewSourceSelection(const QString &path, const QByteArray &source, int first, int end, const QString &cardId) {
     ReviewAnchorPlan invalid;
@@ -604,6 +658,71 @@ FloatEnvironment enclosingFloat(const QList<FloatEnvironment> &floats, const QLi
             best = candidate;
     }
     return best;
+}
+// A page's text in visual lines, top to bottom: boxes whose vertical centres fall in one band.
+struct PageTextLine { qreal top = 0, bottom = 0; QList<const Poppler::TextBox *> boxes; };
+QList<PageTextLine> pageTextLines(const std::vector<std::unique_ptr<Poppler::TextBox>> &boxes) {
+    QList<const Poppler::TextBox *> sorted;
+    for (const auto &box : boxes) if (!box->text().trimmed().isEmpty()) sorted.append(box.get());
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Poppler::TextBox *a, const Poppler::TextBox *b) {
+        return a->boundingBox().center().y() < b->boundingBox().center().y();
+    });
+    QList<PageTextLine> lines;
+    for (const auto *box : std::as_const(sorted)) {
+        const QRectF bounds = box->boundingBox();
+        if (!lines.isEmpty() && bounds.center().y() >= lines.last().top && bounds.center().y() <= lines.last().bottom) {
+            lines.last().top = std::min(lines.last().top, bounds.top());
+            lines.last().bottom = std::max(lines.last().bottom, bounds.bottom());
+            lines.last().boxes.append(box);
+        } else {
+            lines.append({bounds.top(), bounds.bottom(), {box}});
+        }
+    }
+    return lines;
+}
+// The words of a line that hold a letter, lower case and without punctuation.
+QSet<QString> letteredWords(const PageTextLine &line) {
+    QSet<QString> words;
+    for (const auto *box : line.boxes) {
+        QString word;
+        for (const QChar c : box->text()) if (c.isLetterOrNumber()) word += c.toLower();
+        if (std::any_of(word.cbegin(), word.cend(), [](QChar c) { return c.isLetter(); })) words.insert(word);
+    }
+    return words;
+}
+// Two pages show the same running header or footer line: at the same height, with the same
+// words (at least half of them; a section title or date in it may change), or both without
+// letters (page numbers).
+bool sameFurnitureLine(const PageTextLine &a, const PageTextLine &b) {
+    if (qAbs((a.top + a.bottom) / 2 - (b.top + b.bottom) / 2) > 3) return false;
+    const QSet<QString> first = letteredWords(a), second = letteredWords(b);
+    if (first.isEmpty() || second.isEmpty()) return first.isEmpty() && second.isEmpty();
+    return 2 * QSet<QString>(first).intersect(second).size() >= std::max(first.size(), second.size());
+}
+// Page furniture: the running header, footer and page number the page layout prints. They are
+// typeset by the page's output routine, so SyncTeX ties them to whatever source line TeX was
+// reading at the page break, not to their text. They are the page's first or last lines (at
+// most two at each edge, in its top or bottom fifth) that its neighbouring pages repeat at the
+// same height.
+QSet<const Poppler::TextBox *> pageFurniture(const QList<PageTextLine> &lines, qreal pageHeight, const QList<QList<PageTextLine>> &neighbours) {
+    QSet<const Poppler::TextBox *> furniture;
+    const auto repeated = [&neighbours](const PageTextLine &line) {
+        return std::any_of(neighbours.cbegin(), neighbours.cend(), [&line](const QList<PageTextLine> &other) {
+            return std::any_of(other.cbegin(), other.cend(), [&line](const PageTextLine &candidate) { return sameFurnitureLine(line, candidate); });
+        });
+    };
+    int top = 0;
+    for (; top < std::min<qsizetype>(2, lines.size()); ++top) {
+        const auto &line = lines[top];
+        if ((line.top + line.bottom) / 2 > pageHeight / 5 || !repeated(line)) break;
+        for (const auto *box : line.boxes) furniture.insert(box);
+    }
+    for (int index = int(lines.size()) - 1, taken = 0; index >= top && taken < 2; --index, ++taken) {
+        const auto &line = lines[index];
+        if ((line.top + line.bottom) / 2 < pageHeight * 4 / 5 || !repeated(line)) break;
+        for (const auto *box : line.boxes) furniture.insert(box);
+    }
+    return furniture;
 }
 bool ignorableSourceLine(const QByteArray &line, bool tex) {
     const auto trimmed = line.trimmed();
@@ -996,6 +1115,19 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             pageBoxes.insert(number, std::make_shared<std::vector<std::unique_ptr<Poppler::TextBox>>>(pageAt(number)->textList()));
         return *pageBoxes.value(number);
     };
+    // Each page's running header, footer and page number (pageFurniture): never mapped to the
+    // source, never part of an answer.
+    QHash<int, QSet<const Poppler::TextBox *>> furnitureOf;
+    const auto furnitureAt = [&](int number) -> const QSet<const Poppler::TextBox *> & {
+        if (!furnitureOf.contains(number)) {
+            QList<QList<PageTextLine>> neighbours;
+            for (const int other : {number - 1, number + 1})
+                if (other >= 1 && other <= pdf->numPages() && pageAt(other)) neighbours.append(pageTextLines(boxesAt(other)));
+            furnitureOf.insert(number, pageFurniture(pageTextLines(boxesAt(number)), pageAt(number)->pageSizeF().height(), neighbours));
+        }
+        return furnitureOf[number];
+    };
+    const auto isFurniture = [&](int number, const std::unique_ptr<Poppler::TextBox> &box) { return furnitureAt(number).contains(box.get()); };
     QList<QRectF> selections;
     QStringList answers;
     for (int i = 0; i < areas.size(); ++i) {
@@ -1005,7 +1137,20 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             return fail(QStringLiteral("The review page is unavailable."), i);
         const auto size = page->pageSizeF();
         selections.append(QRectF(rect.x()*size.width(), rect.y()*size.height(), rect.width()*size.width(), rect.height()*size.height()));
-        const QString text = page->text(selections.last()).simplified();
+        // The answer's text without the page furniture the area may include at its edges.
+        QRectF answerRect = selections.last();
+        qreal bodyTop = std::numeric_limits<qreal>::max(), bodyBottom = std::numeric_limits<qreal>::lowest();
+        bool furnished = false;
+        for (const auto &box : boxesAt(areas[i].page)) {
+            if (box->text().trimmed().isEmpty() || !answerRect.intersects(box->boundingBox())) continue;
+            if (isFurniture(areas[i].page, box)) { furnished = true; continue; }
+            bodyTop = std::min(bodyTop, box->boundingBox().top());
+            bodyBottom = std::max(bodyBottom, box->boundingBox().bottom());
+        }
+        if (furnished && bodyTop <= bodyBottom)
+            answerRect = QRectF(answerRect.left(), std::max(answerRect.top(), bodyTop - 0.5), answerRect.width(),
+                                std::min(answerRect.bottom(), bodyBottom + 0.5) - std::max(answerRect.top(), bodyTop - 0.5));
+        const QString text = furnished && bodyTop > bodyBottom ? QString() : page->text(answerRect).simplified();
         if (!text.isEmpty()) answers.append(text);
     }
     plan.invalidPdf = false;
@@ -1138,10 +1283,12 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         QMap<QString, QList<int>> mapped;
         QHash<QString, QString> ids;
         // The area's words in reading order, and the editable files the resolver found for them.
-        QStringList words;
+        QStringList words, furniture;
         QSet<QString> files;
         for (const auto &box : boxesAt(pageNumber)) {
             if (box->text().trimmed().isEmpty() || !selection.intersects(box->boundingBox())) continue;
+            // A running header, footer or page number at the area's edge is not the answer's.
+            if (isFurniture(pageNumber, box)) { furniture.append(box->text()); continue; }
             if (!selection.adjusted(-0.5,-0.5,0.5,0.5).contains(box->boundingBox()))
                 return fail(QStringLiteral("Select complete words when creating a source-linked card."), i);
             words.append(box->text());
@@ -1169,6 +1316,9 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             mapped[result.sourcePath].append(result.line);
             ids.insert(result.sourcePath, result.sourceId);
         }
+        if (words.isEmpty() && !furniture.isEmpty())
+            return fail(QStringLiteral("it holds only the page's running header, footer or page number (“%1”), which the page layout prints, "
+                                       "not the note's source. Select text of the note itself.").arg(furniture.join(QLatin1Char(' '))), i);
         const QString mappingFailure = !firstFailure.isEmpty() ? firstFailure : !generatedError.isEmpty() ? generatedError
             : QStringLiteral("The selected region has no verifiable source-linked text.");
         // When the build's lines cannot place the area, its whole text placed once in the
@@ -1256,7 +1406,8 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
     for (const int number : std::as_const(areaPages)) {
         if (lineOwner.isEmpty()) break;
         for (const auto &box : boxesAt(number)) {
-            if (box->text().trimmed().isEmpty()) continue;
+            // Page furniture maps to the line read at the page break, not to its own text.
+            if (box->text().trimmed().isEmpty() || isFurniture(number, box)) continue;
             bool inside = false;
             for (int i = 0; i < areas.size() && !inside; ++i)
                 inside = areas[i].page == number && selections[i].adjusted(-0.5,-0.5,0.5,0.5).contains(box->boundingBox());
@@ -1278,7 +1429,7 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             if (areaPages.contains(number) || number < 1 || number > pdf->numPages()) continue;
             if (!pageAt(number)) return fail(QStringLiteral("An associated PDF page is unavailable."));
             for (const auto &box : boxesAt(number)) {
-                if (box->text().trimmed().isEmpty()) continue;
+                if (box->text().trimmed().isEmpty() || isFurniture(number, box)) continue;
                 const auto center = box->boundingBox().center();
                 const auto mapped = resolver.resolveSource({stem, number, center.x(), center.y(), box->text(), pdfPath, true});
                 if (mapped.success && mapped.sourcePath == sourcePath && lineOwner.contains(mapped.line))
@@ -1363,7 +1514,7 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
     return plan;
 }
 
-ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &source, const QString &cardId) {
+ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &source, const QString &cardId, bool aroundPendingProposals) {
     ReviewAnchorPlan invalid;
     invalid.error = QStringLiteral("Place one complete start/end marker pair around the answer in the source and save it.");
     if (QUuid(cardId).isNull() || source.isEmpty()) return invalid;
@@ -1417,12 +1568,14 @@ ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &s
     const QRegularExpression marker(QStringLiteral("^\\\\ReviewCardMask(Start|End)\\{%1\\}\\{([0-9]+)\\}%$").arg(QRegularExpression::escape(cardId)));
     QByteArray unmarked;
     QList<QPair<int, int>> ranges;
+    QList<int> lineNumbers;  // the source line of each unmarked line, for messages
     bool inside = false;
     int segment = 0, unmarkedLine = 0;
     const auto lines = source.split('\n');
     for (int i = 0; i < lines.size(); ++i) {
         const auto &line = lines[i];
         const auto match = marker.match(QString::fromUtf8(line));
+        if (!match.hasMatch()) lineNumbers.append(i + 1);
         if (match.hasMatch()) {
             if (match.captured(2) != QString::number(segment)) return invalid;
             if (match.captured(1) == QLatin1String("Start")) {
@@ -1443,8 +1596,9 @@ ReviewAnchorPlan readReviewSourceAnchor(const QString &path, const QByteArray &s
         }
     }
     if (!segment || inside) return invalid;
-    // Reuse the writer's visibility/nesting checks and canonical marker layout.
-    auto plan = markTexRanges(path, unmarked, ranges, cardId, nullptr);
+    // Reuse the writer's visibility/nesting checks and canonical marker layout, for a passage
+    // that already is the card's: definitions in it are no obstacle (TexMarkMode).
+    auto plan = markTexRanges(path, unmarked, ranges, cardId, nullptr, ExistingPassage | (aroundPendingProposals ? HeldProposals : NewPassage), lineNumbers);
     if (!plan.error.isEmpty()) {
         // The pair itself is complete; say why the passage around it is refused.
         invalid.error = plan.error;
@@ -1527,8 +1681,114 @@ QByteArray removeReviewCardMarkers(const QString &path, const QByteArray &source
     return edited.toUtf8();
 }
 
+QString reviewCardMarkerProblem(const QString &path, const QByteArray &source, const QString &cardId, const QString &cardName)
+{
+    const bool markdown = isMarkdownPath(path);
+    const QString text = QString::fromUtf8(source);
+    const QString card = cardName.isEmpty() ? cardId : QStringLiteral("“%1”").arg(cardName);
+    const QString fix = QStringLiteral(" Fix the markers in the source, then merge the cards.");
+    const QString id = QRegularExpression::escape(cardId);
+    // Any marker of the card, however written; and a marker line as Thoughts writes it.
+    const QRegularExpression anyMarker(markdown
+        ? QStringLiteral(R"(<!--\s*thoughts:v1:(start|end)\s+review:%1:answer:([^\s>]*)\s*-->)").arg(id)
+        : QStringLiteral(R"(\\ReviewCardMask(Start|End)\s*\{\s*%1\s*\}\s*\{\s*([^}]*?)\s*\})").arg(id),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression markerLine(markdown
+        ? QStringLiteral(R"(^ {0,3}<!-- thoughts:v1:(start|end) review:%1:answer:([0-9]+) -->\r?$)").arg(id)
+        : QStringLiteral(R"(^\\ReviewCardMask(Start|End)\{%1\}\{([0-9]+)\}%$)").arg(id));
+    const QRegularExpression fenceStart(QStringLiteral(R"(^ {0,3}(`{3,}|~{3,}))"));
+    const AgentProposalParse parsed = parseAgentProposals(path, text);
+    const QStringList lines = text.split(QLatin1Char('\n'));
+    int offset = 0, segment = 0, openLine = 0, bodyLines = 0;
+    QString openSegment, fence;
+    bool found = false;
+    for (int i = 0; i < lines.size(); offset += int(lines[i].size()) + 1, ++i) {
+        const QString &line = lines[i];
+        const int number = i + 1;
+        if (markdown) {
+            const QString trimmed = line.trimmed();
+            if (!fence.isEmpty()) {
+                int length = 0;
+                while (length < trimmed.size() && trimmed.at(length) == fence.at(0)) ++length;
+                if (length >= fence.size() && trimmed.mid(length).isEmpty()) fence.clear();
+                else if (line.contains(cardId)) return QStringLiteral("Line %1 of %2 holds a marker of card %3 inside a code block.").arg(QString::number(number), path, card) + fix;
+                continue;
+            }
+            if (const auto match = fenceStart.match(line); match.hasMatch()) {
+                fence = match.captured(1);
+                continue;
+            }
+        }
+        if (!line.contains(cardId, Qt::CaseInsensitive)) {
+            if (openLine && !line.trimmed().isEmpty()) ++bodyLines;
+            continue;
+        }
+        found = true;
+        const auto marker = anyMarker.match(line);
+        if (!marker.hasMatch())
+            return QStringLiteral("Line %1 of %2 mentions card %3 outside its markers; a card's ID may appear only in its markers.").arg(QString::number(number), path, card) + fix;
+        // A marker inside a pending proposal: the proposal holds part of a passage and runs past it.
+        const int at = offset + int(marker.capturedStart());
+        for (const auto &proposal : parsed.proposals) {
+            if (proposal.offset <= at && at < proposal.offset + proposal.length) {
+                const int last = proposal.line + int(QStringView(text).mid(proposal.offset, proposal.length).count(QLatin1Char('\n')));
+                return QStringLiteral("The marker of card %1 on line %2 of %3 lies inside the pending proposal %4 (lines %5-%6), which starts inside the "
+                                      "card's passage and ends outside it, or holds it whole. Decide or withdraw that proposal first, then merge the cards.")
+                    .arg(card, QString::number(number), path, proposal.id, QString::number(proposal.line), QString::number(last));
+            }
+        }
+        for (const auto &issue : parsed.issues)
+            if (issue.offset <= at && at < issue.offset + issue.length)
+                return QStringLiteral("The marker of card %1 on line %2 of %3 lies inside a broken proposal (%4). Fix or remove that proposal first, then merge the cards.")
+                    .arg(card, QString::number(number), path, agentProposalIssueMessage(issue));
+        const auto whole = markerLine.match(line);
+        if (!whole.hasMatch()) {
+            // Text before or after the marker on its line: a pending proposal's brace, a comment, other text.
+            const int lineEnd = offset + int(line.size());
+            for (const auto &proposal : parsed.proposals) {
+                if (proposal.offset < lineEnd && offset < proposal.offset + proposal.length)
+                    return QStringLiteral("The marker of card %1 on line %2 of %3 shares its line with the pending proposal %4. Decide or withdraw that "
+                                          "proposal first (a proposal made now leaves markers on lines of their own), then merge the cards.")
+                        .arg(card, QString::number(number), path, proposal.id);
+            }
+            if (anyMarker.match(line, marker.capturedEnd()).hasMatch())
+                return QStringLiteral("Line %1 of %2 holds more than one marker of card %3; each marker must be on a line of its own.").arg(QString::number(number), path, card) + fix;
+            return QStringLiteral("The marker of card %1 on line %2 of %3 shares its line with other text (“%4”); it must be alone on its line, "
+                                  "written as Thoughts writes it.").arg(card, QString::number(number), path, line.trimmed().left(80)) + fix;
+        }
+        const bool start = whole.captured(1).compare(QLatin1String("start"), Qt::CaseInsensitive) == 0;
+        const QString number_ = whole.captured(2);
+        if (start) {
+            if (openLine)
+                return QStringLiteral("Line %1 of %2 starts passage %3 of card %4 inside its passage %5, which opens on line %6 and has no end marker "
+                                      "before it (nested passages, or a missing end marker).").arg(QString::number(number), path, number_, card, openSegment, QString::number(openLine)) + fix;
+            if (number_ != QString::number(segment))
+                return QStringLiteral("Line %1 of %2 starts passage %3 of card %4, but the card's passages must be numbered 0, 1, … in file order; "
+                                      "passage %5 was expected here.").arg(QString::number(number), path, number_, card, QString::number(segment)) + fix;
+            openLine = number;
+            openSegment = number_;
+            bodyLines = 0;
+            continue;
+        }
+        if (!openLine)
+            return QStringLiteral("Line %1 of %2 ends passage %3 of card %4, which has no start marker before it.").arg(QString::number(number), path, number_, card) + fix;
+        if (number_ != openSegment)
+            return QStringLiteral("Line %1 of %2 ends passage %3 of card %4, but the passage open there is %5 (from line %6).")
+                .arg(QString::number(number), path, number_, card, openSegment, QString::number(openLine)) + fix;
+        if (!bodyLines)
+            return QStringLiteral("Passage %1 of card %2 (lines %3-%4 of %5) is empty.").arg(openSegment, card, QString::number(openLine), QString::number(number), path) + fix;
+        openLine = 0;
+        ++segment;
+    }
+    if (openLine)
+        return QStringLiteral("Line %1 of %2 starts passage %3 of card %4, which has no end marker after it.").arg(QString::number(openLine), path, openSegment, card) + fix;
+    if (!found) return QStringLiteral("The markers of card %1 are not in %2. Sync, then merge the cards again.").arg(card, path);
+    return {};
+}
+
 ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByteArray &source, const QString &keptId,
-                                                const QStringList &mergedIds, const QHash<QString, QSet<QString>> &segmentIds)
+                                                const QStringList &mergedIds, const QHash<QString, QSet<QString>> &segmentIds,
+                                                const QHash<QString, QString> &cardNames)
 {
     ReviewCardMergeSource plan;
     const auto fail = [](const QString &error) {
@@ -1541,13 +1801,17 @@ ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByte
     const QStringList cards = QStringList{keptId} + mergedIds;
     if (mergedIds.isEmpty() || QSet<QString>(cards.cbegin(), cards.cend()).size() != cards.size())
         return fail(QStringLiteral("Choose two or more different cards."));
+    const auto name = [&cardNames](const QString &id) { return cardNames.value(id).isEmpty() ? id : QStringLiteral("“%1”").arg(cardNames.value(id)); };
+    if (QString::fromUtf8(source).toUtf8() != source) return fail(QStringLiteral("The source is not valid UTF-8."));
     for (const QString &id : cards) {
         if (QUuid(id).isNull() || segmentIds.value(id).isEmpty()) return fail(QStringLiteral("Every card to merge must be linked to a source passage."));
-        // Complete pairs in their canonical place, as Thoughts writes them.
-        if (!readReviewSourceAnchor(path, source, id).error.isEmpty())
-            return fail(QStringLiteral("The markers of card %1 in %2 are incomplete, nested, or not on lines of their own. Fix them in the source, then merge the cards.").arg(id, path));
+        // Complete pairs in their canonical place, as Thoughts writes them; say what is wrong.
+        if (const QString problem = reviewCardMarkerProblem(path, source, id, cardNames.value(id)); !problem.isEmpty()) return fail(problem);
+        // Their passages as a card's passages must be, pending proposals held whole.
+        if (const auto anchor = readReviewSourceAnchor(path, source, id, true); !anchor.error.isEmpty())
+            return fail(QStringLiteral("The passage of card %1 in %2 cannot be a card's passage: %3 Fix it in the source, then merge the cards.")
+                            .arg(name(id), path, anchor.error));
     }
-    if (QString::fromUtf8(source).toUtf8() != source) return fail(QStringLiteral("The source is not valid UTF-8."));
     // Every passage: its card and its marker lines (one-based).
     const QRegularExpression marker(markdown
         ? QStringLiteral(R"(^ {0,3}<!-- thoughts:v1:(start|end) review:([0-9A-Za-z-]+):answer:([0-9]+) -->\r?$)")
@@ -1572,7 +1836,7 @@ ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByte
     }
     for (const QString &id : cards) {
         if (marked.value(id) != segmentIds.value(id))
-            return fail(QStringLiteral("Card %1 lists other passages than its markers in %2 hold. Sync, then merge the cards again.").arg(id, path));
+            return fail(QStringLiteral("Card %1 lists other passages than its markers in %2 hold. Sync, then merge the cards again.").arg(name(id), path));
     }
     // The merged cards' markers go first, one card at a time, as their deletions remove them.
     plan.versions.append(source);
@@ -1593,7 +1857,7 @@ ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByte
         lineMap[i + 1] = kept.size();
     }
     if (kept.join('\n') != unmarked)
-        return fail(QStringLiteral("The cards' markers in %1 are not on lines of their own. Fix them in the source, then merge the cards.").arg(path));
+        return fail(QStringLiteral("The cards' markers in %1 cannot be removed line by line. Fix them in the source, then merge the cards.").arg(path));
     // Each passage's own lines, without the text between passages; passages that overlap become one.
     struct Range { int first = 0, last = 0; QStringList cards; };
     QList<Range> ranges;
@@ -1604,7 +1868,7 @@ ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByte
             if (!first) first = lineMap[line];
             last = lineMap[line];
         }
-        if (!first) return fail(QStringLiteral("A passage of card %1 is empty.").arg(passage.card));
+        if (!first) return fail(QStringLiteral("A passage of card %1 is empty.").arg(name(passage.card)));
         ranges.append({first, last, {passage.card}});
     }
     std::stable_sort(ranges.begin(), ranges.end(), [](const Range &a, const Range &b) { return a.first < b.first; });
@@ -1619,7 +1883,8 @@ ReviewCardMergeSource planReviewCardMergeSource(const QString &path, const QByte
     }
     QList<QPair<int, int>> lineRanges;
     for (const auto &range : std::as_const(joined)) lineRanges.append({range.first, range.last});
-    auto marking = markReviewSourceRanges(path, unmarked, lineRanges, keptId);
+    // Pending proposals inside passages stay inside, byte for byte: only marker lines move.
+    auto marking = markReviewSourceRanges(path, unmarked, lineRanges, keptId, nullptr, true);
     if (!marking.error.isEmpty()) return fail(QStringLiteral("The merged card's passages cannot be marked in %1: %2").arg(path, marking.error));
     const auto segments = marking.anchor.value(QStringLiteral("segments")).toArray();
     if (segments.size() != joined.size()) return fail(QStringLiteral("The merged card's passages cannot be marked in %1.").arg(path));

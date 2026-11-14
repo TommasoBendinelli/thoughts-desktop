@@ -164,6 +164,17 @@ QList<ReviewFeedbackOverlay::Item> ReviewFeedbackOverlay::items()
         item.record = record;
         // Another card's record: shown only where it lies in this answer.
         const bool shared = ReviewCardFeedback::isShared(record, m_cardId);
+        // A like or dislike belongs to the PDF version it was given on: on
+        // another version it is neither drawn nor counted, only listed apart; another card's is
+        // left out. A version that cannot be told is not compared.
+        const QString given = record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject().value(QStringLiteral("pdf_sha256")).toString();
+        if (!m_pdfSha256.isEmpty() && !given.isEmpty() && given.compare(m_pdfSha256, Qt::CaseInsensitive) != 0) {
+            if (shared) continue;
+            item.state = QStringLiteral("earlier");
+            item.position = std::numeric_limits<qint64>::max();
+            result.append(item);
+            continue;
+        }
         const auto resolution = shared ? ReviewCardFeedback::resolveShared(record, [this] { return m_answer->text; }, m_pdfSha256, m_regions)
                                        : ReviewCardFeedback::resolve(record, m_answer->text, m_pdfSha256);
         if (shared && resolution.state == QLatin1String("orphaned")) continue;
@@ -182,8 +193,9 @@ QList<ReviewFeedbackOverlay::Item> ReviewFeedbackOverlay::items()
         result.append(item);
     }
     std::stable_sort(result.begin(), result.end(), [](const Item &a, const Item &b) {
-        const bool aOrphaned = a.state == QLatin1String("orphaned"), bOrphaned = b.state == QLatin1String("orphaned");
-        if (aOrphaned != bOrphaned) return bOrphaned;
+        // Found ones by position, then those not found, then those of earlier versions.
+        const auto rank = [](const Item &item) { return item.state == QLatin1String("earlier") ? 2 : item.state == QLatin1String("orphaned") ? 1 : 0; };
+        if (rank(a) != rank(b)) return rank(a) < rank(b);
         return a.position < b.position;
     });
     m_items = result;
@@ -596,17 +608,26 @@ QList<QPair<int, QRectF>> ReviewFeedbackOverlay::rectsOf(const QString &feedback
 
 QString ReviewFeedbackOverlay::summary(const QList<Item> &items)
 {
-    int liked = 0, disliked = 0, orphaned = 0;
+    int liked = 0, disliked = 0, orphaned = 0, earlier = 0;
     for (const Item &item : items) {
+        // Likes and dislikes of another PDF version are not counted with this one, only named.
+        if (item.state == QLatin1String("earlier")) {
+            ++earlier;
+            continue;
+        }
         (item.record.value(QStringLiteral("polarity")).toString() == ReviewCardFeedback::negative() ? disliked : liked) += 1;
         if (item.state == QLatin1String("orphaned")) ++orphaned;
     }
-    if (liked + disliked == 0) return QString();
+    if (liked + disliked + earlier == 0) return QString();
     QStringList parts;
     if (liked) parts.append(i18n("%1 liked", liked));
     if (disliked) parts.append(i18n("%1 disliked", disliked));
     QString text = parts.join(QStringLiteral(" · "));
     if (orphaned) text += QStringLiteral(" ") + i18n("(%1 not found)", orphaned);
+    if (earlier) {
+        const QString note = i18np("1 from an earlier version", "%1 from earlier versions", earlier);
+        text = text.isEmpty() ? note : text + QStringLiteral(" · ") + note;
+    }
     return text;
 }
 }

@@ -297,6 +297,8 @@ public:
                          const QJsonObject &pendingChanges,
                          const QDateTime &lastSuccessfulSyncAt,
                          const QJsonObject &latestSyncOperation = QJsonObject());
+    // What to say while automatic Syncs wait after failures ("" when none waits).
+    void setAutomaticSyncNotice(const QString &notice);
     bool syncOperationRunning() const;
     void syncStarted(const QDateTime &startedAt = QDateTime());
     void syncFinished(bool success, const QString &message, const QString &details = QString(), const QString &errorCode = QString(), const QString &operationId = QString());
@@ -354,6 +356,9 @@ Q_SIGNALS:
     void sourceMergeRequested();
     void documentsChanged();
     void agentProposalsResolveRequested(const QString &bundleId, const QString &action, const QStringList &proposalIds);
+    // The user accepted or rejected proposals here, or undid that, and the
+    // sources on this computer changed: the app sends it by itself shortly.
+    void agentProposalsDecidedLocally();
     void reviewCorrespondenceReviewRequested(const QVariantMap &payload);
     // "Remove from Project" on an agent conversation row: @p record is the removed next revision to queue.
     void agentConversationRemoveRequested(const QVariantMap &record);
@@ -524,6 +529,12 @@ private:
     QJsonObject logicalMutationPayload(QJsonObject payload, const CommentState &state, bool deleted) const;
     QJsonObject logicalReplyPayload(const QJsonObject &parentPayload, const QString &contents) const;
     void populateDocumentList(const QString &selectedStem);
+    struct DocumentRowPresentation {
+        QString toolTip;
+        QString iconName;
+    };
+    DocumentRowPresentation documentRowPresentation(const TrackedCommentDocument &document, bool hasComponents) const;
+    void refreshDocumentListSyncPresentations();
     void populateComments();
     QList<QStandardItem *> makeCommentRow(const TrackedCommentDocument &document, const TrackedComment &comment) const;
     void startDocumentReload(const QString &stem);
@@ -711,6 +722,7 @@ private:
     QString m_idlePdfSyncStatusText;
     QString m_idlePdfSyncStatusDetails;
     QString m_idlePdfSyncTimestampText;
+    QString m_automaticSyncNotice;
     QString m_idlePdfSyncTimestampDetails;
     struct PendingDocumentRemoval {
         QString projectRoot;
@@ -800,6 +812,12 @@ private:
     bool m_reloadDeferred = false;
     bool m_fullReloadScheduled = false;
     bool m_discoveryReloadScheduled = false;
+    // A catalogue change seen while a full reload ran (startFullReload, "catalog_changed"): the
+    // signature it saw. When the running reload started from that same catalogue it already reads
+    // it, so no second reload follows (after Sync the first check always saw the files Sync wrote
+    // just before the reload, and a second full reload of 3 to 12 s followed every time, 13 Nov).
+    bool m_catalogReloadScheduled = false;
+    QByteArray m_scheduledCatalogSignature;
     bool m_fullReloadRunning = false;
     QElapsedTimer m_fullReloadElapsed;
     int m_fullReloadTransientRetries = 0;

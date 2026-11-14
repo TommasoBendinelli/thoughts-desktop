@@ -44,7 +44,7 @@ QIcon paintedIcon(const std::function<void(QPainter *)> &draw)
 QIcon pencilIcon(const QColor &color)
 {
     return paintedIcon([color](QPainter *painter) {
-        // The pencil drawn on the page marker (20 px box), scaled to 16 px.
+        // A pencil for the agent's edit (the page marker is a check mark since 13 November).
         painter->scale(IconSize / 20.0, IconSize / 20.0);
         painter->setPen(QPen(color, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         painter->setBrush(Qt::NoBrush);
@@ -153,7 +153,7 @@ bool AgentProposalHoverBar::pointerInside() const
 
 void AgentProposalHoverBar::paintEvent(QPaintEvent *)
 {
-    // The pencil marker's look: base colour, highlight outline, rounded corners.
+    // The page marker's look: base colour, highlight outline, rounded corners.
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
     QColor shadow(0, 0, 0, 40);

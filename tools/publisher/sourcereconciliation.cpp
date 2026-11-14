@@ -192,7 +192,9 @@ Json reconcile(SourcePublisher &publisher, qint64 through)
     QElapsedTimer clock;
     clock.start();
     const QString manifestSha256 = sha256Hex(Py::readBytes(publisher.manifestPath));
-    const Json snapshot = publisher.api.sourceTree();
+    // The tree a publication of this Sync just read is still the server's when the
+    // server's source frontier has not moved; one older than `through` is not.
+    const Json snapshot = publisher.currentSourceTree(through);
     const qint64 observed = Py::toPythonInt(Py::get(snapshot, QStringLiteral("source_frontier"), Json(-1)));
     if (observed < through) {
         Py::raiseValueError(QStringLiteral("source snapshot predates the requested server checkpoint"));
@@ -376,6 +378,10 @@ Json reconcile(SourcePublisher &publisher, qint64 through)
                                                       {QStringLiteral("action"), Json(QStringLiteral("auto_merge"))},
                                                       {QStringLiteral("rules_version"), Json(rulesVersion)}});
                 receipts.insert(path, newReceipt);
+                // Desktop moves its own base after this run, if it can.
+                if (baseSha && std::optional<QString>(Py::pythonStr(Py::subscript(remote, QStringLiteral("sha256")))) != baseSha) {
+                    publisher.recordSupersededBase(path, *baseSha);
+                }
                 bases.insert(path, Json::object({{QStringLiteral("revision"), Py::subscript(remote, QStringLiteral("revision"))},
                                                  {QStringLiteral("sha256"), Py::subscript(remote, QStringLiteral("sha256"))},
                                                  {QStringLiteral("object_sha256"), Py::subscript(remote, QStringLiteral("object_sha256"))}}));
@@ -504,6 +510,14 @@ Json reconcile(SourcePublisher &publisher, qint64 through)
             if (remoteDeleted) {
                 newBase.insert(QStringLiteral("deleted"), Json(true));
             }
+            if (bases.contains(candidate.path)) {
+                // Desktop moves its own base after this run, if it can.
+                const Json previous = bases.value(candidate.path);
+                const Json previousSha = Py::get(previous, QStringLiteral("sha256"));
+                if (!Py::truthy(Py::get(previous, QStringLiteral("deleted"))) && previousSha.isString() && previousSha != newBase.value(QStringLiteral("sha256"))) {
+                    publisher.recordSupersededBase(candidate.path, previousSha.toString());
+                }
+            }
             bases.insert(candidate.path, newBase);
             installedCount += candidate.action == QLatin1String("install_remote") ? 1 : 0;
             Json entry = Json::object({{QStringLiteral("path"), Json(candidate.path)}});
@@ -564,6 +578,11 @@ Json reconcile(SourcePublisher &publisher, qint64 through)
     }
     return report;
 }
+}
+
+Json reconcileAuthoringSources(SourcePublisher &publisher, qint64 through)
+{
+    return reconcile(publisher, through);
 }
 
 int runReconcile(const ArgParse::Arguments &arguments)

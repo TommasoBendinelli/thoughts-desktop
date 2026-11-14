@@ -18,6 +18,7 @@
 #include "thoughtignore.h"
 
 #include <QCryptographicHash>
+#include <QHash>
 #include <QMap>
 
 #include <algorithm>
@@ -470,9 +471,40 @@ QByteArray buildInputSnapshotBytes(const QString &target, const QList<BuildInput
     return Py::dumpsChecked(payload, options) + '\n';
 }
 
+namespace
+{
+int registeredTargetsScopes = 0;
+qint64 registeredTargetsScans = 0;
+QHash<QString, QList<SourceTarget>> registeredTargetsByRoot;
+}
+
+RegisteredSourceTargetsScope::RegisteredSourceTargetsScope()
+{
+    ++registeredTargetsScopes;
+}
+
+RegisteredSourceTargetsScope::~RegisteredSourceTargetsScope()
+{
+    if (--registeredTargetsScopes == 0) {
+        registeredTargetsByRoot.clear();
+    }
+}
+
+qint64 RegisteredSourceTargetsScope::scans()
+{
+    return registeredTargetsScans;
+}
+
 QList<SourceTarget> registeredSourceProjectTargets(const Py::Path &givenDocsRoot)
 {
     const Py::Path docsRoot = Py::resolve(givenDocsRoot);
+    if (registeredTargetsScopes > 0) {
+        const auto known = registeredTargetsByRoot.constFind(docsRoot.str());
+        if (known != registeredTargetsByRoot.cend()) {
+            return known.value();
+        }
+    }
+    ++registeredTargetsScans;
     const QSet<QString> skipped = excludedProjects(docsRoot);
     QSet<QString> owners;
     for (const Py::Path &path : configurationPaths(docsRoot, false)) {
@@ -504,6 +536,9 @@ QList<SourceTarget> registeredSourceProjectTargets(const Py::Path &givenDocsRoot
         for (const ProjectDocument &document : documents) {
             targets.append({project, document.output});
         }
+    }
+    if (registeredTargetsScopes > 0) {
+        registeredTargetsByRoot.insert(docsRoot.str(), targets);
     }
     return targets;
 }
@@ -610,6 +645,8 @@ Json inspectBuildInputs(const Py::Path &givenDocsRoot, const QString &target, co
 
 Json inspectProjectBuildInputs(const Py::Path &givenDocsRoot, const QStringList &targets, const Py::Path &sourceManifest, const std::optional<QString> &projectOverride)
 {
+    // Every PDF of the run asks which folder builds it; the Project files do not change meanwhile.
+    const RegisteredSourceTargetsScope registry;
     Progress::report("scan_directory", givenDocsRoot, givenDocsRoot / QStringLiteral("current_pdfs"));
     const Py::Path docsRoot = Py::resolve(givenDocsRoot);
     std::optional<QString> selectedName;

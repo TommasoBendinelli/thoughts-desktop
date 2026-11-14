@@ -13,6 +13,7 @@
 #include <QJsonArray>
 #include <QTemporaryDir>
 #include <QTest>
+#include <numeric>
 
 class ProposalAuthoringTest : public QObject {
     Q_OBJECT
@@ -157,6 +158,22 @@ private Q_SLOTS:
         QCOMPARE(written["sync_before"].toString(), "op-failedpdf_build_failed");
         QCOMPARE(written["warnings"].toArray().size(), 1);
         QCOMPARE(written["warnings"].toArray().first().toObject()["code"].toString(), "pdf_build_failed");
+        QVERIFY(get(path).contains("\\agentProposedEdit"));
+
+        // The same from a Sync that succeeded with the build failure as its warning
+        // (Sync no longer waits for the server's builds).
+        put(path, "See \\Cref{tab:x}.\nTwo.\n");
+        QJsonObject warned{{"id", "op-warned"}, {"status", "succeeded"}, {"phase", "succeeded"}, {"warning_code", "pdf_build_failed"},
+                           {"warning_message", "PDF build failed\nYour changes are synced with the server.\npaper.pdf: latex_error"}};
+        const auto writtenAfterWarning = Thoughts::authorProposalAfterSync(root.path(), proposal(), "thoughtsctl", Thoughts::syncCommandOperationResult(warned));
+        QVERIFY2(writtenAfterWarning["accepted"].toBool(), qPrintable(QJsonDocument(writtenAfterWarning).toJson()));
+        QCOMPARE(writtenAfterWarning["sync_before"].toString(), "op-warned");
+        QCOMPARE(writtenAfterWarning["warnings"].toArray().size(), 1);
+        const QJsonObject warning = writtenAfterWarning["warnings"].toArray().first().toObject();
+        QCOMPARE(warning["code"].toString(), "pdf_build_failed");
+        QCOMPARE(warning["sync"].toString(), "before");
+        QCOMPARE(warning["operation_id"].toString(), "op-warned");
+        QVERIFY(warning["message"].toString().contains("latex_error"));
         QVERIFY(get(path).contains("\\agentProposedEdit"));
 
         // A succeeded or skipped Sync: no warning.
@@ -1158,6 +1175,267 @@ private Q_SLOTS:
         QCOMPARE(first("[here](#source-label:none)")["reason"].toString(), "label_not_found");
         QCOMPARE(get(notes), before);
         QVERIFY(create(root, notes, 1, 2, "# Notes {#source-label:top}\n\n[here](#source-label:top) [self](notes.md#source-label:top)\n")["accepted"].toBool());
+    }
+    // ---------------------------------------------------------------- beside review card markers
+    // A card marker line stays alone while a proposal is pending; accepted or rejected, every
+    // proposal reads exactly as the plain whole-line wrapper did. The same cases are thoughts-cli's
+    // (clients/thoughts-cli/tests/test_card_marker_lines.py in thoughts-server).
+private:
+    struct Edit { int start; int end; QString replacement; };
+    static constexpr const char *MarkedCard = "3c9d2e41-7a5b-4c6d-8e9f-0a1b2c3d4e5f";
+    static constexpr const char *OtherCard = "5e1f3a62-8b7c-4d8e-9f0a-1b2c3d4e5f60";
+    static QString cardStart(const QString &card = MarkedCard, int segment = 0) { return QStringLiteral("\\ReviewCardMaskStart{%1}{%2}%").arg(card).arg(segment); }
+    static QString cardEnd(const QString &card = MarkedCard, int segment = 0) { return QStringLiteral("\\ReviewCardMaskEnd{%1}{%2}%").arg(card).arg(segment); }
+    // Lines:  1 Opening line.  2 start  3 First claim.  4 Second claim.  5 end  6 Closing line.
+    static QString note() { return "Opening line.\n" + cardStart() + "\nFirst claim.\nSecond claim.\n" + cardEnd() + "\nClosing line.\n"; }
+    // Two cards back to back (1-5, 6-8), then a commented line and a second segment's end (12).
+    static QString notes() {
+        return "Opening line.\n" + cardStart() + "\nFirst claim.\nSecond claim.\n" + cardEnd() + "\n" + cardStart(OtherCard) + "\nOther answer.\n"
+            + cardEnd(OtherCard) + "\nPlain line.\nKeep this%\nLast claim.\n" + cardEnd(OtherCard, 1) + "\n";
+    }
+    static bool markerLinesAlone(const QString &text) {
+        static const QRegularExpression marker(R"(\A[ \t]*\\ReviewCardMask(?:Start|End)\{[^{}\n]*\}\{[^{}\n]*\}%?[ \t]*\r?\z)");
+        for (const QString &line : text.split('\n'))
+            if (line.contains("\\ReviewCardMask") && !marker.match(line).hasMatch()) return false;
+        return true;
+    }
+    static QJsonObject createEdits(const QString &root, const QString &path, const QList<Edit> &edits) {
+        QJsonArray proposals;
+        for (int i = 0; i < edits.size(); ++i)
+            proposals.append(QJsonObject{{"start_line", edits[i].start}, {"end_line", edits[i].end}, {"replacement", edits[i].replacement},
+                                         {"explanation", QStringLiteral("Edit %1.").arg(i + 1)}});
+        if (edits.size() == 1) {
+            auto req = request(path); req.insert("start_line", edits[0].start); req.insert("end_line", edits[0].end);
+            req["replacement"] = edits[0].replacement; req["explanation"] = "Edit 1.";
+            return Thoughts::authorProposal(root, req);
+        }
+        return Thoughts::authorProposal(root, QJsonObject{{"command", "create-proposals"}, {"source", path}, {"expected_source_sha256", Thoughts::ProposalHistory::digest(get(path))},
+                                                          {"conversation_id", Conversation}, {"request_id", QUuid::createUuid().toString(QUuid::WithoutBraces)}, {"proposals", proposals}});
+    }
+    static QStringList createdIds(const QJsonObject &result) {
+        if (!result.contains("proposals")) return {result["proposal_id"].toString()};
+        QStringList ids;
+        for (const auto &value : result["proposals"].toArray()) ids << value.toObject()["proposal_id"].toString();
+        return ids;
+    }
+    // The source as the writer wrote it before 2026-11-13: each wrapper replaces its whole lines.
+    static QString plainLayout(const QString &text, const QList<Edit> &edits, const QJsonObject &result) {
+        const QStringList ids = createdIds(result);
+        QVector<int> offsets {0};
+        for (const QString &line : text.split('\n')) offsets.append(offsets.last() + int(line.size()) + 1);
+        QList<int> order(edits.size()); std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return std::pair(edits[a].start, edits[a].end) < std::pair(edits[b].start, edits[b].end); });
+        QString output; int cursor = 0;
+        for (const int i : order) {
+            const int low = offsets[edits[i].start - 1], high = offsets[edits[i].end - 1];
+            Thoughts::AgentProposedEdit proposal;
+            proposal.id = ids[i]; proposal.createdAt = result["created_at"].toString().isEmpty() ? result["proposals"].toArray()[0].toObject()["created_at"].toString() : result["created_at"].toString();
+            proposal.conversationId = Conversation; proposal.explanation = QStringLiteral("Edit %1.").arg(i + 1);
+            proposal.original = text.mid(low, high - low); proposal.replacement = edits[i].replacement;
+            QString refusal;
+            output += text.mid(cursor, low - cursor) + Thoughts::formatLatexAgentProposal(proposal, &refusal);
+            cursor = high;
+        }
+        return output + text.mid(cursor);
+    }
+    // Every combination of decisions reads exactly as with the plain layout, and pending ones keep every marker alone.
+    static void verifySameDecisions(const QString &path, const QString &text, const QList<Edit> &edits, const QJsonObject &result) {
+        QVERIFY2(!result.contains("error_code"), qPrintable(QJsonDocument(result).toJson()));
+        const QString updated = QString::fromUtf8(get(path));
+        const QString before = plainLayout(text, edits, result);
+        const QStringList ids = createdIds(result);
+        QCOMPARE(Thoughts::parseAgentProposals(path, updated).proposals.size(), ids.size());
+        int combinations = 1; for (int i = 0; i < ids.size(); ++i) combinations *= 3;
+        for (int combination = 0; combination < combinations; ++combination) {
+            QString now = updated, old = before; bool complete = true;
+            for (int i = 0, code = combination; i < ids.size(); ++i, code /= 3) {
+                if (code % 3 == 2) { complete = false; continue; }
+                const QString action = code % 3 == 0 ? "accept" : "reject";
+                now = decide(path, now, {ids[i]}, action); old = decide(path, old, {ids[i]}, action);
+            }
+            if (complete) QCOMPARE(now, old);
+            QVERIFY2(markerLinesAlone(now), qPrintable(now));
+        }
+        QCOMPARE(decide(path, updated, ids, "reject"), text);
+    }
+private Q_SLOTS:
+    void cardMarkerLinesLastLines() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        // The last line of a card, then its last two lines.
+        for (const auto &edit : {Edit{4, 5, "Sharper second claim.\n"}, Edit{3, 5, "One merged claim.\nWith a second line.\n"}}) {
+            put(path, note().toUtf8());
+            const auto result = createEdits(root.path(), path, {edit});
+            verifySameDecisions(path, note(), {edit}, result);
+            const QString updated = QString::fromUtf8(get(path));
+            const auto proposal = Thoughts::parseAgentProposals(path, updated).proposals.first();
+            QCOMPARE(proposal.original + "\n", note().split('\n').mid(edit.start - 1, edit.end - edit.start).join('\n') + "\n");
+            QCOMPARE(proposal.replacement + "\n", edit.replacement);
+            QVERIFY(updated.contains(proposal.replacement + "}\n" + cardEnd() + "\nClosing line.\n"));
+            // The plain layout put the closing brace on the marker's line.
+            QVERIFY(!markerLinesAlone(plainLayout(note(), {edit}, result)));
+            // The agent's view stays whole lines; the history keeps the wrapper's own texts.
+            QCOMPARE(result["original_text"].toString(), proposal.original + "\n");
+            QCOMPARE(result["replacement"].toString(), edit.replacement);
+            QHash<QString, QJsonObject> current; QVERIFY(Thoughts::ProposalHistory::latest(root.path(), &current));
+            QCOMPARE(current.value(proposal.id)["snapshot"].toObject()["before"].toString(), proposal.original);
+            QCOMPARE(current.value(proposal.id)["snapshot"].toObject()["after"].toString(), proposal.replacement);
+            // Every marker line is one that the Mac's card tools read as a marker.
+            static const QRegularExpression strict(R"(^\\ReviewCardMask(Start|End)\{([^}]+)\}\{([0-9]+)\}%$)");
+            for (const QString &line : updated.split('\n'))
+                if (line.contains("ReviewCardMask")) QVERIFY2(strict.match(line).hasMatch(), qPrintable(line));
+        }
+    }
+    void cardMarkerLinesDeletionAndInsertion() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        put(path, note().toUtf8());
+        const auto deleted = createEdits(root.path(), path, {{4, 5, ""}});
+        verifySameDecisions(path, note(), {{4, 5, ""}}, deleted);
+        QVERIFY(get(path).startsWith(("Opening line.\n" + cardStart() + "\nFirst claim.\\agentProposedEdit[").toUtf8()));
+        QVERIFY(get(path).endsWith(("}{\nSecond claim.}{}\n" + cardEnd() + "\nClosing line.\n").toUtf8()));
+        QCOMPARE(decide(path, QString::fromUtf8(get(path)), {deleted["proposal_id"].toString()}, "accept"),
+                 "Opening line.\n" + cardStart() + "\nFirst claim.\n" + cardEnd() + "\nClosing line.\n");
+        QCOMPARE(deleted["original_text"].toString(), "Second claim.\n");
+        QCOMPARE(deleted["line"].toInt(), 3);
+        put(path, note().toUtf8());
+        const auto inserted = createEdits(root.path(), path, {{5, 5, "Third claim.\n"}});
+        verifySameDecisions(path, note(), {{5, 5, "Third claim.\n"}}, inserted);
+        QVERIFY(get(path).endsWith(("Second claim.\\agentProposedEdit[created=" + inserted["created_at"].toString() + ",conversation_id=" + Conversation + "]{"
+                                    + inserted["proposal_id"].toString() + "}{Edit 1.\n}{}{\nThird claim.}\n" + cardEnd() + "\nClosing line.\n").toUtf8()));
+    }
+    void cardMarkerLinesPlainLayoutWhereNoMarkerFollows() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        // Just after a start marker.
+        put(path, note().toUtf8());
+        auto result = createEdits(root.path(), path, {{3, 4, "Sharper first claim.\n"}});
+        verifySameDecisions(path, note(), {{3, 4, "Sharper first claim.\n"}}, result);
+        QCOMPARE(QString::fromUtf8(get(path)), plainLayout(note(), {{3, 4, "Sharper first claim.\n"}}, result));
+        // Right before a start marker.
+        const QString text = "Lead-in sentence.\n" + cardStart() + "\nThe answer.\n" + cardEnd() + "\n";
+        put(path, text.toUtf8());
+        result = createEdits(root.path(), path, {{1, 2, "A better lead-in.\n"}});
+        verifySameDecisions(path, text, {{1, 2, "A better lead-in.\n"}}, result);
+        // The card after the proposal stays readable on the Mac; the plain layout made it unavailable.
+        QCOMPARE(Thoughts::readReviewSourceAnchor("topic.tex", get(path), MarkedCard).error, QString());
+        QVERIFY(!Thoughts::readReviewSourceAnchor("topic.tex", plainLayout(text, {{1, 2, "A better lead-in.\n"}}, result).toUtf8(), MarkedCard).error.isEmpty());
+        QVERIFY(QString::fromUtf8(get(path)).endsWith("{Lead-in sentence.}{A better lead-in.}\n" + cardStart() + "\nThe answer.\n" + cardEnd() + "\n"));
+        // A range that starts on a marker keeps today's layout: the marker goes into the wrapper.
+        put(path, note().toUtf8());
+        result = createEdits(root.path(), path, {{2, 4, cardStart() + "\nNew first claim.\n"}});
+        QVERIFY2(!result.contains("error_code"), qPrintable(QJsonDocument(result).toJson()));
+        QCOMPARE(QString::fromUtf8(get(path)), plainLayout(note(), {{2, 4, cardStart() + "\nNew first claim.\n"}}, result));
+        // Markdown proposals keep their own marker lines.
+        const auto md = root.filePath("topic.md");
+        const QByteArray markdown = "Intro.\n<!-- thoughts:v1:start review:card:answer:0 -->\nAnswer.\n<!-- thoughts:v1:end review:card:answer:0 -->\n";
+        put(md, markdown);
+        result = createEdits(root.path(), md, {{3, 4, "Better answer.\n"}});
+        QVERIFY2(!result.contains("error_code"), qPrintable(QJsonDocument(result).toJson()));
+        QVERIFY(get(md).endsWith(" -->\n<!-- thoughts:v1:end review:card:answer:0 -->\n"));
+    }
+    void cardMarkerLinesRefusals() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        const auto refusal = [&](const QString &text, const QList<Edit> &edits) {
+            put(path, text.toUtf8());
+            const auto result = createEdits(root.path(), path, edits);
+            [&] { QCOMPARE(get(path), text.toUtf8()); }();
+            return result;
+        };
+        // A card with a single line: its replacement is fine, deleting it would empty the passage.
+        const QString single = "Before.\n" + cardStart() + "\nOnly line.\n" + cardEnd() + "\nAfter.\n";
+        put(path, single.toUtf8());
+        verifySameDecisions(path, single, {{3, 4, "Rewritten only line.\n"}}, createEdits(root.path(), path, {{3, 4, "Rewritten only line.\n"}}));
+        auto refused = refusal(single, {{3, 4, ""}});
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QCOMPARE(refused["line"].toInt(), 4);
+        QVERIFY(refused["message"].toString().contains("Keep at least one"));
+        // The last line of the range ends in a comment: the closing brace cannot follow it.
+        const QString commented = "Before.\n" + cardStart() + "\nFirst claim.\nSecond claim.%\n" + cardEnd() + "\n";
+        refused = refusal(commented, {{4, 5, "Sharper.\n"}});
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QVERIFY(refused["message"].toString().contains("end_line 4"));
+        QCOMPARE(refusal(commented, {{4, 5, ""}})["error_code"].toString(), "card_marker_line");
+        QCOMPARE(refusal(commented, {{5, 5, "Inserted.\n"}})["error_code"].toString(), "card_marker_line");
+        put(path, commented.toUtf8());
+        verifySameDecisions(path, commented, {{3, 4, "Sharper first claim.\n"}}, createEdits(root.path(), path, {{3, 4, "Sharper first claim.\n"}}));
+        QVERIFY(refusal(note(), {{4, 5, "Sharper.%\n"}})["message"].toString().contains("replacement's last line"));
+        // A deletion after a line that ends in a comment or a backslash starts where they would hide it.
+        const QString before = "Before.\n" + cardStart() + "\nFirst claim.%\nSecond claim.\n" + cardEnd() + "\n";
+        refused = refusal(before, {{4, 5, ""}});
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QVERIFY(refused["message"].toString().contains("line 3"));
+        put(path, before.toUtf8());
+        verifySameDecisions(path, before, {{4, 5, "Sharper.\n"}}, createEdits(root.path(), path, {{4, 5, "Sharper.\n"}}));
+        QCOMPARE(refusal("Before.\n" + cardStart() + "\nFirst claim \\\nSecond claim.\n" + cardEnd() + "\n", {{4, 5, ""}})["error_code"].toString(), "card_marker_line");
+        // No final line break before the marker.
+        QVERIFY(refusal(note(), {{4, 5, "No line break"}})["message"].toString().contains("End the replacement with a line break"));
+        QCOMPARE(refusal(note(), {{5, 5, "No line break"}})["error_code"].toString(), "card_marker_line");
+        // Between two markers.
+        QVERIFY(refusal(notes(), {{6, 6, "Between the cards.\n"}})["message"].toString().contains("Insert the text before line 5 or after line 6"));
+        QVERIFY(refusal(notes(), {{2, 6, "Replaced card.\n"}})["message"].toString().contains("Select only lines between card markers"));
+    }
+    void cardMarkerLinesSeveralProposals() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        const QList<Edit> edits {{11, 12, "Last claim, sharper.\n"}, {3, 4, "Sharper first claim.\n"}, {7, 8, "Other answer, rewritten.\n"},
+                                 {4, 5, ""}, {9, 10, "Plain line, rewritten.\n"}};
+        put(path, notes().toUtf8());
+        const auto result = createEdits(root.path(), path, edits);
+        verifySameDecisions(path, notes(), edits, result);
+        QCOMPARE(result["proposals"].toArray()[3].toObject()["original_text"].toString(), "Second claim.\n");
+        // The deletion of line 4 starts where the edit of line 3 now ends: that edit leaves out its line break too.
+        QVERIFY(get(path).contains("{First claim.}{Sharper first claim.}\\agentProposedEdit"));
+        QVERIFY(get(path).contains(("{\nSecond claim.}{}\n" + cardEnd()).toUtf8()));
+        // Deleting a single-line card's line in a batch is refused like one deletion, and writes nothing.
+        put(path, notes().toUtf8());
+        auto refused = createEdits(root.path(), path, {{3, 4, "Edited.\n"}, {7, 8, ""}});
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QCOMPARE(refused["proposal_index"].toInt(), 1);
+        QCOMPARE(get(path), notes().toUtf8());
+        // Touching proposals before a marker.
+        const QString longer = "Opening line.\n" + cardStart() + "\nFirst claim.\nSecond claim.\nThird claim.\n" + cardEnd() + "\n";
+        for (const auto &pair : {QList<Edit>{{4, 5, ""}, {5, 6, ""}}, QList<Edit>{{4, 4, "Inserted.\n"}, {4, 5, ""}}, QList<Edit>{{3, 4, "Edited.\n"}, {6, 6, "Inserted.\n"}}}) {
+            put(path, longer.toUtf8());
+            verifySameDecisions(path, longer, pair, createEdits(root.path(), path, pair));
+        }
+        put(path, note().toUtf8());
+        refused = createEdits(root.path(), path, {{3, 4, "Joined "}, {4, 5, ""}});
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QVERIFY(refused["message"].toString().contains("Proposals 1 and 2"));
+        QCOMPARE(refused["proposal_index"].toInt(), 0);
+        QCOMPARE(createEdits(root.path(), path, {{3, 4, ""}, {4, 5, ""}})["error_code"].toString(), "card_marker_line");
+    }
+    void cardMarkerLinesRevisions() {
+        QTemporaryDir root; const auto path = root.filePath("topic.tex");
+        const auto revise = [&](const QString &id, const QString &replacement) {
+            auto req = request(path, false); req.insert("proposal_id", id); req.insert("replacement", replacement);
+            return Thoughts::authorProposal(root.path(), req);
+        };
+        const QString head = "Opening line.\n" + cardStart() + "\nFirst claim.\n", tail = cardEnd() + "\nClosing line.\n";
+        put(path, note().toUtf8());
+        const QString id = createEdits(root.path(), path, {{4, 5, "Sharper.\n"}})["proposal_id"].toString();
+        QVERIFY(!revise(id, "Sharper still.\n").contains("error_code"));
+        QCOMPARE(decide(path, QString::fromUtf8(get(path)), {id}, "accept"), head + "Sharper still.\n" + tail);
+        QCOMPARE(decide(path, QString::fromUtf8(get(path)), {id}, "reject"), note());
+        QVERIFY(markerLinesAlone(QString::fromUtf8(get(path))));
+        QHash<QString, QJsonObject> current; QVERIFY(Thoughts::ProposalHistory::latest(root.path(), &current));
+        QCOMPARE(current.value(id)["snapshot"].toObject()["after"].toString(), "Sharper still.");
+        QVERIFY(!revise(id, "As written.").contains("error_code"));
+        QCOMPARE(decide(path, QString::fromUtf8(get(path)), {id}, "accept"), head + "As written.\n" + tail);
+        const auto refused = revise(id, "");
+        QCOMPARE(refused["error_code"].toString(), "card_marker_line");
+        QVERIFY(refused["message"].toString().contains("remove_proposal"));
+        // A deletion revised into a replacement, again, and back.
+        put(path, note().toUtf8());
+        const QString deletion = createEdits(root.path(), path, {{4, 5, ""}})["proposal_id"].toString();
+        for (const QString &replacement : {QStringLiteral("Instead of deleting.\n"), QStringLiteral("Once more.\n"), QString()}) {
+            QVERIFY(!revise(deletion, replacement).contains("error_code"));
+            QCOMPARE(decide(path, QString::fromUtf8(get(path)), {deletion}, "accept"), head + replacement + tail);
+            QCOMPARE(decide(path, QString::fromUtf8(get(path)), {deletion}, "reject"), note());
+            QVERIFY(markerLinesAlone(QString::fromUtf8(get(path))));
+        }
+        // Other wrappers take the replacement as they always did.
+        put(path, note().toUtf8());
+        const QString elsewhere = createEdits(root.path(), path, {{3, 4, "Edited.\n"}})["proposal_id"].toString();
+        QVERIFY(!revise(elsewhere, "Again.\n").contains("error_code"));
+        QVERIFY(get(path).contains("{Again.\n}Second claim."));
     }
 };
 QTEST_GUILESS_MAIN(ProposalAuthoringTest)

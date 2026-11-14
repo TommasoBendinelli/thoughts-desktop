@@ -457,14 +457,21 @@ RestoreEdit restoreEdit(const QString &path, const std::optional<QString> &curre
         for (qsizetype at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
             const int start = int(at);
             const int end = start + int(needle.size());
-            const bool startsLine = start == 0 || text.at(start - 1) == QLatin1Char('\n');
-            const bool endsLine = end == text.size() || text.at(end - 1) == QLatin1Char('\n');
+            // Whole lines; beside a card marker (§8.1) a text may also start with the LF that ends
+            // the line before it, or end right before its last LF.
+            const bool startsLine = start == 0 || text.at(start - 1) == QLatin1Char('\n') || needle.startsWith(QLatin1Char('\n'));
+            const bool endsLine = end == text.size() || text.at(end - 1) == QLatin1Char('\n') || text.at(end) == QLatin1Char('\n');
             if (startsLine && endsLine && free(start, end) && !candidates.contains({start, end})) candidates.append({start, end});
         }
     }
-    const bool emptyText = snapshot.value(QStringLiteral("after")).toString().isEmpty() || snapshot.value(QStringLiteral("before")).toString().isEmpty();
-    if (candidates.isEmpty() && emptyText) {
-        const int start = lineStart(text, qMax(1, line));
+    const QString after = snapshot.value(QStringLiteral("after")).toString(), before = snapshot.value(QStringLiteral("before")).toString();
+    if (candidates.isEmpty() && (after.isEmpty() || before.isEmpty())) {
+        int start = lineStart(text, qMax(1, line));
+        // A wrapper that took the LF before its lines (§8.1) started at the end of line L.
+        if ((after.isEmpty() ? before : after).startsWith(QLatin1Char('\n')) && line >= 1 && start < text.size()) {
+            const int newline = int(text.indexOf(QLatin1Char('\n'), start));
+            start = newline < 0 ? int(text.size()) : newline;
+        }
         candidates.append({start, start});
     }
     // 5. The candidate nearest to the line where the wrapper was.

@@ -345,6 +345,11 @@ void printResult(const QJsonObject &result, bool json)
     if (!message.isEmpty()) {
         line += QStringLiteral(" — ") + message;
     }
+    // What a Sync that succeeded could not do, e.g. a PDF the server could not build.
+    const QString warning = result.value(QStringLiteral("warning")).toString().simplified();
+    if (!warning.isEmpty()) {
+        line += QStringLiteral(" — ") + warning;
+    }
     output << line << Qt::endl;
 }
 }

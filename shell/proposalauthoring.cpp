@@ -78,6 +78,243 @@ QString sourceWithAnyId(const QString &root, const QStringList &skip, const QStr
     }
     return {};
 }
+
+// ---------------------------------------------------------------- review card marker lines
+// A review card's marker (\ReviewCardMaskStart{<card>}{<n>}% and \ReviewCardMaskEnd{<card>}{<n>}%)
+// stands alone on its line: card tools (merging, moving, reading a card's passage) refuse a source
+// where one shares its line with other text, a pending proposal's braces included. The rules and
+// messages are thoughts-cli's too (authoring.py, lay_out_beside_card_markers).
+const QLatin1String CardMarkerLineCode("card_marker_line");
+bool isCardMarkerLine(const QString &line)
+{
+    static const QRegularExpression marker(QStringLiteral(R"(\A[ \t]*\\ReviewCardMask(?:Start|End)\{[^{}\n]*\}\{[^{}\n]*\}%?[ \t]*\r?\z)"));
+    return line.contains(QLatin1String("ReviewCardMask")) && marker.match(line).hasMatch();
+}
+// The line that starts at `start`, without its LF.
+QString lineAt(const QString &text, int start)
+{
+    const int end = int(text.indexOf(QLatin1Char('\n'), start));
+    return end < 0 ? text.mid(start) : text.mid(start, end - start);
+}
+int lineOf(const QString &text, int offset) { return int(QStringView(text).left(offset).count(QLatin1Char('\n'))) + 1; }
+// Whether TeX would not read text appended to this line as written: the line has a comment,
+// or ends in a backslash that would escape the first appended character.
+bool hidesAppendedText(const QString &line)
+{
+    for (int i = 0; i < line.size(); ++i) {
+        if (line.at(i) == QLatin1Char('%')) return true;
+        if (line.at(i) == QLatin1Char('\\')) {
+            if (i + 1 == line.size()) return true;
+            ++i;
+        }
+    }
+    return false;
+}
+bool latexRefuses(const QString &text) { return !Thoughts::agentProposalTextRefusal(Thoughts::AgentProposalFormat::Latex, text).isEmpty(); }
+QJsonObject cardMarkerError(const QString &message, int line, const QString &reason)
+{
+    auto result = error(CardMarkerLineCode, message + QStringLiteral(" Nothing was written."));
+    result.insert(QStringLiteral("line"), line);
+    result.insert(QStringLiteral("reason"), reason);
+    return result;
+}
+// One proposal of a create request: its range and texts as given, and where its wrapper goes.
+struct WrapperLayout {
+    int start = 0, end = 0;  // the range of whole lines
+    QString original, replacement;
+    int wrapStart = 0, wrapEnd = 0;  // the wrapper's span and arguments
+    QString wrapOriginal, wrapReplacement;
+};
+// Where each new LaTeX wrapper goes, so that every review card marker stays alone on its line.
+// A wrapper replaces its whole lines exactly. When they end right before a card marker line, its
+// closing brace would sit on the marker's line, so the wrapper ends before their last line break
+// instead, which then follows it (2026-11-13):
+// - a replacement: the original and the replacement both leave out their final line break;
+// - a deletion or an insertion (one side empty): the wrapper takes the line break before its lines
+//   instead and starts at the end of the previous line, which must be no card marker and must not
+//   hide appended text (a comment).
+// Accepted or rejected, the source reads exactly as with the plain wrapper. A proposal of the same
+// request that ends where such a wrapper now starts ends early as well. Returns the refusal
+// (card_marker_line, with what to do instead), or an empty object. `order` lists the layouts by range.
+QJsonObject layOutBesideCardMarkers(const QString &source, QVector<WrapperLayout> &layouts, const QVector<int> &order, bool batch)
+{
+    for (auto &layout : layouts) {
+        layout.wrapStart = layout.start;
+        layout.wrapEnd = layout.end;
+        layout.wrapOriginal = layout.original;
+        layout.wrapReplacement = layout.replacement;
+    }
+    if (!source.contains(QLatin1String("ReviewCardMask"))) return {};
+    int markerAt = -1;
+    for (int position = int(order.size()) - 1; position >= 0; --position) {
+        const int index = order[position];
+        auto &entry = layouts[index];
+        const bool pushed = position + 1 < order.size() && layouts[order[position + 1]].wrapStart < entry.wrapEnd;
+        if (!pushed) {
+            if (entry.end >= source.size() || !isCardMarkerLine(lineAt(source, entry.end))) continue;
+            markerAt = entry.end;
+        }
+        const QString original = entry.original;
+        const QString replacement = entry.replacement;
+        if (latexRefuses(original)) continue;  // the writer refuses this original as before
+        const int line = lineOf(source, markerAt);
+        const QString marker = lineAt(source, markerAt).trimmed();
+        const int first = lineOf(source, entry.start), last = lineOf(source, entry.end) - 1;
+        const QString where = QStringLiteral("Line %1 is the review card marker %2, which must stay alone on its line").arg(line).arg(marker);
+        const auto refuse = [&](QString message) {
+            if (pushed)
+                message = QStringLiteral("Proposals %1 and %2 touch right before the review card marker %3 on line %4, which must stay alone on its line: "
+                                         "give them as one proposal (one range, one replacement).")
+                              .arg(index + 1).arg(order[position + 1] + 1).arg(marker).arg(line);
+            auto result = cardMarkerError(message, line, QStringLiteral("marker_after_proposal"));
+            if (batch) result.insert(QStringLiteral("proposal_index"), index);
+            return result;
+        };
+        if (!replacement.isEmpty() && !replacement.endsWith(QLatin1Char('\n')))
+            return refuse(where + QStringLiteral(", and the replacement does not end with a line break, so its last line would run "
+                                                 "into the marker. End the replacement with a line break."));
+        if (!original.isEmpty() && !replacement.isEmpty()) {
+            const QString keptOriginal = original.chopped(1), keptReplacement = replacement.chopped(1);
+            if (!latexRefuses(keptOriginal) && !latexRefuses(keptReplacement)) {
+                entry.wrapEnd = entry.end - 1;
+                entry.wrapOriginal = keptOriginal;
+                entry.wrapReplacement = keptReplacement;
+                continue;
+            }
+            if (latexRefuses(keptOriginal)) {
+                const int lastStart = entry.end >= 2 ? int(source.lastIndexOf(QLatin1Char('\n'), entry.end - 2)) + 1 : 0;
+                if (isCardMarkerLine(lineAt(source, lastStart)))
+                    return refuse(where + QStringLiteral(", and the selected lines end with another card marker (line %1). "
+                                                         "Select only lines between card markers.").arg(last));
+                return refuse(where + QStringLiteral(". A pending proposal that ends right before it must end before the line break of "
+                                                     "line %1, but that line ends in a LaTeX comment (or a backslash), which would hide the "
+                                                     "proposal's closing brace. Leave line %1 out of the range (end_line %1) if it stays "
+                                                     "as it is, or ask the user to make this change.").arg(last));
+            }
+            return refuse(where + QStringLiteral(". A pending proposal that ends right before it must end before the line break of its "
+                                                 "last line, but the replacement's last line ends in a LaTeX comment (or a backslash), which "
+                                                 "would hide the proposal's closing brace. Write that line without the trailing comment."));
+        }
+        // A deletion or an insertion: the line break before the range goes into the wrapper instead.
+        const QString what = original.isEmpty() ? QStringLiteral("insertion") : QStringLiteral("deletion");
+        const int start = entry.start;
+        if (start == 0)
+            return refuse(where + QStringLiteral(", and a pending %1 at the start of the file cannot leave it so. "
+                                                 "Ask the user to make this change.").arg(what));
+        const int previousStart = start >= 2 ? int(source.lastIndexOf(QLatin1Char('\n'), start - 2)) + 1 : 0;
+        const QString previous = source.mid(previousStart, start - 1 - previousStart);
+        if (isCardMarkerLine(previous)) {
+            if (!original.isEmpty())
+                return refuse(where + QStringLiteral(", and so is line %1 before the selected lines: a pending deletion of "
+                                                     "every line between two card markers cannot leave them alone on their lines. Keep at "
+                                                     "least one of these lines (propose its new text instead), or ask the user to make "
+                                                     "this change.").arg(first - 1));
+            return refuse(where + QStringLiteral(", and so is line %1: a pending insertion between two card markers cannot "
+                                                 "leave them alone on their lines. Insert the text before line %1 or after line "
+                                                 "%2, or ask the user to add it.").arg(first - 1).arg(line));
+        }
+        if (hidesAppendedText(previous))
+            return refuse(where + QStringLiteral(". A pending %1 right before it must start at the end of line %2, but "
+                                                 "that line ends in a LaTeX comment (or a backslash), which would hide the proposal. Include "
+                                                 "line %2 in the range with a replacement whose last line does not end in a "
+                                                 "comment, or ask the user to make this change.").arg(what).arg(first - 1));
+        const QString keptOriginal = original.isEmpty() ? QString() : QLatin1Char('\n') + original.chopped(1);
+        const QString keptReplacement = replacement.isEmpty() ? QString() : QLatin1Char('\n') + replacement.chopped(1);
+        if (latexRefuses(keptOriginal))
+            return refuse(where + QStringLiteral(". A pending deletion right before it must end before the line break of line %1, "
+                                                 "but that line ends in a LaTeX comment (or a backslash), which would hide the proposal's "
+                                                 "closing brace. Ask the user to make this change.").arg(last));
+        if (latexRefuses(keptReplacement))
+            return refuse(where + QStringLiteral(". A pending insertion right before it must end before the line break of its last "
+                                                 "line, but the inserted text's last line ends in a LaTeX comment (or a backslash), which "
+                                                 "would hide the proposal's closing brace. Write that line without the trailing comment."));
+        entry.wrapStart = start - 1;
+        entry.wrapEnd = entry.end - 1;
+        entry.wrapOriginal = keptOriginal;
+        entry.wrapReplacement = keptReplacement;
+    }
+    return {};
+}
+// The replacement argument for a revision of a LaTeX wrapper laid out beside a card marker: the new
+// replacement is given for whole lines, as on create, and written as layOutBesideCardMarkers writes it.
+// A wrapper followed by a line break and a card marker line that starts after the text of the previous
+// line, with an original and replacement that are empty or start with a line break, took the line
+// break before its lines; one that starts a line with an original that does not end in a line break
+// left out its final line break. Any other wrapper takes the replacement as it is.
+// Returns the refusal, or an empty object.
+QJsonObject revisedReplacement(const QString &source, const Thoughts::AgentProposedEdit &found, const QString &replacement, QString *written)
+{
+    *written = replacement;
+    const int after = found.offset + found.length;
+    if (source.mid(after, 1) != QLatin1String("\n") || !isCardMarkerLine(lineAt(source, after + 1))) return {};
+    const int line = lineOf(source, after + 1);
+    const QString marker = lineAt(source, after + 1).trimmed();
+    const QString where = QStringLiteral("Line %1 is the review card marker %2, which must stay alone on its line").arg(line).arg(marker);
+    const bool atLineStart = found.offset == 0 || source.at(found.offset - 1) == QLatin1Char('\n');
+    const QString &original = found.original;
+    const auto refuse = [&](const QString &message) {
+        auto result = cardMarkerError(message, line, QStringLiteral("marker_after_proposal"));
+        result.insert(QStringLiteral("proposal_id"), found.id);
+        return result;
+    };
+    const auto emptyOrLineBreak = [](const QString &text) { return text.isEmpty() || text.startsWith(QLatin1Char('\n')); };
+    if ((!atLineStart && emptyOrLineBreak(original) && emptyOrLineBreak(found.replacement))
+        || (atLineStart && ((original.startsWith(QLatin1Char('\n')) && found.replacement.isEmpty())
+                            || (original.isEmpty() && found.replacement.startsWith(QLatin1Char('\n')))))) {
+        if (replacement.isEmpty()) {
+            written->clear();
+            return {};
+        }
+        if (!replacement.endsWith(QLatin1Char('\n')))
+            return refuse(where + QStringLiteral(", and the replacement does not end with a line break, so its last line would run "
+                                                 "into the marker. End the replacement with a line break."));
+        *written = QLatin1Char('\n') + replacement.chopped(1);
+    } else if (atLineStart && !original.isEmpty() && !original.endsWith(QLatin1Char('\n'))) {
+        if (replacement.isEmpty())
+            return refuse(where + QStringLiteral(", and this pending proposal keeps its last line break outside its text, so an "
+                                                 "empty replacement would leave a blank line before the marker. To delete these lines, "
+                                                 "withdraw this proposal (remove_proposal) and propose the deletion again."));
+        *written = replacement.endsWith(QLatin1Char('\n')) ? replacement.chopped(1) : replacement;
+    } else {
+        return {};
+    }
+    if (latexRefuses(*written))
+        return refuse(where + QStringLiteral(". This pending proposal ends right before it, so the replacement's last line break "
+                                             "stays outside its text, but the replacement's last line ends in a LaTeX comment (or a "
+                                             "backslash), which would hide the proposal's closing brace. Write that line without the "
+                                             "trailing comment."));
+    return {};
+}
+// The card marker lines of text that no span touches: marker -> their one-based line numbers.
+QHash<QString, QList<int>> loneMarkers(const QString &text, const QVector<QPair<int, int>> &spans)
+{
+    QHash<QString, QList<int>> found;
+    int start = 0, number = 0;
+    for (const QString &line : text.split(QLatin1Char('\n'))) {
+        ++number;
+        const int end = start + int(line.size());
+        if (isCardMarkerLine(line)
+            && std::none_of(spans.cbegin(), spans.cend(), [&](const auto &span) { return span.first < end && start < span.second; }))
+            found[line.trimmed()].append(number);
+        start = end + 1;
+    }
+    return found;
+}
+// The layout's safety net: refuse (card_marker_line) to write `updated` when a card marker line of
+// `source` outside the `replaced` ranges no longer stands alone on its line outside the `written` wrappers.
+QJsonObject checkCardMarkerLines(const QString &source, const QString &updated, const QVector<QPair<int, int>> &replaced, const QVector<QPair<int, int>> &written)
+{
+    if (!source.contains(QLatin1String("ReviewCardMask"))) return {};
+    const auto before = loneMarkers(source, replaced), after = loneMarkers(updated, written);
+    QList<QPair<int, QString>> missing;  // sorted, so the message names the first such line
+    for (auto it = before.cbegin(); it != before.cend(); ++it)
+        if (after.value(it.key()).size() < it.value().size()) missing.append({it.value().first(), it.key()});
+    if (missing.isEmpty()) return {};
+    std::sort(missing.begin(), missing.end());
+    return cardMarkerError(QStringLiteral("Line %1 is the review card marker %2, which must stay alone on its line, and the "
+                                          "proposal would put text on that line.").arg(missing.first().first).arg(missing.first().second),
+                           missing.first().first, QStringLiteral("marker_line_shared"));
+}
 }
 
 QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject &request, const QString &origin, const QString &claimDatabase)
@@ -112,7 +349,10 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
     if (!validUuid(requestId) || !validUuid(conversation) || !QRegularExpression(QStringLiteral("^[0-9a-f]{64}$")).match(expected).hasMatch())
         return error(QStringLiteral("invalid_request"), QStringLiteral("Provide UUID request/conversation IDs and a SHA-256 source version."));
     // A single create is a batch of one; revise and removal use the first entry's text.
-    struct Entry { QJsonObject fields; QString id; QString comment; QString before; int start = 0; int end = 0; int offset = 0; };
+    // wrapStart..wrapReplacement: where its wrapper goes and what it holds, the range [start, end) with before
+    // and the replacement except beside a review card marker (layOutBesideCardMarkers).
+    struct Entry { QJsonObject fields; QString id; QString comment; QString before; int start = 0; int end = 0; int offset = 0;
+                   int wrapStart = 0; int wrapEnd = 0; QString wrapOriginal; QString wrapReplacement; };
     QVector<Entry> entries;
     if (batch) {
         const auto list = request.value(QStringLiteral("proposals"));
@@ -325,26 +565,42 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
                 return error(QStringLiteral("proposal_overlap"), QStringLiteral("The proposals of one request must not overlap or insert at the same line."));
         }
         created = formatAgentProposalTimestamp(QDateTime::currentDateTimeUtc());
+        // A review card marker line stays alone while the proposals are pending.
+        QVector<WrapperLayout> layouts;
+        for (const auto &entry : std::as_const(entries)) {
+            WrapperLayout layout;
+            layout.start = entry.start;
+            layout.end = entry.end;
+            layout.original = entry.before;
+            layout.replacement = entry.fields.value(QStringLiteral("replacement")).toString();
+            layouts.append(layout);
+        }
+        if (const auto refusal = layOutBesideCardMarkers(markdown ? QString() : source, layouts, order, batch); !refusal.isEmpty()) return refusal;
+        for (int i = 0; i < entries.size(); ++i) {
+            entries[i].wrapStart = layouts[i].wrapStart;
+            entries[i].wrapEnd = layouts[i].wrapEnd;
+            entries[i].wrapOriginal = layouts[i].wrapOriginal;
+            entries[i].wrapReplacement = layouts[i].wrapReplacement;
+        }
         // Original and replacement contents must round-trip byte-for-byte. A
         // trailing comment can only be captured safely when its newline is included.
         int shift = 0;
         for (const int index : order) {
             auto &entry = entries[index];
-            const QString after = entry.fields.value(QStringLiteral("replacement")).toString();
             AgentProposedEdit proposal;
             proposal.id = entry.id;
             proposal.createdAt = created;
             proposal.conversationId = conversation.toLower();
             proposal.conversationUrl = conversationUrl;
             proposal.explanation = entry.fields.value(QStringLiteral("explanation")).toString().trimmed();
-            proposal.original = entry.before;
-            proposal.replacement = after;
+            proposal.original = entry.wrapOriginal;
+            proposal.replacement = entry.wrapReplacement;
             QString refusal;
             const QString block = markdown ? formatMarkdownAgentProposal(proposal, &refusal) : formatLatexAgentProposal(proposal, &refusal);
             if (block.isEmpty()) return writerError(refusal);
-            entry.offset = entry.start + shift;
-            updated.replace(entry.offset, entry.end - entry.start, block);
-            shift += block.size() - (entry.end - entry.start);
+            entry.offset = entry.wrapStart + shift;
+            updated.replace(entry.offset, entry.wrapEnd - entry.wrapStart, block);
+            shift += block.size() - (entry.wrapEnd - entry.wrapStart);
         }
         before = entries.first().before;
         start = entries.first().offset;
@@ -360,6 +616,7 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
         created = original.createdAt;
         before = original.original;
         start = original.offset;
+        QString written = replacement;
         if (markdown) {
             original.explanation = comment;
             original.replacement = replacement;
@@ -369,9 +626,15 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
             updated.replace(original.offset, original.length, block);
         } else {
             // Revise in place, keeping the wrapper's own layout and metadata.
-            updated.replace(original.replacementOffset, original.replacementLength, replacement);
+            if (const auto refusal = revisedReplacement(source, original, replacement, &written); !refusal.isEmpty()) return refusal;
+            updated.replace(original.replacementOffset, original.replacementLength, written);
             updated.replace(original.explanationOffset, original.explanationLength, comment + QLatin1Char('\n'));
         }
+        auto &entry = entries.first();
+        entry.start = original.offset;
+        entry.end = original.offset + original.length;
+        entry.wrapOriginal = original.original;
+        entry.wrapReplacement = written;
     }
     if (!create) {
         auto &entry = entries.first();
@@ -383,14 +646,21 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
     QVector<AgentProposedEdit> written;
     for (const auto &entry : entries) {
         const AgentProposedEdit *found = resultParse.proposal(entry.id);
-        if (!found || found->offset != entry.offset || found->original != entry.before
-            || found->replacement != entry.fields.value(QStringLiteral("replacement")).toString() || found->createdAt != created
+        if (!found || found->offset != entry.offset || found->original != entry.wrapOriginal
+            || found->replacement != entry.wrapReplacement || found->createdAt != created
             || found->explanation != (markdown ? entry.comment : entry.comment + QLatin1Char('\n')))
             return error(QStringLiteral("invalid_proposal"), markdown ? QStringLiteral("The Markdown proposal did not round-trip exactly.") : QStringLiteral("The proposed text does not round-trip as a valid TeX argument; check balanced braces and include newlines after trailing comments."));
         written.append(*found);
     }
     if (resultParse.proposals.size() != parsed.proposals.size() + (create ? entries.size() : 0) || resultParse.issues.size() != parsed.issues.size())
         return error(QStringLiteral("invalid_proposal"), QStringLiteral("The proposals changed other pending proposals; check balanced braces and include newlines after trailing comments."));
+    if (!markdown) {
+        // Every card marker outside the replaced text is still alone on its line (the layout's safety net).
+        QVector<QPair<int, int>> replaced, spans;
+        for (const auto &entry : std::as_const(entries)) replaced.append({entry.start, entry.end});
+        for (const auto &proposal : std::as_const(written)) spans.append({proposal.offset, proposal.offset + proposal.length});
+        if (const auto refusal = checkCardMarkerLines(source, updated, replaced, spans); !refusal.isEmpty()) return refusal;
+    }
     // Every link the proposed text introduces must resolve as the build
     // resolves it; links the original already had are not this proposal's.
     QJsonArray linkIssues;
@@ -435,9 +705,10 @@ QJsonObject Thoughts::authorProposal(const QString &docsRoot, const QJsonObject 
     // Every event carries the whole result, so a retry of the request replays it.
     QJsonArray events;
     for (int i = 0; i < entries.size(); ++i) {
+        // The wrapper's own texts, as later reads of the source find them.
         const QJsonObject snapshot {{QStringLiteral("proposal_id"), entries[i].id}, {QStringLiteral("source_file"), QDir(root).relativeFilePath(path)},
                                    {QStringLiteral("created_at"), created}, {QStringLiteral("conversation_id"), written[i].conversationId}, {QStringLiteral("comment"), written[i].explanation},
-                                   {QStringLiteral("before"), entries[i].before}, {QStringLiteral("after"), entries[i].fields.value(QStringLiteral("replacement"))}};
+                                   {QStringLiteral("before"), written[i].original}, {QStringLiteral("after"), written[i].replacement}};
         QJsonObject linked = snapshot;
         if (!written[i].conversationUrl.isEmpty()) linked.insert(QStringLiteral("conversation_url"), written[i].conversationUrl);
         auto event = ProposalHistory::event(create ? QStringLiteral("first_seen") : QStringLiteral("changed"), linked, actual, afterHash);

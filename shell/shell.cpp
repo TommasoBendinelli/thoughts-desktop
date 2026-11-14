@@ -41,6 +41,7 @@
 #include "developerlogdialog.h"
 #include "updatecheck.h"
 #include "activeparttoolbarcontroller.h"
+#include "automaticsyncpolicy.h"
 #include "thoughtscommandprotocol.h"
 
 #include <atomic>
@@ -68,6 +69,8 @@
 #include <KWindowSystem>
 #include <KXMLGUIFactory>
 #include <QApplication>
+#include <QPixmapCache>
+#include <QElapsedTimer>
 #include <QClipboard>
 #include <QComboBox>
 #include <QCryptographicHash>
@@ -134,9 +137,6 @@
 #include <QSet>
 #include <QSignalBlocker>
 #include <QSizePolicy>
-#include <QSqlDatabase>
-#include <QSqlError>
-#include <QSqlQuery>
 #include <QStandardPaths>
 #include <QStyle>
 #include <QStyleOptionToolButton>
@@ -188,6 +188,7 @@
 #include "reviewcardeditor.h"
 #include "reviewcardmerge.h"
 #include "shellutils.h"
+#include "syncjournal.h"
 #include "syncoperationstate.h"
 #include "syncstatuslabels.h"
 
@@ -205,6 +206,23 @@ static constexpr char SIDEBAR_LOCKED_KEY[] = "LockSidebar";
 static constexpr char SIDEBAR_VISIBLE_KEY[] = "ShowSidebar";
 static constexpr char TAB_DRAG_MIME_TYPE[] = "application/x-thoughts-tab";
 static constexpr int TAB_DROP_ANIMATION_DURATION = 130;
+// A refresh of the Logs window asks the journal for this many of its newest
+// runs, besides the runs that reported a change.
+static constexpr int SyncLogsRefreshRows = 30;
+// How often the app asks the server whether it has work for this computer, and
+// how soon after a failed Sync it asks for the state that Sync left there.
+static constexpr int RemoteWorkWatchIntervalMs = 20 * 1000;
+static constexpr int StateAfterFailedSyncDelayMs = 1000;
+// An ended build's Sync that could not start while the journal was rewritten is
+// tried again this much later.
+static constexpr int AnnouncedWorkRetryMs = 2000;
+// A decision on a proposal made on this computer is sent by a Sync the app
+// starts by itself this long after the last decision.
+static constexpr int ProposalDecisionSyncDelayMs = 5 * 1000;
+// How often the app looks whether the Sync journal can be compacted, and how
+// long Thoughts must not have been the active application before it is.
+static constexpr int SyncJournalUpkeepIntervalMs = 60 * 1000;
+static constexpr int SyncJournalCompactIdleMs = 2 * 60 * 1000;
 // The A/B rating page: THOUGHTS_AB_TESTING_URL in the environment, else the
 // build's (config-thoughts.h). Without one, File › A/B testing and its toolbar
 // button stay hidden. Desktop Thoughts has no web view, so it opens in the browser.
@@ -299,12 +317,6 @@ static QString compactMenuDetail(const QString &detail)
     return compact;
 }
 
-static QString normalizedSyncInitiationControl(const QString &control)
-{
-    static const QRegularExpression validControl(QStringLiteral("^[a-z0-9_]{1,64}$"));
-    return validControl.match(control).hasMatch() ? control : QStringLiteral("unknown");
-}
-
 static QString syncInitiationControlLabel(const QString &control)
 {
     if (control == QLatin1String("pdf_toolbar_sync")) {
@@ -337,626 +349,38 @@ static QString syncInitiationControlLabel(const QString &control)
     if (control == QLatin1String("runtime_adoption")) {
         return i18n("Recovered running sync");
     }
+    if (control == QLatin1String("remote_change")) {
+        return i18n("Automatic Sync after changes on the server");
+    }
+    if (control == QLatin1String("proposal_decision")) {
+        return i18n("Automatic Sync after a proposal decision");
+    }
     if (control == QLatin1String("direct_sync_request")) {
         return i18n("Direct sync request");
     }
     return i18n("Older app or unknown control");
 }
 
-static QString syncOperationsPath()
+// The Sync journal lives on its own thread (syncjournal.h). These keep the
+// names the rest of this file uses.
+static Thoughts::SyncJournal *syncJournal()
 {
-    return QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("thoughts-server/sync-operations.sqlite"));
-}
-
-static QString legacySyncOperationsPath()
-{
-    return QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("thoughts-server/sync-operations.json"));
-}
-
-static bool normalizeEmbeddedSyncOperationEvents(QSqlDatabase &database);
-
-static QSqlDatabase syncOperationsDatabase()
-{
-    static const QString connectionName = QStringLiteral("thoughts-sync-operations");
-    if (QSqlDatabase::contains(connectionName)) {
-        return QSqlDatabase::database(connectionName);
-    }
-    const QFileInfo info(syncOperationsPath());
-    if (!QDir().mkpath(info.absolutePath())) {
-        return {};
-    }
-    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
-    database.setDatabaseName(info.absoluteFilePath());
-    if (!database.open()) {
-        qWarning() << "Could not open the Thoughts synchronization journal:" << database.lastError().text();
-        return {};
-    }
-    QSqlQuery query(database);
-    query.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
-    query.exec(QStringLiteral("PRAGMA synchronous=FULL"));
-    query.exec(QStringLiteral("PRAGMA busy_timeout=5000"));
-    const QStringList schema {
-        QStringLiteral("CREATE TABLE IF NOT EXISTS sync_runs (id TEXT PRIMARY KEY, trace_id TEXT NOT NULL UNIQUE, retry_of TEXT, kind TEXT NOT NULL, target TEXT, status TEXT NOT NULL, phase TEXT NOT NULL, created_at_ms INTEGER NOT NULL, "
-                       "started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, duration_ms INTEGER, build_id TEXT, payload_json TEXT NOT NULL, server_state TEXT NOT NULL DEFAULT '', server_terminal "
-                       "INTEGER NOT NULL DEFAULT 0, last_server_sequence INTEGER NOT NULL DEFAULT 0, stream_state TEXT NOT NULL DEFAULT 'offline', transfer_metrics_recorded INTEGER NOT NULL DEFAULT 0, uploaded_completed_bytes INTEGER NOT "
-                       "NULL DEFAULT 0, uploaded_total_bytes INTEGER NOT NULL DEFAULT 0, downloaded_completed_bytes INTEGER NOT NULL DEFAULT 0, downloaded_total_bytes INTEGER NOT NULL DEFAULT 0, initiation_control TEXT NOT NULL DEFAULT 'unknown')"),
-        QStringLiteral("CREATE INDEX IF NOT EXISTS sync_runs_state_updated ON sync_runs(status, updated_at_ms)"),
-        QStringLiteral("CREATE INDEX IF NOT EXISTS sync_runs_target_updated ON sync_runs(target, updated_at_ms)"),
-        QStringLiteral("CREATE INDEX IF NOT EXISTS sync_runs_global_success ON sync_runs(kind, phase, target, completed_at_ms, updated_at_ms)"),
-        // The status bar asks for the newest Sync on every progress event.
-        QStringLiteral("CREATE INDEX IF NOT EXISTS sync_runs_kind_updated ON sync_runs(kind, updated_at_ms)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS sync_steps (run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, phase TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, request_id TEXT, started_at_ms INTEGER NOT NULL, "
-                       "updated_at_ms INTEGER NOT NULL, deadline_at_ms INTEGER, facts_json TEXT, PRIMARY KEY(run_id, ordinal))"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS sync_events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, at_ms INTEGER NOT NULL, phase TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, message TEXT "
-                       "NOT NULL, duration_ms INTEGER, error_code TEXT, origin TEXT NOT NULL DEFAULT 'desktop', server_sequence INTEGER, server_timestamp_ms INTEGER, received_at_ms INTEGER, component TEXT NOT NULL DEFAULT 'desktop', "
-                       "build_id TEXT, completed INTEGER, total INTEGER, bytes_completed INTEGER, bytes_total INTEGER, metadata_json TEXT NOT NULL DEFAULT '{}', terminal INTEGER NOT NULL DEFAULT 0)"),
-        QStringLiteral("CREATE INDEX IF NOT EXISTS sync_events_run_time ON sync_events(run_id, at_ms)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS sync_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
-    };
-    for (const QString &statement : schema) {
-        if (!query.exec(statement)) {
-            qWarning() << "Could not initialize the Thoughts synchronization journal:" << query.lastError().text();
-            database.close();
-            return {};
-        }
-    }
-    const auto ensureColumn = [&database](const QString &table, const QString &column, const QString &definition) {
-        QSqlQuery columns(database);
-        if (!columns.exec(QStringLiteral("PRAGMA table_info(%1)").arg(table))) {
-            return false;
-        }
-        while (columns.next()) {
-            if (columns.value(1).toString() == column) {
-                return true;
-            }
-        }
-        QSqlQuery alter(database);
-        return alter.exec(QStringLiteral("ALTER TABLE %1 ADD COLUMN %2 %3").arg(table, column, definition));
-    };
-    const QList<std::tuple<QString, QString, QString>> migrations {
-        {QStringLiteral("sync_runs"), QStringLiteral("server_state"), QStringLiteral("TEXT NOT NULL DEFAULT ''")},
-        {QStringLiteral("sync_runs"), QStringLiteral("server_terminal"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("last_server_sequence"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("stream_state"), QStringLiteral("TEXT NOT NULL DEFAULT 'offline'")},
-        {QStringLiteral("sync_runs"), QStringLiteral("transfer_metrics_recorded"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("uploaded_completed_bytes"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("uploaded_total_bytes"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("downloaded_completed_bytes"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("downloaded_total_bytes"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-        {QStringLiteral("sync_runs"), QStringLiteral("initiation_control"), QStringLiteral("TEXT NOT NULL DEFAULT 'unknown'")},
-        {QStringLiteral("sync_events"), QStringLiteral("origin"), QStringLiteral("TEXT NOT NULL DEFAULT 'desktop'")},
-        {QStringLiteral("sync_events"), QStringLiteral("server_sequence"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("server_timestamp_ms"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("received_at_ms"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("component"), QStringLiteral("TEXT NOT NULL DEFAULT 'desktop'")},
-        {QStringLiteral("sync_events"), QStringLiteral("build_id"), QStringLiteral("TEXT")},
-        {QStringLiteral("sync_events"), QStringLiteral("completed"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("total"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("bytes_completed"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("bytes_total"), QStringLiteral("INTEGER")},
-        {QStringLiteral("sync_events"), QStringLiteral("metadata_json"), QStringLiteral("TEXT NOT NULL DEFAULT '{}'")},
-        {QStringLiteral("sync_events"), QStringLiteral("terminal"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
-    };
-    for (const auto &[table, column, definition] : migrations) {
-        if (!ensureColumn(table, column, definition)) {
-            qWarning() << "Could not migrate the Thoughts synchronization journal column" << table << column;
-            database.close();
-            return {};
-        }
-    }
-    query.exec(QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS sync_events_server_sequence ON sync_events(run_id, origin, server_sequence)"));
-    QSqlQuery embeddedEventsMigration(database);
-    embeddedEventsMigration.prepare(QStringLiteral("SELECT value FROM sync_metadata WHERE key = 'embedded_events_extracted_v1'"));
-    const bool embeddedEventsAlreadyExtracted = embeddedEventsMigration.exec() && embeddedEventsMigration.next();
-    if (!embeddedEventsAlreadyExtracted) {
-        if (!normalizeEmbeddedSyncOperationEvents(database)) {
-            qWarning() << "Could not migrate embedded Thoughts synchronization events";
-            database.close();
-            return {};
-        }
-        QSqlQuery markEmbeddedEventsMigration(database);
-        if (!markEmbeddedEventsMigration.exec(QStringLiteral("INSERT OR REPLACE INTO sync_metadata(key, value) VALUES('embedded_events_extracted_v1', '1')"))) {
-            qWarning() << "Could not record the embedded Thoughts synchronization event migration";
-            database.close();
-            return {};
-        }
-    }
-    return database;
-}
-
-static QString legacySyncOperationPhase(const QString &status, const QString &event = {})
-{
-    const QString detail = event.toLower();
-    const Thoughts::SyncOperationState lifecycle = Thoughts::syncOperationState(QJsonObject {{QStringLiteral("status"), status}});
-    if (lifecycle == Thoughts::SyncOperationState::Succeeded) {
-        return QStringLiteral("succeeded");
-    }
-    if (lifecycle == Thoughts::SyncOperationState::Failed || lifecycle == Thoughts::SyncOperationState::Interrupted || lifecycle == Thoughts::SyncOperationState::Cancelled) {
-        return detail.contains(QStringLiteral("interrupt")) ? QStringLiteral("interrupted") : QStringLiteral("failed");
-    }
-    if (status == i18n("Building…") || status == QLatin1String("Building…") || detail.contains(QStringLiteral("build"))) {
-        return QStringLiteral("building");
-    }
-    if (status == i18n("Waiting to publish sources…") || detail.contains(QStringLiteral("publish")) || detail.contains(QStringLiteral("upload"))) {
-        return QStringLiteral("uploading");
-    }
-    if (detail.contains(QStringLiteral("prepar")) || detail.contains(QStringLiteral("preflight"))) {
-        return QStringLiteral("preflight");
-    }
-    if (detail.contains(QStringLiteral("verify"))) {
-        return QStringLiteral("verifying");
-    }
-    if (detail.contains(QStringLiteral("activat")) || detail.contains(QStringLiteral("install"))) {
-        return QStringLiteral("activating");
-    }
-    if (detail.contains(QStringLiteral("download")) || detail.contains(QStringLiteral("transfer")) || detail.contains(QStringLiteral("artifact"))) {
-        return QStringLiteral("downloading");
-    }
-    if (detail.contains(QStringLiteral("network"))) {
-        return QStringLiteral("waiting_network");
-    }
-    return QStringLiteral("queued");
-}
-
-static QJsonObject normalizedStoredSyncOperation(QJsonObject operation)
-{
-    const Thoughts::SyncOperationState lifecycle = Thoughts::syncOperationState(operation);
-    if (lifecycle == Thoughts::SyncOperationState::Unknown) {
-        return operation;
-    }
-    operation.insert(QStringLiteral("status"), Thoughts::syncOperationStateId(lifecycle));
-    if (lifecycle != Thoughts::SyncOperationState::Running) {
-        operation.insert(QStringLiteral("phase"), Thoughts::syncOperationStateId(lifecycle));
-    }
-    return operation;
-}
-
-static int syncOperationPhaseOrdinal(const QString &phase)
-{
-    static const QStringList phases {QStringLiteral("queued"),
-                                     QStringLiteral("checking_server"),
-                                     QStringLiteral("preflight"),
-                                     QStringLiteral("uploading"),
-                                     QStringLiteral("waiting_network"),
-                                     QStringLiteral("waiting_user"),
-                                     QStringLiteral("building"),
-                                     QStringLiteral("downloading"),
-                                     QStringLiteral("verifying"),
-                                     QStringLiteral("activating")};
-    const int index = phases.indexOf(phase);
-    return index < 0 ? phases.size() : index;
-}
-
-static QJsonObject syncOperationPayloadWithoutEvents(QJsonObject operation)
-{
-    operation.remove(QStringLiteral("events"));
-    return operation;
-}
-
-static bool insertEmbeddedSyncOperationEvent(QSqlDatabase &database, const QString &runId, const QJsonObject &operation, const QJsonObject &embeddedEvent)
-{
-    const QString message = embeddedEvent.value(QStringLiteral("message")).toString();
-    const QString phase = embeddedEvent.value(QStringLiteral("phase")).toString(legacySyncOperationPhase(embeddedEvent.value(QStringLiteral("state")).toString(), message)).left(64);
-    QJsonObject eventLifecycle {{QStringLiteral("status"), embeddedEvent.value(QStringLiteral("state")).toString()}, {QStringLiteral("phase"), phase}};
-    Thoughts::SyncOperationState lifecycle = Thoughts::syncOperationState(eventLifecycle);
-    if (lifecycle == Thoughts::SyncOperationState::Unknown) {
-        lifecycle = Thoughts::SyncOperationState::Running;
-    }
-    const QString state = Thoughts::syncOperationStateId(lifecycle);
-    const QString origin = embeddedEvent.value(QStringLiteral("origin")).toString() == QLatin1String("server") ? QStringLiteral("server") : QStringLiteral("desktop");
-    const qint64 sequence = qMax<qint64>(embeddedEvent.value(QStringLiteral("server_sequence")).toVariant().toLongLong(), embeddedEvent.value(QStringLiteral("sequence")).toVariant().toLongLong());
-    const qint64 fallbackAt = operation.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong();
-    const qint64 embeddedAt = embeddedEvent.value(QStringLiteral("at_ms")).toVariant().toLongLong();
-    const qint64 atMs = embeddedAt > 0 ? embeddedAt : fallbackAt;
-    const QString errorCode = embeddedEvent.value(QStringLiteral("error_code")).toString().left(128);
-
-    // Older Desktop builds wrote every local event both here and inside
-    // payload_json.  Check the complete stable identity so extracting an old
-    // payload is idempotent even when its matching journal row already exists.
-    QSqlQuery existing(database);
-    existing.prepare(QStringLiteral("SELECT 1 FROM sync_events WHERE run_id = ? AND origin = ? AND at_ms = ? AND phase = ? AND message = ? AND COALESCE(server_sequence, -1) = ? LIMIT 1"));
-    existing.addBindValue(runId);
-    existing.addBindValue(origin);
-    existing.addBindValue(atMs);
-    existing.addBindValue(phase);
-    existing.addBindValue(message.left(origin == QLatin1String("server") ? 4000 : 600));
-    existing.addBindValue(sequence > 0 ? sequence : -1);
-    if (!existing.exec()) {
-        return false;
-    }
-    if (existing.next()) {
-        return true;
-    }
-
-    QJsonObject metadata = embeddedEvent.value(QStringLiteral("metadata")).toObject();
-    for (const QString &field : {QStringLiteral("path"), QStringLiteral("target"), QStringLiteral("build_target")}) {
-        if (embeddedEvent.contains(field)) {
-            metadata.insert(field, embeddedEvent.value(field));
-        }
-    }
-    const QVariant bytesCompleted = embeddedEvent.contains(QStringLiteral("bytes_completed")) ? embeddedEvent.value(QStringLiteral("bytes_completed")).toVariant() : embeddedEvent.value(QStringLiteral("bytes_transferred")).toVariant();
-    const QVariant bytesTotal = embeddedEvent.contains(QStringLiteral("bytes_total")) ? embeddedEvent.value(QStringLiteral("bytes_total")).toVariant() : embeddedEvent.value(QStringLiteral("total_bytes")).toVariant();
-    const qint64 serverTimestampMs = embeddedEvent.value(QStringLiteral("server_timestamp_ms")).toVariant().toLongLong();
-    const qint64 receivedAtMs = embeddedEvent.value(QStringLiteral("received_at_ms")).toVariant().toLongLong();
-    QSqlQuery insert(database);
-    insert.prepare(
-        QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, attempt, message, duration_ms, error_code, origin, server_sequence, server_timestamp_ms, received_at_ms, component, build_id, completed, total, bytes_completed, "
-                       "bytes_total, metadata_json, terminal) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
-    insert.addBindValue(runId);
-    insert.addBindValue(atMs);
-    insert.addBindValue(phase);
-    insert.addBindValue(state);
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("attempt")).toInt(operation.value(QStringLiteral("attempt")).toInt()));
-    insert.addBindValue(message.left(origin == QLatin1String("server") ? 4000 : 600));
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("duration_ms")).toVariant());
-    insert.addBindValue(errorCode);
-    insert.addBindValue(origin);
-    insert.addBindValue(sequence > 0 ? QVariant(sequence) : QVariant());
-    insert.addBindValue(origin == QLatin1String("server") ? (serverTimestampMs > 0 ? serverTimestampMs : atMs) : QVariant());
-    insert.addBindValue(origin == QLatin1String("server") ? (receivedAtMs > 0 ? receivedAtMs : atMs) : QVariant());
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("component")).toString(origin).left(64));
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("build_id")).toString().left(128));
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("completed")).toVariant());
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("total")).toVariant());
-    insert.addBindValue(bytesCompleted);
-    insert.addBindValue(bytesTotal);
-    insert.addBindValue(QString::fromUtf8(QJsonDocument(metadata).toJson(QJsonDocument::Compact)));
-    insert.addBindValue(embeddedEvent.value(QStringLiteral("terminal")).toBool());
-    return insert.exec();
-}
-
-static bool normalizeEmbeddedSyncOperationEvents(QSqlDatabase &database)
-{
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return false;
-    }
-    QList<QPair<QString, QJsonObject>> embeddedPayloads;
-    QSqlQuery select(database);
-    if (!select.exec(QStringLiteral("SELECT id, payload_json FROM sync_runs WHERE payload_json LIKE '%\"events\"%'"))) {
-        database.rollback();
-        return false;
-    }
-    while (select.next()) {
-        const QJsonDocument document = QJsonDocument::fromJson(select.value(1).toString().toUtf8());
-        if (document.isObject() && document.object().contains(QStringLiteral("events"))) {
-            embeddedPayloads.append({select.value(0).toString(), document.object()});
-        }
-    }
-    select.finish();
-
-    QSqlQuery update(database);
-    update.prepare(QStringLiteral("UPDATE sync_runs SET payload_json = ? WHERE id = ?"));
-    for (const auto &[runId, embeddedPayload] : std::as_const(embeddedPayloads)) {
-        for (const QJsonValue &eventValue : embeddedPayload.value(QStringLiteral("events")).toArray()) {
-            if (eventValue.isObject() && !insertEmbeddedSyncOperationEvent(database, runId, embeddedPayload, eventValue.toObject())) {
-                database.rollback();
-                return false;
-            }
-        }
-        const QJsonObject compactPayload = syncOperationPayloadWithoutEvents(embeddedPayload);
-        update.bindValue(0, QString::fromUtf8(QJsonDocument(compactPayload).toJson(QJsonDocument::Compact)));
-        update.bindValue(1, runId);
-        if (!update.exec() || update.numRowsAffected() != 1) {
-            database.rollback();
-            return false;
-        }
-    }
-    return database.commit();
-}
-
-static QJsonArray readLegacySyncOperations()
-{
-    QFile file(legacySyncOperationsPath());
-    QJsonArray kept;
-    if (file.open(QIODevice::ReadOnly)) {
-        const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-        if (document.isArray()) {
-            const qint64 cutoff = QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch();
-            for (const QJsonValue &value : document.array()) {
-                const QJsonObject operation = value.toObject();
-                if (!operation.value(QStringLiteral("id")).toString().isEmpty() && operation.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong() >= cutoff) {
-                    kept.append(operation);
-                    if (kept.size() == 500) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return kept;
-}
-
-static bool writeSyncOperations(const QJsonArray &operations)
-{
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        qWarning() << "Could not start a Thoughts synchronization journal transaction:" << database.lastError().text();
-        return false;
-    }
-    QSqlQuery insertRun(database);
-    insertRun.prepare(QStringLiteral(
-        "INSERT INTO sync_runs(id, trace_id, retry_of, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, duration_ms, build_id, payload_json, server_state, server_terminal, last_server_sequence, "
-        "stream_state, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, initiation_control) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON "
-        "CONFLICT(id) DO UPDATE SET trace_id=excluded.trace_id, retry_of=excluded.retry_of, kind=excluded.kind, target=excluded.target, status=excluded.status, phase=excluded.phase, created_at_ms=excluded.created_at_ms, "
-        "started_at_ms=excluded.started_at_ms, updated_at_ms=MAX(sync_runs.updated_at_ms, excluded.updated_at_ms), completed_at_ms=excluded.completed_at_ms, duration_ms=excluded.duration_ms, build_id=COALESCE(NULLIF(excluded.build_id, "
-        "''), sync_runs.build_id), payload_json=excluded.payload_json, transfer_metrics_recorded=excluded.transfer_metrics_recorded, uploaded_completed_bytes=excluded.uploaded_completed_bytes, "
-        "uploaded_total_bytes=excluded.uploaded_total_bytes, downloaded_completed_bytes=excluded.downloaded_completed_bytes, downloaded_total_bytes=excluded.downloaded_total_bytes, initiation_control=excluded.initiation_control"));
-    QSqlQuery insertStep(database);
-    insertStep.prepare(QStringLiteral("INSERT INTO sync_steps(run_id, ordinal, phase, state, attempt, started_at_ms, updated_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?)"));
-    QSqlQuery clearEvents(database);
-    clearEvents.prepare(QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"));
-    QSqlQuery clearSteps(database);
-    clearSteps.prepare(QStringLiteral("DELETE FROM sync_steps WHERE run_id = ?"));
-    for (const QJsonValue &value : operations) {
-        QJsonObject operation = normalizedStoredSyncOperation(value.toObject());
-        const QString id = operation.value(QStringLiteral("id")).toString();
-        if (id.isEmpty()) {
-            continue;
-        }
-        const QString status = operation.value(QStringLiteral("status")).toString();
-        const QJsonArray events = operation.value(QStringLiteral("events")).toArray();
-        const QString lastEvent = events.isEmpty() ? QString() : events.at(events.size() - 1).toObject().value(QStringLiteral("message")).toString();
-        const QString phase = operation.value(QStringLiteral("phase")).toString(legacySyncOperationPhase(status, lastEvent));
-        operation.insert(QStringLiteral("trace_id"), id);
-        operation.insert(QStringLiteral("status"), status);
-        operation.insert(QStringLiteral("phase"), phase);
-        const bool transferMetricsRecorded = operation.value(QStringLiteral("transfer_metrics_recorded")).toBool();
-        const qint64 uploadedCompleted = transferMetricsRecorded ? qMax<qint64>(0, operation.value(QStringLiteral("uploaded_completed_bytes")).toVariant().toLongLong()) : 0;
-        const qint64 uploadedTotal = transferMetricsRecorded ? qMax(uploadedCompleted, operation.value(QStringLiteral("uploaded_total_bytes")).toVariant().toLongLong()) : 0;
-        const qint64 downloadedCompleted = transferMetricsRecorded ? qMax<qint64>(0, operation.value(QStringLiteral("downloaded_completed_bytes")).toVariant().toLongLong()) : 0;
-        const qint64 downloadedTotal = transferMetricsRecorded ? qMax(downloadedCompleted, operation.value(QStringLiteral("downloaded_total_bytes")).toVariant().toLongLong()) : 0;
-        operation.insert(QStringLiteral("transfer_metrics_recorded"), transferMetricsRecorded);
-        operation.insert(QStringLiteral("uploaded_completed_bytes"), uploadedCompleted);
-        operation.insert(QStringLiteral("uploaded_total_bytes"), uploadedTotal);
-        operation.insert(QStringLiteral("downloaded_completed_bytes"), downloadedCompleted);
-        operation.insert(QStringLiteral("downloaded_total_bytes"), downloadedTotal);
-        const QString initiationControl = normalizedSyncInitiationControl(operation.value(QStringLiteral("initiation_control")).toString());
-        operation.insert(QStringLiteral("initiation_control"), initiationControl);
-        if (transferMetricsRecorded) {
-            operation.insert(QStringLiteral("bytes_transferred"), uploadedCompleted + downloadedCompleted);
-            operation.insert(QStringLiteral("total_bytes"), uploadedTotal + downloadedTotal);
-        }
-        insertRun.bindValue(0, id);
-        insertRun.bindValue(1, id);
-        insertRun.bindValue(2, operation.value(QStringLiteral("retry_of")).toString());
-        insertRun.bindValue(3, operation.value(QStringLiteral("kind")).toString());
-        insertRun.bindValue(4, operation.value(QStringLiteral("target")).toString());
-        insertRun.bindValue(5, status);
-        insertRun.bindValue(6, phase);
-        insertRun.bindValue(7, operation.value(QStringLiteral("created_at_ms")).toVariant());
-        insertRun.bindValue(8, operation.value(QStringLiteral("started_at_ms")).toVariant());
-        insertRun.bindValue(9, operation.value(QStringLiteral("updated_at_ms")).toVariant());
-        insertRun.bindValue(10, operation.value(QStringLiteral("completed_at_ms")).toVariant());
-        insertRun.bindValue(11, operation.value(QStringLiteral("duration_ms")).toVariant());
-        insertRun.bindValue(12, operation.value(QStringLiteral("build_id")).toString());
-        insertRun.bindValue(13, QString::fromUtf8(QJsonDocument(syncOperationPayloadWithoutEvents(operation)).toJson(QJsonDocument::Compact)));
-        insertRun.bindValue(14, operation.value(QStringLiteral("server_state")).toString(QStringLiteral("")));
-        insertRun.bindValue(15, operation.value(QStringLiteral("server_terminal")).toBool());
-        insertRun.bindValue(16, operation.value(QStringLiteral("last_server_sequence")).toVariant().toLongLong());
-        insertRun.bindValue(17, operation.value(QStringLiteral("stream_state")).toString(QStringLiteral("offline")));
-        insertRun.bindValue(18, transferMetricsRecorded);
-        insertRun.bindValue(19, uploadedCompleted);
-        insertRun.bindValue(20, uploadedTotal);
-        insertRun.bindValue(21, downloadedCompleted);
-        insertRun.bindValue(22, downloadedTotal);
-        insertRun.bindValue(23, initiationControl);
-        if (!insertRun.exec()) {
-            qWarning() << "Could not write Thoughts synchronization run" << id << insertRun.lastError().text();
-            database.rollback();
-            return false;
-        }
-        clearEvents.bindValue(0, id);
-        clearSteps.bindValue(0, id);
-        if (!clearEvents.exec() || !clearSteps.exec()) {
-            qWarning() << "Could not replace Thoughts synchronization run details" << id << database.lastError().text();
-            database.rollback();
-            return false;
-        }
-        for (const QJsonValue &eventValue : events) {
-            if (!eventValue.isObject() || !insertEmbeddedSyncOperationEvent(database, id, operation, eventValue.toObject())) {
-                qWarning() << "Could not write a Thoughts synchronization event for" << id;
-                database.rollback();
-                return false;
-            }
-        }
-        insertStep.bindValue(0, id);
-        insertStep.bindValue(1, syncOperationPhaseOrdinal(phase));
-        insertStep.bindValue(2, phase);
-        insertStep.bindValue(3, status);
-        insertStep.bindValue(4, operation.value(QStringLiteral("attempt")).toInt());
-        insertStep.bindValue(5, operation.value(QStringLiteral("started_at_ms")).toVariant());
-        insertStep.bindValue(6, operation.value(QStringLiteral("updated_at_ms")).toVariant());
-        if (!insertStep.exec()) {
-            qWarning() << "Could not write a Thoughts synchronization step for" << id << insertStep.lastError().text();
-            database.rollback();
-            return false;
-        }
-    }
-    QSqlQuery prune(database);
-    prune.prepare(QStringLiteral("DELETE FROM sync_runs WHERE updated_at_ms < ?"));
-    prune.addBindValue(QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch());
-    if (!prune.exec()) {
-        qWarning() << "Could not prune Thoughts synchronization runs:" << prune.lastError().text();
-        database.rollback();
-        return false;
-    }
-    QSqlQuery pruneEvents(database);
-    QSqlQuery pruneSteps(database);
-    if (!pruneEvents.exec(QStringLiteral("DELETE FROM sync_events WHERE run_id NOT IN (SELECT id FROM sync_runs)")) || !pruneSteps.exec(QStringLiteral("DELETE FROM sync_steps WHERE run_id NOT IN (SELECT id FROM sync_runs)"))) {
-        qWarning() << "Could not prune Thoughts synchronization details:" << database.lastError().text();
-        database.rollback();
-        return false;
-    }
-    if (!database.commit()) {
-        qWarning() << "Could not commit the Thoughts synchronization journal:" << database.lastError().text();
-        return false;
-    }
-    return true;
-}
-
-static QJsonArray readSyncOperations(const QString &requestedOperationId, bool includeHistory)
-{
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    const qint64 cutoff = QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch();
-    QSqlQuery query(database);
-    const QString selection = requestedOperationId.isEmpty() ? QStringLiteral("updated_at_ms >= ? ORDER BY created_at_ms DESC LIMIT 500") : QStringLiteral("id = ? OR trace_id = ?");
-    query.prepare(
-        QStringLiteral("SELECT id, payload_json, status, phase, server_state, server_terminal, last_server_sequence, stream_state, build_id, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, "
-                       "downloaded_completed_bytes, downloaded_total_bytes, initiation_control, "
-                       "EXISTS(SELECT 1 FROM sync_events WHERE run_id = sync_runs.id AND error_code = 'invalid_source_publication') FROM sync_runs WHERE %1").arg(selection));
-    if (requestedOperationId.isEmpty()) {
-        query.addBindValue(cutoff);
-    } else {
-        query.addBindValue(requestedOperationId);
-        query.addBindValue(requestedOperationId);
-    }
-    QList<QJsonObject> storedOperations;
-    QStringList operationIds;
-    if (query.exec()) {
-        while (query.next()) {
-            const QJsonDocument document = QJsonDocument::fromJson(query.value(1).toString().toUtf8());
-            if (document.isObject()) {
-                QJsonObject operation = document.object();
-                const QString operationId = query.value(0).toString();
-                operation.insert(QStringLiteral("id"), operationId);
-                operation.insert(QStringLiteral("trace_id"), operation.value(QStringLiteral("trace_id")).toString(operationId));
-                operation.insert(QStringLiteral("status"), query.value(2).toString());
-                operation.insert(QStringLiteral("phase"), query.value(3).toString());
-                operation.insert(QStringLiteral("server_state"), query.value(4).toString());
-                operation.insert(QStringLiteral("server_terminal"), query.value(5).toBool());
-                operation.insert(QStringLiteral("last_server_sequence"), query.value(6).toLongLong());
-                operation.insert(QStringLiteral("stream_state"), query.value(7).toString());
-                if (!query.value(8).toString().isEmpty()) {
-                    operation.insert(QStringLiteral("build_id"), query.value(8).toString());
-                }
-                operation.insert(QStringLiteral("transfer_metrics_recorded"), query.value(9).toBool());
-                operation.insert(QStringLiteral("uploaded_completed_bytes"), query.value(10).toLongLong());
-                operation.insert(QStringLiteral("uploaded_total_bytes"), query.value(11).toLongLong());
-                operation.insert(QStringLiteral("downloaded_completed_bytes"), query.value(12).toLongLong());
-                operation.insert(QStringLiteral("downloaded_total_bytes"), query.value(13).toLongLong());
-                operation.insert(QStringLiteral("initiation_control"), normalizedSyncInitiationControl(query.value(14).toString()));
-                operation.insert(QStringLiteral("needs_source_conflict_resolution"), query.value(15).toBool());
-                operation.remove(QStringLiteral("events"));
-                operationIds.append(operationId);
-                storedOperations.append(operation);
-            }
-        }
-    }
-
-    // The list needs only summaries. The detail window reads the selected run,
-    // so live trace updates never deserialize every other run in the journal.
-    QHash<QString, QJsonArray> eventsByRun;
-    if (includeHistory && !operationIds.isEmpty()) {
-        QStringList placeholders;
-        placeholders.fill(QStringLiteral("?"), operationIds.size());
-        QSqlQuery journalEvents(database);
-        journalEvents.prepare(QStringLiteral("SELECT run_id, at_ms, phase, state, attempt, message, duration_ms, error_code, origin, server_sequence, server_timestamp_ms, received_at_ms, component, build_id, completed, total, "
-                                             "bytes_completed, bytes_total, metadata_json, terminal FROM sync_events WHERE run_id IN (%1) ORDER BY run_id, COALESCE(server_timestamp_ms, at_ms), id")
-                                  .arg(placeholders.join(QLatin1Char(','))));
-        for (const QString &operationId : std::as_const(operationIds)) {
-            journalEvents.addBindValue(operationId);
-        }
-        if (journalEvents.exec()) {
-            while (journalEvents.next()) {
-                const bool serverOrigin = journalEvents.value(8).toString() == QLatin1String("server");
-                const qint64 serverTimestamp = journalEvents.value(10).toLongLong();
-                QJsonObject event {{QStringLiteral("at_ms"), serverOrigin && serverTimestamp > 0 ? serverTimestamp : journalEvents.value(1).toLongLong()},
-                                   {QStringLiteral("phase"), journalEvents.value(2).toString()},
-                                   {QStringLiteral("state"), journalEvents.value(3).toString()},
-                                   {QStringLiteral("attempt"), journalEvents.value(4).toInt()},
-                                   {QStringLiteral("message"), journalEvents.value(5).toString()},
-                                   {QStringLiteral("duration_ms"), QJsonValue::fromVariant(journalEvents.value(6))},
-                                   {QStringLiteral("error_code"), journalEvents.value(7).toString()},
-                                   {QStringLiteral("origin"), journalEvents.value(8).toString()},
-                                   {QStringLiteral("server_sequence"), journalEvents.value(9).toLongLong()},
-                                   {QStringLiteral("received_at_ms"), journalEvents.value(11).toLongLong()},
-                                   {QStringLiteral("component"), journalEvents.value(12).toString()},
-                                   {QStringLiteral("build_id"), journalEvents.value(13).toString()},
-                                   {QStringLiteral("completed"), QJsonValue::fromVariant(journalEvents.value(14))},
-                                   {QStringLiteral("total"), QJsonValue::fromVariant(journalEvents.value(15))},
-                                   {QStringLiteral("bytes_transferred"), QJsonValue::fromVariant(journalEvents.value(16))},
-                                   {QStringLiteral("total_bytes"), QJsonValue::fromVariant(journalEvents.value(17))},
-                                   {QStringLiteral("terminal"), journalEvents.value(19).toBool()}};
-                const QJsonDocument metadata = QJsonDocument::fromJson(journalEvents.value(18).toString().toUtf8());
-                if (metadata.isObject()) {
-                    event.insert(QStringLiteral("metadata"), metadata.object());
-                }
-                eventsByRun[journalEvents.value(0).toString()].append(event);
-            }
-        }
-    }
-
-    QJsonArray operations;
-    for (QJsonObject operation : std::as_const(storedOperations)) {
-        if (!includeHistory) {
-            operations.append(normalizedStoredSyncOperation(operation));
-            continue;
-        }
-        QJsonArray events = eventsByRun.value(operation.value(QStringLiteral("id")).toString());
-        QList<QJsonObject> orderedEvents;
-        orderedEvents.reserve(events.size());
-        for (const QJsonValue &event : std::as_const(events)) {
-            orderedEvents.append(event.toObject());
-        }
-        std::stable_sort(orderedEvents.begin(), orderedEvents.end(), [](const QJsonObject &a, const QJsonObject &b) {
-            const qint64 atA = a.value(QStringLiteral("at_ms")).toVariant().toLongLong();
-            const qint64 atB = b.value(QStringLiteral("at_ms")).toVariant().toLongLong();
-            if (atA != atB) {
-                return atA < atB;
-            }
-            return a.value(QStringLiteral("server_sequence")).toVariant().toLongLong() < b.value(QStringLiteral("server_sequence")).toVariant().toLongLong();
-        });
-        events = {};
-        for (const QJsonObject &event : std::as_const(orderedEvents)) {
-            events.append(event);
-        }
-        operation.insert(QStringLiteral("events"), events);
-        operations.append(normalizedStoredSyncOperation(operation));
-    }
-    QSqlQuery imported(database);
-    imported.prepare(QStringLiteral("SELECT value FROM sync_metadata WHERE key = 'legacy_json_imported'"));
-    const bool importRecorded = imported.exec() && imported.next();
-    if (!importRecorded) {
-        if (operations.isEmpty() && requestedOperationId.isEmpty()) {
-            const QJsonArray legacy = readLegacySyncOperations();
-            if (!legacy.isEmpty() && writeSyncOperations(legacy)) {
-                QSqlQuery mark(database);
-                mark.exec(QStringLiteral("INSERT OR REPLACE INTO sync_metadata(key, value) VALUES('legacy_json_imported', '1')"));
-                return readSyncOperations(requestedOperationId, includeHistory);
-            }
-        }
-        QSqlQuery mark(database);
-        mark.exec(QStringLiteral("INSERT OR REPLACE INTO sync_metadata(key, value) VALUES('legacy_json_imported', '1')"));
-    }
-    return operations;
+    return Thoughts::SyncJournal::instance();
 }
 
 QJsonArray Shell::recentSyncOperationsWithHistory()
 {
-    // Compatibility/export callers may restore an older database after the
-    // schema migration. Keep extraction here, outside the live Logs refresh.
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!normalizeEmbeddedSyncOperationEvents(database)) {
-        qWarning() << "Could not normalize embedded synchronization history";
-    }
-    return readSyncOperations({}, true);
+    return syncJournal()->recentOperations(true);
 }
 
 QJsonArray Shell::recentSyncOperationSummaries()
 {
-    return readSyncOperations({}, false);
+    return syncJournal()->recentOperations(false);
 }
 
 QJsonObject Shell::syncOperationWithHistory(const QString &operationId)
 {
-    if (operationId.isEmpty()) {
-        return {};
-    }
-    const QJsonArray operations = readSyncOperations(operationId, true);
-    return operations.isEmpty() ? QJsonObject() : operations.first().toObject();
+    return syncJournal()->operationWithHistory(operationId);
 }
 
 static bool safeOperationPdfTarget(const QString &target)
@@ -964,459 +388,89 @@ static bool safeOperationPdfTarget(const QString &target)
     return !target.isEmpty() && target.endsWith(QLatin1String(".pdf"), Qt::CaseInsensitive) && !target.contains(QLatin1Char('/')) && !target.contains(QLatin1Char('\\'));
 }
 
-static QJsonObject syncOperationSummaryFromCurrentRow(const QSqlQuery &query)
-{
-    const QJsonDocument payload = QJsonDocument::fromJson(query.value(13).toString().toUtf8());
-    // A restored older journal may still embed its history in the payload.
-    QJsonObject operation = payload.isObject() ? syncOperationPayloadWithoutEvents(payload.object()) : QJsonObject();
-    operation.insert(QStringLiteral("id"), query.value(0).toString());
-    operation.insert(QStringLiteral("trace_id"), query.value(1).toString());
-    operation.insert(QStringLiteral("retry_of"), query.value(2).toString());
-    operation.insert(QStringLiteral("kind"), query.value(3).toString());
-    operation.insert(QStringLiteral("target"), query.value(4).toString());
-    operation.insert(QStringLiteral("status"), query.value(5).toString());
-    operation.insert(QStringLiteral("phase"), query.value(6).toString());
-    operation.insert(QStringLiteral("created_at_ms"), query.value(7).toLongLong());
-    operation.insert(QStringLiteral("started_at_ms"), query.value(8).toLongLong());
-    operation.insert(QStringLiteral("updated_at_ms"), query.value(9).toLongLong());
-    if (!query.value(10).isNull()) {
-        operation.insert(QStringLiteral("completed_at_ms"), query.value(10).toLongLong());
-    }
-    if (!query.value(11).isNull()) {
-        operation.insert(QStringLiteral("duration_ms"), query.value(11).toLongLong());
-    }
-    if (!query.value(12).toString().isEmpty()) {
-        operation.insert(QStringLiteral("build_id"), query.value(12).toString());
-    }
-    operation.insert(QStringLiteral("server_state"), query.value(14).toString());
-    operation.insert(QStringLiteral("server_terminal"), query.value(15).toBool());
-    operation.insert(QStringLiteral("last_server_sequence"), query.value(16).toLongLong());
-    operation.insert(QStringLiteral("stream_state"), query.value(17).toString());
-    operation.insert(QStringLiteral("transfer_metrics_recorded"), query.value(18).toBool());
-    operation.insert(QStringLiteral("uploaded_completed_bytes"), query.value(19).toLongLong());
-    operation.insert(QStringLiteral("uploaded_total_bytes"), query.value(20).toLongLong());
-    operation.insert(QStringLiteral("downloaded_completed_bytes"), query.value(21).toLongLong());
-    operation.insert(QStringLiteral("downloaded_total_bytes"), query.value(22).toLongLong());
-    operation.insert(QStringLiteral("initiation_control"), normalizedSyncInitiationControl(query.value(23).toString()));
-    return normalizedStoredSyncOperation(operation);
-}
-
 static QJsonObject readSyncOperationSummary(const QString &operationId)
 {
-    if (operationId.isEmpty()) {
-        return {};
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(
-        QStringLiteral("SELECT id, trace_id, retry_of, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, duration_ms, build_id, payload_json, server_state, server_terminal, last_server_sequence, "
-                       "stream_state, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, initiation_control FROM sync_runs WHERE id = ? OR trace_id = ? LIMIT 1"));
-    query.addBindValue(operationId);
-    query.addBindValue(operationId);
-    if (!query.exec() || !query.next()) {
-        return {};
-    }
-    return syncOperationSummaryFromCurrentRow(query);
+    return syncJournal()->operationSummary(operationId);
 }
 
 static QList<QJsonObject> runningSyncOperationSummaries()
 {
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(QStringLiteral("SELECT id, payload_json, status, phase, kind, target FROM sync_runs WHERE completed_at_ms IS NULL AND updated_at_ms >= ? ORDER BY updated_at_ms DESC"));
-    query.addBindValue(QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch());
-    if (!query.exec()) {
-        return {};
-    }
-    QList<QJsonObject> operations;
-    while (query.next()) {
-        const QJsonDocument payload = QJsonDocument::fromJson(query.value(1).toString().toUtf8());
-        QJsonObject operation = payload.isObject() ? payload.object() : QJsonObject();
-        operation.insert(QStringLiteral("id"), query.value(0).toString());
-        operation.insert(QStringLiteral("status"), query.value(2).toString());
-        operation.insert(QStringLiteral("phase"), query.value(3).toString());
-        operation.insert(QStringLiteral("kind"), query.value(4).toString());
-        operation.insert(QStringLiteral("target"), query.value(5).toString());
-        if (Thoughts::syncOperationIsRunning(operation)) {
-            operations.append(operation);
-        }
-    }
-    return operations;
+    return syncJournal()->runningSummaries();
 }
 
 QDateTime Shell::lastSuccessfulGlobalSyncAt()
 {
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(QStringLiteral(
-        "SELECT completed_at_ms, updated_at_ms FROM sync_runs WHERE kind = 'sync' AND phase = 'succeeded' AND (target IS NULL OR target = '' OR target = 'All documents') ORDER BY COALESCE(completed_at_ms, updated_at_ms) DESC LIMIT 1"));
-    if (!query.exec() || !query.next()) {
-        return {};
-    }
-    const qint64 completedMs = query.value(0).toLongLong();
-    const qint64 updatedMs = query.value(1).toLongLong();
-    const qint64 latestMs = completedMs > 0 ? completedMs : updatedMs;
-    return latestMs > 0 ? QDateTime::fromMSecsSinceEpoch(latestMs, Qt::UTC) : QDateTime();
+    return syncJournal()->lastSuccessfulGlobalSyncAt();
 }
 
 QJsonObject Shell::latestGlobalSyncOperationSummary()
 {
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(QStringLiteral(
-        "SELECT id, trace_id, retry_of, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, duration_ms, build_id, payload_json, server_state, server_terminal, last_server_sequence, "
-        "stream_state, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, initiation_control FROM sync_runs WHERE kind = 'sync' AND "
-        "(target IS NULL OR target = '' OR target = 'All documents') ORDER BY updated_at_ms DESC LIMIT 1"));
-    return query.exec() && query.next() ? syncOperationSummaryFromCurrentRow(query) : QJsonObject();
+    return syncJournal()->latestGlobalSummary();
 }
 
 QJsonObject Shell::latestDocumentSyncOperationSummary(const QString &target)
 {
-    if (!safeOperationPdfTarget(target)) {
-        return {};
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(QStringLiteral(
-        "SELECT id, trace_id, retry_of, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, duration_ms, build_id, payload_json, server_state, server_terminal, last_server_sequence, "
-        "stream_state, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, initiation_control FROM sync_runs WHERE kind = 'sync' AND "
-        "(target = ? OR target IS NULL OR target = '' OR target = 'All documents') ORDER BY updated_at_ms DESC LIMIT 1"));
-    query.addBindValue(target);
-    return query.exec() && query.next() ? syncOperationSummaryFromCurrentRow(query) : QJsonObject();
+    return safeOperationPdfTarget(target) ? syncJournal()->latestDocumentSummary(target) : QJsonObject();
 }
 
 static QString runningBuildOperationIdForTarget(const QString &target)
 {
-    if (!safeOperationPdfTarget(target)) {
-        return {};
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return {};
-    }
-    QSqlQuery query(database);
-    query.prepare(QStringLiteral("SELECT id, payload_json, status, phase FROM sync_runs WHERE kind = 'build' AND target = ? AND completed_at_ms IS NULL ORDER BY updated_at_ms DESC"));
-    query.addBindValue(target);
-    if (!query.exec()) {
-        return {};
-    }
-    while (query.next()) {
-        QJsonObject operation = QJsonDocument::fromJson(query.value(1).toString().toUtf8()).object();
-        operation.insert(QStringLiteral("status"), query.value(2).toString());
-        operation.insert(QStringLiteral("phase"), query.value(3).toString());
-        if (Thoughts::syncOperationIsRunning(operation)) {
-            return query.value(0).toString();
-        }
-    }
-    return {};
-}
-
-static QString syncOperationStartedMessage(const QString &kind, bool retry)
-{
-    if (kind == QLatin1String("build")) {
-        return retry ? i18n("Build retry started") : i18n("Build started");
-    }
-    return retry ? i18n("Sync retry started") : i18n("Sync started");
-}
-
-static bool insertLocalSyncOperationEvent(QSqlDatabase &database, const QString &runId, const QJsonObject &event, int defaultAttempt = 0)
-{
-    QJsonObject metadata = event.value(QStringLiteral("metadata")).toObject();
-    for (const QString &field : {QStringLiteral("path"), QStringLiteral("target")}) {
-        if (event.contains(field)) {
-            metadata.insert(field, event.value(field));
-        }
-    }
-    QSqlQuery insert(database);
-    insert.prepare(
-        QStringLiteral("INSERT INTO sync_events(run_id, at_ms, phase, state, attempt, message, duration_ms, error_code, origin, component, build_id, completed, total, bytes_completed, bytes_total, metadata_json, terminal) VALUES(?, ?, ?, "
-                       "?, ?, ?, ?, ?, 'desktop', ?, ?, ?, ?, ?, ?, ?, ?)"));
-    insert.addBindValue(runId);
-    insert.addBindValue(event.value(QStringLiteral("at_ms")).toVariant());
-    insert.addBindValue(event.value(QStringLiteral("phase")).toString().left(64));
-    insert.addBindValue(event.value(QStringLiteral("state")).toString(QStringLiteral("running")).left(32));
-    insert.addBindValue(event.value(QStringLiteral("attempt")).toInt(defaultAttempt));
-    insert.addBindValue(event.value(QStringLiteral("message")).toString().left(600));
-    insert.addBindValue(event.value(QStringLiteral("duration_ms")).toVariant());
-    insert.addBindValue(event.value(QStringLiteral("error_code")).toString().left(64));
-    insert.addBindValue(event.value(QStringLiteral("component")).toString(QStringLiteral("desktop")).left(64));
-    insert.addBindValue(event.value(QStringLiteral("build_id")).toString().left(128));
-    insert.addBindValue(event.value(QStringLiteral("completed")).toVariant());
-    insert.addBindValue(event.value(QStringLiteral("total")).toVariant());
-    insert.addBindValue(event.value(QStringLiteral("bytes_transferred")).toVariant());
-    insert.addBindValue(event.value(QStringLiteral("total_bytes")).toVariant());
-    insert.addBindValue(QString::fromUtf8(QJsonDocument(metadata).toJson(QJsonDocument::Compact)));
-    insert.addBindValue(event.value(QStringLiteral("terminal")).toBool());
-    return insert.exec();
-}
-
-static bool upsertSyncOperationStep(QSqlDatabase &database, const QString &runId, const QString &phase, const QString &state, int attempt, qint64 startedAt, qint64 updatedAt)
-{
-    QSqlQuery step(database);
-    step.prepare(
-        QStringLiteral("INSERT INTO sync_steps(run_id, ordinal, phase, state, attempt, started_at_ms, updated_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, ordinal) DO UPDATE SET phase=excluded.phase, state=excluded.state, "
-                       "attempt=excluded.attempt, updated_at_ms=excluded.updated_at_ms"));
-    step.addBindValue(runId);
-    step.addBindValue(syncOperationPhaseOrdinal(phase));
-    step.addBindValue(phase);
-    step.addBindValue(state);
-    step.addBindValue(attempt);
-    step.addBindValue(startedAt);
-    step.addBindValue(updatedAt);
-    return step.exec();
+    return safeOperationPdfTarget(target) ? syncJournal()->runningBuildOperationIdForTarget(target) : QString();
 }
 
 static QString beginSyncOperation(const QString &kind, const QString &target, const QString &phase, const QString &initiationControl, const QString &retryOf = {})
 {
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return {};
-    }
-    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    const QString storedPhase = phase.isEmpty() ? QStringLiteral("queued") : phase.left(64);
-    const QString storedInitiationControl = normalizedSyncInitiationControl(initiationControl);
-    const QJsonObject startedEvent {
-        {QStringLiteral("at_ms"), now},
-        {QStringLiteral("phase"), QStringLiteral("queued")},
-        {QStringLiteral("state"), QStringLiteral("running")},
-        {QStringLiteral("message"), syncOperationStartedMessage(kind, !retryOf.isEmpty())},
-        {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("initiation_control"), storedInitiationControl}}}};
-    QJsonObject operation {{QStringLiteral("id"), id},
-                           {QStringLiteral("trace_id"), id},
-                           {QStringLiteral("kind"), kind},
-                           {QStringLiteral("target"), target},
-                           {QStringLiteral("initiation_control"), storedInitiationControl},
-                           {QStringLiteral("status"), QStringLiteral("running")},
-                           {QStringLiteral("phase"), storedPhase},
-                           {QStringLiteral("created_at_ms"), now},
-                           {QStringLiteral("started_at_ms"), now},
-                           {QStringLiteral("updated_at_ms"), now},
-                           {QStringLiteral("server_state"), QStringLiteral("")},
-                           {QStringLiteral("server_terminal"), false},
-                           {QStringLiteral("last_server_sequence"), 0},
-                           {QStringLiteral("stream_state"), QStringLiteral("offline")},
-                           {QStringLiteral("transfer_metrics_recorded"), true},
-                           {QStringLiteral("uploaded_completed_bytes"), 0},
-                           {QStringLiteral("uploaded_total_bytes"), 0},
-                           {QStringLiteral("downloaded_completed_bytes"), 0},
-                           {QStringLiteral("downloaded_total_bytes"), 0},
-                           {QStringLiteral("bytes_transferred"), 0},
-                           {QStringLiteral("total_bytes"), 0}};
-    if (!retryOf.isEmpty()) {
-        operation.insert(QStringLiteral("retry_of"), retryOf);
-    }
-    QSqlQuery insert(database);
-    insert.prepare(
-        QStringLiteral("INSERT INTO sync_runs(id, trace_id, retry_of, kind, target, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, duration_ms, build_id, payload_json, server_state, server_terminal, "
-                       "last_server_sequence, stream_state, transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, initiation_control) VALUES(?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, NULL, "
-                       "NULL, NULL, ?, '', 0, 0, 'offline', 1, 0, 0, 0, 0, ?)"));
-    insert.addBindValue(id);
-    insert.addBindValue(id);
-    insert.addBindValue(retryOf);
-    insert.addBindValue(kind);
-    insert.addBindValue(target);
-    insert.addBindValue(storedPhase);
-    insert.addBindValue(now);
-    insert.addBindValue(now);
-    insert.addBindValue(now);
-    insert.addBindValue(QString::fromUtf8(QJsonDocument(operation).toJson(QJsonDocument::Compact)));
-    insert.addBindValue(storedInitiationControl);
-    if (!insert.exec() || !insertLocalSyncOperationEvent(database, id, startedEvent) || !upsertSyncOperationStep(database, id, storedPhase, QStringLiteral("running"), 0, now, now)) {
-        database.rollback();
-        return {};
-    }
-    QSqlQuery prune(database);
-    prune.prepare(QStringLiteral("DELETE FROM sync_runs WHERE updated_at_ms < ?"));
-    prune.addBindValue(QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch());
-    QSqlQuery pruneEvents(database);
-    QSqlQuery pruneSteps(database);
-    // Orphan cleanup scans every journal event (~0.15 s with 200k events), so run it
-    // only when runs were just pruned, and once per session for older leftovers.
-    static bool orphansChecked = false;
-    if (!prune.exec()) {
-        database.rollback();
-        return {};
-    }
-    const bool pruneOrphans = prune.numRowsAffected() != 0 || !orphansChecked;
-    if ((pruneOrphans && (!pruneEvents.exec(QStringLiteral("DELETE FROM sync_events WHERE run_id NOT IN (SELECT id FROM sync_runs)")) ||
-                          !pruneSteps.exec(QStringLiteral("DELETE FROM sync_steps WHERE run_id NOT IN (SELECT id FROM sync_runs)")))) || !database.commit()) {
-        database.rollback();
-        return {};
-    }
-    orphansChecked = true;
-    Thoughts::DeveloperLog::record(QStringLiteral("operation.started"), {{QStringLiteral("operation_id"), id}, {QStringLiteral("kind"), kind}, {QStringLiteral("phase"), storedPhase}});
-    return id;
+    return syncJournal()->beginOperation(kind, target, phase, initiationControl, retryOf);
 }
 
-static void updateSyncOperation(const QString &id, Thoughts::SyncOperationState state, const QString &phase, const QString &event, const QString &buildId = {}, const QString &errorCode = {})
+static void updateSyncOperation(const QString &id, Thoughts::SyncOperationState state, const QString &phase, const QString &event, const QString &buildId = {}, const QString &errorCode = {},
+                                const QString &warningCode = {}, const QString &warning = {})
 {
-    if (id.isEmpty()) {
-        return;
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return;
-    }
-    QSqlQuery select(database);
-    select.prepare(QStringLiteral("SELECT payload_json, status, phase, created_at_ms, started_at_ms, completed_at_ms, duration_ms, kind, build_id FROM sync_runs WHERE id = ? OR trace_id = ? LIMIT 1"));
-    select.addBindValue(id);
-    select.addBindValue(id);
-    if (!select.exec() || !select.next()) {
-        database.rollback();
-        return;
-    }
-    const QJsonDocument payload = QJsonDocument::fromJson(select.value(0).toString().toUtf8());
-    if (!payload.isObject()) {
-        database.rollback();
-        return;
-    }
-    QJsonObject operation = syncOperationPayloadWithoutEvents(payload.object());
-    operation.insert(QStringLiteral("id"), operation.value(QStringLiteral("id")).toString(id));
-    operation.insert(QStringLiteral("trace_id"), operation.value(QStringLiteral("trace_id")).toString(id));
-    operation.insert(QStringLiteral("status"), select.value(1).toString());
-    operation.insert(QStringLiteral("phase"), select.value(2).toString());
-    operation.insert(QStringLiteral("created_at_ms"), select.value(3).toLongLong());
-    operation.insert(QStringLiteral("started_at_ms"), select.value(4).toLongLong());
-    operation.insert(QStringLiteral("kind"), select.value(7).toString());
-    if (!select.value(8).toString().isEmpty()) {
-        operation.insert(QStringLiteral("build_id"), select.value(8).toString());
-    }
-
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    const QString storedPhase = phase.left(64);
-    const QString storedState = Thoughts::syncOperationStateId(state);
-    const bool terminal = state == Thoughts::SyncOperationState::Succeeded || state == Thoughts::SyncOperationState::Failed || state == Thoughts::SyncOperationState::Interrupted || state == Thoughts::SyncOperationState::Cancelled;
-    const bool failed = state == Thoughts::SyncOperationState::Failed || state == Thoughts::SyncOperationState::Interrupted || state == Thoughts::SyncOperationState::Cancelled;
-    const qint64 startedAt = qMax<qint64>(0, operation.value(QStringLiteral("started_at_ms")).toVariant().toLongLong());
-    const qint64 durationMs = terminal ? qMax<qint64>(0, now - startedAt) : select.value(6).toLongLong();
-    const QVariant completedAt = terminal ? QVariant(now) : select.value(5);
-    const QVariant storedDuration = terminal ? QVariant(durationMs) : select.value(6);
-
-    QString safeEvent = event.left(600);
-    QString resolvedErrorCode = errorCode.left(64);
-    if (failed && resolvedErrorCode.isEmpty()) {
-        QSqlQuery previousFailure(database);
-        previousFailure.prepare(QStringLiteral("SELECT message, error_code FROM sync_events WHERE run_id = ? AND error_code IS NOT NULL AND error_code != '' ORDER BY COALESCE(server_timestamp_ms, at_ms) DESC, id DESC LIMIT 1"));
-        previousFailure.addBindValue(operation.value(QStringLiteral("id")).toString(id));
-        if (previousFailure.exec() && previousFailure.next()) {
-            resolvedErrorCode = previousFailure.value(1).toString().left(64);
-            if (safeEvent == i18n("Build failed") || safeEvent == Thoughts::SyncStatusLabels::syncFailed() || safeEvent == i18n("Operation failed")) {
-                safeEvent = previousFailure.value(0).toString().left(600);
-            }
-        }
-        if (resolvedErrorCode.isEmpty()) {
-            resolvedErrorCode = operation.value(QStringLiteral("kind")).toString() == QLatin1String("build") ? QStringLiteral("build_failed") : QStringLiteral("sync_failed");
-        }
-    }
-
-    const Thoughts::SyncOperationState previousState = Thoughts::syncOperationState(operation);
-    QJsonObject previousEvent;
-    QSqlQuery previousEventQuery(database);
-    previousEventQuery.prepare(QStringLiteral("SELECT phase, state, message, error_code FROM sync_events WHERE run_id = ? AND origin = 'desktop' ORDER BY at_ms DESC, id DESC LIMIT 1"));
-    previousEventQuery.addBindValue(operation.value(QStringLiteral("id")).toString(id));
-    if (previousEventQuery.exec() && previousEventQuery.next()) {
-        previousEvent.insert(QStringLiteral("phase"), previousEventQuery.value(0).toString());
-        previousEvent.insert(QStringLiteral("state"), previousEventQuery.value(1).toString());
-        previousEvent.insert(QStringLiteral("message"), previousEventQuery.value(2).toString());
-        if (!previousEventQuery.value(3).toString().isEmpty()) {
-            previousEvent.insert(QStringLiteral("error_code"), previousEventQuery.value(3).toString());
-        }
-    }
-    const bool unchangedProgress = (safeEvent == Thoughts::SyncStatusLabels::syncing() || safeEvent == i18n("Waiting to publish sources…") || safeEvent == i18n("Building…")) && state == previousState;
-    const bool duplicateEvent = previousEvent.value(QStringLiteral("phase")).toString() == storedPhase && previousEvent.value(QStringLiteral("state")).toString() == storedState &&
-        previousEvent.value(QStringLiteral("message")).toString() == safeEvent && previousEvent.value(QStringLiteral("error_code")).toString() == resolvedErrorCode;
-    const bool appendEvent = !safeEvent.isEmpty() && !duplicateEvent && !unchangedProgress;
-    QJsonObject eventObject;
-    if (appendEvent) {
-        eventObject = {{QStringLiteral("at_ms"), now}, {QStringLiteral("phase"), storedPhase}, {QStringLiteral("state"), storedState}, {QStringLiteral("message"), safeEvent}, {QStringLiteral("terminal"), terminal}};
-        if (terminal) {
-            eventObject.insert(QStringLiteral("duration_ms"), durationMs);
-        }
-        if (!resolvedErrorCode.isEmpty()) {
-            eventObject.insert(QStringLiteral("error_code"), resolvedErrorCode);
-        }
-        if (!buildId.isEmpty()) {
-            eventObject.insert(QStringLiteral("build_id"), buildId.left(128));
-        }
-    }
-    operation.insert(QStringLiteral("status"), storedState);
-    operation.insert(QStringLiteral("phase"), storedPhase);
-    operation.insert(QStringLiteral("updated_at_ms"), now);
-    if (terminal) {
-        operation.insert(QStringLiteral("completed_at_ms"), now);
-        operation.insert(QStringLiteral("duration_ms"), durationMs);
-    }
-    if (failed) {
-        operation.insert(QStringLiteral("last_error_message"), safeEvent);
-        operation.insert(QStringLiteral("last_error_code"), resolvedErrorCode);
-    }
-    if (!buildId.isEmpty()) {
-        operation.insert(QStringLiteral("build_id"), buildId.left(128));
-    }
-
-    QSqlQuery update(database);
-    update.prepare(QStringLiteral("UPDATE sync_runs SET status = ?, phase = ?, updated_at_ms = ?, completed_at_ms = ?, duration_ms = ?, build_id = COALESCE(NULLIF(?, ''), build_id), payload_json = ? WHERE id = ?"));
-    update.addBindValue(storedState);
-    update.addBindValue(storedPhase);
-    update.addBindValue(now);
-    update.addBindValue(completedAt);
-    update.addBindValue(storedDuration);
-    update.addBindValue(buildId.left(128));
-    update.addBindValue(QString::fromUtf8(QJsonDocument(operation).toJson(QJsonDocument::Compact)));
-    update.addBindValue(operation.value(QStringLiteral("id")).toString(id));
-    if (!update.exec() || update.numRowsAffected() != 1 || (appendEvent && !insertLocalSyncOperationEvent(database, operation.value(QStringLiteral("id")).toString(id), eventObject, operation.value(QStringLiteral("attempt")).toInt())) ||
-        !upsertSyncOperationStep(database, operation.value(QStringLiteral("id")).toString(id), storedPhase, storedState, operation.value(QStringLiteral("attempt")).toInt(), startedAt, now) || !database.commit()) {
-        database.rollback();
-    } else if (appendEvent) {
-        Thoughts::DeveloperLog::record(QStringLiteral("operation.updated"), {{QStringLiteral("operation_id"), id}, {QStringLiteral("phase"), storedPhase},
-            {QStringLiteral("state"), storedState}, {QStringLiteral("duration_ms"), durationMs}});
-    }
+    syncJournal()->updateOperation(id, state, phase, event, buildId, errorCode, warningCode, warning);
 }
 
 static void reconcileInterruptedSyncOperations(qint64 startedBeforeMs)
 {
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen()) {
-        return;
-    }
-    QStringList runningIds;
-    {
-        QSqlQuery query(database);
-        query.prepare(QStringLiteral("SELECT id, payload_json, status, phase FROM sync_runs WHERE completed_at_ms IS NULL AND updated_at_ms >= ? AND started_at_ms < ?"));
-        query.addBindValue(QDateTime::currentDateTimeUtc().addDays(-90).toMSecsSinceEpoch());
-        query.addBindValue(startedBeforeMs);
-        if (!query.exec()) {
-            return;
-        }
-        while (query.next()) {
-            QJsonObject operation = QJsonDocument::fromJson(query.value(1).toString().toUtf8()).object();
-            operation.insert(QStringLiteral("status"), query.value(2).toString());
-            operation.insert(QStringLiteral("phase"), query.value(3).toString());
-            if (Thoughts::syncOperationIsRunning(operation)) {
-                runningIds.append(query.value(0).toString());
-            }
-        }
-    }
-    for (const QString &id : std::as_const(runningIds)) {
-        updateSyncOperation(id, Thoughts::SyncOperationState::Interrupted, QStringLiteral("interrupted"), i18n("Interrupted when Thoughts restarted"), QString(), QStringLiteral("desktop_restarted"));
-    }
+    syncJournal()->reconcileInterrupted(startedBeforeMs);
 }
+
+namespace
+{
+// When Thoughts starts a Sync by itself (automaticsyncpolicy.h). One for the
+// process: the server is asked once for all windows.
+Thoughts::AutomaticSyncPolicy s_automaticSync;
+
+// Who started a Sync, from the control recorded with it.
+Thoughts::AutomaticSyncPolicy::Initiation automaticSyncInitiation(const QString &initiationControl)
+{
+    if (initiationControl == QLatin1String("remote_change") || initiationControl == QLatin1String("proposal_decision")) {
+        return Thoughts::AutomaticSyncPolicy::Initiation::Automatic;
+    }
+    if (initiationControl == QLatin1String("command_api") || initiationControl == QLatin1String("runtime_adoption")) {
+        return Thoughts::AutomaticSyncPolicy::Initiation::Command;
+    }
+    return Thoughts::AutomaticSyncPolicy::Initiation::User;
+}
+
+// Why a Sync failed, as the repository says with the failure itself
+// ("failure_kind" of the part's fedoraManualSyncState): transient, needs the
+// user, or a defect. A Sync that the shell could not even start has no kind.
+Thoughts::AutomaticSyncPolicy::FailureKind automaticSyncFailureKind(const QVariantMap &manualSync)
+{
+    return Thoughts::AutomaticSyncPolicy::failureKindFromName(manualSync.value(QStringLiteral("failure_kind")).toString());
+}
+
+// What the status area says while automatic Syncs wait after failures.
+QString automaticSyncNotice()
+{
+    const qint64 notBefore = s_automaticSync.notBeforeMs();
+    if (notBefore <= QDateTime::currentMSecsSinceEpoch()) {
+        return {};
+    }
+    return i18n("Next automatic Sync not before %1", QLocale().toString(QDateTime::fromMSecsSinceEpoch(notBefore).toLocalTime().time(), QLocale::ShortFormat));
+}
+}
+
 
 class ThoughtsSyncCommandService final : public QObject
 {
@@ -1680,327 +734,7 @@ static ThoughtsSyncCommandService *syncCommandService(bool create)
     }
     return s_syncCommandService;
 }
-static void appendStoredSyncOperationEvent(const QString &id, const QJsonObject &incomingEvent);
 static bool repeatedSyncSignal(const QString &traceId, const QJsonObject &event);
-
-static bool persistServerSyncOperationEvent(const QString &id, const QJsonObject &incomingEvent)
-{
-    QSqlDatabase database = syncOperationsDatabase();
-    if (id.isEmpty() || !database.isValid() || !database.isOpen() || !database.transaction()) {
-        return false;
-    }
-    const QString streamState = incomingEvent.value(QStringLiteral("stream_state")).toString();
-    const qint64 sequence = incomingEvent.value(QStringLiteral("sequence")).toVariant().toLongLong();
-    if (sequence <= 0) {
-        if (!streamState.isEmpty()) {
-            QSqlQuery payload(database);
-            payload.prepare(QStringLiteral("SELECT payload_json FROM sync_runs WHERE id = ?"));
-            payload.addBindValue(id);
-            if (!payload.exec() || !payload.next()) {
-                database.rollback();
-                return false;
-            }
-            const QJsonDocument document = QJsonDocument::fromJson(payload.value(0).toString().toUtf8());
-            const QJsonObject compactPayload = document.isObject() ? syncOperationPayloadWithoutEvents(document.object()) : QJsonObject();
-            QSqlQuery update(database);
-            update.prepare(QStringLiteral("UPDATE sync_runs SET stream_state = ?, payload_json = ? WHERE id = ?"));
-            update.addBindValue(streamState.left(32));
-            update.addBindValue(QString::fromUtf8(QJsonDocument(compactPayload).toJson(QJsonDocument::Compact)));
-            update.addBindValue(id);
-            if (!update.exec()) {
-                database.rollback();
-                return false;
-            }
-        }
-        return database.commit();
-    }
-    QDateTime occurredAt = QDateTime::fromString(incomingEvent.value(QStringLiteral("timestamp")).toString(), Qt::ISODateWithMs);
-    if (!occurredAt.isValid()) {
-        occurredAt = QDateTime::fromString(incomingEvent.value(QStringLiteral("timestamp")).toString(), Qt::ISODate);
-    }
-    const qint64 receivedAt = QDateTime::currentMSecsSinceEpoch();
-    const qint64 atMs = occurredAt.isValid() ? occurredAt.toUTC().toMSecsSinceEpoch() : receivedAt;
-    const QJsonObject metadata = incomingEvent.value(QStringLiteral("metadata")).toObject();
-    QSqlQuery payloadQuery(database);
-    payloadQuery.prepare(QStringLiteral("SELECT payload_json FROM sync_runs WHERE id = ?"));
-    payloadQuery.addBindValue(id);
-    if (!payloadQuery.exec() || !payloadQuery.next()) {
-        database.rollback();
-        return false;
-    }
-    const QJsonDocument payloadDocument = QJsonDocument::fromJson(payloadQuery.value(0).toString().toUtf8());
-    if (!payloadDocument.isObject()) {
-        database.rollback();
-        return false;
-    }
-    QJsonObject operationPayload = syncOperationPayloadWithoutEvents(payloadDocument.object());
-    QJsonObject eventIdentity;
-    Thoughts::mergeSyncEventIdentity(operationPayload, eventIdentity, incomingEvent);
-    const QString payloadJson = QString::fromUtf8(QJsonDocument(operationPayload).toJson(QJsonDocument::Compact));
-    QSqlQuery insert(database);
-    insert.prepare(
-        QStringLiteral("INSERT OR IGNORE INTO sync_events(run_id, at_ms, phase, state, attempt, message, error_code, origin, server_sequence, server_timestamp_ms, received_at_ms, component, build_id, completed, total, bytes_completed, "
-                       "bytes_total, metadata_json, terminal) VALUES(?, ?, ?, ?, 0, ?, ?, 'server', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
-    insert.addBindValue(id);
-    insert.addBindValue(atMs);
-    insert.addBindValue(incomingEvent.value(QStringLiteral("phase")).toString().left(64));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("state")).toString().left(32));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("message")).toString().simplified().left(4000));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("error_code")).toString().left(128));
-    insert.addBindValue(sequence);
-    insert.addBindValue(atMs);
-    insert.addBindValue(receivedAt);
-    insert.addBindValue(incomingEvent.value(QStringLiteral("component")).toString().left(64));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("build_id")).toString().left(128));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("completed")).toVariant());
-    insert.addBindValue(incomingEvent.value(QStringLiteral("total")).toVariant());
-    insert.addBindValue(incomingEvent.value(QStringLiteral("bytes_completed")).toVariant());
-    insert.addBindValue(incomingEvent.value(QStringLiteral("bytes_total")).toVariant());
-    insert.addBindValue(QString::fromUtf8(QJsonDocument(metadata).toJson(QJsonDocument::Compact)));
-    insert.addBindValue(incomingEvent.value(QStringLiteral("terminal")).toBool());
-    if (!insert.exec()) {
-        database.rollback();
-        return false;
-    }
-    QSqlQuery update(database);
-    update.prepare(
-        QStringLiteral("UPDATE sync_runs SET server_state = ?, server_terminal = ?, last_server_sequence = ?, stream_state = ?, updated_at_ms = MAX(updated_at_ms, ?), build_id = COALESCE(NULLIF(?, ''), build_id), payload_json = ? WHERE id "
-                       "= ? AND last_server_sequence < ?"));
-    update.addBindValue(incomingEvent.value(QStringLiteral("state")).toString().left(32));
-    update.addBindValue(incomingEvent.value(QStringLiteral("terminal")).toBool());
-    update.addBindValue(sequence);
-    update.addBindValue(streamState.isEmpty() ? QStringLiteral("live") : streamState.left(32));
-    update.addBindValue(receivedAt);
-    update.addBindValue(incomingEvent.value(QStringLiteral("build_id")).toString().left(128));
-    update.addBindValue(payloadJson);
-    update.addBindValue(id);
-    update.addBindValue(sequence);
-    if (!update.exec()) {
-        database.rollback();
-        return false;
-    }
-    return database.commit();
-}
-
-static bool normalizedAbsoluteTransferSnapshot(const QJsonObject &incoming, QJsonObject *normalized)
-{
-    if (!normalized || incoming.value(QStringLiteral("schema_version")).toInt(1) != 1 || !incoming.value(QStringLiteral("transfer_metrics_recorded")).toBool()) {
-        return false;
-    }
-    static const QStringList fields {QStringLiteral("uploaded_completed_bytes"), QStringLiteral("uploaded_total_bytes"), QStringLiteral("downloaded_completed_bytes"), QStringLiteral("downloaded_total_bytes")};
-    QJsonObject result {{QStringLiteral("schema_version"), 1}, {QStringLiteral("transfer_metrics_recorded"), true}};
-    for (const QString &field : fields) {
-        if (!incoming.contains(field)) {
-            return false;
-        }
-        const qint64 value = incoming.value(field).toVariant().toLongLong();
-        if (value < 0) {
-            return false;
-        }
-        result.insert(field, value);
-    }
-    if (result.value(QStringLiteral("uploaded_completed_bytes")).toVariant().toLongLong() > result.value(QStringLiteral("uploaded_total_bytes")).toVariant().toLongLong() ||
-        result.value(QStringLiteral("downloaded_completed_bytes")).toVariant().toLongLong() > result.value(QStringLiteral("downloaded_total_bytes")).toVariant().toLongLong()) {
-        return false;
-    }
-    result.insert(QStringLiteral("flush"), incoming.value(QStringLiteral("flush")).toBool());
-    *normalized = result;
-    return true;
-}
-
-static bool updateStoredSyncOperationTransferProgress(const QString &traceId, const QJsonObject &incomingSnapshot)
-{
-    QJsonObject snapshot;
-    if (traceId.isEmpty() || !normalizedAbsoluteTransferSnapshot(incomingSnapshot, &snapshot)) {
-        return false;
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return false;
-    }
-    QSqlQuery select(database);
-    select.prepare(QStringLiteral("SELECT id, payload_json FROM sync_runs WHERE trace_id = ? OR id = ? LIMIT 1"));
-    select.addBindValue(traceId);
-    select.addBindValue(traceId);
-    if (!select.exec() || !select.next()) {
-        database.rollback();
-        return false;
-    }
-    const QString operationId = select.value(0).toString();
-    const QJsonDocument document = QJsonDocument::fromJson(select.value(1).toString().toUtf8());
-    QJsonObject operation = document.isObject() ? syncOperationPayloadWithoutEvents(document.object()) : QJsonObject();
-    const qint64 uploadedCompleted = snapshot.value(QStringLiteral("uploaded_completed_bytes")).toVariant().toLongLong();
-    const qint64 uploadedTotal = snapshot.value(QStringLiteral("uploaded_total_bytes")).toVariant().toLongLong();
-    const qint64 downloadedCompleted = snapshot.value(QStringLiteral("downloaded_completed_bytes")).toVariant().toLongLong();
-    const qint64 downloadedTotal = snapshot.value(QStringLiteral("downloaded_total_bytes")).toVariant().toLongLong();
-    operation.insert(QStringLiteral("transfer_metrics_recorded"), true);
-    operation.insert(QStringLiteral("uploaded_completed_bytes"), uploadedCompleted);
-    operation.insert(QStringLiteral("uploaded_total_bytes"), uploadedTotal);
-    operation.insert(QStringLiteral("downloaded_completed_bytes"), downloadedCompleted);
-    operation.insert(QStringLiteral("downloaded_total_bytes"), downloadedTotal);
-    operation.insert(QStringLiteral("bytes_transferred"), uploadedCompleted + downloadedCompleted);
-    operation.insert(QStringLiteral("total_bytes"), uploadedTotal + downloadedTotal);
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    operation.insert(QStringLiteral("updated_at_ms"), now);
-
-    QSqlQuery update(database);
-    update.prepare(
-        QStringLiteral("UPDATE sync_runs SET transfer_metrics_recorded = 1, uploaded_completed_bytes = ?, uploaded_total_bytes = ?, downloaded_completed_bytes = ?, downloaded_total_bytes = ?, updated_at_ms = MAX(updated_at_ms, ?), "
-                       "payload_json = ? WHERE id = ?"));
-    update.addBindValue(uploadedCompleted);
-    update.addBindValue(uploadedTotal);
-    update.addBindValue(downloadedCompleted);
-    update.addBindValue(downloadedTotal);
-    update.addBindValue(now);
-    update.addBindValue(QString::fromUtf8(QJsonDocument(operation).toJson(QJsonDocument::Compact)));
-    update.addBindValue(operationId);
-    if (!update.exec() || update.numRowsAffected() != 1) {
-        database.rollback();
-        return false;
-    }
-    return database.commit();
-}
-
-static void updateStoredSyncOperationProgress(const QString &id, const QString &phase, qint64 transferredBytes, qint64 totalBytes, const QString &event)
-{
-    if (id.isEmpty() || phase.isEmpty()) {
-        return;
-    }
-    QJsonObject journalEvent {{QStringLiteral("at_ms"), QDateTime::currentMSecsSinceEpoch()},
-                              {QStringLiteral("phase"), phase.left(64)},
-                              {QStringLiteral("state"), QStringLiteral("running")},
-                              {QStringLiteral("message"), event.left(600)},
-                              {QStringLiteral("bytes_transferred"), qMax<qint64>(0, transferredBytes)},
-                              {QStringLiteral("total_bytes"), qMax<qint64>(0, totalBytes)}};
-    appendStoredSyncOperationEvent(id, journalEvent);
-}
-
-static void appendStoredSyncOperationEvent(const QString &id, const QJsonObject &incomingEvent)
-{
-    if (id.isEmpty()) {
-        return;
-    }
-    if (incomingEvent.value(QStringLiteral("origin")).toString() == QLatin1String("server") || incomingEvent.value(QStringLiteral("sequence")).toVariant().toLongLong() > 0 || incomingEvent.contains(QStringLiteral("stream_state"))) {
-        persistServerSyncOperationEvent(id, incomingEvent);
-        return;
-    }
-    QSqlDatabase database = syncOperationsDatabase();
-    if (!database.isValid() || !database.isOpen() || !database.transaction()) {
-        return;
-    }
-    QSqlQuery select(database);
-    select.prepare(QStringLiteral("SELECT payload_json, status, phase, transfer_metrics_recorded FROM sync_runs WHERE id = ? OR trace_id = ? LIMIT 1"));
-    select.addBindValue(id);
-    select.addBindValue(id);
-    if (!select.exec() || !select.next()) {
-        database.rollback();
-        return;
-    }
-    const QJsonDocument payloadDocument = QJsonDocument::fromJson(select.value(0).toString().toUtf8());
-    if (!payloadDocument.isObject()) {
-        database.rollback();
-        return;
-    }
-    QJsonObject operation = syncOperationPayloadWithoutEvents(payloadDocument.object());
-    operation.insert(QStringLiteral("id"), operation.value(QStringLiteral("id")).toString(id));
-    operation.insert(QStringLiteral("trace_id"), operation.value(QStringLiteral("trace_id")).toString(id));
-    operation.insert(QStringLiteral("status"), select.value(1).toString());
-    operation.insert(QStringLiteral("phase"), select.value(2).toString());
-    operation.insert(QStringLiteral("transfer_metrics_recorded"), select.value(3).toBool());
-    if (!Thoughts::syncOperationIsRunning(operation)) {
-        database.rollback();
-        return;
-    }
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    const QString message = incomingEvent.value(QStringLiteral("message")).toString().trimmed().left(600);
-    const QString phase = incomingEvent.value(QStringLiteral("phase")).toString().left(64);
-    const QString state = incomingEvent.value(QStringLiteral("state")).toString(QStringLiteral("running")).left(32);
-    const QString errorCode = incomingEvent.value(QStringLiteral("error_code")).toString().left(64);
-    const qint64 atMs = incomingEvent.value(QStringLiteral("at_ms")).toVariant().toLongLong();
-    QJsonObject eventObject {{QStringLiteral("at_ms"), atMs > 0 ? atMs : now},
-                             {QStringLiteral("phase"), phase.isEmpty() ? legacySyncOperationPhase(operation.value(QStringLiteral("status")).toString(), message) : phase},
-                             {QStringLiteral("state"), state},
-                             {QStringLiteral("message"), message}};
-    if (!errorCode.isEmpty()) {
-        eventObject.insert(QStringLiteral("error_code"), errorCode);
-    }
-    Thoughts::mergeSyncEventIdentity(operation, eventObject, incomingEvent);
-    if (incomingEvent.value(QStringLiteral("metadata")).isObject()) {
-        eventObject.insert(QStringLiteral("metadata"), incomingEvent.value(QStringLiteral("metadata")));
-        const QString outcome = incomingEvent.value(QStringLiteral("metadata")).toObject().value(QStringLiteral("sync_outcome")).toString();
-        if (outcome == QLatin1String("changes_synced") || outcome == QLatin1String("available_updates_synced"))
-            operation.insert(QStringLiteral("sync_outcome"), outcome);
-    }
-    if (incomingEvent.contains(QStringLiteral("component"))) {
-        eventObject.insert(QStringLiteral("component"), incomingEvent.value(QStringLiteral("component")).toString().left(64));
-    }
-    for (const QString &field : {QStringLiteral("path"), QStringLiteral("target")}) {
-        const QString value = incomingEvent.value(field).toString();
-        if (!value.isEmpty()) {
-            eventObject.insert(field, value.left(512));
-        }
-    }
-    for (const QString &field : {QStringLiteral("bytes_transferred"), QStringLiteral("total_bytes")}) {
-        const qint64 value = incomingEvent.value(field).toVariant().toLongLong();
-        if (incomingEvent.contains(field) && value >= 0) {
-            eventObject.insert(field, value);
-            if (!operation.value(QStringLiteral("transfer_metrics_recorded")).toBool()) {
-                operation.insert(field, value);
-            }
-        }
-    }
-    for (const QString &field : {QStringLiteral("attempt"), QStringLiteral("completed"), QStringLiteral("total"), QStringLiteral("duration_ms")}) {
-        if (incomingEvent.contains(field)) {
-            eventObject.insert(field, incomingEvent.value(field));
-        }
-    }
-    if (!phase.isEmpty()) {
-        operation.insert(QStringLiteral("phase"), phase);
-    }
-    operation.insert(QStringLiteral("updated_at_ms"), now);
-    QJsonObject previous;
-    QSqlQuery previousEvent(database);
-    previousEvent.prepare(QStringLiteral("SELECT phase, state, message, error_code, bytes_completed, bytes_total FROM sync_events WHERE run_id = ? AND origin = 'desktop' ORDER BY at_ms DESC, id DESC LIMIT 1"));
-    previousEvent.addBindValue(operation.value(QStringLiteral("id")).toString(id));
-    if (previousEvent.exec() && previousEvent.next()) {
-        previous.insert(QStringLiteral("phase"), previousEvent.value(0).toString());
-        previous.insert(QStringLiteral("state"), previousEvent.value(1).toString());
-        previous.insert(QStringLiteral("message"), previousEvent.value(2).toString());
-        if (!previousEvent.value(3).toString().isEmpty()) {
-            previous.insert(QStringLiteral("error_code"), previousEvent.value(3).toString());
-        }
-        if (!previousEvent.value(4).isNull()) {
-            previous.insert(QStringLiteral("bytes_transferred"), QJsonValue::fromVariant(previousEvent.value(4)));
-        }
-        if (!previousEvent.value(5).isNull()) {
-            previous.insert(QStringLiteral("total_bytes"), QJsonValue::fromVariant(previousEvent.value(5)));
-        }
-    }
-    const bool duplicate = previous.value(QStringLiteral("phase")) == eventObject.value(QStringLiteral("phase")) && previous.value(QStringLiteral("state")) == eventObject.value(QStringLiteral("state")) &&
-        previous.value(QStringLiteral("message")) == eventObject.value(QStringLiteral("message")) && previous.value(QStringLiteral("error_code")) == eventObject.value(QStringLiteral("error_code")) &&
-        previous.value(QStringLiteral("bytes_transferred")) == eventObject.value(QStringLiteral("bytes_transferred")) && previous.value(QStringLiteral("total_bytes")) == eventObject.value(QStringLiteral("total_bytes"));
-    const bool appendEvent = !message.isEmpty() && !duplicate;
-    if (state == QLatin1String("failed") || !errorCode.isEmpty()) {
-        operation.insert(QStringLiteral("last_error_message"), message);
-        operation.insert(QStringLiteral("last_error_code"), errorCode.isEmpty() ? QStringLiteral("sync_failed") : errorCode);
-    }
-    if (appendEvent && !insertLocalSyncOperationEvent(database, operation.value(QStringLiteral("id")).toString(id), eventObject, incomingEvent.value(QStringLiteral("attempt")).toInt(operation.value(QStringLiteral("attempt")).toInt()))) {
-        database.rollback();
-        return;
-    }
-    QSqlQuery update(database);
-    update.prepare(QStringLiteral("UPDATE sync_runs SET phase = CASE WHEN ? = '' THEN phase ELSE ? END, updated_at_ms = MAX(updated_at_ms, ?), payload_json = ? WHERE id = ?"));
-    update.addBindValue(phase);
-    update.addBindValue(phase);
-    update.addBindValue(now);
-    update.addBindValue(QString::fromUtf8(QJsonDocument(syncOperationPayloadWithoutEvents(operation)).toJson(QJsonDocument::Compact)));
-    update.addBindValue(operation.value(QStringLiteral("id")).toString(id));
-    if (!update.exec() || update.numRowsAffected() != 1) {
-        database.rollback();
-        return;
-    }
-    database.commit();
-}
 
 static QString fileSha256(const QString &path);
 
@@ -3779,6 +2513,7 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
 {
     setObjectName(QStringLiteral("okular::Shell#"));
     startRemoteWorkWatch();
+    startSyncJournalUpkeep();
     connect(qApp, &QGuiApplication::focusWindowChanged, this, [this] { styleMainToolBarActions(); });
     if (Thoughts::ReaderChrome::mergesTitleBar()) {
         setWindowFlag(Qt::ExpandedClientAreaHint);
@@ -6417,27 +5152,23 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
         m_syncOperationsDialog = nullptr;
         oldDialog->close();
     }
-    const auto loadOperations = [] {
-        QList<QJsonObject> result;
-        const QJsonArray stored = recentSyncOperationSummaries();
-        result.reserve(stored.size());
-        for (const QJsonValue &value : stored) {
-            result.append(value.toObject());
-        }
-        std::sort(result.begin(), result.end(), [](const QJsonObject &left, const QJsonObject &right) {
-            return left.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong() > right.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong();
-        });
-        return result;
+    // The runs loaded so far, newest change first. The journal is read on its
+    // own thread, one page at a time; a refresh asks for the newest runs and
+    // the ones that changed, and only their rows are touched.
+    struct LogsList {
+        QList<QJsonObject> operations;
+        // A row's text is kept until its run changes: formatting it costs more than moving it.
+        QHash<QString, std::pair<QJsonObject, QString>> texts;
+        QSet<QString> changed;
+        // Where the next older page starts.
+        qint64 oldestCreatedAtMs = 0;
+        QString oldestId;
+        bool hasOlder = false;
+        bool loadingOlder = false;
+        bool loaded = false;
     };
-    const auto operationsFingerprint = [](const QList<QJsonObject> &items) {
-        QJsonArray array;
-        for (const QJsonObject &item : items) {
-            array.append(item);
-        }
-        return QJsonDocument(array).toJson(QJsonDocument::Compact);
-    };
-    auto operations = std::make_shared<QList<QJsonObject>>(loadOperations());
-    auto fingerprint = std::make_shared<QByteArray>(operationsFingerprint(*operations));
+    auto state = std::make_shared<LogsList>();
+    auto operations = std::shared_ptr<QList<QJsonObject>>(state, &state->operations);
     auto *dialog = new QDialog(this);
     m_syncOperationsDialog = dialog;
     dialog->setAttribute(Qt::WA_DeleteOnClose);
@@ -6454,6 +5185,9 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
     list->setObjectName(QStringLiteral("operationsList"));
     layout->addWidget(list, 1);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+    auto *olderButton = buttons->addButton(i18n("Show older"), QDialogButtonBox::ActionRole);
+    olderButton->setObjectName(QStringLiteral("loadOlderOperations"));
+    olderButton->setVisible(false);
     auto *resolveConflictButton = buttons->addButton(i18n("Resolve source conflict"), QDialogButtonBox::ActionRole);
     auto *retryButton = buttons->addButton(i18n("Retry"), QDialogButtonBox::ActionRole);
     auto *logsButton = buttons->addButton(i18n("Details"), QDialogButtonBox::ActionRole);
@@ -6463,33 +5197,94 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
     logsButton->setEnabled(false);
     layout->addWidget(buttons);
 
-    const auto populateList = [operations, list](const QString &selectedId = {}) {
+    const auto rowText = [state](const QJsonObject &operation) {
+        const QString id = operation.value(QStringLiteral("id")).toString();
+        const auto cached = state->texts.constFind(id);
+        if (cached != state->texts.cend() && cached->first == operation) {
+            return cached->second;
+        }
+        const QString status = Thoughts::syncOperationOutcome(operation).title;
+        const QString storedTarget = operation.value(QStringLiteral("target")).toString();
+        const QString target = storedTarget.isEmpty() ? i18n("All documents") : storedTarget;
+        const QString duration = Thoughts::syncOperationDurationLabel(operation);
+        const QString initiation = syncInitiationControlLabel(operation.value(QStringLiteral("initiation_control")).toString());
+        const QDateTime updated = QDateTime::fromMSecsSinceEpoch(operation.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong()).toLocalTime();
+        const QString summary = duration.isEmpty() ? QStringLiteral("%1 · %2").arg(status, target) : QStringLiteral("%1 · %2 · %3").arg(status, target, duration);
+        const QString text = QStringLiteral("%1\n%2 · %3").arg(summary, initiation, QLocale().toString(updated, QLocale::ShortFormat));
+        state->texts.insert(id, {operation, text});
+        return text;
+    };
+    // Brings the list to the loaded runs without resetting it: rows that stay
+    // keep their item, a changed run gets its new text, a new one is inserted.
+    const auto populateList = [state, list, rowText](const QString &selectedId = {}) {
         const QSignalBlocker blocker(list);
-        list->clear();
-        int selectedRow = -1;
-        for (const QJsonObject &operation : std::as_const(*operations)) {
-            const QString status = Thoughts::syncOperationOutcome(operation).title;
-            const QString storedTarget = operation.value(QStringLiteral("target")).toString();
-            const QString target = storedTarget.isEmpty() ? i18n("All documents") : storedTarget;
-            const QString duration = Thoughts::syncOperationDurationLabel(operation);
-            const QString initiation = syncInitiationControlLabel(operation.value(QStringLiteral("initiation_control")).toString());
-            const QDateTime updated = QDateTime::fromMSecsSinceEpoch(operation.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong()).toLocalTime();
-            const QString summary = duration.isEmpty() ? QStringLiteral("%1 · %2").arg(status, target) : QStringLiteral("%1 · %2 · %3").arg(status, target, duration);
-            auto *item = new QListWidgetItem(QStringLiteral("%1\n%2 · %3").arg(summary, initiation, QLocale().toString(updated, QLocale::ShortFormat)), list);
-            const QString id = operation.value(QStringLiteral("id")).toString();
-            item->setData(Qt::UserRole, id);
-            if (!selectedId.isEmpty() && id == selectedId) {
-                selectedRow = list->count() - 1;
+        for (int row = list->count() - 1; row >= 0; --row) {
+            if (list->item(row)->data(Qt::UserRole).toString().isEmpty()) {
+                delete list->takeItem(row);
             }
         }
-        if (operations->isEmpty()) {
-            auto *item = new QListWidgetItem(i18n("No recent operations"), list);
-            item->setFlags(Qt::NoItemFlags);
-        } else {
-            list->setCurrentRow(selectedRow >= 0 ? selectedRow : 0);
+        for (int row = 0; row < state->operations.size(); ++row) {
+            const QJsonObject &operation = state->operations.at(row);
+            const QString id = operation.value(QStringLiteral("id")).toString();
+            QListWidgetItem *item = row < list->count() ? list->item(row) : nullptr;
+            if (!item || item->data(Qt::UserRole).toString() != id) {
+                item = nullptr;
+                for (int later = row + 1; later < list->count(); ++later) {
+                    if (list->item(later)->data(Qt::UserRole).toString() == id) {
+                        item = list->takeItem(later);
+                        break;
+                    }
+                }
+                if (!item) {
+                    item = new QListWidgetItem;
+                    item->setData(Qt::UserRole, id);
+                }
+                list->insertItem(row, item);
+            }
+            const QString text = rowText(operation);
+            if (item->text() != text) {
+                item->setText(text);
+            }
         }
+        while (list->count() > state->operations.size()) {
+            delete list->takeItem(list->count() - 1);
+        }
+        if (state->operations.isEmpty()) {
+            auto *item = new QListWidgetItem(state->loaded ? i18n("No recent operations") : i18n("Loading…"), list);
+            item->setFlags(Qt::NoItemFlags);
+            return;
+        }
+        int selectedRow = 0;
+        for (int row = 0; !selectedId.isEmpty() && row < list->count(); ++row) {
+            if (list->item(row)->data(Qt::UserRole).toString() == selectedId) {
+                selectedRow = row;
+                break;
+            }
+        }
+        list->setCurrentRow(selectedRow);
     };
-    populateList(requestedOperationId);
+    // Adds or replaces runs; true when the list has to follow.
+    const auto mergeOperations = [state](const QList<QJsonObject> &incoming) {
+        bool changed = false;
+        for (const QJsonObject &operation : incoming) {
+            const QString id = operation.value(QStringLiteral("id")).toString();
+            const auto found = std::find_if(state->operations.begin(), state->operations.end(), [&id](const QJsonObject &known) { return known.value(QStringLiteral("id")).toString() == id; });
+            if (found == state->operations.end()) {
+                state->operations.append(operation);
+                changed = true;
+            } else if (*found != operation) {
+                *found = operation;
+                changed = true;
+            }
+        }
+        if (changed) {
+            std::stable_sort(state->operations.begin(), state->operations.end(), [](const QJsonObject &left, const QJsonObject &right) {
+                return left.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong() > right.value(QStringLiteral("updated_at_ms")).toVariant().toLongLong();
+            });
+        }
+        return changed;
+    };
+    populateList();
 
     const auto selectedOperation = [operations, list]() -> QJsonObject {
         const QListWidgetItem *item = list->currentItem();
@@ -6771,7 +5566,6 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
             }
         });
 
-        const auto findOperation = [operationId] { return syncOperationWithHistory(operationId); };
         auto logContentDirty = std::make_shared<bool>(true);
         const auto refreshLog = [displayedOperation,
                                  logContentDirty,
@@ -6889,21 +5683,55 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
         auto *historyRefreshTimer = new QTimer(logDialog);
         historyRefreshTimer->setSingleShot(true);
         historyRefreshTimer->setInterval(100);
-        connect(historyRefreshTimer, &QTimer::timeout, logDialog, [displayedOperation, logContentDirty, findOperation, refreshLog, copyButton, logText] {
-            const QJsonObject refreshed = findOperation();
-            if (refreshed.isEmpty()) {
-                logText->setPlainText(i18n("This log is no longer available."));
-                copyButton->setEnabled(false);
+        // The run's history comes from the journal's thread. A refresh asks
+        // only for the events after the last one read, however long the run.
+        struct LoadedHistory {
+            QJsonObject operation;
+            QList<Thoughts::SyncJournal::Event> events;
+            qint64 lastRow = 0;
+            bool pending = false;
+            bool again = false;
+            bool asked = false;
+        };
+        auto history = std::make_shared<LoadedHistory>();
+        auto requestHistory = std::make_shared<std::function<void()>>();
+        const std::weak_ptr<std::function<void()>> requestHistoryAgain = requestHistory;
+        *requestHistory = [history, requestHistoryAgain, logDialog, operationId, displayedOperation, logContentDirty, refreshLog, copyButton, logText] {
+            if (history->pending) {
+                history->again = true;
                 return;
             }
-            if (refreshed == *displayedOperation && copyButton->isEnabled()) {
-                return;
-            }
-            *displayedOperation = refreshed;
-            *logContentDirty = true;
-            refreshLog();
-            copyButton->setEnabled(true);
-        });
+            history->pending = true;
+            // The window's first history normally arrives while it opens, as the
+            // first page of the list does; a busy journal fills it in later.
+            const int waitMs = std::exchange(history->asked, true) ? 0 : Thoughts::SyncJournal::LogsOpenWaitMs;
+            syncJournal()->fetchHistory(logDialog, operationId, history->lastRow, [=](const Thoughts::SyncJournal::History &loaded) {
+                history->pending = false;
+                if (!loaded.found) {
+                    logText->setPlainText(i18n("This log is no longer available."));
+                    copyButton->setEnabled(false);
+                } else if (!loaded.events.isEmpty() || loaded.operation != history->operation || !copyButton->isEnabled()) {
+                    history->operation = loaded.operation;
+                    for (const Thoughts::SyncJournal::Event &event : loaded.events) {
+                        history->lastRow = qMax(history->lastRow, event.row);
+                        history->events.append(event);
+                    }
+                    const QJsonObject refreshed = Thoughts::SyncJournal::operationFromHistory(loaded.operation, history->events);
+                    if (refreshed != *displayedOperation || !copyButton->isEnabled()) {
+                        *displayedOperation = refreshed;
+                        *logContentDirty = true;
+                        refreshLog();
+                        copyButton->setEnabled(true);
+                    }
+                }
+                if (std::exchange(history->again, false)) {
+                    if (const auto again = requestHistoryAgain.lock()) {
+                        (*again)();
+                    }
+                }
+            }, waitMs);
+        };
+        connect(historyRefreshTimer, &QTimer::timeout, logDialog, [requestHistory] { (*requestHistory)(); });
         connect(this, &Shell::syncOperationJournalChanged, logDialog, [historyRefreshTimer, operationId](const QString &changedTraceId) {
             if (changedTraceId == operationId && !historyRefreshTimer->isActive()) {
                 historyRefreshTimer->start(100);
@@ -6927,28 +5755,78 @@ void Shell::showSyncOperationLogs(const QString &requestedOperationId)
     auto *listRefreshTimer = new QTimer(dialog);
     listRefreshTimer->setSingleShot(true);
     listRefreshTimer->setInterval(100);
-    connect(listRefreshTimer, &QTimer::timeout, dialog, [operations, fingerprint, loadOperations, operationsFingerprint, populateList, updateSelection, list] {
-        QList<QJsonObject> refreshed = loadOperations();
-        const QByteArray refreshedFingerprint = operationsFingerprint(refreshed);
-        if (refreshedFingerprint == *fingerprint) {
-            return;
-        }
+    const auto selectedId = [list] {
         const QListWidgetItem *selected = list->currentItem();
-        const QString selectedId = selected ? selected->data(Qt::UserRole).toString() : QString();
-        *operations = std::move(refreshed);
-        *fingerprint = refreshedFingerprint;
-        populateList(selectedId);
-        updateSelection();
+        return selected ? selected->data(Qt::UserRole).toString() : QString();
+    };
+    connect(listRefreshTimer, &QTimer::timeout, dialog, [state, dialog, mergeOperations, populateList, updateSelection, selectedId] {
+        Thoughts::SyncJournal::PageRequest request;
+        request.limit = SyncLogsRefreshRows;
+        request.named = QStringList(state->changed.cbegin(), state->changed.cend());
+        state->changed.clear();
+        syncJournal()->fetchPage(dialog, request, [state, mergeOperations, populateList, updateSelection, selectedId](const Thoughts::SyncJournal::Page &page) {
+            if (!state->loaded || !mergeOperations(page.operations + page.named)) {
+                return;
+            }
+            populateList(selectedId());
+            updateSelection();
+        });
     });
-    connect(this, &Shell::syncOperationJournalChanged, dialog, [listRefreshTimer](const QString &) {
+    connect(this, &Shell::syncOperationJournalChanged, dialog, [listRefreshTimer, state](const QString &traceId) {
+        state->changed.insert(traceId);
         if (!listRefreshTimer->isActive()) {
             listRefreshTimer->start();
         }
     });
+    const auto loadOlder = [state, dialog, olderButton, mergeOperations, populateList, updateSelection, selectedId] {
+        if (!state->hasOlder || state->loadingOlder) {
+            return;
+        }
+        state->loadingOlder = true;
+        Thoughts::SyncJournal::PageRequest request;
+        request.beforeCreatedAtMs = state->oldestCreatedAtMs;
+        request.beforeId = state->oldestId;
+        syncJournal()->fetchPage(dialog, request, [state, olderButton, mergeOperations, populateList, updateSelection, selectedId](const Thoughts::SyncJournal::Page &page) {
+            state->loadingOlder = false;
+            state->hasOlder = page.hasOlder;
+            if (!page.oldestId.isEmpty()) {
+                state->oldestCreatedAtMs = page.oldestCreatedAtMs;
+                state->oldestId = page.oldestId;
+            }
+            olderButton->setVisible(state->hasOlder);
+            if (mergeOperations(page.operations)) {
+                populateList(selectedId());
+                updateSelection();
+            }
+        });
+    };
+    connect(olderButton, &QPushButton::clicked, dialog, loadOlder);
+    // Reaching the end of the list loads the page before it.
+    connect(list->verticalScrollBar(), &QScrollBar::valueChanged, dialog, [list, loadOlder](int value) {
+        if (value > 0 && value >= list->verticalScrollBar()->maximum()) {
+            loadOlder();
+        }
+    });
     updateSelection();
-    if (!requestedOperationId.isEmpty() && selectedOperation().value(QStringLiteral("id")).toString() == requestedOperationId) {
-        QTimer::singleShot(0, logsButton, &QPushButton::click);
+    // The first page normally arrives before the window shows; when the journal
+    // is busy the window opens at once and fills in when the page is there.
+    Thoughts::SyncJournal::PageRequest firstPage;
+    if (!requestedOperationId.isEmpty()) {
+        firstPage.named.append(requestedOperationId);
     }
+    syncJournal()->fetchPage(dialog, firstPage, [state, olderButton, logsButton, mergeOperations, populateList, updateSelection, selectedOperation, requestedOperationId](const Thoughts::SyncJournal::Page &page) {
+        state->loaded = true;
+        state->hasOlder = page.hasOlder;
+        state->oldestCreatedAtMs = page.oldestCreatedAtMs;
+        state->oldestId = page.oldestId;
+        olderButton->setVisible(state->hasOlder);
+        mergeOperations(page.operations + page.named);
+        populateList(requestedOperationId);
+        updateSelection();
+        if (!requestedOperationId.isEmpty() && selectedOperation().value(QStringLiteral("id")).toString() == requestedOperationId) {
+            QTimer::singleShot(0, logsButton, &QPushButton::click);
+        }
+    }, Thoughts::SyncJournal::LogsOpenWaitMs);
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -7423,7 +6301,7 @@ void Shell::retrySyncOperation(const QString &operationId)
         const LocalLibraryEntry targetEntry = targeted ? localLibraryEntry(ShellUtils::docsRoot(), target) : LocalLibraryEntry();
         const TargetSyncMode targetMode = targeted ? targetSyncMode(targetEntry.available, targetEntry.found, targetEntry.kind) : TargetSyncMode::SnapshotOnly;
         const QString retryOperationId = beginSyncOperation(QStringLiteral("sync"), target, QStringLiteral("queued"), QStringLiteral("logs_retry"), operationId);
-        if (!setActiveManualSyncOperation(retryOperationId)) {
+        if (!setActiveManualSyncOperation(retryOperationId, QStringLiteral("logs_retry"))) {
             if (!retryOperationId.isEmpty()) {
                 updateSyncOperation(retryOperationId, Thoughts::SyncOperationState::Failed, QStringLiteral("failed"), i18n("Another Thoughts sync is already active"));
             }
@@ -8308,6 +7186,7 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
             shell->refreshCommentsOverviewDocumentSyncStates();
         }
     });
+    connect(overview, &Thoughts::CommentsOverview::agentProposalsDecidedLocally, overview, [] { proposalDecided(); });
     connect(overview, &Thoughts::CommentsOverview::agentProposalsResolveRequested, overview, [overview](const QString &bundleId, const QString &action, const QStringList &proposalIds) {
         QString operationId;
         QString error;
@@ -8769,6 +7648,18 @@ void Shell::refreshSidebarReviewCards(KParts::ReadOnlyPart *part, const QJsonObj
     Thoughts::ReviewStore store(ShellUtils::docsRoot(), [projections] { return projections; });
     QJsonArray cards;
     const QString stem = QFileInfo(part->url().toLocalFile()).completeBaseName();
+    // An earlier version opened from History (pdf-versions/<sha256>.pdf) shows the cards
+    // retired on it: each stays on the version it was on when it was retired.
+    if (Thoughts::PdfVersions::isCachedVersion(part->url().toLocalFile())) {
+        for (const auto &card : store.cards()) {
+            if (!card.schedule.retired || card.schedule.deleted || card.pdfSha256() != stem) continue;
+            QJsonObject record = card.record;
+            record.insert(QStringLiteral("sidebar_schedule"), Thoughts::sidebarReviewSchedule(card, false, false));
+            cards.append(record);
+        }
+        QMetaObject::invokeMethod(part, "setSidebarReviewCards", Qt::DirectConnection, Q_ARG(QJsonArray, cards));
+        return;
+    }
     const QList<Thoughts::ReviewCard> documentCards = store.cards(nullptr, stem);
     // Each card's schedule rides along, read from the cards already folded here. Which of them the
     // review queue takes is activeCards()' rule; the tab compares the cards with its own PDF.
@@ -8922,6 +7813,17 @@ void Shell::updateCommentsOverviewPendingChanges(const QJsonObject &snapshot)
 void Shell::applyCommentsOverviewPendingChanges()
 {
     m_pendingChangesUpdateScheduled = false;
+    // More waits to be sent than before, and no Sync runs: the user changed
+    // something on this computer, which ends the wait of the automatic Syncs.
+    static int knownPendingTotal = -1;
+    const int pendingTotal = m_globalPendingChangesSnapshot.value(QStringLiteral("available")).toBool() ? m_globalPendingChangesSnapshot.value(QStringLiteral("total")).toInt() : -1;
+    if (pendingTotal > knownPendingTotal && knownPendingTotal >= 0 && m_fedoraManualSyncState != 1 && s_automaticSync.notBeforeMs() > 0) {
+        s_automaticSync.localChange();
+        refreshAutomaticSyncNotice();
+    }
+    if (pendingTotal >= 0) {
+        knownPendingTotal = pendingTotal;
+    }
     updatePdfSyncStatus();
     updateCommentsOverviewDocumentSyncPresentations();
 }
@@ -8991,8 +7893,11 @@ QJsonObject Shell::handleSyncCommandRequest(const QJsonObject &request)
     if (command == QLatin1String("decide-proposal")) {
         // The same local decision as Accept/Reject in the Comments view, with its claim.
         const QJsonObject result = Thoughts::ProposalDecisions::decideProposal(ShellUtils::docsRoot(), request);
-        if (result.value(QStringLiteral("accepted")).toBool() && !result.value(QStringLiteral("replayed")).toBool() && s_commentsOverview) {
-            s_commentsOverview->reload();
+        if (result.value(QStringLiteral("accepted")).toBool() && !result.value(QStringLiteral("replayed")).toBool()) {
+            if (s_commentsOverview) {
+                s_commentsOverview->reload();
+            }
+            proposalDecided();
         }
         return result;
     }
@@ -9558,7 +8463,7 @@ QJsonObject Shell::startSyncCommand(const QString &target)
     }
 
     const QString operationId = beginSyncOperation(QStringLiteral("sync"), target, QStringLiteral("queued"), QStringLiteral("command_api"));
-    if (!setActiveManualSyncOperation(operationId)) {
+    if (!setActiveManualSyncOperation(operationId, QStringLiteral("command_api"))) {
         if (!operationId.isEmpty()) {
             updateSyncOperation(operationId, Thoughts::SyncOperationState::Failed, QStringLiteral("failed"), i18n("Another Thoughts sync is already active"));
         }
@@ -9585,14 +8490,21 @@ QJsonObject Shell::syncCommandStatus(const QString &operationId) const
     return Thoughts::syncCommandError(QStringLiteral("unknown_operation"), QStringLiteral("Sync operation was not found."));
 }
 
-bool Shell::setActiveManualSyncOperation(const QString &operationId)
+bool Shell::setActiveManualSyncOperation(const QString &operationId, const QString &initiationControl)
 {
     ThoughtsSyncCommandService *service = syncCommandService(true);
-    return service && service->claimManualSync(this, operationId);
+    if (!service || !service->claimManualSync(this, operationId)) {
+        return false;
+    }
+    s_automaticSync.syncStarted(automaticSyncInitiation(initiationControl));
+    refreshAutomaticSyncNotice();
+    return true;
 }
 
+// The claimed Sync could not be started.
 void Shell::clearActiveManualSyncOperation()
 {
+    automaticSyncEnded(false, QVariantMap());
     if (ThoughtsSyncCommandService *service = syncCommandService(false)) {
         service->completeManualSync(this, m_activeManualSyncOperationId);
     } else {
@@ -9645,11 +8557,208 @@ void Shell::triggerFedoraSync()
     triggerFedoraSyncWithInitiationControl(sender() ? QStringLiteral("pdf_reader_sync") : QStringLiteral("direct_sync_request"));
 }
 
+// The wait of the automatic Syncs began, changed or ended: every window's
+// status area says so, and says so no longer once the wait is over.
+void Shell::refreshAutomaticSyncNotice()
+{
+    static QPointer<QTimer> expiry;
+    if (!expiry) {
+        expiry = new QTimer(qApp);
+        expiry->setSingleShot(true);
+        QObject::connect(expiry, &QTimer::timeout, qApp, [] { refreshAutomaticSyncNotice(); });
+    }
+    const qint64 remaining = s_automaticSync.notBeforeMs() - QDateTime::currentMSecsSinceEpoch();
+    if (remaining > 0) {
+        expiry->start(int(remaining) + 500);
+    } else {
+        expiry->stop();
+    }
+    if (s_commentsOverview) {
+        s_commentsOverview->setAutomaticSyncNotice(automaticSyncNotice());
+    }
+    const auto windows = KMainWindow::memberList();
+    for (KMainWindow *window : windows) {
+        if (auto *shell = qobject_cast<Shell *>(window)) {
+            shell->schedulePdfSyncStatusUpdate();
+        }
+    }
+}
+
+void Shell::resetAutomaticSyncForTesting()
+{
+    s_automaticSync = Thoughts::AutomaticSyncPolicy();
+    refreshAutomaticSyncNotice();
+}
+
 namespace
 {
-// The server state the last automatic Sync was started for: the same state never starts another,
-// so a Sync that cannot finish is not retried in a loop.
-QString s_lastAutomaticSyncStateKey;
+// The Sync that sends the user's proposal decisions (Shell::proposalDecided).
+QPointer<QTimer> s_proposalDecisionSyncTimer;
+bool s_proposalDecisionSyncWanted = false;
+// ProposalDecisionSyncDelayMs, shorter in tests.
+int s_proposalDecisionSyncDelayMs = ProposalDecisionSyncDelayMs;
+}
+
+// The user accepted or rejected a proposal on this computer, or undid that.
+// A Sync sends it by itself ProposalDecisionSyncDelayMs after the last such
+// decision, so a run of decisions goes as one Sync.
+void Shell::proposalDecided()
+{
+    // A change the user made on this computer: automatic Syncs wait no longer.
+    s_automaticSync.localChange();
+    refreshAutomaticSyncNotice();
+    if (!s_proposalDecisionSyncTimer) {
+        s_proposalDecisionSyncTimer = new QTimer(qApp);
+        s_proposalDecisionSyncTimer->setSingleShot(true);
+        QObject::connect(s_proposalDecisionSyncTimer, &QTimer::timeout, qApp, [] { startProposalDecisionSync(); });
+    }
+    s_proposalDecisionSyncWanted = true;
+    s_proposalDecisionSyncTimer->start(s_proposalDecisionSyncDelayMs);
+}
+
+void Shell::startProposalDecisionSync()
+{
+    if (!s_proposalDecisionSyncWanted) {
+        return;
+    }
+    // Without a server there is nowhere to send it. And while the last failure
+    // needs the user (a merge, a credential, documents that need attention) the
+    // decision stays saved on this computer and goes with the user's next Sync.
+    if (Thoughts::ServerAddress::normalized(Thoughts::ServerAddress::configured()).isEmpty() || s_automaticSync.lastFailureNeedsUser()) {
+        s_proposalDecisionSyncWanted = false;
+        return;
+    }
+    Shell *first = nullptr;
+    bool busy = false;
+    const auto windows = KMainWindow::memberList();
+    for (KMainWindow *window : windows) {
+        if (auto *shell = qobject_cast<Shell *>(window)) {
+            first = first ? first : shell;
+            busy = busy || shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation() || !shell->m_activeBuildOperationId.isEmpty();
+        }
+    }
+    if (!first || !first->fedoraGatewayPart()) {
+        s_proposalDecisionSyncWanted = false;
+        return;
+    }
+    // Never while a Sync or a build runs: one follows when it has ended. And an
+    // automatic Sync that failed since the decision makes this one wait too.
+    const qint64 wait = s_automaticSync.notBeforeMs() - QDateTime::currentMSecsSinceEpoch();
+    if (busy || syncJournal()->compactionRunning() || wait > 0) {
+        s_proposalDecisionSyncTimer->start(wait > 0 && !busy ? int(wait) + 500 : s_proposalDecisionSyncDelayMs);
+        return;
+    }
+    s_proposalDecisionSyncWanted = false;
+    first->triggerFedoraSyncWithInitiationControl(QStringLiteral("proposal_decision"));
+}
+
+void Shell::resetProposalDecisionSyncForTesting(int delayMs)
+{
+    s_proposalDecisionSyncDelayMs = delayMs > 0 ? delayMs : ProposalDecisionSyncDelayMs;
+    s_proposalDecisionSyncWanted = false;
+    if (s_proposalDecisionSyncTimer) {
+        s_proposalDecisionSyncTimer->stop();
+    }
+}
+
+// A Sync ended, or could not be started at all.
+void Shell::automaticSyncEnded(bool success, const QVariantMap &manualSync)
+{
+    s_automaticSync.syncFinished(success, success ? Thoughts::AutomaticSyncPolicy::FailureKind::Unknown : automaticSyncFailureKind(manualSync), QDateTime::currentMSecsSinceEpoch());
+    refreshAutomaticSyncNotice();
+    if (s_proposalDecisionSyncWanted && s_proposalDecisionSyncTimer) {
+        // The decisions made while this Sync ran go with one of their own.
+        s_proposalDecisionSyncTimer->start(s_proposalDecisionSyncDelayMs);
+    }
+    // A Sync reads and verifies most of what the caches keep: record their size after each.
+    recordCacheSizes();
+    if (!success) {
+        // What the server holds right after a failed Sync is that Sync's own
+        // state: ask for it now, so it is not taken for news later.
+        QTimer::singleShot(StateAfterFailedSyncDelayMs, this, &Shell::checkRemoteWork);
+    }
+}
+
+// A Mac's menus traditionally carry no icons. Since macOS 26 Qt hands every
+// action's icon to the native menu all the same, as one image with every size
+// the icon theme offers (seven for most icons): for the menus of this app that
+// was well over a hundred megabytes that nobody needed. Toolbars and buttons do
+// not go through this and keep their icons.
+void Shell::applyMenuIconPolicy()
+{
+#ifdef Q_OS_MACOS
+    QCoreApplication::setAttribute(Qt::AA_DontShowIconsInMenus, true);
+#endif
+}
+
+// What the caches hold now. A later measurement of the app's memory can be set
+// against these lines of the developer log.
+void Shell::recordCacheSizes()
+{
+    const Thoughts::VerifiedArtifactCacheStatistics artifacts = Thoughts::verifiedArtifactCacheStatistics();
+    Thoughts::DeveloperLog::record(QStringLiteral("memory.caches"),
+                                   {{QStringLiteral("artifact_bytes_entries"), artifacts.bytesEntries},
+                                    {QStringLiteral("artifact_bytes_kept"), artifacts.bytesKept},
+                                    {QStringLiteral("artifact_bytes_limit"), Thoughts::VerifiedArtifactBytesLimit},
+                                    {QStringLiteral("source_artifacts_parsed"), artifacts.jsonEntries},
+                                    {QStringLiteral("source_artifacts_estimated_bytes"), artifacts.jsonBytesKept},
+                                    {QStringLiteral("source_artifacts_limit"), Thoughts::SourceArtifactJsonBytesLimit},
+                                    {QStringLiteral("verified_identities"), artifacts.verifiedIdentities},
+                                    {QStringLiteral("artifact_bytes_hits"), artifacts.bytesHits},
+                                    {QStringLiteral("artifact_bytes_misses"), artifacts.bytesMisses},
+                                    {QStringLiteral("source_artifact_hits"), artifacts.jsonHits},
+                                    {QStringLiteral("source_artifact_misses"), artifacts.jsonMisses},
+                                    {QStringLiteral("pixmap_cache_limit_kib"), QPixmapCache::cacheLimit()},
+                                    {QStringLiteral("menu_icons"), !QCoreApplication::testAttribute(Qt::AA_DontShowIconsInMenus)}});
+}
+
+// The Sync journal is rewritten once so that removing old runs shrinks its file
+// (SyncJournal::compact). The rewrite takes seconds and the journal answers
+// nothing else meanwhile, so it waits until no Sync or build runs and Thoughts
+// has not been the active application for SyncJournalCompactIdleMs.
+void Shell::startSyncJournalUpkeep()
+{
+    static QPointer<QTimer> timer;
+    if (timer) {
+        return;
+    }
+    static QElapsedTimer inactive;
+    if (QGuiApplication::applicationState() != Qt::ApplicationActive) {
+        inactive.start();
+    }
+    QObject::connect(qApp, &QGuiApplication::applicationStateChanged, qApp, [](Qt::ApplicationState state) {
+        if (state == Qt::ApplicationActive) {
+            inactive.invalidate();
+        } else if (!inactive.isValid()) {
+            inactive.start();
+        }
+    });
+    timer = new QTimer(qApp);
+    timer->setInterval(SyncJournalUpkeepIntervalMs);
+    QObject::connect(timer, &QTimer::timeout, qApp, [] {
+        Thoughts::SyncJournal *journal = syncJournal();
+        if (!journal->compactionPending() || journal->compactionRunning() || !inactive.isValid() || inactive.elapsed() < SyncJournalCompactIdleMs) {
+            return;
+        }
+        const auto windows = KMainWindow::memberList();
+        for (KMainWindow *window : windows) {
+            const auto *shell = qobject_cast<Shell *>(window);
+            if (shell && (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation() || !shell->m_activeBuildOperationId.isEmpty())) {
+                return;
+            }
+        }
+        journal->compact();
+    });
+    timer->start();
+    // The status area answered from memory during the rewrite: ask again.
+    QObject::connect(syncJournal(), &Thoughts::SyncJournal::compactionFinished, qApp, [] {
+        const auto windows = KMainWindow::memberList();
+        for (KMainWindow *window : windows) {
+            if (auto *shell = qobject_cast<Shell *>(window)) {
+                shell->schedulePdfSyncStatusUpdate();
+            }
+        }
+    });
 }
 
 void Shell::startRemoteWorkWatch()
@@ -9659,7 +8768,7 @@ void Shell::startRemoteWorkWatch()
         return;
     }
     timer = new QTimer(qApp);
-    timer->setInterval(20000);
+    timer->setInterval(RemoteWorkWatchIntervalMs);
     QObject::connect(timer, &QTimer::timeout, qApp, [] {
         const auto windows = KMainWindow::memberList();
         for (KMainWindow *window : windows) {
@@ -9674,7 +8783,8 @@ void Shell::startRemoteWorkWatch()
 
 void Shell::checkRemoteWork()
 {
-    if (m_fedoraManualSyncState == 1 || hasProcessManualSyncOperation() || !m_activeBuildOperationId.isEmpty()) {
+    // No automatic Sync while the journal is rewritten: its start would wait for the rewrite.
+    if (m_fedoraManualSyncState == 1 || hasProcessManualSyncOperation() || !m_activeBuildOperationId.isEmpty() || syncJournal()->compactionRunning()) {
         return;
     }
     KParts::ReadWritePart *part = fedoraGatewayPart();
@@ -9682,18 +8792,45 @@ void Shell::checkRemoteWork()
         return;
     }
     connect(part, SIGNAL(fedoraRemoteWorkChecked(bool,QString)), this, SLOT(remoteWorkChecked(bool,QString)), Qt::UniqueConnection); // clazy:exclude=old-style-connect
+    s_automaticSync.stateRequested(QDateTime::currentMSecsSinceEpoch());
     QMetaObject::invokeMethod(part, "checkFedoraRemoteWork", Qt::QueuedConnection);
 }
 
 void Shell::remoteWorkChecked(bool pending, const QString &stateKey)
 {
-    if (!pending || stateKey.isEmpty() || stateKey == s_lastAutomaticSyncStateKey) {
+    // Whether this state starts a Sync is the policy's decision: not while
+    // automatic Syncs wait after failures, and not for the state a failed Sync
+    // left.
+    if (s_automaticSync.stateAnswered(pending, stateKey, QDateTime::currentMSecsSinceEpoch()) != Thoughts::AutomaticSyncPolicy::Decision::Start) {
         return;
     }
     if (m_fedoraManualSyncState == 1 || hasProcessManualSyncOperation() || !m_activeBuildOperationId.isEmpty()) {
         return;
     }
-    s_lastAutomaticSyncStateKey = stateKey;
+    s_automaticSync.automaticSyncStartedFor(stateKey);
+    triggerFedoraSyncWithInitiationControl(QStringLiteral("remote_change"));
+}
+
+void Shell::remoteWorkAnnounced(bool pending, const QString &stateKey)
+{
+    // The policy decides here too, by its rule for an ended build: its Sync
+    // starts at once, also while automatic Syncs wait after failures, but not
+    // for a state a Sync already ran against. The parts of all tabs and windows
+    // relay the one announcement; the first one starts the Sync and the others
+    // find it started.
+    if (s_automaticSync.stateAnnounced(pending, stateKey) != Thoughts::AutomaticSyncPolicy::Decision::Start) {
+        return;
+    }
+    if (m_fedoraManualSyncState == 1 || hasProcessManualSyncOperation() || !m_activeBuildOperationId.isEmpty()) {
+        // What runs now fetches the PDF, or the next periodic check finds it.
+        return;
+    }
+    if (syncJournal()->compactionRunning()) {
+        // The start would wait for the rewrite of the journal.
+        QTimer::singleShot(AnnouncedWorkRetryMs, this, [this, pending, stateKey] { remoteWorkAnnounced(pending, stateKey); });
+        return;
+    }
+    s_automaticSync.automaticSyncStartedFor(stateKey);
     triggerFedoraSyncWithInitiationControl(QStringLiteral("remote_change"));
 }
 
@@ -9713,7 +8850,7 @@ void Shell::triggerFedoraSyncWithInitiationControl(const QString &initiationCont
         return;
     }
     const QString operationId = beginSyncOperation(QStringLiteral("sync"), QString(), QStringLiteral("queued"), initiationControl);
-    if (!setActiveManualSyncOperation(operationId)) {
+    if (!setActiveManualSyncOperation(operationId, initiationControl)) {
         if (!operationId.isEmpty()) {
             updateSyncOperation(operationId, Thoughts::SyncOperationState::Failed, QStringLiteral("failed"), i18n("Another Thoughts sync is already active"));
         }
@@ -9780,13 +8917,19 @@ void Shell::updateCommentsOverviewManualSyncState(int state, const QString &mess
         const QString completion = unresolvedLinks > 0
             ? i18np("Synced; 1 comment needs linking", "Synced; %1 comments need linking", unresolvedLinks)
             : i18n("Completed");
-        updateSyncOperation(operationId, Thoughts::SyncOperationState::Succeeded, QStringLiteral("succeeded"), completion);
+        // A Sync whose changes arrived succeeds also when the server could not build a
+        // PDF: the repository says so as a warning, which the run keeps for whoever asks
+        // about this Sync afterwards (thoughtsctl and the proposal commands).
+        updateSyncOperation(operationId, Thoughts::SyncOperationState::Succeeded, QStringLiteral("succeeded"), completion, QString(), QString(),
+                            manualSync.value(QStringLiteral("warning_code")).toString(), manualSync.value(QStringLiteral("warning")).toString());
         service->completeManualSync(this, operationId);
+        automaticSyncEnded(true, manualSync);
     } else if (journalState && state == 3) {
         const QString failure = Thoughts::syncOperationFailureJournalMessage(message.trimmed().isEmpty() ? Thoughts::SyncStatusLabels::syncFailed() : message, details);
         updateSyncOperation(operationId, Thoughts::SyncOperationState::Failed, QStringLiteral("failed"), failure, QString(),
                             manualSync.value(QStringLiteral("error_code")).toString());
         service->completeManualSync(this, operationId);
+        automaticSyncEnded(false, manualSync);
     }
     updatePdfSyncStatus();
     updateCommentsOverviewDocumentSyncPresentations();
@@ -9813,7 +8956,7 @@ void Shell::updateSyncOperationProgress(const QString &traceId, const QString &p
 {
     if (repeatedSyncSignal(traceId, QJsonObject{{QStringLiteral("progress_phase"), phase}, {QStringLiteral("transferred"), transferredBytes},
                                                 {QStringLiteral("total"), totalBytes}, {QStringLiteral("message"), message}})) return;
-    updateStoredSyncOperationProgress(traceId, phase, transferredBytes, totalBytes, message);
+    syncJournal()->appendProgress(traceId, phase, transferredBytes, totalBytes, message);
     Q_EMIT syncOperationJournalChanged(traceId);
     schedulePdfSyncStatusUpdate();
 }
@@ -9821,7 +8964,7 @@ void Shell::updateSyncOperationProgress(const QString &traceId, const QString &p
 void Shell::updateSyncOperationTransferProgress(const QString &traceId, const QJsonObject &absoluteSnapshot)
 {
     QJsonObject normalized;
-    if (traceId.isEmpty() || !normalizedAbsoluteTransferSnapshot(absoluteSnapshot, &normalized)) {
+    if (traceId.isEmpty() || !Thoughts::normalizedSyncTransferSnapshot(absoluteSnapshot, &normalized)) {
         return;
     }
     m_pendingSyncTransferSnapshots.insert(traceId, normalized);
@@ -9856,10 +8999,7 @@ void Shell::flushPendingSyncTransferProgress(const QString &traceId)
         m_syncTransferProgressTimer->stop();
     }
     for (auto iterator = snapshots.cbegin(); iterator != snapshots.cend(); ++iterator) {
-        if (!updateStoredSyncOperationTransferProgress(iterator.key(), iterator.value())) {
-            qWarning() << "Could not persist directional transfer progress for" << iterator.key();
-            continue;
-        }
+        syncJournal()->updateTransferProgress(iterator.key(), iterator.value());
         Q_EMIT syncOperationJournalChanged(iterator.key());
     }
     if (!snapshots.isEmpty()) {
@@ -9883,7 +9023,7 @@ static bool repeatedSyncSignal(const QString &traceId, const QJsonObject &event)
 void Shell::updateSyncOperationJournalEvent(const QString &traceId, const QJsonObject &event)
 {
     if (repeatedSyncSignal(traceId, event)) return;
-    appendStoredSyncOperationEvent(traceId, event);
+    syncJournal()->appendEvent(traceId, event);
     Q_EMIT syncOperationJournalChanged(traceId);
     schedulePdfSyncStatusUpdate();
 }
@@ -9897,7 +9037,21 @@ void Shell::updateCommentsOverviewRenderState(const QJsonObject &state)
 
 void Shell::updateCommentsOverviewAgentProposalResolution(const QString &operationId, const QStringList &proposalIds, const QString &action, const QString &status, const QString &message)
 {
-    Q_UNUSED(operationId)
+    // Saved on this computer ("applied"), also when the server could not be
+    // told yet ("waiting"). A decision that waited reports "applied" once a
+    // Sync delivered it: that is no new decision.
+    if (status == QLatin1String("applied") || status == QLatin1String("waiting")) {
+        static QStringList counted;
+        if (operationId.isEmpty() || !counted.contains(operationId)) {
+            if (!operationId.isEmpty()) {
+                counted.append(operationId);
+                if (counted.size() > 256) {
+                    counted.removeFirst();
+                }
+            }
+            proposalDecided();
+        }
+    }
     if (s_commentsOverview) {
         s_commentsOverview->finishAgentProposalResolution(proposalIds, action, status, message);
     }
@@ -12106,6 +11260,13 @@ void Shell::updatePdfSyncStatus()
     } else {
         detail = i18n("No previous sync");
     }
+    if (!running) {
+        // "It keeps starting by itself" is said out loud: when the next automatic Sync may start.
+        const QString notice = automaticSyncNotice();
+        if (!notice.isEmpty()) {
+            detail = detail.isEmpty() ? notice : QStringLiteral("%1 · %2").arg(detail, notice);
+        }
+    }
     m_pdfSyncSummaryMenuAction->setText(summary);
     m_pdfSyncDetailMenuAction->setText(detail);
     m_pdfSyncDetailMenuAction->setVisible(!detail.isEmpty());
@@ -12592,6 +11753,7 @@ void Shell::connectPart(const KParts::ReadWritePart *part)
     connect(part, SIGNAL(fedoraProjectionsChanged(QJsonObject, qint64)), this, SLOT(updateCommentsOverviewFedoraProjections(QJsonObject, qint64)));                                                        // clazy:exclude=old-style-connect
     connect(part, SIGNAL(pendingChangesChanged(QJsonObject)), this, SLOT(updateCommentsOverviewPendingChanges(QJsonObject)));                                                                              // clazy:exclude=old-style-connect
     connect(part, SIGNAL(fedoraManualSyncStateChanged(int, QString, QString)), this, SLOT(updateCommentsOverviewManualSyncState(int, QString, QString)));                                                  // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(fedoraRemoteWorkFound(bool, QString)), this, SLOT(remoteWorkAnnounced(bool, QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(syncProgressChanged(QString, QString, qint64, qint64, QString)), this, SLOT(updateSyncOperationProgress(QString, QString, qint64, qint64, QString)));                             // clazy:exclude=old-style-connect
     connect(part, SIGNAL(syncTransferProgressChanged(QString, QJsonObject)), this, SLOT(updateSyncOperationTransferProgress(QString, QJsonObject)));                                                       // clazy:exclude=old-style-connect
     connect(part, SIGNAL(syncJournalEvent(QString, QJsonObject)), this, SLOT(updateSyncOperationJournalEvent(QString, QJsonObject)));                                                                      // clazy:exclude=old-style-connect

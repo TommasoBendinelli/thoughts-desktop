@@ -30,6 +30,7 @@
 // qt/kde includes
 #include <QActionGroup>
 #include <QApplication>
+#include <QStyleHints>
 #include <QClipboard>
 #include <QCryptographicHash>
 #include <QCursor>
@@ -303,12 +304,14 @@ TableSelectionPart::TableSelectionPart(PageViewItem *item_p, const Okular::Norma
 {
 }
 
-// The proposal hover toolbar appears once the pointer rests on a pencil this
-// long, stays this long after the pointer leaves the pencil and the toolbar,
+// The proposal hover toolbar appears once the pointer rests on a marker this
+// long, stays this long after the pointer leaves the marker and the toolbar,
 // and does not appear right after the page scrolled under the pointer.
 static constexpr int AgentProposalHoverShowDelayMs = 200;
 static constexpr int AgentProposalHoverGraceMs = 350;
 static constexpr int AgentProposalHoverScrollQuietMs = 300;
+// A press on a proposal's marker this soon after a wheel or trackpad scroll stops the page; it does not accept.
+static constexpr int AgentProposalPressScrollQuietMs = 100;
 
 // structure used internally by PageView for data storage
 class PageViewPrivate
@@ -332,23 +335,31 @@ public:
     QList<Thoughts::AgentProposalOverlay> agentProposalOverlays;
     QString selectedAgentProposalId;
     QString pressedAgentProposalMarker;
+    // A press on a ✓ marker accepts on release. Held still for the press-and-hold interval it
+    // shows the marker's bar (Open / Accept / Reject) instead; moved past the drag distance,
+    // scrolled meanwhile, or made while the page was still scrolling, it does nothing.
+    QTimer *agentProposalHoldTimer = nullptr;
+    bool agentProposalPressHeld = false;
+    bool agentProposalPressCancelled = false;
     bool agentProposalTextHighlight = false;
     QSet<QString> suppressedAgentProposalIds;
     QSet<QString> decidedAgentProposalIds;
     QPointer<AgentProposalWindow> agentProposalWindow;
     quint64 agentProposalReloadGeneration = 0;
     bool agentProposalOverlaysReady = false;
-    // Open / Accept / Reject next to a hovered pencil.
+    // Open / Accept / Reject next to a hovered or held marker.
     QPointer<AgentProposalHoverBar> agentProposalHoverBar;
     QTimer *agentProposalHoverShowTimer = nullptr;
     QTimer *agentProposalHoverHideTimer = nullptr;
     QString agentProposalHoverCandidate;
-    // The pencil the bar belongs to, in viewport coordinates.
+    // The marker the bar belongs to, in viewport coordinates.
     QRect agentProposalHoverMarker;
     QPoint agentProposalHoverPointer;
     bool agentProposalHoverPointerValid = false;
     int agentProposalHoverPage = -1;
     QElapsedTimer agentProposalLastScroll;
+    // The last wheel or trackpad scroll the page received (a press right after it stops the page).
+    QElapsedTimer agentProposalLastWheel;
     std::function<AgentProposalDecisionState(const QString &)> agentProposalDecisionStateProvider;
     QList<PageViewItem *> items;
     QList<PageViewItem *> visibleItems;
@@ -728,6 +739,17 @@ PageView::PageView(QWidget *parent, Okular::Document *document)
     d->agentProposalHoverShowTimer->setSingleShot(true);
     d->agentProposalHoverShowTimer->setInterval(AgentProposalHoverShowDelayMs);
     connect(d->agentProposalHoverShowTimer, &QTimer::timeout, this, &PageView::showAgentProposalHoverBar);
+    d->agentProposalHoldTimer = new QTimer(this);
+    d->agentProposalHoldTimer->setSingleShot(true);
+    d->agentProposalHoldTimer->setInterval(QGuiApplication::styleHints()->mousePressAndHoldInterval());
+    connect(d->agentProposalHoldTimer, &QTimer::timeout, this, [this] {
+        if (d->pressedAgentProposalMarker.isEmpty() || d->agentProposalPressCancelled) {
+            return;
+        }
+        // Held: the bar instead of an accept on release.
+        d->agentProposalPressHeld = true;
+        showAgentProposalHoverBarFor(d->pressedAgentProposalMarker);
+    });
     d->agentProposalHoverHideTimer = new QTimer(this);
     d->agentProposalHoverHideTimer->setSingleShot(true);
     d->agentProposalHoverHideTimer->setInterval(AgentProposalHoverGraceMs);
@@ -2969,7 +2991,7 @@ void PageView::slotRealNotifyViewportChanged(bool smoothMove)
         viewport()->update();
     }
 
-    // A page change takes the proposal toolbar away with its pencil.
+    // A page change takes the proposal toolbar away with its marker.
     if (d->agentProposalHoverBar && d->agentProposalHoverBar->isVisible() && d->agentProposalHoverPage != static_cast<int>(d->document->currentPage())) {
         hideAgentProposalHoverBar();
     }
@@ -5396,7 +5418,7 @@ void PageView::reloadAgentProposalOverlays()
                 }
                 guard->d->agentProposalOverlays = Thoughts::mergeAgentProposalOverlayLines(std::move(overlays), pageSizes);
                 guard->d->agentProposalOverlaysReady = true;
-                // A toolbar stays only if its pencil is still where it was.
+                // A toolbar stays only if its marker is still where it was.
                 guard->checkAgentProposalHoverAnchor();
                 guard->viewport()->update();
                 Q_EMIT guard->agentProposalOverlaysReloaded();
@@ -5462,7 +5484,7 @@ void PageView::paintAgentProposalOverlays(QPainter *painter, const QRect &conten
     const QString hoveredMarker = d->agentProposalHoverBar && d->agentProposalHoverBar->isVisible() ? d->agentProposalHoverBar->proposalId() : QString();
     for (const auto &marker : agentProposalMarkers()) {
         if (!marker.second.intersects(contentsRect)) continue;
-        // The pencil whose toolbar is open stands out from its neighbours.
+        // The marker whose toolbar is open stands out from its neighbours.
         const bool hovered = marker.first == hoveredMarker;
         painter->setPen(QPen(palette().color(QPalette::Highlight), hovered ? 2.0 : 1.0));
         QColor fill = palette().color(QPalette::Base);
@@ -5474,17 +5496,14 @@ void PageView::paintAgentProposalOverlays(QPainter *painter, const QRect &conten
         painter->drawRoundedRect(marker.second, 4, 4);
         painter->save();
         painter->translate(marker.second.topLeft());
-        painter->setPen(QPen(palette().color(QPalette::Text), 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        // A check mark in the 20 px box, in the green of Accept: a click accepts.
+        painter->setPen(QPen(QColor(35, 155, 75), 2.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         painter->setBrush(Qt::NoBrush);
-        QPainterPath pencil;
-        pencil.moveTo(5, 15);
-        pencil.lineTo(6, 11);
-        pencil.lineTo(12, 5);
-        pencil.lineTo(15, 8);
-        pencil.lineTo(9, 14);
-        pencil.closeSubpath();
-        painter->drawPath(pencil);
-        painter->drawLine(QPointF(10.5, 6.5), QPointF(13.5, 9.5));
+        QPainterPath check;
+        check.moveTo(5, 10.5);
+        check.lineTo(8.5, 14);
+        check.lineTo(15, 6.5);
+        painter->drawPath(check);
         painter->restore();
     }
     painter->restore();
@@ -5496,7 +5515,7 @@ QList<QPair<QString, QRectF>> PageView::agentProposalMarkers() const
     if (!Okular::Settings::highlightAgentEdits()) return markers;
     // Select a stable document-wide anchor before applying layout visibility:
     // the proposal's earliest own occurrence. LaTeX-made copies (contents
-    // entries, running heads) keep their highlight but anchor the pencil only
+    // entries, running heads) keep their highlight but anchor the marker only
     // when the proposal has no other fragment.
     QList<QSizeF> pageSizes;
     for (const PageViewItem *item : std::as_const(d->items)) {
@@ -5588,7 +5607,7 @@ void PageView::updateAgentProposalHover(const QPoint &viewportPos, Qt::MouseButt
             d->agentProposalHoverHideTimer->stop();
             return;
         }
-        // Another pencil (proposals close together): its own toolbar.
+        // Another marker (proposals close together): its own toolbar.
         if (visible) {
             hideAgentProposalHoverBar();
         }
@@ -5624,6 +5643,16 @@ void PageView::showAgentProposalHoverBar()
     if (agentProposalMarkerAt(contentAreaPoint(d->agentProposalHoverPointer)) != proposalId) {
         return;
     }
+    showAgentProposalHoverBarFor(proposalId);
+}
+
+void PageView::showAgentProposalHoverBarFor(const QString &proposalId)
+{
+    d->agentProposalHoverShowTimer->stop();
+    d->agentProposalHoverCandidate.clear();
+    if (d->agentProposalHoverBar && d->agentProposalHoverBar->isVisible() && d->agentProposalHoverBar->proposalId() != proposalId) {
+        hideAgentProposalHoverBar();
+    }
     const QRect marker = agentProposalMarkerRect(proposalId);
     if (marker.isEmpty()) {
         return;
@@ -5652,7 +5681,7 @@ void PageView::showAgentProposalHoverBar()
     AgentProposalHoverBar *bar = d->agentProposalHoverBar;
     bar->setProposal(proposalId, state);
     const QSize size = bar->sizeHint();
-    // Just above the pencil, left edges aligned, so the pencil row and the
+    // Just above the marker, left edges aligned, so the marker row and the
     // proposal's own text stay visible; below it when there is no room above.
     constexpr int gap = 2;
     int y = marker.top() - gap - size.height();
@@ -5674,7 +5703,7 @@ bool PageView::agentProposalHoverBridgeContains(const QPoint &viewportPos) const
     if (!d->agentProposalHoverBar || !d->agentProposalHoverBar->isVisible()) {
         return false;
     }
-    // The pencil, the toolbar and the strip between them, with a little slack.
+    // The marker, the toolbar and the strip between them, with a little slack.
     const QRect bar = d->agentProposalHoverBar->geometry();
     const QRect marker = d->agentProposalHoverMarker;
     const int top = qMin(marker.top(), bar.top());
@@ -6299,12 +6328,20 @@ void PageView::continuousZoomEnd()
 void PageView::mouseMoveEvent(QMouseEvent *e)
 {
     d->previousMouseMovePos = e->globalPosition();
-    updateAgentProposalHover(e->pos(), e->buttons());
-
     if (!d->pressedAgentProposalMarker.isEmpty()) {
+        // A drag that starts on a marker neither accepts it nor scrolls the page.
+        if (!d->agentProposalPressCancelled && (d->mousePressPos - e->globalPosition()).manhattanLength() >= QApplication::startDragDistance()) {
+            d->agentProposalPressCancelled = true;
+            d->agentProposalHoldTimer->stop();
+        }
+        // The bar a hold opened stays while the button is down.
+        if (!d->agentProposalPressHeld) {
+            updateAgentProposalHover(e->pos(), e->buttons());
+        }
         e->accept();
         return;
     }
+    updateAgentProposalHover(e->pos(), e->buttons());
 
     // don't perform any mouse action when no document is shown
     if (d->items.isEmpty()) {
@@ -6533,11 +6570,20 @@ void PageView::mousePressEvent(QMouseEvent *e)
     }
 
     d->pressedAgentProposalMarker.clear();
+    d->agentProposalHoldTimer->stop();
     if (e->button() == Qt::LeftButton) {
         d->pressedAgentProposalMarker = agentProposalMarkerAt(eventPos);
         if (!d->pressedAgentProposalMarker.isEmpty()) {
             d->mousePressPos = e->globalPosition();
+            d->agentProposalPressHeld = false;
+            // A press that stops a page still scrolling (a fling coasting, a trackpad's momentum
+            // still arriving as wheel events) is not a click on the marker it lands on.
+            d->agentProposalPressCancelled = d->scroller->state() == QScroller::Scrolling
+                || (d->agentProposalLastWheel.isValid() && d->agentProposalLastWheel.elapsed() < AgentProposalPressScrollQuietMs);
             d->scroller->stop();
+            if (!d->agentProposalPressCancelled) {
+                d->agentProposalHoldTimer->start();
+            }
             e->accept();
             return;
         }
@@ -6833,13 +6879,17 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
     if (leftButton && !d->pressedAgentProposalMarker.isEmpty()) {
         const QString proposalId = std::exchange(d->pressedAgentProposalMarker, {});
         const QPointF pressPos = std::exchange(d->mousePressPos, QPointF());
+        d->agentProposalHoldTimer->stop();
+        const bool held = std::exchange(d->agentProposalPressHeld, false);
+        const bool cancelled = std::exchange(d->agentProposalPressCancelled, false);
         d->mouseTextSelecting = false;
         d->mouseCommentCandidate = nullptr;
         d->mouseCommentCandidatePage = -1;
-        if (agentProposalMarkerAt(eventPos) == proposalId && (pressPos - e->globalPosition()).manhattanLength() < QApplication::startDragDistance()) {
-            // A click accepts a proposal that can be decided here; resting the
-            // pointer on the marker shows Open and Reject. One that cannot be
-            // decided opens its window, which says why.
+        if (!held && !cancelled && agentProposalMarkerAt(eventPos) == proposalId
+            && (pressPos - e->globalPosition()).manhattanLength() < QApplication::startDragDistance()) {
+            // A click on the ✓ accepts a proposal that can be decided here;
+            // holding it, or resting the pointer on it, shows Open, Accept and
+            // Reject. One that cannot be decided opens its window, which says why.
             if (agentProposalDecisionState(proposalId).decidable) {
                 hideAgentProposalHoverBar();
                 Q_EMIT agentProposalResolutionRequested(proposalId, QStringLiteral("accept"));
@@ -7725,6 +7775,7 @@ void PageView::mouseDoubleClickEvent(QMouseEvent *e)
 
 void PageView::wheelEvent(QWheelEvent *e)
 {
+    d->agentProposalLastWheel.start();
     if (!d->document->isOpened()) {
         QAbstractScrollArea::wheelEvent(e);
         return;
@@ -7835,8 +7886,8 @@ bool PageView::viewportEvent(QEvent *e)
         if (!(d->annotator && d->annotator->active()) && !agentProposalMarkerAt(contentAreaPoint(he->pos())).isEmpty()) {
             const QString markerId = agentProposalMarkerAt(contentAreaPoint(he->pos()));
             QToolTip::showText(he->globalPos(),
-                               agentProposalDecisionState(markerId).decidable ? i18n("Accept agent edit (rest the pointer here to open or reject it)")
-                                                                              : i18n("Open agent edit"),
+                               agentProposalDecisionState(markerId).decidable ? i18nc("@info:tooltip on a proposal's check mark", "Click to accept · hold for more")
+                                                                              : i18nc("@info:tooltip on a proposal's check mark", "Click to open · hold for more"),
                                viewport());
             e->accept();
             return true;
@@ -7877,8 +7928,13 @@ bool PageView::viewportEvent(QEvent *e)
 
 void PageView::scrollContentsBy(int dx, int dy)
 {
-    // The page moved under the pointer: no proposal toolbar now.
+    // The page moved under the pointer: no proposal toolbar now, and a press on a marker
+    // accepts nothing.
     d->agentProposalLastScroll.start();
+    if (!d->pressedAgentProposalMarker.isEmpty()) {
+        d->agentProposalPressCancelled = true;
+        d->agentProposalHoldTimer->stop();
+    }
     hideAgentProposalHoverBar();
     const QRect r = viewport()->rect();
     viewport()->scroll(dx, dy, r);
@@ -9334,7 +9390,7 @@ void PageView::slotRelayoutPages()
         viewport()->update();
     }
 
-    // Zoom or a layout change moved the pencil the toolbar belongs to.
+    // Zoom or a layout change moved the marker the toolbar belongs to.
     checkAgentProposalHoverAnchor();
     placeTextBoxEditor();
 }

@@ -55,11 +55,23 @@ PaperWebsite PaperWebsite::resolve(const QString &input)
     return {direct, direct, url.host(), {}};
 }
 
+QString singleLineName(const QString &text)
+{
+    return text.simplified();
+}
+
+QString documentNameProblem(const QString &name)
+{
+    if (name.isEmpty()) return i18n("Enter a document name.");
+    if (name.size() > 150) return i18n("The name has %1 characters; shorten it to 150 or fewer.", name.size());
+    for (const QChar c : name)
+        if (c.unicode() < 32) return i18n("The name contains an invisible control character; retype the name without it.");
+    return {};
+}
+
 QString usablePaperTitle(const QString &raw)
 {
-    QString title = raw;
-    title.replace(QRegularExpression(QStringLiteral("[\\s\\x{00a0}]+")), QStringLiteral(" "));
-    title = title.trimmed();
+    const QString title = singleLineName(raw);
     const QStringList generic{QStringLiteral("untitled"), QStringLiteral("untitled document"), QStringLiteral("document"),
                               QStringLiteral("paper"), QStringLiteral("main"), QStringLiteral("main.pdf")};
     if (generic.contains(title.toLower()) || QRegularExpression(QStringLiteral("^(?:arxiv[ :]+)?[0-9]{4}\\.[0-9]{4,5}(?:v[0-9]+)?(?:\\.pdf)?$"), QRegularExpression::CaseInsensitiveOption).match(title).hasMatch()) return {};
@@ -135,10 +147,11 @@ WebsiteImportDialog::WebsiteImportDialog(const QString &destination, Import impo
     });
     connect(m_next, &QPushButton::clicked, this, [this] {
         if (!m_prepared) { prepare(); return; }
-        const QString name = m_name->text().trimmed();
-        bool valid = !name.isEmpty() && name.size() <= 150;
-        for (const QChar c : name) valid = valid && c.unicode() >= 32;
-        if (!valid) { m_status->setText(i18n("Enter a name between 1 and 150 characters.")); return; }
+        // A title pasted over several lines is one name.
+        const QString name = singleLineName(m_name->text());
+        if (name != m_name->text()) m_name->setText(name);
+        const QString problem = documentNameProblem(name);
+        if (!problem.isEmpty()) { m_status->setText(problem); return; }
         const QString error = m_import(m_path, name, m_paper.pageUrl);
         if (!error.isEmpty()) { m_status->setText(error); return; }
         accept();
@@ -206,7 +219,7 @@ void WebsiteImportDialog::download()
         if (m_title.isEmpty()) m_title = usablePaperTitle(pdf->info(QStringLiteral("Title")));
         m_prepared = true;
         setWindowTitle(i18n("Confirm import"));
-        m_link->hide(); m_name->show(); m_name->setText(m_title); m_name->setFocus();
+        m_link->hide(); m_name->show(); m_name->setText(singleLineName(m_title)); m_name->setFocus();
         m_details->setText(i18n("Website: %1\nFile size: %2\nPages: %3\nDestination: %4", m_paper.website, QLocale().formattedDataSize(bytes.size()), pdf->numPages(), m_destination));
         m_status->setText(m_title.isEmpty() ? i18n("The title could not be found. Enter a document name to continue.") : i18n("You can edit the name before importing."));
         m_next->setText(i18n("Import")); m_next->setEnabled(true);

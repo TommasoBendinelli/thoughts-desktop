@@ -14,7 +14,12 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <QSemaphore>
 #include <QSignalSpy>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QThread>
+#include <functional>
 #include <QTemporaryDir>
 #include <QTest>
 #include <limits>
@@ -400,6 +405,7 @@ private Q_SLOTS:
     void startupReconciliationIsConservativelyUnknown();
     void freezeAndAcknowledgeAreGenerationSafe();
     void frozenRevertRemainsPendingAfterAcceptance();
+    void baselinesWaitForAnotherWriter();
     void frozenRevertSurvivesProcessRestart();
     void directorySentinelDetectsNewFiles();
     void fileCreatedWhileClosedIsPendingOnceSettled();
@@ -760,6 +766,67 @@ void DesktopSyncStoreTest::frozenRevertSurvivesProcessRestart()
     QVERIFY2(finalTracker.setTrackedPaths(finalStore.trackingPaths(&error), &error), qPrintable(error));
     QVERIFY2(finalTracker.reconcileNow(&error), qPrintable(error));
     QCOMPARE(finalStore.summary(&error).status, DesktopSyncStatus::Clean);
+}
+
+// 13 Nov: recording the baselines of the sources a Sync installed failed with
+// "database is locked" while another connection wrote, and Desktop's base
+// stayed behind the publisher's. A transaction that reads first cannot take
+// SQLite's write lock later in WAL mode, whatever busy_timeout says; the
+// baseline transactions now take it first and wait for it.
+void DesktopSyncStoreTest::baselinesWaitForAnotherWriter()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString sourcePath = QDir(temporary.path()).filePath(QStringLiteral("main.tex"));
+    const QString databasePath = QDir(temporary.path()).filePath(QStringLiteral("desktop-sync.sqlite"));
+    QVERIFY(writeBytes(sourcePath, QByteArrayLiteral("accepted\n")));
+    DesktopSyncStore store(databasePath);
+    QString error;
+    QVERIFY2(store.open(&error), qPrintable(error));
+    QVERIFY2(store.replaceBaselines({fileState(temporary.path(), QStringLiteral("main.tex"), {QStringLiteral("paper.pdf")})}, &error), qPrintable(error));
+    SourceChangeTracker tracker(temporary.path(), &store);
+    QVERIFY2(tracker.setTrackedPaths(store.baselines(&error), &error), qPrintable(error));
+    QVERIFY2(tracker.reconcileNow(&error), qPrintable(error));
+    QVERIFY(writeBytes(sourcePath, QByteArrayLiteral("installed and edited\n")));
+    QVERIFY2(tracker.reconcileNow(&error), qPrintable(error));
+
+    // Another writer (the change tracker's thread, a thoughtsctl decision)
+    // holds the write lock for a moment while each step starts.
+    const auto whileAnotherWriterHoldsTheLock = [&databasePath](const std::function<void()> &step) {
+        QSemaphore locked;
+        QThread *writer = QThread::create([&] {
+            {
+                QSqlDatabase other = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("other-writer"));
+                other.setDatabaseName(databasePath);
+                if (other.open()) {
+                    QSqlQuery query(other);
+                    query.exec(QStringLiteral("PRAGMA busy_timeout=5000"));
+                    query.exec(QStringLiteral("BEGIN IMMEDIATE"));
+                    query.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS other_writer(x INTEGER)"));
+                    query.exec(QStringLiteral("INSERT INTO other_writer VALUES(1)"));
+                    locked.release();
+                    QThread::msleep(300);
+                    query.exec(QStringLiteral("COMMIT"));
+                } else {
+                    locked.release();
+                }
+            }
+            QSqlDatabase::removeDatabase(QStringLiteral("other-writer"));
+        });
+        writer->start();
+        locked.acquire();
+        step();
+        writer->wait();
+        delete writer;
+    };
+    DesktopSyncSnapshot frozen;
+    whileAnotherWriterHoldsTheLock([&] { frozen = store.freezeForPublication(QStringLiteral("11111111-1111-4111-8111-111111111111"), &error); });
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(frozen.files.size(), 1);
+    bool accepted = false;
+    whileAnotherWriterHoldsTheLock([&] { accepted = store.acceptBaselinesAndAcknowledge({frozen.files.constFirst().trackedState}, frozen, &error); });
+    QVERIFY2(accepted, qPrintable(error));
+    QCOMPARE(store.baselines(&error).constFirst().sha256, frozen.files.constFirst().trackedState.sha256);
 }
 
 void DesktopSyncStoreTest::directorySentinelDetectsNewFiles()

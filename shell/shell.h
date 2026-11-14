@@ -140,6 +140,9 @@ public:
     // document_id, Library filename, PDF path or document name) | "project" (id or name),
     // "note_id"}: the window in front with those notes.
     static QJsonObject openAgentNotesCommand(const QJsonObject &request);
+    // On macOS menus carry no icons; toolbars and buttons keep theirs. Call
+    // once the application object exists.
+    static void applyMenuIconPolicy();
 
 public Q_SLOTS:
     Q_SCRIPTABLE Q_NOREPLY void tryRaise(const QString &startupId);
@@ -181,6 +184,9 @@ protected:
 private Q_SLOTS:
     // The answer of the gateway part's checkFedoraRemoteWork (see startRemoteWorkWatch).
     void remoteWorkChecked(bool pending, const QString &stateKey);
+    // A part's fedoraRemoteWorkFound: a PDF build that a Sync left running on the
+    // server has ended. Every part of every window says so; one Sync starts.
+    void remoteWorkAnnounced(bool pending, const QString &stateKey);
     void fileOpen();
     void openFromUrl();
 
@@ -494,7 +500,7 @@ private:
     // Once per installation: links the conversations of the current proposals (spec section 6.7).
     void backfillAgentConversations(const QJsonObject &projections);
     QJsonObject syncCommandStatus(const QString &operationId) const;
-    bool setActiveManualSyncOperation(const QString &operationId);
+    bool setActiveManualSyncOperation(const QString &operationId, const QString &initiationControl);
     void clearActiveManualSyncOperation();
     bool hasProcessManualSyncOperation() const;
     static void reconcileInterruptedSyncOperationsForTesting(qint64 startedBeforeMs);
@@ -512,6 +518,21 @@ private:
     // An agent's proposals and new PDF builds reach Fedora without this computer knowing. One
     // timer per process asks the server every 20 seconds, through the first window.
     static void startRemoteWorkWatch();
+    // The Syncs the app starts by itself (automaticsyncpolicy.h).
+    // `manualSync` is the part's fedoraManualSyncState of the Sync that ended.
+    void automaticSyncEnded(bool success, const QVariantMap &manualSync);
+    static void refreshAutomaticSyncNotice();
+    // Forgets failed automatic Syncs and their wait (tests).
+    static void resetAutomaticSyncForTesting();
+    // The Sync that follows a proposal decision made on this computer.
+    static void proposalDecided();
+    static void startProposalDecisionSync();
+    // Forgets a pending one; `delayMs` replaces the delay after a decision (0: the real one).
+    static void resetProposalDecisionSyncForTesting(int delayMs = 0);
+    // Compacts the Sync journal once, while no Sync runs and nobody uses the app.
+    static void startSyncJournalUpkeep();
+    // Writes what the caches hold to the developer log.
+    static void recordCacheSizes();
     void checkRemoteWork();
     void reconcileOrphanedManualSync();
     void reloadAllXML();

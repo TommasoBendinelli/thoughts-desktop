@@ -202,7 +202,7 @@ public:
     // Tells the hover toolbar whether a proposal can be decided now, and why not.
     void setAgentProposalDecisionStateProvider(std::function<AgentProposalDecisionState(const QString &)> provider);
     AgentProposalDecisionState agentProposalDecisionState(const QString &proposalId) const;
-    // The pencil of a proposal in viewport coordinates; empty when none is shown.
+    // The check mark of a proposal in viewport coordinates; empty when none is shown.
     Q_INVOKABLE QRect agentProposalMarkerRect(const QString &proposalId) const;
     void hideAgentProposalHoverBar();
     bool isPdfLinkAnchorDocument(QString *paperKey = nullptr) const;
@@ -479,8 +479,10 @@ private:
     QString agentProposalMarkerAt(const QPoint &eventPos) const;
     void updateAgentProposalHover(const QPoint &viewportPos, Qt::MouseButtons buttons);
     void showAgentProposalHoverBar();
+    // The bar of one marker at once (a press held on it, or a hover that rested).
+    void showAgentProposalHoverBarFor(const QString &proposalId);
     bool agentProposalHoverBridgeContains(const QPoint &viewportPos) const;
-    // Hides the toolbar when its pencil moved (scroll, zoom, page change) or went away.
+    // Hides the toolbar when its marker moved (scroll, zoom, page change) or went away.
     void checkAgentProposalHoverAnchor();
     QString agentProposalAt(const PageViewItem *pageItem, const QPoint &eventPos) const;
     Q_INVOKABLE QPainterPath reviewSelectionPath() const;

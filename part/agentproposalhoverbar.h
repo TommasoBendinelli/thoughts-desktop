@@ -23,7 +23,8 @@ struct AgentProposalDecisionState {
     bool removal = false;
 };
 
-// The small toolbar that appears next to a proposal's pencil on the page:
+// The small toolbar that appears next to a proposal's check mark on the page (resting
+// the pointer on it, or holding a press on it):
 // Open (the full proposal window), Accept, Reject.
 class OKULARPART_EXPORT AgentProposalHoverBar : public QFrame
 {

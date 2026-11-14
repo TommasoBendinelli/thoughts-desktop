@@ -303,7 +303,19 @@ private:
     // Returns a failed Outcome at once when the test has already failed: the
     // QSignalSpy waits then return immediately (no event loop runs), so a Sync
     // would never finish and the test would stall until QTest's watchdog.
+    // A Sync as the app runs it since Sync of the whole Library no longer waits for the
+    // server's PDF builds (14 November 2026): the Sync, and while it left builds running,
+    // the Sync that the repository announces (remoteWorkFound) when a build has ended and
+    // that the shell then starts. Returns when no build is pending any more.
     Outcome sync(const QString &label);
+    // One Sync, which may end while the server still builds.
+    Outcome syncOnce(const QString &label);
+    // Since 14 November 2026 a PDF the server could not build no longer fails the Sync
+    // whose changes arrived: the Sync succeeded with the warning pdf_build_failed.
+    bool buildFailed(const Outcome &outcome) const
+    {
+        return outcome.state == FedoraRepository::ManualSyncState::Succeeded && m_repository->manualSyncWarningCode() == QLatin1String("pdf_build_failed");
+    }
     // A completed Sync must leave nothing pending, and the next one must be a
     // quick no-op that changes neither sources nor the Library. Called through
     // VERIFY_SETTLED, which ends the test function when it failed.
@@ -426,6 +438,40 @@ void DocumentPipelineE2ETest::initTestCase()
 }
 
 DocumentPipelineE2ETest::Outcome DocumentPipelineE2ETest::sync(const QString &label)
+{
+    Outcome outcome = syncOnce(label);
+    for (int followUp = 1; followUp <= 8 && outcome.state == FedoraRepository::ManualSyncState::Succeeded && !QTest::currentTestFailed() && !m_repository->pendingServerBuilds().isEmpty(); ++followUp) {
+        QSignalSpy found(m_repository, SIGNAL(remoteWorkFound(bool, QString)));
+        QElapsedTimer waited;
+        waited.start();
+        // The request the repository holds notices the end of the build; it then asks the
+        // server's state and announces the work.
+        if (!QTest::qWaitFor([&] { return !found.isEmpty() || m_repository->pendingServerBuilds().isEmpty(); }, syncTimeoutMs)) {
+            outcome.state = FedoraRepository::ManualSyncState::Failed;
+            outcome.message = QStringLiteral("the end of the server's build was not noticed");
+            return outcome;
+        }
+        if (found.isEmpty()) {
+            found.wait(5000);
+        }
+        qInfo().noquote() << "E2E sync" << label << "left a build running; its end was" << (found.isEmpty() ? "not announced" : "announced") << "after" << waited.elapsed() << "ms";
+        Outcome next = syncOnce(label + QStringLiteral(" (after the build, #%1)").arg(followUp));
+        for (const QString &phase : std::as_const(outcome.phases)) {
+            if (!next.phases.contains(phase)) {
+                next.phases.append(phase);
+            }
+        }
+        for (auto &entry : next.messages) {
+            entry.first += outcome.elapsedMs + waited.elapsed();
+        }
+        next.messages = outcome.messages + next.messages;
+        next.elapsedMs += outcome.elapsedMs;
+        outcome = next;
+    }
+    return outcome;
+}
+
+DocumentPipelineE2ETest::Outcome DocumentPipelineE2ETest::syncOnce(const QString &label)
 {
     Outcome outcome;
     if (QTest::currentTestFailed()) {
@@ -911,6 +957,10 @@ QJsonObject DocumentPipelineE2ETest::syncCommandResult(const Outcome &outcome) c
     if (!succeeded) {
         operation.insert(QStringLiteral("last_error_code"), m_repository->manualSyncErrorCode());
         operation.insert(QStringLiteral("last_error_message"), outcome.message);
+    } else if (!m_repository->manualSyncWarningCode().isEmpty()) {
+        // What the shell keeps with a succeeded Sync's run: the repository's warning.
+        operation.insert(QStringLiteral("warning_code"), m_repository->manualSyncWarningCode());
+        operation.insert(QStringLiteral("warning_message"), m_repository->manualSyncWarning());
     }
     return Thoughts::syncCommandOperationResult(operation);
 }
@@ -945,25 +995,30 @@ void DocumentPipelineE2ETest::testProposalAfterFailedBuild()
     m_brokenFragment = QDir(m_docs).filePath(owner + QLatin1Char('/') + fragmentRelative);
 
     Outcome outcome = sync(QStringLiteral("build fails"));
-    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Failed, "the PDF build must fail");
-    QCOMPARE(m_repository->manualSyncErrorCode(), QStringLiteral("pdf_build_failed"));
+    QVERIFY2(buildFailed(outcome), qPrintable(QStringLiteral("the PDF build must fail: ") + outcome.message));
+    QVERIFY(m_repository->manualSyncErrorCode().isEmpty());
     QCOMPARE(serverSource(owner + QLatin1Char('/') + fragmentRelative), fragment);
     // Fedora names the fragment and the command (thoughts-server 69dfbd6 on).
-    const QString details = m_repository->manualSyncDetails();
+    const QString details = m_repository->manualSyncWarning();
     QVERIFY2(details.contains(owner + QStringLiteral("/tex/fragments/sections/results.tex:3 failed: Undefined control sequence \\Cref")), qPrintable(details));
 
     // The Sync before a proposal: sources synced, so the proposal is written and the build failure is a warning.
     const QJsonObject before = syncCommandResult(outcome);
-    QCOMPARE(before.value(QStringLiteral("state")).toString(), QStringLiteral("failed"));
+    QCOMPARE(before.value(QStringLiteral("state")).toString(), QStringLiteral("succeeded"));
     QVERIFY2(Thoughts::syncCommandSourcesSynced(before), QJsonDocument(before).toJson().constData());
     const QJsonObject created = Thoughts::authorProposalAfterSync(m_docs, proposalRequest(m_brokenFragment, 3, "See Table~\\ref{tab:results} for the numbers.\n"),
                                                                   QStringLiteral("thoughtsctl"), before);
     QVERIFY2(created.value(QStringLiteral("state")).toString() == QLatin1String("proposal_created"), QJsonDocument(created).toJson().constData());
     QVERIFY(!created.contains(QStringLiteral("error_code")));
     const QJsonArray warnings = created.value(QStringLiteral("warnings")).toArray();
+    // The shell keeps the succeeded Sync's warning (manualSyncWarningCode, "warning_code" in
+    // fedoraManualSyncState) with its run, and the command protocol passes it on.
+    QCOMPARE(before.value(QStringLiteral("warning_code")).toString(), QStringLiteral("pdf_build_failed"));
     QCOMPARE(warnings.size(), 1);
-    QCOMPARE(warnings.first().toObject().value(QStringLiteral("code")).toString(), QStringLiteral("pdf_build_failed"));
-    QVERIFY(warnings.first().toObject().value(QStringLiteral("message")).toString().contains(QStringLiteral("PDF")));
+    if (!warnings.isEmpty()) {
+        QCOMPARE(warnings.first().toObject().value(QStringLiteral("code")).toString(), QStringLiteral("pdf_build_failed"));
+        QVERIFY(warnings.first().toObject().value(QStringLiteral("message")).toString().contains(QStringLiteral("PDF")));
+    }
     QVERIFY(readFile(m_brokenFragment).contains("\\agentProposedEdit"));
 
     // The Sync after it delivers the proposal; its preview renders the fix, so the build passes.
@@ -1002,7 +1057,7 @@ void DocumentPipelineE2ETest::testFailureOfReplacedRenderer()
     // One build fails both PDFs.
     for (const QString &source : sources) QVERIFY(writeFile(source, broken));
     outcome = sync(QStringLiteral("stale failure: both fail"));
-    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Failed, qPrintable(outcome.message));
+    QVERIFY2(buildFailed(outcome), qPrintable(outcome.message));
     const QString sharedFailure = buildOf(added.at(0)).value(QStringLiteral("id")).toString();
     QCOMPARE(buildOf(added.at(1)).value(QStringLiteral("id")).toString(), sharedFailure);
     const QJsonArray sharedFailures = buildOf(added.at(0)).value(QStringLiteral("result")).toObject().value(QStringLiteral("failed_documents")).toArray();
@@ -1019,9 +1074,9 @@ void DocumentPipelineE2ETest::testFailureOfReplacedRenderer()
     QCOMPARE(renderStatus(fixedPdf).value(QStringLiteral("status")).toString(), QStringLiteral("synced"));
     QCOMPARE(buildOf(stuckPdf).value(QStringLiteral("id")).toString(), sharedFailure);
     outcome = sync(QStringLiteral("stale failure: other PDF still fails"));
-    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Failed, qPrintable(outcome.message));
+    QVERIFY2(buildFailed(outcome), qPrintable(outcome.message));
     // The Sync names the failure of the PDF that still fails, not the fixed one's.
-    QString details = m_repository->manualSyncDetails();
+    QString details = m_repository->manualSyncWarning();
     QVERIFY2(details.contains(stuckFile) && !details.contains(fixedFile), qPrintable(details));
 
     // The renderer is replaced (a deploy or rollback). The sources are still
@@ -1031,14 +1086,13 @@ void DocumentPipelineE2ETest::testFailureOfReplacedRenderer()
     }));
     QCOMPARE(renderStatus(stuckPdf).value(QStringLiteral("status")).toString(), QStringLiteral("out_of_sync"));
     outcome = sync(QStringLiteral("stale failure: renderer replaced, sources broken"));
-    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Failed, qPrintable(outcome.message));
-    QCOMPARE(m_repository->manualSyncErrorCode(), QStringLiteral("pdf_build_failed"));
-    details = m_repository->manualSyncDetails();
+    QVERIFY2(buildFailed(outcome), qPrintable(outcome.message));
+    details = m_repository->manualSyncWarning();
     QVERIFY2(details.contains(stuckFile), qPrintable(details));
     const QString retried = buildOf(stuckPdf).value(QStringLiteral("id")).toString();
     QVERIFY(!retried.isEmpty() && retried != sharedFailure);
     outcome = sync(QStringLiteral("stale failure: a current failure is not retried"));
-    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Failed, qPrintable(outcome.message));
+    QVERIFY2(buildFailed(outcome), qPrintable(outcome.message));
     QCOMPARE(buildOf(stuckPdf).value(QStringLiteral("id")).toString(), retried);
 
     // Fixed, it builds. Then its build at these inputs is recorded as failed
@@ -2401,7 +2455,10 @@ void DocumentPipelineE2ETest::testLinkedReviewCards()
     if (!convertedC) qWarning().noquote() << "E2E unconverted cards:" << describe(pdfOnlyCard) << describe(seededCard);
     QVERIFY2(linked(pdfOnlyCard), qPrintable(QStringLiteral("c) ") + describe(pdfOnlyCard)));
     QVERIFY2(linked(seededCard), qPrintable(QStringLiteral("d) ") + describe(seededCard)));
-    QVERIFY(syncUntil(QStringLiteral("converted cards placed"), [&] { return placed(pdfOnlyCard, 1) && placed(seededCard, 1); }));
+    const bool placedC = syncUntil(QStringLiteral("converted cards placed"), [&] { return placed(pdfOnlyCard, 1) && placed(seededCard, 1); });
+    QVERIFY2(placedC, qPrintable(QStringLiteral("c) %1\nd) %2\nLibrary PDF %3, status %4")
+                                     .arg(describe(pdfOnlyCard), describe(seededCard), library().value(target),
+                                          QString::fromUtf8(QJsonDocument(renderStatus(target)).toJson(QJsonDocument::Compact)).left(600))));
 
     VERIFY_SETTLED(QStringLiteral("linked review cards"));
 }
@@ -2784,7 +2841,8 @@ void DocumentPipelineE2ETest::testMoveSourceDocument()
                                                                   Thoughts::SourceDocumentMove::operationValues(plan, true));
         };
         connect(m_repository, SIGNAL(syncProgressChanged(QString, QString, qint64, qint64, QString)), &hook, SLOT(progress(QString, QString, qint64, qint64, QString)));
-        outcome = sync(QStringLiteral("move queued during Sync"));
+        // This one Sync must leave the move queued; the Sync after its build would send it.
+        outcome = syncOnce(QStringLiteral("move queued during Sync"));
         disconnect(m_repository, nullptr, &hook, nullptr);
         QVERIFY(queued);
         QVERIFY2(error.isEmpty(), qPrintable(error));

@@ -455,7 +455,12 @@ Q_SIGNALS:
     void globalSyncRequested();
     void fedoraRenderStatusChanged(const QString &target, const QJsonObject &status);
     void fedoraBuildSourceDiffReady(const QString &buildId, const QJsonObject &diff, const QString &error);
+    // The answer to checkFedoraRemoteWork.
     void fedoraRemoteWorkChecked(bool pending, const QString &stateKey);
+    // The same kind of answer, given without having been asked: a PDF build that a Sync left
+    // running on the server has ended and the server holds a PDF this computer lacks. Kept apart
+    // from the answers, so that whoever asked can tell its own answer from this news.
+    void fedoraRemoteWorkFound(bool pending, const QString &stateKey);
     void fedoraBuildInputSnapshotChanged(const QString &target, const QJsonObject &snapshot, const QString &error);
     void fedoraRenderStateChanged(const QJsonObject &state);
     void agentProposalResolutionStatusChanged(const QString &operationId,

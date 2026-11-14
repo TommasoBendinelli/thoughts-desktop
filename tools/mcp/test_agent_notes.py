@@ -826,6 +826,14 @@ class ReplyListeningTest(FakeServerCase):
         self.assertEqual(result['reply_listening'], {'state': 'unknown', 'listeners': []})
         self.assertIn('thoughts-watch-replies', result['next_step'])
 
+        # Only the reply agent (or a topic owner) listens: this conversation still starts its watcher.
+        responder = {'device_id': 'server', 'conversation_id': None, 'note_id': None, 'last_seen_at': now_iso(),
+                     'responder': True, 'role': 'responder'}
+        self.fake.reply_listening = {'state': 'listening', 'listeners': [responder]}
+        result = self.send()
+        self.assertIn('start thoughts-watch-replies', result['next_step'])
+        self.assertIn("answering rules", result['next_step'])
+
     def test_feed_cursor_is_the_newest_reply_not_the_first_page(self):
         ours = self.fake.add_note(title='Ours', origin={'agent': 'mcp', 'conversation_id': CONVERSATION})
         other = self.fake.add_note(title='Other')
@@ -902,6 +910,128 @@ class ReplyListeningTest(FakeServerCase):
             self.assertIsNone(conversation_identity.claude_session_of_ancestors(400, parent=parents.get))
 
 
+class WhoAnswersFake:
+    """Claims, rules, owners and pages on top of FakeThoughts (protocol "Who answers")."""
+
+    def __init__(self, fake):
+        self.fake, self.claims, self.owners, self.pages = fake, {}, {}, []
+        self.rules = {'text': '# Answering rules\nAnswer in plain words.\n', 'sha256': 'r1',
+                      'source_path': 'docs-notes/agent-note-rules.md', 'revision': 3, 'updated_at': now_iso()}
+        self.covering = set()  # item ids this Mac's conversation covers
+        original = fake.route
+
+        def route(method, path, query, body):
+            if path == '/v1/health':
+                return 200, {'capabilities': ['agent_notes_v1', 'agent_note_claims_v1', 'agent_note_owners_v1',
+                                              'agent_note_rules_v1']}, 'application/json'
+            if path == '/v1/agent-notes/rules':
+                if self.rules is None:
+                    return 404, {'detail': 'none', 'error_code': 'agent_note_not_found'}, 'application/json'
+                return 200, {**self.rules, 'others': []}, 'application/json'
+            claim = re.fullmatch(r'/v1/agent-notes/handling/([0-9a-f-]{36})/claim', path)
+            if claim and method == 'POST':
+                item = claim.group(1)
+                held = self.claims.get(item)
+                me = {'device_id': 'thoughts-mac', 'conversation_id': body.get('conversation_id'), 'role': 'sender',
+                      'claimed_at': now_iso(), 'answer_note_id': None}
+                if held and held['conversation_id'] != body.get('conversation_id'):
+                    return 409, {'claimed': False, 'error_code': 'agent_note_claimed', 'claim': held}, 'application/json'
+                if not held and item not in self.covering:
+                    return 409, {'claimed': False, 'error_code': 'agent_note_not_covering', 'claim': None}, 'application/json'
+                self.claims[item] = held or me
+                return (200 if held else 201), {'claimed': True, 'claim': self.claims[item]}, 'application/json'
+            if path == '/v1/agent-notes/owners' and method == 'POST':
+                owner = {'owner_id': 'a' * 24, 'live': True, **body}
+                self.owners[owner['owner_id']] = owner
+                return 201, owner, 'application/json'
+            if path == '/v1/agent-notes/owners' and method == 'GET':
+                return 200, {'owners': list(self.owners.values())}, 'application/json'
+            if path == '/v1/agent-notes/pages':
+                if 'after' not in query:
+                    return 200, {'notes': [], 'cursor': 0}, 'application/json'
+                found = [n for n in self.pages if n['sequence'] > int(query['after'])
+                         and (not query.get('conversation_id') or n.get('owned_by') == query['conversation_id'])]
+                if not found:
+                    time.sleep(0.2)
+                return 200, {'notes': found, 'cursor': max([n['sequence'] for n in found] + [int(query['after'])])}, \
+                    'application/json'
+            return original(method, path, query, body)
+
+        fake.route = route
+
+
+class WhoAnswersTest(FakeServerCase):
+    def setUp(self):
+        super().setUp()
+        self.extra = WhoAnswersFake(self.fake)
+
+    def test_a_covered_reply_is_claimed_for_this_conversation_with_the_rules(self):
+        note = self.fake.add_note(title='Group mean', origin={'agent': 'mcp', 'conversation_id': CONVERSATION})
+        reply = self.fake.add_reply(note, strokes=False, message='Why 3?')
+        self.extra.covering.add(reply['reply_id'])
+        handling = agent_notes.claim_item(reply['reply_id'], CONVERSATION, client=self.client)
+        self.assertEqual(handling['state'], 'yours')
+        self.assertIn('answering rules', handling['next_step'])
+        self.assertEqual(agent_notes.claim_item(reply['reply_id'], CONVERSATION, client=self.client)['state'], 'yours')
+        rules = agent_notes.answering_rules(self.client)
+        self.assertEqual(rules['text'], '# Answering rules\nAnswer in plain words.\n')
+        self.assertEqual(rules['source_path'], 'docs-notes/agent-note-rules.md')
+
+    def test_a_reply_another_agent_has_or_nobody_here_covers_is_left_alone(self):
+        note = self.fake.add_note(title='Group mean')
+        taken = self.fake.add_reply(note, strokes=False)
+        self.extra.claims[taken['reply_id']] = {'device_id': 'server', 'conversation_id': 'x', 'role': 'responder',
+                                                'claimed_at': now_iso(), 'answer_note_id': None}
+        handling = agent_notes.claim_item(taken['reply_id'], CONVERSATION, client=self.client)
+        self.assertEqual(handling['state'], 'taken')
+        self.assertIn('Thoughts reply agent answers it', handling['next_step'])
+        other = self.fake.add_reply(note, strokes=False)
+        handling = agent_notes.claim_item(other['reply_id'], CONVERSATION, client=self.client)
+        self.assertEqual(handling['state'], 'not_yours')
+        self.assertNotIn(other['reply_id'], self.extra.claims)
+
+    def test_missing_rules_and_older_servers_are_said(self):
+        self.extra.rules = None
+        self.assertIn('agent-note-rules.md', agent_notes.answering_rules(self.client)['missing'])
+        older = agent_notes.Client(agent_notes.Config(self.fake.url, TOKEN))
+        older._capabilities = (time.monotonic(), set())
+        self.assertEqual(agent_notes.claim_item(str(uuid.uuid4()), CONVERSATION, client=older)['state'], 'unknown')
+        self.assertIn('does not serve', agent_notes.answering_rules(older)['missing'])
+
+    def test_an_existing_reply_to_another_devices_note_comes_from_the_note(self):
+        note = self.fake.add_note(title='[Reading group] Variant B', sender='server')
+        reply = self.fake.add_reply(note, strokes=False, message='Redo it')
+        entry = agent_notes.wait_for_reply(note, 0, client=self.client, root=self.root)
+        self.assertEqual(entry['reply_id'], reply['reply_id'])
+        self.assertEqual(entry['message'], 'Redo it')
+        self.assertTrue(Path(entry['image_path']).is_file())
+
+    def test_own_and_release_a_topic(self):
+        owner = agent_notes.own_topic(CONVERSATION, 'Reading group', title_tags=['[Reading group]'], captures=True,
+                                      client=self.client)
+        self.assertEqual(owner['owner_id'], 'a' * 24)
+        posted = [r for r in self.fake.requests if r['path'] == '/v1/agent-notes/owners' and r['method'] == 'POST']
+        self.assertEqual(posted[0]['body'], {'conversation_id': CONVERSATION, 'label': 'Reading group',
+                                             'document_ids': [], 'review_card_ids': [],
+                                             'title_tags': ['[Reading group]'], 'captures': True})
+
+    def test_the_watcher_prints_the_rules_and_only_its_topics_pages(self):
+        process, lines = ReplyListeningTest.watcher(self, '--conversation', CONVERSATION)
+        self.assertTrue(ReplyListeningTest.wait_until(self, lambda: any(
+            r['path'] == '/v1/agent-notes/pages' and r['query'].get('conversation_id') == CONVERSATION
+            for r in self.fake.requests)), lines)
+        self.assertIn('RULES| Answer in plain words.', lines)
+        self.extra.pages.append({'note_id': str(uuid.uuid4()), 'sequence': 5, 'title': 'Not mine', 'origin': {},
+                                 'owned_by': 'another-conversation'})
+        mine = str(uuid.uuid4())
+        self.extra.pages.append({'note_id': mine, 'sequence': 6, 'title': '[Reading group] page 2',
+                                 'origin': {'page': 2}, 'message': 'What next?', 'owned_by': CONVERSATION})
+        self.assertTrue(ReplyListeningTest.wait_until(self, lambda: any(line.startswith('PAGE') for line in lines)), lines)
+        pages = [line for line in lines if line.startswith('PAGE')]
+        self.assertEqual(len(pages), 1, lines)
+        self.assertIn(f'note={mine}', pages[0])
+
+
 def stub_assets(name):
     """Stand-ins for the Markdown page's marked and KaTeX files, so no test downloads them."""
     if not agent_notes.ASSET_NAME.fullmatch(name):
@@ -954,25 +1084,56 @@ class RenderTest(unittest.TestCase):
         return runner, calls
 
     def test_command_line(self):
-        argv = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'file:///tmp/p.html', 700, screenshot=Path('/tmp/s.png'))
+        argv = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'file:///tmp/p.html', 700, screenshot=Path('/tmp/s.png'),
+                                          platform='darwin')
         self.assertEqual(argv[:4], ['/usr/bin/nice', '-n', '10', '/x/Chrome'])
         for flag in ('--headless=new', '--user-data-dir=/tmp/profile', '--hide-scrollbars', '--force-device-scale-factor=2.5',
                      '--window-size=480,700', '--screenshot=/tmp/s.png', '--use-mock-keychain'):
             self.assertIn(flag, argv)
         self.assertTrue(any(a.startswith('--virtual-time-budget=') for a in argv))
         self.assertEqual(argv[-1], 'file:///tmp/p.html')
-        dump = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'file:///tmp/p.html', 100)
+        dump = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'file:///tmp/p.html', 100, platform='darwin')
         self.assertIn('--dump-dom', dump)
         self.assertFalse(any(a.startswith('--screenshot') for a in dump))
         # Chrome has no network: every request goes to the render proxy, loopback addresses too,
         # and no name resolves. Without a proxy it is pointed at a closed port.
-        proxied = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'http://thoughts-note.invalid/x/page.html', 100, proxy='127.0.0.1:4321')
+        proxied = agent_notes.chrome_command('/x/Chrome', Path('/tmp/profile'), 'http://thoughts-note.invalid/x/page.html', 100,
+                                             proxy='127.0.0.1:4321', platform='darwin')
         for flag in ('--proxy-server=http://127.0.0.1:4321', '--proxy-bypass-list=<-loopback>',
                      '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', '--disable-background-networking'):
             self.assertIn(flag, proxied)
         self.assertIn('--proxy-server=http://127.0.0.1:9', dump)
         self.assertIn('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', dump)
         self.assertFalse(any('allow-file-access' in a or 'disable-web-security' in a for a in proxied))
+        self.assertNotIn('--password-store=basic', proxied)
+
+    def test_command_line_on_linux(self):
+        """Chromium on Linux: the cookie key stays out of the desktop keyring, and no host rule cuts short notes."""
+        proxied = agent_notes.chrome_command('/usr/bin/chromium-browser', Path('/tmp/profile'), 'http://thoughts-note.invalid/x/page.html',
+                                             100, screenshot=Path('/tmp/s.png'), proxy='127.0.0.1:4321', platform='linux')
+        for flag in ('--proxy-server=http://127.0.0.1:4321', '--proxy-bypass-list=<-loopback>', '--password-store=basic',
+                     '--disable-background-networking', '--window-size=480,100', '--screenshot=/tmp/s.png'):
+            self.assertIn(flag, proxied)
+        self.assertFalse(any(a.startswith(('--host-resolver-rules', '--host-rules')) for a in proxied))
+        self.assertEqual(proxied[-1], 'http://thoughts-note.invalid/x/page.html')
+        dump = agent_notes.chrome_command('/usr/bin/chromium-browser', Path('/tmp/profile'), 'http://thoughts-note.invalid/x/page.html',
+                                          100, platform='linux')
+        self.assertIn('--proxy-server=http://127.0.0.1:9', dump)
+        self.assertIn('--password-store=basic', dump)
+        self.assertEqual(dump[-2:], ['--dump-dom', 'http://thoughts-note.invalid/x/page.html'])
+        self.assertFalse(any('allow-file-access' in a or 'disable-web-security' in a for a in proxied))
+
+    def test_render_proxy_keeps_quiet_when_chrome_hangs_up(self):
+        """A connection Chrome closes before the answer is no traceback on stderr; other errors still are."""
+        with agent_notes.RenderServer('<p>note</p>', 'N0nce') as server:
+            printed = []
+            with unittest.mock.patch.object(ThreadingHTTPServer, 'handle_error', lambda *args: printed.append(args)):
+                for error in (BrokenPipeError(), ConnectionResetError(), ValueError('a bug')):
+                    try:
+                        raise error
+                    except Exception:
+                        server._server.handle_error(None, ('127.0.0.1', 1))
+            self.assertEqual(len(printed), 1)
 
     def test_two_passes_with_measured_height_and_clipping(self):
         runner, calls = self.fake_runner(900)
@@ -1270,6 +1431,19 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(self.fetches, [])
 
     @unittest.skipUnless(os.environ.get('THOUGHTS_TEST_CHROME') == '1', 'Set THOUGHTS_TEST_CHROME=1 to render with the real Google Chrome')
+    def test_real_chrome_paints_a_short_note_to_its_last_line(self):
+        """A note lower than 150 CSS px (Chromium on Linux painted only its first 128 device px under a host rule)."""
+        html = ('<html><body style="margin:0;padding:8px 12px;font:20px/30px sans-serif;color:#000;background:#fff">'
+                'first line<br>second line<br><a href="https://example.org/">third line</a></body></html>')
+        rendered = agent_notes.render(html=html)
+        width, height, rows = png_pixels(rendered.png)
+        self.assertEqual((width, rendered.css_height), (1200, 106))
+        inked = [y for y, row in enumerate(rows) if any(sum(pixel) < 600 for pixel in row[::3])]   # text on white
+        self.assertGreater(max(inked), height * 0.7, 'the third line is painted')
+        self.assertEqual([href for href, _rect, _label in rendered.links], ['https://example.org/'])
+        self.assertTrue(68 <= rendered.links[0][1][1] < 98, rendered.links)   # on the third line (68 to 98 CSS px)
+
+    @unittest.skipUnless(os.environ.get('THOUGHTS_TEST_CHROME') == '1', 'Set THOUGHTS_TEST_CHROME=1 to render with the real Google Chrome')
     def test_real_chrome(self):
         markdown = ('# The GRPO advantage\n\nFor a group of $G$ answers with rewards $r_1,\\dots,r_G$:\n\n'
                     '$$A_i = \\frac{r_i - \\operatorname{mean}(r)}{\\operatorname{std}(r)}$$\n\n'
@@ -1427,10 +1601,10 @@ class LinksTest(FakeServerCase):
         self.chrome = self.directory / 'Google Chrome'
         self.chrome.write_text('#!/bin/sh\nexit 0\n')
         self.chrome.chmod(0o755)
-        os.environ['THOUGHTS_CHROME'] = str(self.chrome)
-        self.addCleanup(os.environ.pop, 'THOUGHTS_CHROME', None)
-        os.environ['THOUGHTS_DOCS'] = str(self.directory)
-        self.addCleanup(os.environ.pop, 'THOUGHTS_DOCS', None)
+        # patch.dict puts back what was there: the real-Chrome tests after this class still find THOUGHTS_CHROME.
+        environment = unittest.mock.patch.dict(os.environ, {'THOUGHTS_CHROME': str(self.chrome), 'THOUGHTS_DOCS': str(self.directory)})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_hrefs_become_what_the_phone_opens(self):
         resolve = lambda href, doc=None: agent_notes.resolve_link(href, doc, self.pdfs)

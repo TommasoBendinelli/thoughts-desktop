@@ -16,6 +16,7 @@
 
 #include <QJsonArray>
 #include <QList>
+#include <QLocale>
 #include <QHash>
 #include <QPointer>
 #include <QScopeGuard>
@@ -126,6 +127,32 @@ static QString scheduleUntil(const QDateTime &at, const QDateTime &now)
 {
     const QDateTime local = at.toLocalTime();
     return local.toString(local.date() == now.toLocalTime().date() ? QStringLiteral("HH:mm") : QStringLiteral("yyyy-MM-dd"));
+}
+
+// When a card comes due, in local time, for "Due …": "in 25 min" and "in 3 h" when that close,
+// "today 21:40", "tomorrow 08:15", else its date, "29 Nov" (with the year when it is another one).
+static QString scheduleDue(const QDateTime &at, const QDateTime &now)
+{
+    const qint64 seconds = std::max<qint64>(0, now.secsTo(at));
+    const QDateTime local = at.toLocalTime();
+    const QDate today = now.toLocalTime().date();
+    const qint64 days = today.daysTo(local.date());
+    const QString time = local.toString(QStringLiteral("HH:mm"));
+    if (seconds < 3600) return i18nc("a review card is due in some minutes", "in %1 min", std::max<qint64>(1, (seconds + 59) / 60));
+    if (seconds < 4 * 3600) return i18nc("a review card is due in some hours", "in %1 h", seconds / 3600);
+    if (days <= 0) return i18nc("a review card is due today at a time", "today %1", time);
+    if (days == 1) return i18nc("a review card is due tomorrow at a time", "tomorrow %1", time);
+    return QLocale::c().toString(local.date(), local.date().year() == today.year() ? QStringLiteral("d MMM") : QStringLiteral("d MMM yyyy"));
+}
+
+// How a card the review queue does not take stands against its due date: "Overdue 15 days",
+// "Due now" (earlier today), "Due 29 Nov"; nothing for a card that was never due.
+static QString scheduleDueState(const QDateTime &dueAt, const QDateTime &now)
+{
+    if (!dueAt.isValid()) return {};
+    if (dueAt > now) return i18nc("a review card", "Due %1", scheduleDue(dueAt, now));
+    const qint64 days = std::max<qint64>(0, dueAt.toLocalTime().date().daysTo(now.toLocalTime().date()));
+    return days > 0 ? i18np("Overdue 1 day", "Overdue %1 days", days) : i18n("Due now");
 }
 
 // What the page column shows.
@@ -589,13 +616,20 @@ QVariant AnnotationModel::data(const QModelIndex &index, int role) const
             if (role == ReviewCardDueRole) return schedule.due;
             if (role == ReviewCardDueOrderRole) return QVariantList{schedule.dueGroup, schedule.dueOrderAt.isValid() ? schedule.dueOrderAt.toMSecsSinceEpoch() : qint64(0)};
             const QString details = schedule.details.isEmpty() ? QString() : schedule.details.toHtmlEscaped() + QLatin1Char('\n');
+            if (item->card.retired && item->card.page < 0)
+                return i18n("Review card: %1\n%2It stays on the PDF version it was on when it was retired (%3): open that version from its History to see it there.",
+                            item->card.question.toHtmlEscaped(), details, item->card.pdfSha256.left(12));
             return item->card.page < 0
                 ? i18n("Review card: %1\n%2The answer’s PDF location needs updating.", item->card.question.toHtmlEscaped(), details)
                 : i18n("Review card: %1\n%2Select to highlight the answer in the PDF. Double-click or press Enter to jump to its location.", item->card.question.toHtmlEscaped(), details);
         }
         if (role == PageRole) return item->card.page;
         if (role == PagesRole) { QVariantList pages; for (int page : item->card.pages) pages.append(page); return pages; }
-        if (role == ReviewCardStatusRole) return item->card.page < 0 ? i18n("PDF location needs updating") : d->reviewCardStatuses.value(item->card.id);
+        if (role == ReviewCardStatusRole) {
+            // A retired card is never placed again: it stays on its own version, which is not this one.
+            if (item->card.retired && item->card.page < 0) return i18n("On the PDF version it was retired on");
+            return item->card.page < 0 ? i18n("PDF location needs updating") : d->reviewCardStatuses.value(item->card.id);
+        }
         if (role == CandidateRole) return item->card.candidate;
         if (role == ReviewCardPagesLabelRole) return item->card.page < 0 ? QString() : AnnotationModel::reviewCardPagesLabel(item->card.pages, item->card.wholeDocument);
         if (role == ReviewCardPagesLabelsRole) return d->reviewCardPageLabels;
@@ -1014,12 +1048,23 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
     } else if (state == QLatin1String("never")) {
         line.append(i18n("Never due"));
         details.append(i18n("Due: never (interval Never)"));
-    } else if (state == QLatin1String("unpublished")) {
-        line.append(i18n("Not reviewed: document unpublished"));
-        details.append(i18n("Not reviewed: its document is unpublished in its Project. Its schedule is kept."));
-    } else if (!queued) {
-        line.append(i18n("Not in review now"));
-        details.append(i18n("Not offered for review now, for example while its place in the PDF is updated."));
+    } else if (state == QLatin1String("unpublished") || !queued) {
+        // When it is due, and why it is not offered.
+        const QString when = scheduleDueState(dueAt, utcNow);
+        const bool placement = schedule.value(QStringLiteral("not_offered")).toString() == QLatin1String("placement");
+        if (state == QLatin1String("unpublished")) {
+            line.append(when.isEmpty() ? i18n("Not offered: document unpublished") : when);
+            if (!when.isEmpty()) line.append(i18nc("why a review card is not offered", "not offered: document unpublished"));
+            details.append(i18n("Not reviewed: its document is unpublished in its Project. Its schedule is kept."));
+        } else if (placement) {
+            line.append(when.isEmpty() ? (isNew ? i18n("New") : i18n("Not offered")) : when);
+            line.append(i18nc("why a review card is not offered", "waiting for its place in the PDF"));
+            details.append(i18n("Not offered for review until its answer is placed in this version of the PDF."));
+        } else {
+            line.append(when.isEmpty() ? (isNew ? i18n("New") : i18n("Not offered")) : when);
+            line.append(i18nc("why a review card is not offered", "not offered now"));
+            details.append(i18n("Not offered for review now."));
+        }
         if (dueAt.isValid()) details.append(i18n("Due date: %1", scheduleWhen(dueAt)));
     } else if (skipped) {
         line.append(i18n("Skipped until %1", scheduleUntil(skippedUntil, utcNow)));
@@ -1032,7 +1077,8 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
                                          : i18n("Due: %1 (due now)", scheduleWhen(dueAt)));
     } else {
         const QString in = scheduleIn(dueFrom, utcNow);
-        line.append(isNew ? i18nc("a new review card, first due", "New · due %1", in) : i18nc("a review card", "Due %1", in));
+        const QString due = scheduleDue(dueFrom, utcNow);
+        line.append(isNew ? i18nc("a new review card, first due", "New · due %1", due) : i18nc("a review card", "Due %1", due));
         details.append(i18n("Due: %1 (%2)", scheduleWhen(dueAt.isValid() ? dueAt : dueFrom), in));
     }
     if (isNew) details.append(i18n("New: not answered yet"));

@@ -93,6 +93,13 @@ private Q_SLOTS:
         QVERIFY(Thoughts::paperMetadataTitle(R"({"notes":[{},{}]})", true).isEmpty());
         QVERIFY(Thoughts::usablePaperTitle(QStringLiteral("2401.12345v2")).isEmpty());
         QVERIFY(Thoughts::usablePaperTitle(QStringLiteral("Untitled")).isEmpty());
+        // Titles broken over lines (a conference template's metadata, a PDF title) become one line.
+        QCOMPARE(Thoughts::paperMetadataTitle(R"({"notes":[{"content":{"title":{"value":"Sparse Probes for\nTiny Models"}}}]})", true),
+                 QStringLiteral("Sparse Probes for Tiny Models"));
+        QCOMPARE(Thoughts::usablePaperTitle(QStringLiteral("Sparse Probes\r\n\tfor Tiny Models")), QStringLiteral("Sparse Probes for Tiny Models"));
+        QCOMPARE(Thoughts::usablePaperTitle(QStringLiteral("Sparse Probes\u2028for Tiny\u2029Models\u00a0")), QStringLiteral("Sparse Probes for Tiny Models"));
+        QVERIFY(Thoughts::usablePaperTitle(QStringLiteral("Sparse\x01Probes")).isEmpty());
+        QCOMPARE(Thoughts::documentNameProblem(QStringLiteral("Sparse Probes")), QString());
     }
     void confirmationAndRetry() {
         QByteArray pdf;
@@ -115,11 +122,18 @@ private Q_SLOTS:
             QCOMPARE(imports, 0);
             auto *name = dialog.findChild<QLineEdit *>(QStringLiteral("websiteImportName"));
             QCOMPARE(name->text(), QStringLiteral("Suggested title"));
+            auto *status = dialog.findChild<QLabel *>(QStringLiteral("websiteImportStatus"));
             name->clear(); next->click(); QCOMPARE(imports, 0);
+            QCOMPARE(status->text(), QStringLiteral("Enter a document name."));
             name->setText(QString(151, QLatin1Char('x'))); next->click(); QCOMPARE(imports, 0);
-            name->setText(QStringLiteral("Edited title")); next->click(); QCOMPARE(imports, 1);
+            QCOMPARE(status->text(), QStringLiteral("The name has 151 characters; shorten it to 150 or fewer."));
+            name->setText(QStringLiteral("Edited\x01title")); next->click(); QCOMPARE(imports, 0);
+            QVERIFY2(status->text().contains(QStringLiteral("control character")), qPrintable(status->text()));
+            // A title pasted over two lines is one name.
+            name->setText(QStringLiteral(" Edited\n\ttitle ")); next->click(); QCOMPARE(imports, 1);
+            QCOMPARE(name->text(), QStringLiteral("Edited title"));
             QVERIFY(dialog.isVisible()); QVERIFY(QFile::exists(downloaded));
-            QCOMPARE(dialog.findChild<QLabel *>(QStringLiteral("websiteImportStatus"))->text(), QStringLiteral("Retry saving"));
+            QCOMPARE(status->text(), QStringLiteral("Retry saving"));
             next->click(); QCOMPARE(imports, 2); QCOMPARE(dialog.result(), int(QDialog::Accepted));
             QCOMPARE(importedLink, QUrl(QStringLiteral("https://arxiv.org/abs/2401.12345")));
             QCOMPARE(network.requests.size(), 2);

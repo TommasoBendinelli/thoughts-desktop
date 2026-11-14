@@ -24,7 +24,11 @@ QJsonObject syncCommandStatusRequest(const QString &operationId);
 // (failure_code pdf_build_failed). Conflicts and unsent changes are not synced.
 bool syncCommandSourcesSynced(const QJsonObject &result);
 // The warning for a Sync whose sources synced but whose PDF build failed;
-// empty otherwise. @p sync names the Sync ("before" or "after").
+// empty otherwise. @p sync names the Sync ("before" or "after"). Such a Sync
+// succeeds with "warning_code" and "warning" in its result; an app from before
+// Sync stopped waiting for the server's builds reports it as a failed Sync
+// with failure_code pdf_build_failed and sources_synced. Both give the same
+// warning {code, sync, message, operation_id}.
 QJsonObject syncCommandBuildWarning(const QJsonObject &result, const QString &sync);
 QJsonObject syncCommandError(const QString &code,
                              const QString &message,

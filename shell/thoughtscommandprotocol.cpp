@@ -150,6 +150,13 @@ QJsonObject Thoughts::syncCommandOperationResult(const QJsonObject &operation, b
         // is blocked or unsent; any other failure leaves sources unsynced.
         result.insert(QStringLiteral("sources_synced"),
                       state == QLatin1String("succeeded") || failureCode == QLatin1String("pdf_build_failed"));
+        // Since Sync no longer waits for the server's builds, a PDF that could not be
+        // built is the warning of a succeeded Sync instead of a failed Sync's code.
+        const QString warningCode = operation.value(QStringLiteral("warning_code")).toString();
+        if (state == QLatin1String("succeeded") && !warningCode.isEmpty()) {
+            result.insert(QStringLiteral("warning_code"), warningCode);
+            result.insert(QStringLiteral("warning"), operation.value(QStringLiteral("warning_message")).toString());
+        }
     }
     return result;
 }
@@ -164,12 +171,28 @@ bool Thoughts::syncCommandSourcesSynced(const QJsonObject &result)
 
 QJsonObject Thoughts::syncCommandBuildWarning(const QJsonObject &result, const QString &sync)
 {
-    if (result.value(QStringLiteral("state")).toString() != QLatin1String("failed") || !syncCommandSourcesSynced(result)) {
+    const QString state = result.value(QStringLiteral("state")).toString();
+    QString code;
+    QString message;
+    if (state == QLatin1String("succeeded")) {
+        // The Sync succeeded and says what it could not do (warning_code, warning).
+        code = result.value(QStringLiteral("warning_code")).toString();
+        message = result.value(QStringLiteral("warning")).toString();
+        if (message.isEmpty()) {
+            message = result.value(QStringLiteral("message")).toString();
+        }
+    } else if (state == QLatin1String("failed") && syncCommandSourcesSynced(result)) {
+        // An app from before Sync stopped waiting for builds: a failed Sync whose
+        // sources synced (failure_code pdf_build_failed).
+        code = result.value(QStringLiteral("failure_code")).toString(QStringLiteral("pdf_build_failed"));
+        message = result.value(QStringLiteral("message")).toString();
+    }
+    if (code.isEmpty()) {
         return {};
     }
-    QJsonObject warning {{QStringLiteral("code"), result.value(QStringLiteral("failure_code")).toString(QStringLiteral("pdf_build_failed"))},
+    QJsonObject warning {{QStringLiteral("code"), code},
                          {QStringLiteral("sync"), sync},
-                         {QStringLiteral("message"), result.value(QStringLiteral("message")).toString()}};
+                         {QStringLiteral("message"), message}};
     const QString operationId = result.value(QStringLiteral("operation_id")).toString();
     if (!operationId.isEmpty()) {
         warning.insert(QStringLiteral("operation_id"), operationId);

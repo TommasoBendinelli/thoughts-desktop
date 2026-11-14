@@ -9,6 +9,7 @@
 
 #include <QBuffer>
 #include <QCoreApplication>
+#include <QGuiApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -450,32 +451,51 @@ void Client::list(int limit, QObject *context, std::function<void(const Result &
     if (!ensureServer(&error)) {
         QPointer<QObject> guard(context);
         QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
-            if (guard) done({{}, Failure::NotConnected, error});
+            if (guard) done({{}, Failure::NotConnected, error, false});
         });
         return;
     }
     QUrlQuery query;
     if (!documentId.isEmpty()) query.addQueryItem(QStringLiteral("document_id"), documentId);
     query.addQueryItem(QStringLiteral("limit"), QString::number(qBound(1, limit, 200)));
-    QNetworkReply *reply = get(QStringLiteral("/v1/agent-notes?") + query.toString(QUrl::FullyEncoded), 30000);
+    const QString pathAndQuery = QStringLiteral("/v1/agent-notes?") + query.toString(QUrl::FullyEncoded);
+    QNetworkRequest listRequest = request(pathAndQuery, 30000);
+    // The version the server gave this list last time: unchanged, it answers 304 without the notes.
+    const QByteArray version = m_listVersions.value(pathAndQuery);
+    if (!version.isEmpty()) listRequest.setRawHeader("If-None-Match", version);
+    QNetworkReply *reply = m_network->get(listRequest);
     QPointer<QObject> guard(context);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, done = std::move(done)] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, pathAndQuery, done = std::move(done)] {
         reply->deleteLater();
         const Failure failure = failureOf(reply);
         // A refused token is read again next time (the Mac may have been paired again).
         if (failure == Failure::Unauthorized && !m_explicitServer) m_token.clear();
+        if (failure != Failure::None) m_listVersions.remove(pathAndQuery);
         if (!guard) return;
         if (failure != Failure::None) {
-            done({{}, failure, describe(failure, reply)});
+            done({{}, failure, describe(failure, reply), false});
+            return;
+        }
+        if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 304) {
+            done({{}, Failure::None, {}, true});
             return;
         }
         QString parseError;
         const auto notes = parseNotes(reply->readAll(), &parseError);
         if (!notes) {
-            done({{}, Failure::Failed, i18n("The Thoughts server sent an unreadable list of agent notes: %1", parseError)});
+            m_listVersions.remove(pathAndQuery);
+            done({{}, Failure::Failed, i18n("The Thoughts server sent an unreadable list of agent notes: %1", parseError), false});
             return;
         }
-        done({*notes, Failure::None, {}});
+        // A few lists are asked for (the newest 20, the newest 100, a document's): keep each one's version.
+        const QByteArray answered = reply->rawHeader("ETag");
+        if (answered.isEmpty()) {
+            m_listVersions.remove(pathAndQuery);
+        } else {
+            if (m_listVersions.size() >= 64 && !m_listVersions.contains(pathAndQuery)) m_listVersions.clear();
+            m_listVersions.insert(pathAndQuery, answered);
+        }
+        done({*notes, Failure::None, {}, false});
     });
 }
 
@@ -640,6 +660,13 @@ Center *Center::instance()
         auto *client = new Client(QDir(root).filePath(QStringLiteral("images")));
         center = new Center(client, QDir(root).filePath(QStringLiteral("state.json")), {}, QCoreApplication::instance());
         client->setParent(center);
+        // Behind another application nobody looks at the notes: the slow pace is enough.
+        if (auto *application = qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
+            center->setForeground(application->applicationState() == Qt::ApplicationActive);
+            connect(application, &QGuiApplication::applicationStateChanged, center, [](Qt::ApplicationState state) {
+                if (center) center->setForeground(state == Qt::ApplicationActive);
+            });
+        }
     }
     return center;
 }
@@ -721,8 +748,47 @@ void Center::setWatching(const QObject *viewer, bool watching)
     });
 }
 
+void Center::setForeground(bool foreground)
+{
+    if (m_foreground == foreground) return;
+    m_foreground = foreground;
+    if (!foreground) return;
+    // The user is back: the pace starts over, and a list older than the fast pace is asked for now.
+    m_unchangedPolls = 0;
+    if (!m_watching || m_inFlight) return;
+    if (!m_lastUpdated.isValid() || m_lastUpdated.msecsTo(m_clock()) >= WatchingIntervalMs) {
+        refresh();
+    } else {
+        schedule(WatchingIntervalMs);
+    }
+}
+
+// The pace of the kind of poll that is due. It doubles with each poll in a row that found
+// nothing new, after the first: 15, 15, 30 seconds while a view is watched, and 1, 1, 2
+// minutes otherwise.
+int Center::pollInterval() const
+{
+    const int maximum = watchingNow() ? WatchingMaximumIntervalMs : IdleMaximumIntervalMs;
+    qint64 interval = watchingNow() ? WatchingIntervalMs : IdleIntervalMs;
+    for (int poll = 1; poll < m_unchangedPolls && interval < maximum; ++poll) interval *= 2;
+    return int(qMin<qint64>(interval, maximum));
+}
+
+int Center::nextPollDelayMs() const
+{
+    return m_timer->isActive() ? m_timer->interval() : -1;
+}
+
+void Center::pollNow()
+{
+    m_timer->stop();
+    poll();
+}
+
+// Asked for (the window's Refresh, a view coming on screen, a reply sent): the pace starts over.
 void Center::refresh()
 {
+    m_unchangedPolls = 0;
     m_timer->stop();
     poll();
 }
@@ -978,7 +1044,7 @@ void Center::poll()
     }
     m_inFlight = true;
     Q_EMIT stateChanged();
-    m_client->list(m_watching ? WatchingLimit : IdleLimit, this, [this](const Client::Result &result) { finished(result); });
+    m_client->list(watchingNow() ? WatchingLimit : IdleLimit, this, [this](const Client::Result &result) { finished(result); });
 }
 
 void Center::finished(const Client::Result &result)
@@ -992,7 +1058,7 @@ void Center::finished(const Client::Result &result)
         m_lastFailure = result.failure;
         m_lastError = result.error;
         ++m_failures;
-        int delay = m_watching ? WatchingIntervalMs : IdleIntervalMs;
+        int delay = watchingNow() ? WatchingIntervalMs : IdleIntervalMs;
         if (result.failure == Client::Failure::NotConnected || result.failure == Client::Failure::Unsupported
             || result.failure == Client::Failure::Unauthorized) {
             delay = 30 * 60 * 1000;
@@ -1009,14 +1075,16 @@ void Center::finished(const Client::Result &result)
     m_lastFailure = Client::Failure::None;
     m_lastError.clear();
     m_lastUpdated = m_clock();
-    apply(result.notes);
+    // The server's list is the one already shown (304), or the same notes came again.
+    const bool changed = !result.notModified && apply(result.notes);
+    m_unchangedPolls = changed ? 0 : qMin(m_unchangedPolls + 1, 16);
     Q_EMIT stateChanged();
     if (again) {
         poll();
         return;
     }
     if (!m_started && !m_watching) return;
-    int delay = m_watching ? WatchingIntervalMs : IdleIntervalMs;
+    int delay = pollInterval();
     // A new note still inside its grace period: look again once it ends.
     const QDateTime now = m_clock();
     for (const Note &note : std::as_const(m_notes)) {
@@ -1027,7 +1095,7 @@ void Center::finished(const Client::Result &result)
     schedule(delay);
 }
 
-void Center::apply(const QList<Note> &fetched)
+bool Center::apply(const QList<Note> &fetched)
 {
     QList<Note> merged;
     if (!fetched.isEmpty()) {
@@ -1048,11 +1116,13 @@ void Center::apply(const QList<Note> &fetched)
     const bool firstList = !std::exchange(m_listed, true);
     decideNotifications();
     const QByteArray signature = signatureOf(m_notes);
-    if (firstList || signature != m_signature) {
+    const bool changed = firstList || signature != m_signature;
+    if (changed) {
         m_signature = signature;
         Q_EMIT notesChanged();
     }
     emitUnreadIfChanged();
+    return changed;
 }
 
 void Center::merge(const QList<Note> &fetched)

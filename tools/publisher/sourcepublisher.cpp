@@ -54,6 +54,13 @@ QString utcTimestamp()
 
 // Fedora stores device sequences in PostgreSQL INTEGER columns.
 constexpr qint64 maximumDeviceSequence = 2147483647;
+// The sources sent alone to /v1/sources/apply, by path, while Fedora's answer is
+// outstanding: a retry after a lost answer repeats the same operation.
+const QString pendingAppliesKey = QStringLiteral("pending_source_applies");
+// Earlier bases of a path the Desktop's own record (desktop_source_baselines)
+// may still name, newest last: see recordSupersededBase.
+const QString supersededBasesKey = QStringLiteral("superseded_bases");
+constexpr qsizetype maximumSupersededBases = 4;
 // Renumbering is bounded: a writer that keeps taking this device's next sequence
 // (another tool using the publisher's token) must not make Sync loop forever.
 constexpr int maximumSequenceRecoveries = 3;
@@ -688,20 +695,136 @@ void SourcePublisher::activatePublicationResults(const Json &result, const QHash
         if (outcome != Json(QStringLiteral("applied")) && outcome != Json(QStringLiteral("merged"))) {
             continue;
         }
-        const Json canonicalSha256 = Py::get(accepted, QStringLiteral("sha256"));
-        const Json canonicalObject = Py::get(accepted, QStringLiteral("object_sha256"));
-        if (canonicalSha256 == Json(frozenSha256)) {
-            continue;
-        }
-        if (!canonicalSha256.isString() || !canonicalObject.isString()) {
-            Py::raiseValueError(QStringLiteral("the server returned an invalid merged source identity: ") + path.toString());
-        }
-        const QByteArray canonical = api.download(canonicalObject.toString());
-        if (sha256Hex(canonical) != canonicalSha256.toString()) {
-            Py::raiseValueError(QStringLiteral("merged source from the server failed identity verification: ") + path.toString());
-        }
-        activateFrozenRemoteSha(path.toString(), frozenSha256, canonical, false);
+        activateMergedResult(path.toString(), frozenSha256, Py::get(accepted, QStringLiteral("sha256")), Py::get(accepted, QStringLiteral("object_sha256")));
     }
+}
+
+bool SourcePublisher::activateMergedResult(const QString &path, const QString &frozenSha256, const Json &canonicalSha256, const Json &canonicalObject,
+                                           std::optional<QByteArray> *installed)
+{
+    if (canonicalSha256 == Json(frozenSha256)) {
+        return true;
+    }
+    if (!canonicalSha256.isString() || !canonicalObject.isString()) {
+        Py::raiseValueError(QStringLiteral("the server returned an invalid merged source identity: ") + path);
+    }
+    // Fedora's result replaces the bytes Desktop sent: until Desktop records
+    // it, its base for the path is those bytes or the base before them.
+    const Json previous = Py::get(Py::get(state, QStringLiteral("bases"), Json::object()), path);
+    if (previous.isObject() && previous.value(QStringLiteral("sha256")).isString()) {
+        recordSupersededBase(path, previous.value(QStringLiteral("sha256")).toString());
+    }
+    recordSupersededBase(path, frozenSha256);
+    const QByteArray canonical = api.download(canonicalObject.toString());
+    if (sha256Hex(canonical) != canonicalSha256.toString()) {
+        Py::raiseValueError(QStringLiteral("merged source from the server failed identity verification: ") + path);
+    }
+    if (!activateFrozenRemoteSha(path, frozenSha256, canonical, false)) {
+        return false;
+    }
+    if (installed) {
+        *installed = canonical;
+    }
+    return true;
+}
+
+// The installer and the publisher move a path's base in this state; Desktop
+// records its own copy (desktop_source_baselines) afterwards, in another step
+// that can fail (a busy database) or decline (the file changed meanwhile).
+// Until it catches up, the frozen copies it sends name an earlier base. Those
+// earlier bases are kept here, so a frozen copy written on one of them is
+// merged against it (laggingFrozenBase) instead of being refused forever.
+void SourcePublisher::recordSupersededBase(const QString &path, const QString &sha256)
+{
+    if (sha256.isEmpty() || sha256 == emptySha256) {
+        return;
+    }
+    Json all = Py::get(state, supersededBasesKey, Json::object());
+    if (!all.isObject()) {
+        all = Json::object();
+    }
+    QStringList shas = supersededBases(path);
+    shas.removeAll(sha256);
+    shas.append(sha256);
+    while (shas.size() > maximumSupersededBases) {
+        shas.removeFirst();
+    }
+    Json list = Json::array();
+    for (const QString &sha : std::as_const(shas)) {
+        list.append(Json(sha));
+    }
+    all.insert(path, list);
+    state.insert(supersededBasesKey, all);
+}
+
+QStringList SourcePublisher::supersededBases(const QString &path) const
+{
+    const Json all = state.value(supersededBasesKey);
+    QStringList shas;
+    if (!all.isObject()) {
+        return shas;
+    }
+    const Json list = all.value(path);
+    if (list.isArray()) {
+        for (const Json &sha : list.items()) {
+            if (sha.isString() && Py::isLowerHex(sha.toString(), 64)) {
+                shas.append(sha.toString());
+            }
+        }
+    }
+    return shas;
+}
+
+void SourcePublisher::forgetSupersededBases(const QString &path)
+{
+    Json all = state.value(supersededBasesKey);
+    if (!all.isObject() || !all.contains(path)) {
+        return;
+    }
+    all.remove(path);
+    if (all.size() > 0) {
+        state.insert(supersededBasesKey, all);
+    } else {
+        state.remove(supersededBasesKey);
+    }
+}
+
+Json SourcePublisher::laggingFrozenBase(const QString &path, const QByteArray &content, const Json &recordedBase, const QString &desktopBase)
+{
+    const QString refused = QStringLiteral("frozen Desktop source has no matching authoring or server base: ") + path;
+    QByteArray earlier;
+    try {
+        earlier = api.download(desktopBase);
+    } catch (const Py::Exception &error) {
+        if (error.type != Py::apiErrorType || error.status != 404) {
+            throw;
+        }
+        Py::raiseValueError(refused + QStringLiteral(" (the server no longer holds its earlier base)"));
+    }
+    if (sha256Hex(earlier) != desktopBase) {
+        Py::raiseValueError(QStringLiteral("earlier source base failed identity verification: ") + path);
+    }
+    const QByteArray recorded = api.download(recordedBase.value(QStringLiteral("object_sha256")).toString());
+    if (Json(sha256Hex(recorded)) != recordedBase.value(QStringLiteral("sha256"))) {
+        Py::raiseValueError(QStringLiteral("recorded source base failed identity verification: ") + path);
+    }
+    const auto [merged, conflictCount] = mergeSources(earlier, recorded, content, path);
+    if (!conflictCount && merged == content) {
+        // Everything the recorded base changed since the earlier one is in the
+        // file: it was written on the recorded base (the installer's merge or
+        // install, or Fedora's result), so that is its base.
+        report(QStringLiteral("Desktop still names an earlier base of %1; the file holds every change since, so it is published against revision %2.")
+                   .arg(path, Py::pythonStr(recordedBase.value(QStringLiteral("revision")))));
+        return recordedBase;
+    }
+    // The file may lack changes Fedora made since the earlier base (an editor
+    // that saved its older copy over the installed one): merged against that
+    // base, Fedora keeps them; published against the recorded one, it would
+    // take them back.
+    report(QStringLiteral("Desktop still names an earlier base of %1 and the file lacks changes made since; it is merged against that earlier base.").arg(path));
+    return Json::object({{QStringLiteral("revision"), recordedBase.value(QStringLiteral("revision"))},
+                         {QStringLiteral("sha256"), Json(desktopBase)},
+                         {QStringLiteral("object_sha256"), Json(desktopBase)}});
 }
 
 void SourcePublisher::recordBases(const std::optional<Json> &givenSnapshot)
@@ -718,6 +841,120 @@ void SourcePublisher::recordBases(const std::optional<Json> &givenSnapshot)
         }
     }
     state.insert(QStringLiteral("bases"), bases);
+}
+
+namespace
+{
+Py::Path sourceTreeCachePath(const Py::Path &statePath)
+{
+    return statePath.parent() / QStringLiteral("source-tree-cache.json");
+}
+
+// The frontier of a well-formed tree, or nothing.
+std::optional<qint64> treeFrontier(const Json &tree)
+{
+    const Json frontier = Py::get(tree, QStringLiteral("source_frontier"));
+    if (!tree.isObject() || frontier.type() != Json::Type::Int || !Py::get(tree, QStringLiteral("sources")).isArray()) {
+        return std::nullopt;
+    }
+    return Py::toPythonInt(frontier);
+}
+}
+
+Json SourcePublisher::currentSourceTree(const std::optional<qint64> &atLeast)
+{
+    const Py::Path cachePath = sourceTreeCachePath(statePath);
+    try {
+        if (Py::isFile(cachePath)) {
+            const Json kept = Py::loadsBytes(Py::readBytes(cachePath));
+            const Json tree = Py::get(kept, QStringLiteral("tree"));
+            const std::optional<qint64> frontier = treeFrontier(tree);
+            if (frontier && Py::get(kept, QStringLiteral("schema_version")) == Json(1) && Py::get(kept, QStringLiteral("server")) == Json(api.baseUrl())
+                && (!atLeast || *frontier >= *atLeast)) {
+                const Json serverFrontier = Py::get(api.syncState(), QStringLiteral("source_frontier"));
+                if (serverFrontier.type() == Json::Type::Int && Py::toPythonInt(serverFrontier) == *frontier) {
+                    return tree;
+                }
+            }
+        }
+    } catch (const Py::Exception &) {
+        // An unreadable kept tree, or a server that cannot say its frontier: read the tree.
+    }
+    const Json tree = api.sourceTree();
+    keepSourceTree(tree);
+    return tree;
+}
+
+void SourcePublisher::keepSourceTree(const Json &tree)
+{
+    const Py::Path cachePath = sourceTreeCachePath(statePath);
+    try {
+        if (!treeFrontier(tree)) {
+            if (Py::isFile(cachePath)) {
+                Py::atomicWrite(cachePath, QByteArrayLiteral("{}\n"));
+            }
+            return;
+        }
+        Py::atomicWrite(cachePath, Py::dumpsChecked(Json::object({{QStringLiteral("schema_version"), Json(1)}, {QStringLiteral("server"), Json(api.baseUrl())}, {QStringLiteral("tree"), tree}})));
+    } catch (const Py::Exception &) {
+        // Only a saving: the next run reads the tree from the server.
+    }
+}
+
+bool SourcePublisher::onlyOwnChanges(const Json &before, const Json &after, const QList<Json> &mutations, const Json &result)
+{
+    // Every head, as text: the tree's paths with revision, digests and deletion.
+    const auto headText = [](const Json &revision, const Json &sha256, const Json &object, bool deleted) {
+        return QStringLiteral("%1 %2 %3 %4").arg(Py::pythonStr(revision), Py::pythonStr(sha256), Py::pythonStr(object), deleted ? QStringLiteral("deleted") : QStringLiteral("present"));
+    };
+    const auto heads = [&headText](const Json &tree, QHash<QString, QString> *out) {
+        const Json sources = Py::get(tree, QStringLiteral("sources"));
+        if (!sources.isArray()) {
+            return false;
+        }
+        for (const Json &item : sources.items()) {
+            if (!item.isObject() || !item.value(QStringLiteral("path")).isString()) {
+                return false;
+            }
+            out->insert(item.value(QStringLiteral("path")).toString(),
+                        headText(item.value(QStringLiteral("revision")), item.value(QStringLiteral("sha256")), item.value(QStringLiteral("object_sha256")),
+                                 Py::truthy(Py::get(item, QStringLiteral("deleted"), Json(false)))));
+        }
+        return true;
+    };
+    QHash<QString, QString> expected;
+    QHash<QString, QString> actual;
+    if (!heads(before, &expected) || !heads(after, &actual)) {
+        return false;
+    }
+    QHash<QString, bool> deletions;
+    for (const Json &mutation : mutations) {
+        deletions.insert(Py::pythonStr(Py::get(mutation, QStringLiteral("path"))), Py::get(mutation, QStringLiteral("action")) == Json(QStringLiteral("delete")));
+    }
+    const Json results = Py::get(result, QStringLiteral("results"));
+    if (!results.isArray() || results.size() != mutations.size()) {
+        return false;
+    }
+    for (const Json &item : results.items()) {
+        const Json outcome = Py::get(item, QStringLiteral("outcome"));
+        const Json path = Py::get(item, QStringLiteral("path"));
+        if (!path.isString() || !deletions.contains(path.toString())
+            || !(outcome == Json(QStringLiteral("applied")) || outcome == Json(QStringLiteral("merged")) || outcome == Json(QStringLiteral("duplicate")))) {
+            return false;
+        }
+        if (deletions.value(path.toString())) {
+            // A deletion keeps the path; its head is compared by revision and deletion only.
+            const QString head = actual.value(path.toString());
+            if (!head.startsWith(Py::pythonStr(Py::get(item, QStringLiteral("revision"))) + QLatin1Char(' ')) || !head.endsWith(QLatin1String(" deleted"))) {
+                return false;
+            }
+            expected.insert(path.toString(), head);
+        } else {
+            expected.insert(path.toString(),
+                            headText(Py::get(item, QStringLiteral("revision")), Py::get(item, QStringLiteral("sha256")), Py::get(item, QStringLiteral("object_sha256")), false));
+        }
+    }
+    return expected == actual;
 }
 
 QSet<QString> SourcePublisher::reconcilePreservedConflicts(LocalSources &local, const SourceHeads &current)
@@ -1001,9 +1238,118 @@ Json SourcePublisher::applyMutation(Json mutation)
             }
             const qint64 sequence = reserveSequences(*serverNext, 1);
             mutation.insert(QStringLiteral("device_sequence"), Json(sequence));
+            // Same operation ID: if the renumbered request is applied and its
+            // answer lost, the retry is answered from Fedora's record.
+            storePendingApply(mutation);
             report(QStringLiteral("The server assigned this source change's device sequence to another change; renumbered it to %1.").arg(sequence));
         }
     }
+}
+
+void SourcePublisher::storePendingApply(const Json &mutation)
+{
+    Json pending = Py::get(state, pendingAppliesKey, Json::object());
+    if (!pending.isObject()) {
+        pending = Json::object();
+    }
+    pending.insert(Py::subscript(mutation, QStringLiteral("path")).toString(), mutation);
+    state.insert(pendingAppliesKey, pending);
+    writeState();
+}
+
+void SourcePublisher::forgetPendingApplies(const QSet<QString> &paths)
+{
+    if (!state.contains(pendingAppliesKey)) {
+        return;
+    }
+    Json pending = state.value(pendingAppliesKey);
+    if (pending.isObject()) {
+        for (const QString &path : paths) {
+            pending.remove(path);
+        }
+    }
+    if (pending.isObject() && pending.size() > 0) {
+        state.insert(pendingAppliesKey, pending);
+    } else {
+        state.remove(pendingAppliesKey);
+    }
+}
+
+Json SourcePublisher::sourceApplyMutation(const QString &path, const Json &base, const QByteArray &content)
+{
+    const Json applies = Py::get(state, pendingAppliesKey, Json::object());
+    const Json pending = applies.isObject() ? Py::get(applies, path) : Json();
+    const Json revision(Py::toPythonInt(Py::get(base, QStringLiteral("revision"), Json(0))));
+    if (pending.isObject() && Py::get(pending, QStringLiteral("path")) == Json(path) && Py::get(pending, QStringLiteral("content_sha256")) == Json(sha256Hex(content))
+        && Py::get(pending, QStringLiteral("base_revision")) == revision
+        && Py::get(pending, QStringLiteral("base_sha256")) == Py::get(base, QStringLiteral("sha256"), Json(emptySha256))
+        && Py::get(pending, QStringLiteral("base_object_sha256")) == Py::get(base, QStringLiteral("object_sha256"), Json(emptySha256))
+        && Py::get(pending, QStringLiteral("operation_id")).isString() && Py::get(pending, QStringLiteral("device_sequence")).isInt()
+        && Py::get(pending, QStringLiteral("client_timestamp")).isString()) {
+        report(QStringLiteral("Repeating the unanswered source change %1 with its operation ID.").arg(path));
+        return pending;
+    }
+    Json mutation = newMutation(QStringLiteral("upsert"), path, base, content);
+    ensureEmptyBase({mutation});
+    mutation.remove(QStringLiteral("action"));
+    storePendingApply(mutation);
+    return mutation;
+}
+
+std::optional<SourcePublisher::SettledApply> SourcePublisher::settleMergedApply(const QString &path, const QByteArray &content, const Json &result,
+                                                                               const std::optional<Json> &previousBase)
+{
+    const Json outcome = Py::get(result, QStringLiteral("outcome"));
+    const bool duplicate = outcome == Json(QStringLiteral("duplicate"));
+    if (!duplicate && outcome != Json(QStringLiteral("applied")) && outcome != Json(QStringLiteral("merged"))) {
+        return std::nullopt;
+    }
+    Json head = result;
+    if (duplicate) {
+        // Fedora committed this operation before (its answer was lost) and
+        // answers with its current version, which already contains the change.
+        const SourceHeads heads(Py::iterate(Py::get(api.sourceTree(), QStringLiteral("sources"), Json::array())));
+        const std::optional<Json> item = heads.get(path);
+        if (!item || Py::truthy(Py::get(*item, QStringLiteral("deleted"), Json(false)))) {
+            forgetPendingApplies({path});
+            writeState();
+            Py::raiseValueError(QStringLiteral("source was deleted on the server after the server merged this computer's change: ") + path);
+        }
+        head = *item;
+    }
+    const Json revision = Py::get(head, QStringLiteral("revision"));
+    const Json resultSha256 = Py::get(head, QStringLiteral("sha256"));
+    const Json resultObject = Py::get(head, QStringLiteral("object_sha256"));
+    if (Py::get(head, QStringLiteral("path")) != Json(path) || !revision.isInt() || revision.toInt() < 1 || !resultSha256.isString()
+        || resultSha256.toString().size() != 64 || !resultObject.isString() || resultObject.toString().size() != 64) {
+        Py::raiseValueError(QStringLiteral("the server returned an inconsistent source merge result: ") + path);
+    }
+    // Fedora's merge is authoritative: it reads agent proposals, removed and
+    // moved review-card markers and adjacent edits, which this computer's
+    // merge does not, and it has committed its result. That result replaces
+    // the file the merge started from, as a merged publication result does,
+    // and becomes its base.
+    SettledApply settled;
+    const bool current = activateMergedResult(path, sha256Hex(content), resultSha256, resultObject, &settled.installed);
+    // Edited again after Desktop froze it: the newer edit keeps the previous
+    // base, so the next Sync merges it with Fedora's result.
+    settled.base = current ? std::optional<Json>(baseOf(head)) : previousBase;
+    Json bases = Py::get(state, QStringLiteral("bases"), Json::object());
+    if (settled.base) {
+        bases.insert(path, *settled.base);
+    } else {
+        bases.remove(path);
+    }
+    state.insert(QStringLiteral("bases"), bases);
+    forgetPendingApplies({path});
+    writeState();
+    if (current) {
+        report(QStringLiteral("The server merged source change %1 into revision %2.").arg(path, Py::pythonStr(revision)));
+    } else {
+        report(QStringLiteral("The server merged source change %1 into revision %2; the file changed after Desktop froze it, so the next Sync merges the newer edit.")
+                   .arg(path, Py::pythonStr(revision)));
+    }
+    return settled;
 }
 
 void SourcePublisher::ensureEmptyBase(const QList<Json> &mutations)
@@ -1090,7 +1436,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     }
     this->report(QStringLiteral("Read %1 managed path(s); %2 path(s) are absent locally.").arg(local.size()).arg(missingCount));
     this->report(QStringLiteral("Checking the current server source frontier."), phaseFields(QStringLiteral("checking_server")));
-    const Json snapshot = api.sourceTree();
+    const Json snapshot = currentSourceTree();
     const SourceHeads current(Py::iterate(Py::get(snapshot, QStringLiteral("sources"), Json::array())));
     QSet<QString> localPaths;
     for (const auto &entry : std::as_const(local)) {
@@ -1125,6 +1471,56 @@ SourcePublisher::Report SourcePublisher::publishOnce()
         this->report(QStringLiteral("Uploaded source change %1 (%2).").arg(path, formatEventBytes(content.size())),
                      uploadingFields(path, content.size(), content.size()));
     };
+    // Sources Fedora merged alone: the base each keeps (none: no base) over
+    // the heads recorded at the end, and Fedora's results now installed.
+    QHash<QString, std::optional<Json>> settledBases;
+    QList<QPair<QString, QByteArray>> settledContents;
+    // This computer's three-way merge conflicts: the source goes to Fedora
+    // alone, whose merge decides. Fedora merges more than this computer does,
+    // so it may merge it cleanly; otherwise it preserves the conflict.
+    const auto sendAlone = [&](const QString &path, const QByteArray &content, const Json &sentBase, const std::optional<Json> &previousBase) {
+        api.uploadObject(content);
+        const Json result = applyMutation(sourceApplyMutation(path, sentBase, content));
+        if (const std::optional<SettledApply> settled = settleMergedApply(path, content, result, previousBase)) {
+            settledBases.insert(path, settled->base);
+            if (settled->installed) {
+                settledContents.append({path, *settled->installed});
+            }
+            return;
+        }
+        const Json conflictId = Py::get(result, QStringLiteral("conflict_id"));
+        const Json revision = Py::get(result, QStringLiteral("revision"));
+        if (Py::get(result, QStringLiteral("outcome")) != Json(QStringLiteral("conflict")) || !conflictId.isString() || conflictId.toString().isEmpty()
+            || !(revision.type() == Json::Type::Int || revision.isBool())) {
+            Py::raiseValueError(QStringLiteral("the server returned an inconsistent source merge result: ") + path);
+        }
+        // Recorded now and used as a folder name when the conflict is settled.
+        requireConflictId(conflictId.toString());
+        Json conflicts = state.contains(QStringLiteral("conflicts")) ? state.value(QStringLiteral("conflicts")) : Json::object();
+        conflicts.insert(path, Json::object({{QStringLiteral("conflict_id"), conflictId},
+                                             {QStringLiteral("local_sha256"), Json(sha256Hex(content))},
+                                             {QStringLiteral("server_revision"), revision}}));
+        state.insert(QStringLiteral("conflicts"), conflicts);
+        forgetPendingApplies({path});
+        writeState();
+        preservedConflicts.append(path);
+    };
+    // After the heads are recorded at the end of a run.
+    const auto finishSettledApplies = [&] {
+        Json recorded = Py::get(state, QStringLiteral("bases"), Json::object());
+        for (auto it = settledBases.cbegin(); it != settledBases.cend(); ++it) {
+            if (it.value()) {
+                recorded.insert(it.key(), *it.value());
+            } else {
+                recorded.remove(it.key());
+            }
+        }
+        if (!settledBases.isEmpty()) {
+            state.insert(QStringLiteral("bases"), recorded);
+        }
+        // This run examined these paths: an older unanswered apply of one is settled.
+        forgetPendingApplies(localPaths);
+    };
     for (const auto &[path, content] : std::as_const(local)) {
         const std::optional<Json> remote = current.get(path);
         const std::optional<Json> base = bases.contains(path) ? std::optional<Json>(bases.value(path)) : std::nullopt;
@@ -1132,6 +1528,10 @@ SourcePublisher::Report SourcePublisher::publishOnce()
         const bool remoteDeleted = remote && Py::truthy(Py::get(*remote, QStringLiteral("deleted"), Json(false)));
         if (frozen) {
             const bool remoteExists = remote && !remoteDeleted;
+            if (frozen->baseSha256 && base && base->isObject() && base->value(QStringLiteral("sha256")) == Json(*frozen->baseSha256)) {
+                // Desktop has caught up with the recorded base.
+                forgetSupersededBases(path);
+            }
             if (!content) {
                 if (!remoteExists) {
                     ++unchanged;
@@ -1190,26 +1590,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
                     continue;
                 }
                 if (conflictCount) {
-                    api.uploadObject(*content);
-                    Json mutation = newMutation(QStringLiteral("upsert"), path, emptyBase, content);
-                    ensureEmptyBase({mutation});
-                    mutation.remove(QStringLiteral("action"));
-                    const Json result = applyMutation(mutation);
-                    const Json conflictId = Py::get(result, QStringLiteral("conflict_id"));
-                    const Json revision = Py::get(result, QStringLiteral("revision"));
-                    if (Py::get(result, QStringLiteral("outcome")) != Json(QStringLiteral("conflict")) || !conflictId.isString()
-                        || conflictId.toString().isEmpty() || !(revision.type() == Json::Type::Int || revision.isBool())) {
-                        Py::raiseValueError(QStringLiteral("the server returned an inconsistent source merge result: ") + path);
-                    }
-                    // Recorded now and used as a folder name when the conflict is settled.
-                    requireConflictId(conflictId.toString());
-                    Json conflicts = state.contains(QStringLiteral("conflicts")) ? state.value(QStringLiteral("conflicts")) : Json::object();
-                    conflicts.insert(path, Json::object({{QStringLiteral("conflict_id"), conflictId},
-                                                         {QStringLiteral("local_sha256"), Json(digest)},
-                                                         {QStringLiteral("server_revision"), revision}}));
-                    state.insert(QStringLiteral("conflicts"), conflicts);
-                    writeState();
-                    preservedConflicts.append(path);
+                    sendAlone(path, *content, emptyBase, std::nullopt);
                     continue;
                 }
                 // Fedora's copy is empty: this file only adds to it.
@@ -1220,6 +1601,9 @@ SourcePublisher::Report SourcePublisher::publishOnce()
             } else if (remote && Py::truthy(*remote)) {
                 authoringBase = *remote;
             }
+            // The base the frozen bytes are merged from: the recorded one,
+            // or an earlier one Desktop has not moved on from.
+            std::optional<Json> mergeBase = recordedBase;
             if (recordedBase) {
                 const QSet<QString> allowed{Py::hashKey(recordedBaseSha256),
                                             Py::hashKey(remoteExists ? Py::get(*remote, QStringLiteral("sha256")) : Json(emptySha256))};
@@ -1227,14 +1611,19 @@ SourcePublisher::Report SourcePublisher::publishOnce()
                     const Json receipt = Py::get(Py::get(state, QStringLiteral("review_source_base_receipts"), Json::object()), path, Json::object());
                     if (Py::get(receipt, QStringLiteral("sha256")) != recordedBaseSha256
                         || Py::get(receipt, QStringLiteral("previous_base_sha256")) != Json(*frozen->baseSha256)) {
-                        Py::raiseValueError(QStringLiteral("frozen Desktop source has no matching authoring or server base: ") + path);
+                        if (!supersededBases(path).contains(*frozen->baseSha256)) {
+                            Py::raiseValueError(QStringLiteral("frozen Desktop source has no matching authoring or server base: ") + path);
+                        }
+                        mergeBase = laggingFrozenBase(path, *content, *recordedBase, *frozen->baseSha256);
+                        authoringBase = *mergeBase;
                     }
                 }
             }
-            if (recordedBase && remoteExists && Py::get(*remote, QStringLiteral("sha256")) != recordedBaseSha256) {
-                const QByteArray baseContent = api.download(recordedBase->value(QStringLiteral("object_sha256")).toString());
+            const Json mergeBaseSha256 = mergeBase ? mergeBase->value(QStringLiteral("sha256")) : Json();
+            if (mergeBase && remoteExists && Py::get(*remote, QStringLiteral("sha256")) != mergeBaseSha256) {
+                const QByteArray baseContent = api.download(mergeBase->value(QStringLiteral("object_sha256")).toString());
                 const QByteArray remoteContent = api.download(Py::pythonStr(Py::subscript(*remote, QStringLiteral("object_sha256"))));
-                if (Json(sha256Hex(baseContent)) != recordedBaseSha256) {
+                if (Json(sha256Hex(baseContent)) != mergeBaseSha256) {
                     Py::raiseValueError(QStringLiteral("recorded source base failed identity verification: ") + path);
                 }
                 if (Json(sha256Hex(remoteContent)) != Py::subscript(*remote, QStringLiteral("sha256"))) {
@@ -1247,25 +1636,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
                     continue;
                 }
                 if (conflictCount) {
-                    api.uploadObject(*content);
-                    Json mutation = newMutation(QStringLiteral("upsert"), path, *recordedBase, content);
-                    mutation.remove(QStringLiteral("action"));
-                    const Json result = applyMutation(mutation);
-                    const Json conflictId = Py::get(result, QStringLiteral("conflict_id"));
-                    const Json revision = Py::get(result, QStringLiteral("revision"));
-                    if (Py::get(result, QStringLiteral("outcome")) != Json(QStringLiteral("conflict")) || !conflictId.isString()
-                        || conflictId.toString().isEmpty() || !(revision.type() == Json::Type::Int || revision.isBool())) {
-                        Py::raiseValueError(QStringLiteral("the server returned an inconsistent source merge result: ") + path);
-                    }
-                    // Recorded now and used as a folder name when the conflict is settled.
-                    requireConflictId(conflictId.toString());
-                    Json conflicts = state.contains(QStringLiteral("conflicts")) ? state.value(QStringLiteral("conflicts")) : Json::object();
-                    conflicts.insert(path, Json::object({{QStringLiteral("conflict_id"), conflictId},
-                                                         {QStringLiteral("local_sha256"), Json(digest)},
-                                                         {QStringLiteral("server_revision"), revision}}));
-                    state.insert(QStringLiteral("conflicts"), conflicts);
-                    writeState();
-                    preservedConflicts.append(path);
+                    sendAlone(path, *content, *mergeBase, *recordedBase);
                     continue;
                 }
             }
@@ -1327,21 +1698,39 @@ SourcePublisher::Report SourcePublisher::publishOnce()
         this->report(QStringLiteral("Scheduling source update: ") + path);
         mutations.append(newMutation(QStringLiteral("upsert"), path, effectiveBase, content));
     }
+    for (const auto &[path, installed] : std::as_const(settledContents)) {
+        local[localIndex(local, path)].second = installed;
+    }
     if (!preservedConflicts.isEmpty()) {
         Py::raiseValueError(QStringLiteral("source conflict was preserved on the server for resolution: ") + preservedConflicts.join(QStringLiteral(", ")));
     }
     for (const auto &[path, contents] : std::as_const(remoteActivations)) {
         activateFrozenRemoteSha(path, sha256Hex(contents.first), contents.second, true);
     }
+    const qint64 mergedAlone = settledBases.size();
     if (mutations.isEmpty()) {
         prepareProposalClaims(*this, local, mutations);
-        this->report(QStringLiteral("No source changes need publication."));
-        recordBases(snapshot);
-        pruneRetiredManifestPaths();
-        writeState();
+        // Fedora committed what it merged alone after `snapshot` was read.
+        const Json heads = mergedAlone ? api.sourceTree() : snapshot;
+        if (mergedAlone) {
+            keepSourceTree(heads);
+        }
         Report result;
         result.unchanged = unchanged;
-        result.sourceFrontier = Json(Py::toPythonInt(Py::get(snapshot, QStringLiteral("source_frontier"), Json(0))));
+        result.upserted = mergedAlone;
+        result.sourceFrontier = Json(Py::toPythonInt(Py::get(heads, QStringLiteral("source_frontier"), Json(0))));
+        if (mergedAlone) {
+            this->report(QStringLiteral("Publication complete at source frontier %1: %2 updated, 0 deleted, %3 unchanged.")
+                             .arg(Py::pythonStr(result.sourceFrontier))
+                             .arg(result.upserted)
+                             .arg(result.unchanged));
+        } else {
+            this->report(QStringLiteral("No source changes need publication."));
+        }
+        recordBases(heads);
+        finishSettledApplies();
+        pruneRetiredManifestPaths();
+        writeState();
         return result;
     }
     if (mutations.size() > 1000) {
@@ -1368,6 +1757,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     activatePublicationResults(result, frozenSha256ByPath);
     Report report;
     report.unchanged = unchanged;
+    report.upserted = mergedAlone;
     for (const Json &item : std::as_const(mutations)) {
         const Json action = item.value(QStringLiteral("action"));
         report.upserted += action == Json(QStringLiteral("upsert")) ? 1 : 0;
@@ -1379,7 +1769,21 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     state.remove(QStringLiteral("pending_frozen_activations"));
     expireProposalClaims(*this, result);
     state.insert(QStringLiteral("last_publication"), result);
-    recordBases();
+    // The server's tree after the publication, read once: the bases, and whether it is
+    // the tree read before with exactly this publication's changes. If so, the editable-
+    // source installer has nothing to find up to this frontier, and the app need not run
+    // it again only to see what was just sent.
+    const Json after = api.sourceTree();
+    keepSourceTree(after);
+    recordBases(after);
+    if (!mergedAlone && onlyOwnChanges(snapshot, after, mutations, result)) {
+        const Json before = Py::get(snapshot, QStringLiteral("source_frontier"));
+        const Json through = Py::get(after, QStringLiteral("source_frontier"));
+        if (before.type() == Json::Type::Int && through.type() == Json::Type::Int) {
+            report.sourceTreeVerified = QPair<qint64, qint64>(Py::toPythonInt(before), Py::toPythonInt(through));
+        }
+    }
+    finishSettledApplies();
     pruneRetiredManifestPaths();
     writeState();
     this->report(QStringLiteral("Publication complete at source frontier %1: %2 updated, %3 deleted, %4 unchanged.")

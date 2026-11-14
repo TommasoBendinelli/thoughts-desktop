@@ -184,6 +184,11 @@ public:
     OKULARPART_EXPORT QString manualSyncMessage() const;
     OKULARPART_EXPORT QString manualSyncDetails() const;
     OKULARPART_EXPORT QString manualSyncErrorCode() const;
+    // Why a failed Sync failed, for whoever decides when to try again: "transient" (the
+    // server did not answer or answered 502/503/504 even after the retries; a later Sync
+    // may work), "needs_user" (the user has to act: a merge, a credential, an update) or
+    // "bug" (neither; trying again changes nothing). Empty unless the Sync failed.
+    OKULARPART_EXPORT QString manualSyncFailureKind() const;
     OKULARPART_EXPORT QJsonObject effectiveProjections(bool includeSourceJournals = true, bool includeSourceSnapshot = true) const;
     OKULARPART_EXPORT bool hasProjectionSnapshot() const;
     OKULARPART_EXPORT bool enqueueLogicalComment(const QJsonObject &payload);
@@ -221,7 +226,7 @@ public:
     QJsonObject pendingDocumentChanges(const QString &target) const;
     void publishSources(const QString &buildTarget = QString(), const QString &traceId = QString());
     void publishNewSourceDocument(const QString &project, const QString &buildTarget, const QString &traceId = QString());
-    QJsonObject buildActivity(const QString &target) const;
+    OKULARPART_EXPORT QJsonObject buildActivity(const QString &target) const;
     QJsonObject sourcePublicationActivity() const;
     QVariantMap sourceTrackingDiagnostics() const;
     OKULARPART_EXPORT QJsonObject renderStatus(const QString &target);
@@ -261,6 +266,14 @@ public:
     // PDF build, records from another device), from one GET /v2/sync/state; changes nothing locally.
     // @p done gets that answer and a key naming the server state it was computed for.
     OKULARPART_EXPORT void checkRemoteWork(std::function<void(bool pending, const QString &stateKey)> done);
+    // The PDF builds a Sync left running on the server: each {id, target, documents}. A Sync of
+    // the whole Library no longer waits for them; while Thoughts runs, one long poll follows the
+    // first of them and remoteWorkFound announces the Sync that fetches the new PDFs.
+    OKULARPART_EXPORT QJsonArray pendingServerBuilds() const;
+    // A finished Sync's warning: "pdf_build_failed" when the sources were synced and the server
+    // could not build a PDF. Empty while a Sync runs and after one without warnings.
+    OKULARPART_EXPORT QString manualSyncWarningCode() const;
+    OKULARPART_EXPORT QString manualSyncWarning() const;
 
 Q_SIGNALS:
     void projectionsChanged(const QJsonObject &projections, qint64 frontier);
@@ -284,12 +297,16 @@ Q_SIGNALS:
     void sourceConflictResolutionBundleReady(const QJsonObject &bundle, const QString &error);
     void sourceConflictResolutionStatusChanged(const QString &operationId, const QString &status, const QString &message);
     void pendingChangesChanged(const QJsonObject &snapshot);
+    // The same answer as checkRemoteWork's, given without being asked: a PDF build that a Sync
+    // left running on the server has ended, so the server holds a PDF this computer lacks.
+    void remoteWorkFound(bool pending, const QString &stateKey);
 
 private Q_SLOTS:
     void handleDesktopSyncStoreChanged(const QString &databasePath);
 
 private:
     friend class PartTest;
+    friend class SyncFlowTest;
     friend class DocumentPipelineE2ETest;
     enum class ManualSyncPhase {
         None,
@@ -339,7 +356,15 @@ private:
         QString message;
         QString details;
         QString errorCode;
+        QString failureKind;
         QString buildFailure;
+        // What a succeeded Sync still has to tell (see manualSyncWarningCode).
+        QString warningCode;
+        QString warning;
+        // The PDFs the render check reported as failed, each {filename, reason, build_id}.
+        QJsonArray buildFailureDocuments;
+        // The PDFs the server was still building when this Sync asked: it ends without them.
+        QStringList pendingBuildDocuments;
         QString renderCheckRequestId;
         QString sourcePublicationTraceId;
         ServerStatePurpose serverStatePurpose = ServerStatePurpose::Initial;
@@ -516,6 +541,9 @@ private:
     void startPendingSourcePublication();
     void startNextDeferredTargetedBuild();
     void startManualAuthoringReconciliation(qint64 through);
+    // The publisher's "source_tree_verified": this Sync's own publication is all that
+    // changed on the server since the installer's check, which then holds through it.
+    Q_INVOKABLE void noteVerifiedSourcePublication(const QJsonObject &publication);
     QStringList sourcePublicationArguments(const QString &target, const QString &project = QString()) const;
     QString buildRunDirectory(const QString &runId) const;
     Q_INVOKABLE bool applyChangePage(const QJsonObject &page, qint64 expectedCursor);
@@ -550,7 +578,13 @@ private:
     void checkManualServerState();
     Q_INVOKABLE bool applyManualServerState(const QJsonObject &serverState);
     OKULARPART_EXPORT void resumeManualSyncAfterSourceReconciliation();
-    bool manualReaderArtifactsCurrent(const QJsonObject &serverState);
+    OKULARPART_EXPORT bool manualReaderArtifactsCurrent(const QJsonObject &serverState);
+    // The two halves of manualReaderArtifactsCurrent: what the store records about this
+    // Library revision (`receipts`: the recorded file facts of each cached object), and
+    // whether the files on disk still are those. The second touches the file system only
+    // and may run on any thread.
+    bool manualReaderArtifactsRecorded(const QJsonObject &serverState, QList<QJsonObject> *receipts);
+    static bool readerArtifactFilesUnchanged(const QList<QJsonObject> &receipts);
     bool canPullPlanlessRemoteChanges(const QJsonObject &serverState);
     void pullPlanlessManualChangePage();
     void uploadNextManualBatch(const QList<QJsonObject> &operations);
@@ -582,8 +616,23 @@ private:
     void pullDocumentSnapshot();
     Q_INVOKABLE bool applyDocumentSnapshot(const QJsonObject &snapshot);
     OKULARPART_EXPORT QList<QJsonObject> documentOperations(const QString &target, const QList<QJsonObject> &operations) const;
-    void failManualSync(const QString &message, const QString &details = QString());
-    void deferManualBuildFailure(const QJsonObject &build, const QString &message);
+    void failManualSync(const QString &message, const QString &details = QString(), const QString &kind = QString());
+    // Sends an idempotent request of the running Sync. A transient failure (no answer, a
+    // timeout, 408/429/502/503/504) is asked again after m_retryDelaysMs; every other
+    // answer, and the last transient one, goes to `finished`.
+    void retryingRequest(std::function<QNetworkReply *()> send, std::function<void(QNetworkReply *)> finished, int attempt = 0);
+    void deferManualBuildFailure(const QJsonObject &build, const QString &message, const QJsonArray &failedDocuments = {});
+    // Replaces (a Sync of the whole Library saw every document) or extends the builds the
+    // server still runs; an empty build with wholeLibrary forgets them all.
+    void recordPendingServerBuild(const QJsonObject &build, const QStringList &documents, bool wholeLibrary);
+    // Holds one GET /v2/builds/{id}?wait_ms=... for the first pending build, off the Sync.
+    Q_INVOKABLE void watchPendingServerBuilds();
+    void finishPendingServerBuild(const QString &buildId, const QJsonObject &build);
+    void announceRemoteWorkAfterPendingBuild();
+    bool pendingServerBuildsSuppressRevisionChanges() const;
+    // checkRemoteWork's question. With whileBuildsPending a Library revision that changed
+    // only because a pending build progresses is not work.
+    OKULARPART_EXPORT void evaluateRemoteWork(bool whileBuildsPending, std::function<void(bool pending, const QString &stateKey)> done);
     Q_INVOKABLE void completeManualSync(bool skipRenderStateRefresh = false);
     Thoughts::DesktopSyncStore *desktopSyncStore(QString *error = nullptr);
     OKULARPART_EXPORT bool sourceManifestMatchesAccepted(Thoughts::DesktopSyncStore *store, bool *matches, QString *error = nullptr);
@@ -607,6 +656,7 @@ private:
     Q_INVOKABLE QString localPublicationState(const QString &target, const QJsonObject &publication) const;
     void setLiveRenderStatus(const QString &target, const QJsonObject &status);
     void storeRenderStatus(const QString &target, const QJsonObject &status);
+    void storeRenderStatuses(const QHash<QString, QJsonObject> &statusesByTarget);
     Q_INVOKABLE void completeLibraryBuildActivationIfReady();
     void applyCompletedLibraryBuildActivations(const QHash<QString, QJsonObject> &completedRuns, const QString &inspectionError = QString());
     void schedulePendingChangesRefresh();
@@ -764,6 +814,20 @@ private:
     bool m_renderStateRequestRunning = false;
     SyncCoordinator m_syncCoordinator;
     bool m_outboxReady = false;
+    // The long poll following a build a Sync left running (watchPendingServerBuilds).
+    QPointer<QNetworkReply> m_pendingBuildReply;
+    int m_pendingBuildWatchFailures = 0;
+    // When the server last confirmed that a pending build is still queued or running.
+    qint64 m_pendingBuildConfirmedAtMs = -1;
+    // A pending build ended while a Sync ran: ask the server once that Sync is over.
+    bool m_pendingBuildAnnouncementDue = false;
+    int m_pendingBuildWaitMs = 25000;
+    // The periodic remote work check looks at the cached files on a worker thread.
+    QList<int> m_retryDelaysMs {1000, 2000, 4000};
+    // Tests shorten the pauses before a superseded reader plan is requested again.
+    int m_readerReplanDelayScale = 1;
+    bool m_readerArtifactCheckRunning = false;
+    Qt::HANDLE m_readerArtifactCheckThread = nullptr;
 };
 
 }

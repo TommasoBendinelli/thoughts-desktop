@@ -320,7 +320,7 @@ class Client:
         self._ssl = ssl_context() if self.https else None
 
     def request(self, method: str, path: str, query: dict | None = None, body: dict | None = None,
-                read_timeout: float = 30.0, raw: bool = False):
+                read_timeout: float = 30.0, raw: bool = False, allow: tuple = ()):
         target = self.base_path + path
         query = {k: v for k, v in (query or {}).items() if v is not None}
         if query:
@@ -354,14 +354,17 @@ class Client:
             raise AgentNoteError("server_unreachable", f"Request to {where} failed: {error}") from None
         finally:
             connection.close()
-        if status >= 400:
+        if status >= 400 and status not in allow:
             raise map_error(status, payload)
         if raw:
             return payload
         if not payload:
-            return {}
+            return {"_status": status} if allow else {}
         try:
-            return json.loads(payload)
+            answer = json.loads(payload)
+            if allow and isinstance(answer, dict):
+                answer["_status"] = status
+            return answer
         except ValueError:
             raise AgentNoteError("invalid_response", f"The server answered {method} {path} with non-JSON content.", status) from None
 
@@ -386,6 +389,44 @@ class Client:
                             query=dict(after=after, wait=wait, note_id=note_id, conversation_id=conversation_id,
                                        listen="true" if listen else None),
                             read_timeout=wait + 20)
+
+    def capabilities(self) -> set:
+        """The server's capabilities (GET /v1/health), read once per five minutes."""
+        cached = getattr(self, "_capabilities", None)
+        if cached is not None and time.monotonic() - cached[0] < 300:
+            return cached[1]
+        try:
+            found = set(self.request("GET", "/v1/health", read_timeout=15).get("capabilities") or [])
+        except AgentNoteError:
+            found = set()
+        self._capabilities = (time.monotonic(), found)
+        return found
+
+    def claim(self, item_id: str, conversation_id: str | None, only_if_covering: bool = True) -> dict:
+        """Claim a reply or page for this conversation (protocol "Who answers"); the answer has _status."""
+        return self.request("POST", f"/v1/agent-notes/handling/{urllib.parse.quote(item_id)}/claim",
+                            body={"conversation_id": conversation_id, "only_if_covering": only_if_covering},
+                            allow=(409,))
+
+    def rules(self) -> dict:
+        return self.request("GET", "/v1/agent-notes/rules", allow=(404,))
+
+    def own_topic(self, body: dict) -> dict:
+        return self.request("POST", "/v1/agent-notes/owners", body=body)
+
+    def owners(self) -> dict:
+        return self.request("GET", "/v1/agent-notes/owners")
+
+    def release_topic(self, owner_id: str) -> None:
+        self.request("DELETE", f"/v1/agent-notes/owners/{urllib.parse.quote(owner_id)}")
+
+    def release_topics(self, conversation_id: str) -> None:
+        self.request("DELETE", "/v1/agent-notes/owners", query={"conversation_id": conversation_id})
+
+    def pages(self, after: int | None = None, wait: int = 0, conversation_id: str | None = None) -> dict:
+        wait = max(0, min(60, int(wait)))
+        return self.request("GET", "/v1/agent-notes/pages",
+                            query=dict(after=after, wait=wait, conversation_id=conversation_id), read_timeout=wait + 20)
 
     def download(self, url: str) -> bytes:
         """image_url / strokes_url from a record: a path on this server."""
@@ -787,6 +828,14 @@ class RenderServer:
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
+        # Chrome may close a connection before the answer is written (a request it gave up on):
+        # that is no error worth a traceback on stderr. Anything else still gets one.
+        server = self._server
+
+        def handle_error(request, address):
+            if not isinstance(sys.exc_info()[1], ConnectionError):
+                ThreadingHTTPServer.handle_error(server, request, address)
+        server.handle_error = handle_error
         self.proxy = f"127.0.0.1:{self._server.server_address[1]}"
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True,
                                         name="agent-note-render")
@@ -810,14 +859,25 @@ def chrome_path(environ=None) -> str:
 
 
 def chrome_command(chrome: str, profile: Path, url: str, height: int, screenshot: Path | None = None,
-                   budget_ms: int = 8000, proxy: str | None = None) -> list[str]:
+                   budget_ms: int = 8000, proxy: str | None = None, platform: str | None = None) -> list[str]:
     """One headless pass: --dump-dom (screenshot None) or --screenshot=<file>.
 
     Chrome gets no network: every request goes to @p proxy (a RenderServer, also for loopback
-    addresses, which Chrome would otherwise reach directly) and no host name resolves (the
-    proxy's own address is the one exception the resolver rule needs). Without a proxy it is
-    pointed at a closed port.
+    addresses, which Chrome would otherwise reach directly) and, on the Mac, no host name
+    resolves (the proxy's own address is the one exception the resolver rule needs). Without a
+    proxy it is pointed at a closed port.
+
+    On Linux (@p platform, sys.platform by default) Chromium differs in two ways:
+      - It keeps the profile's cookie key in the desktop keyring (Secret Service). When that
+        keyring is locked and nobody can unlock it, as on a server, every page loaded over
+        http, the note's own page included, waits forever; --password-store=basic keeps the
+        key in the throwaway profile instead (the Mac's --use-mock-keychain does the same).
+      - Any host rule (--host-resolver-rules, --host-rules) leaves a window lower than about
+        150 CSS px painted only in its first 128 device pixels, so a short note lost its lines
+        (Chromium 156 on Fedora). Linux goes without the resolver rule: the proxy still gets
+        every request, and Chromium resolves no host a page names (only its own service hosts).
     """
+    linux = (platform or sys.platform).startswith("linux")
     nice = "/usr/bin/nice" if os.path.exists("/usr/bin/nice") else "nice"
     argv = [nice, "-n", "10", chrome, "--headless=new", f"--user-data-dir={profile}", "--hide-scrollbars",
             f"--force-device-scale-factor={SCALE}", f"--window-size={PAGE_WIDTH},{height}",
@@ -825,10 +885,10 @@ def chrome_command(chrome: str, profile: Path, url: str, height: int, screenshot
             "--disable-extensions", "--disable-sync", "--disable-background-networking", "--disable-component-update",
             "--disable-default-apps", "--mute-audio", "--run-all-compositor-stages-before-draw",
             f"--proxy-server=http://{proxy or '127.0.0.1:9'}", "--proxy-bypass-list=<-loopback>",
-            "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1", "--no-pings", "--disable-quic",
-            "--disable-domain-reliability", "--disable-client-side-phishing-detection",
+            "--no-pings", "--disable-quic", "--disable-domain-reliability", "--disable-client-side-phishing-detection",
             # The page's address is http on purpose; Chrome must not try https for it first.
             "--disable-features=HttpsUpgrades"]
+    argv.append("--password-store=basic" if linux else "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
     argv.append(f"--screenshot={screenshot}" if screenshot is not None else "--dump-dom")
     argv.append(url)
     return argv
@@ -1391,6 +1451,15 @@ def wait_for_reply(note_id: str, wait_seconds: float = 0, client: Client | None 
     """The newest reply to note_id (local entry), long-polling in steps of <= 60 s until the deadline; None if none."""
     client = client or default_client()
     root = root or notes_root()
+    # A reply that is already there comes from the note itself, whichever device sent the note (a topic
+    # this conversation owns may hold notes of other devices, which this Mac's reply feed does not list).
+    note = client.get_note(note_id)
+    note = note.get("note", note) if isinstance(note, dict) else {}
+    existing = [reply for reply in note.get("replies") or [] if isinstance(reply, dict) and reply.get("reply_id")]
+    if existing:
+        newest = max(existing, key=lambda reply: reply.get("sequence") or 0)
+        summary = {key: note.get(key) for key in ("note_id", "title", "document_id", "review_card_id")}
+        return store_reply(client, root, {**newest, "note": summary})
     deadline = clock() + max(0.0, wait_seconds)
     position = 0
     while True:
@@ -1410,6 +1479,86 @@ def wait_for_reply(note_id: str, wait_seconds: float = 0, client: Client | None 
         position = max(position, result["cursor"])
         if deadline - clock() <= 0.05:
             return None
+
+
+# ---------------------------------------------------------------- who answers (protocol "Who answers")
+
+CLAIMS_CAPABILITY = "agent_note_claims_v1"
+OWNERS_CAPABILITY = "agent_note_owners_v1"
+RULES_CAPABILITY = "agent_note_rules_v1"
+RULES_NOTE = "agent-note-rules.md"
+_rules_cache: dict = {}
+
+
+def answering_rules(client: Client | None = None, max_age: float = 60.0) -> dict:
+    """The user's answering rules for every agent (the Library note agent-note-rules.md, served by the
+    Thoughts server): {"text", "sha256", "source_path", ...}, or {"text": None, "missing": why}."""
+    client = client or default_client()
+    cached = _rules_cache.get(id(client))
+    if cached is not None and time.monotonic() - cached[0] < max_age:
+        return cached[1]
+    if RULES_CAPABILITY not in client.capabilities():
+        found = {"text": None, "missing": "this Thoughts server does not serve answering rules yet"}
+    else:
+        answer = client.rules()
+        if answer.get("_status") == 404 or not isinstance(answer.get("text"), str):
+            found = {"text": None, "missing": f"the Library has no note named {RULES_NOTE} yet"}
+        else:
+            found = {key: answer.get(key) for key in ("text", "sha256", "source_path", "revision", "updated_at")}
+    _rules_cache[id(client)] = (time.monotonic(), found)
+    return found
+
+
+def claim_item(item_id: str, conversation_id: str | None, client: Client | None = None) -> dict:
+    """Claims a reply (its reply_id) or a page (its note_id) for this conversation, only when it covers it.
+
+    Returns {"state": "yours" | "taken" | "not_yours" | "unknown", "claim": ..., "next_step": what to do}.
+    The first claim wins on the server, so two agents never both answer the same reply or page."""
+    client = client or default_client()
+    if CLAIMS_CAPABILITY not in client.capabilities():
+        return {"state": "unknown", "claim": None, "next_step": ""}
+    answer = client.claim(item_id, conversation_id)
+    claim = answer.get("claim") if isinstance(answer.get("claim"), dict) else None
+    if answer.get("claimed"):
+        return {"state": "yours", "claim": claim,
+                "next_step": "This conversation answers it (claimed for you): answer it following the user's "
+                             "answering rules below."}
+    if answer.get("error_code") == "agent_note_claimed" and claim:
+        role = claim.get("role")
+        who = ("the Thoughts reply agent" if role == "responder" else
+               f"another agent ({claim.get('device_id')}"
+               + (f", conversation {claim['conversation_id']}" if claim.get("conversation_id") else "") + ")")
+        done = " It already answered with note " + claim["answer_note_id"] + "." if claim.get("answer_note_id") else ""
+        return {"state": "taken", "claim": claim,
+                "next_step": f"{who[0].upper()}{who[1:]} answers it.{done} Do not answer it again; read it only if "
+                             "your own task needs it."}
+    return {"state": "not_yours", "claim": None,
+            "next_step": "This conversation does not cover it: the agent that sent the note, the topic's owner or "
+                         "the Thoughts reply agent answers it. Read it, but answer it with a note only if the user "
+                         "asks you here."}
+
+
+def own_topic(conversation_id: str, label: str | None = None, document_ids: list | None = None,
+              review_card_ids: list | None = None, title_tags: list | None = None, captures: bool = False,
+              client: Client | None = None) -> dict:
+    client = client or default_client()
+    if OWNERS_CAPABILITY not in client.capabilities():
+        raise AgentNoteError("unsupported", "This Thoughts server does not support topic owners yet (agent_note_owners_v1).")
+    body = {"conversation_id": conversation_id, "label": label, "document_ids": document_ids or [],
+            "review_card_ids": review_card_ids or [], "title_tags": title_tags or [], "captures": bool(captures)}
+    return client.own_topic({key: value for key, value in body.items() if value is not None})
+
+
+def release_topic(owner_id: str | None, conversation_id: str | None, client: Client | None = None) -> dict:
+    client = client or default_client()
+    if owner_id:
+        client.release_topic(owner_id)
+        return {"released": [owner_id]}
+    if not conversation_id:
+        raise AgentNoteError("invalid_agent_note", "Name the topic (owner_id) or run inside the owning conversation.")
+    mine = [row["owner_id"] for row in client.owners().get("owners") or [] if row.get("conversation_id") == conversation_id]
+    client.release_topics(conversation_id)
+    return {"released": mine}
 
 
 def has_recent_note(root: Path, seconds: float = RECENT_SECONDS) -> bool:
@@ -1548,16 +1697,23 @@ def send_note(title: str, *, image_path: str | None = None, html: str | None = N
         next_step = ("No phone is listening right now. Ask the user to open Thoughts on the phone (or tap the "
                      "\"Agent note\" notification); a phone that is not listening receives the note within about 15 minutes. "
                      f"Then call get_note_reply(note_id=\"{note_id}\", wait_seconds=300) or watch {directory} for reply-*.png.")
-    if reply_listening.get("state") != "listening":
+    # The listeners the server lists cover this note; a sender's one is this conversation (or this Mac's --all
+    # watcher), unlike a topic owner or the reply agent, which do not make this conversation hear its reply.
+    ours = [row for row in reply_listening.get("listeners") or [] if isinstance(row, dict)
+            and row.get("role", "sender") == "sender" and not row.get("responder")]
+    if reply_listening.get("state") != "listening" or not ours:
         next_step += (" Nothing in this conversation is listening for the user's reply yet, and the phone shows the user "
                       "that no agent is listening. Before you end your turn, start thoughts-watch-replies as a background "
                       "monitor (one line per reply or page; it listens for this conversation's notes), so a reply that "
                       "comes after your turn still reaches you.")
+    next_step += (" You answer the replies to your notes while you run: get_note_reply claims a reply for this "
+                  "conversation and hands you the user's answering rules; follow them.")
     result = {"note_id": note_id, "title": note.get("title", title), "created_at": note.get("created_at"),
               "review_card_id": note.get("review_card_id", review_card_id), "document_id": note.get("document_id", document_id),
               "review_question": note.get("review_question"),
               "delivery": {"live": live, "listeners": delivery.get("listeners") or []},
-              # An agent of this conversation that will hear the user's reply (thoughts-watch-replies, get_note_reply).
+              # Who hears the user's reply: this conversation (thoughts-watch-replies, get_note_reply), a topic
+              # owner (role owner) or the Thoughts reply agent (role responder).
               "reply_listening": {"state": reply_listening.get("state") or "unknown",
                                   "listeners": reply_listening.get("listeners") or []},
               # Per phone that stored the note (servers before per-device delivery send none).

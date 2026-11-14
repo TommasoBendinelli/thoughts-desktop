@@ -3,7 +3,9 @@
 // desktop: decision claims (write-ahead with the source, attach, expire, undo
 // drop, conflict carry), thoughtsctl decide-proposal, and Restore Proposal
 // against autotests/data/agent-proposals/decisions.json (a copy of the
-// server's protocol/fixtures/agent-proposals/decisions.json).
+// server's protocol/fixtures/agent-proposals/decisions.json). Also the
+// publisher's frozen source that its own merge cannot join and Fedora's
+// proposal-aware merge does.
 
 #include "../part/desktopsyncstore.h"
 #include "../part/projectconfiguration.h"
@@ -16,6 +18,7 @@
 #include "../tools/publisher/managedsource.h"
 #include "../tools/publisher/sourceapi.h"
 #include "../tools/publisher/sourcepublisher.h"
+#include "../tools/publisher/sourcereconciliation.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -40,10 +43,19 @@ using namespace Thoughts;
 
 namespace
 {
+// The publisher pauses 1, 2 and 4 s before it sends an unanswered request again; these
+// tests do not wait that long.
+const bool shortRetryPauses = (Thoughts::Publisher::SourceApi::setRetryDelays({1, 2, 4}), true);
+}
+
+namespace
+{
 const QString Relative = QStringLiteral("docs-x/tex/source/a.tex");
 const QString Wrapper = QStringLiteral("\\agentProposedEdit[created=2026-10-10T12:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]{agent-1}{Clarify.\n}{Old line.\n}{New line.\n}");
 const QString Base = QStringLiteral("Intro.\n") + Wrapper + QStringLiteral("Outro.\n");
 const QString FixtureWrapperSha256 = QStringLiteral("252bfd0570e87e771344faa0a2033f6d46454250eaf6f11d2ea7e8644f76dd8e");
+// Another agent proposal, around the line after the first one.
+const QString SecondWrapper = QStringLiteral("\\agentProposedEdit[created=2026-10-10T12:05:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]{agent-2}{Shorten.\n}{Outro.\n}{End.\n}");
 
 QString sha(const QByteArray &bytes)
 {
@@ -82,8 +94,9 @@ QJsonObject removedRow(const QJsonObject &snapshot, int line, const QString &sou
             {QStringLiteral("revision"), 4}, {QStringLiteral("deleted"), false}};
 }
 
-// A minimal Fedora source API for the publisher: sources, objects, health and
-// atomic source publications. Every publication request body is kept.
+// A minimal Fedora source API for the publisher: sources, objects, health,
+// atomic source publications and single source applies. Every publication and
+// apply request body is kept.
 class FakeSourceServer : public QObject
 {
 public:
@@ -105,6 +118,29 @@ public:
     QList<QJsonObject> publications;
     QHash<QString, QJsonObject> heads;
     int frontier = 0;
+    // POST /v1/sources/apply: Fedora's merge result, committed as the next
+    // revision and answered "merged"; an operation seen before is answered
+    // "duplicate" with the current head, as Fedora answers from its record.
+    QByteArray applyResult;
+    // Answers without the result's identity.
+    bool malformedApplyAnswer = false;
+    // Commits, then answers 504 as a proxy that lost Fedora's answer.
+    int loseNextApplyAnswers = 0;
+    // Runs while Fedora merges, before it answers.
+    std::function<void()> whileApplying;
+    QList<QJsonObject> applies;
+
+    // A new revision of `file` written on Fedora (another device or an agent).
+    QJsonObject commit(const QString &file, const QByteArray &content)
+    {
+        const QString digest = sha(content);
+        m_objects.insert(digest, content);
+        const QJsonObject head{{QStringLiteral("path"), file}, {QStringLiteral("revision"), heads.value(file).value(QStringLiteral("revision")).toInt() + 1},
+                               {QStringLiteral("sha256"), digest}, {QStringLiteral("object_sha256"), digest}, {QStringLiteral("deleted"), false}};
+        heads.insert(file, head);
+        ++frontier;
+        return head;
+    }
 
 private:
     void handle(QTcpSocket *socket)
@@ -144,6 +180,34 @@ private:
             const QString digest = path.mid(12);
             status = m_objects.contains(digest) ? 200 : 404;
             if (method == "GET") response = m_objects.value(digest);
+        } else if (method == "POST" && path == QLatin1String("/v1/sources/apply")) {
+            const QJsonObject mutation = QJsonDocument::fromJson(body).object();
+            applies.append(mutation);
+            const QString file = mutation.value(QStringLiteral("path")).toString();
+            const QString operation = mutation.value(QStringLiteral("operation_id")).toString();
+            QJsonObject result;
+            if (m_appliedOperations.contains(operation)) {
+                result = heads.value(file);
+                result.remove(QStringLiteral("deleted"));
+                result.insert(QStringLiteral("outcome"), QStringLiteral("duplicate"));
+            } else {
+                m_appliedOperations.insert(operation);
+                result = commit(file, applyResult);
+                result.remove(QStringLiteral("deleted"));
+                result.insert(QStringLiteral("outcome"), QStringLiteral("merged"));
+                if (malformedApplyAnswer) {
+                    result.remove(QStringLiteral("sha256"));
+                    result.remove(QStringLiteral("object_sha256"));
+                }
+            }
+            result.insert(QStringLiteral("server_sequence"), frontier);
+            response = QJsonDocument(result).toJson(QJsonDocument::Compact);
+            if (whileApplying) whileApplying();
+            if (loseNextApplyAnswers > 0) {
+                --loseNextApplyAnswers;
+                status = 504;
+                response = "{\"detail\":\"gateway timeout\"}";
+            }
         } else if (method == "POST" && path == QLatin1String("/v1/source-publications")) {
             const QJsonObject publication = QJsonDocument::fromJson(body).object();
             publications.append(publication);
@@ -190,6 +254,7 @@ private:
     QTcpServer m_server;
     QHash<QTcpSocket *, QByteArray> m_buffers;
     QHash<QString, QByteArray> m_objects;
+    QSet<QString> m_appliedOperations;
 };
 
 // A Project in `root` whose connected folder is `owner`.
@@ -228,13 +293,48 @@ struct Workspace {
     {
         return publishTo(server.url(), QStringLiteral("token"), failure, messages);
     }
-    bool publishTo(const QString &url, const QString &token, QString *failure = nullptr, QStringList *messages = nullptr)
+    // One publishOnce of the source as Desktop freezes it when Sync starts:
+    // its bytes now, against the base the publisher's state records.
+    // `desktopBase`: the base Desktop's own record names, when it has not
+    // caught up with the publisher's state.
+    bool publishFrozen(FakeSourceServer &server, QString *failure = nullptr, QStringList *messages = nullptr, const QString &desktopBase = {})
+    {
+        const QByteArray content = read(source());
+        Publisher::FrozenEntry entry;
+        entry.path = relative;
+        entry.action = QStringLiteral("upsert");
+        entry.sha256 = sha(content);
+        entry.sizeBytes = content.size();
+        entry.content = content;
+        entry.baseSha256 = state().value(QStringLiteral("bases")).toObject().value(relative).toObject().value(QStringLiteral("sha256")).toString(Publisher::emptySha256);
+        if (!desktopBase.isEmpty()) entry.baseSha256 = desktopBase;
+        Publisher::FrozenInputs frozen;
+        frozen.sourceRoot = Py::Path(root());
+        frozen.sources.append(entry);
+        return publishTo(server.url(), QStringLiteral("token"), failure, messages, &frozen);
+    }
+    // The editable-source installer of a Sync, through Fedora's frontier.
+    bool install(FakeSourceServer &server, QString *failure = nullptr)
+    {
+        Publisher::SourceApi api(server.url(), QStringLiteral("token"), 30);
+        try {
+            Publisher::SourcePublisher publisher(Py::Path(root()), Py::Path(manifest()),
+                                                 Py::Path(QDir(stateRoot()).filePath(QStringLiteral("source-publication.json"))), api);
+            Publisher::reconcileAuthoringSources(publisher, server.frontier);
+            return true;
+        } catch (const Py::Exception &error) {
+            if (failure) *failure = error.line();
+            return false;
+        }
+    }
+    bool publishTo(const QString &url, const QString &token, QString *failure = nullptr, QStringList *messages = nullptr,
+                   const Publisher::FrozenInputs *frozen = nullptr)
     {
         Publisher::SourceApi api(url, token, 30);
         try {
             Publisher::SourcePublisher publisher(Py::Path(root()), Py::Path(manifest()),
                                                  Py::Path(QDir(stateRoot()).filePath(QStringLiteral("source-publication.json"))), api, std::nullopt,
-                                                 std::nullopt, std::nullopt, nullptr, [messages](const QString &message, const Publisher::ProgressFields &) {
+                                                 std::nullopt, std::nullopt, frozen, [messages](const QString &message, const Publisher::ProgressFields &) {
                                                      if (messages) messages->append(message);
                                                  });
             publisher.publishOnce();
@@ -284,6 +384,11 @@ private Q_SLOTS:
     void testRetriedPublicationSendsTheSameClaims();
     void testClaimsWaitWhenTheServerCannotBeAsked();
     void testConflictResolutionCarriesClaims();
+    void testFedoraMergeOfAConflictingSourceIsInstalled();
+    void testUnansweredSourceApplyIsRepeated();
+    void testEditDuringFedoraMergeKeepsItsBase();
+    void testFrozenCopyOnDesktopsEarlierBase_data();
+    void testFrozenCopyOnDesktopsEarlierBase();
     void testClaimsAgainstServer();
     void testDecideProposalCommand();
     void testRestoreRemovedProposal();
@@ -296,7 +401,7 @@ void ProposalDecisionsTest::initTestCase()
     const QJsonObject data = fixtures();
     QCOMPARE(data.value(QStringLiteral("schema_version")).toInt(), 1);
     QCOMPARE(data.value(QStringLiteral("attach")).toArray().size(), 4);
-    QCOMPARE(data.value(QStringLiteral("restore")).toArray().size(), 21);
+    QCOMPARE(data.value(QStringLiteral("restore")).toArray().size(), 27);
 }
 
 void ProposalDecisionsTest::testWrapperSha256()
@@ -750,13 +855,19 @@ void ProposalDecisionsTest::testRetriedPublicationSendsTheSameClaims()
     FakeSourceServer server;
     QVERIFY(workspace.publish(server));
     QVERIFY(workspace.decide(QStringLiteral("accept")));
-    server.failNextPublications = 1;
+    // Since 14 November 2026 the publisher itself sends a publication again when the
+    // server is unavailable (three times). The run fails only when the server stays
+    // unavailable; the next run then sends the same request.
+    server.failNextPublications = 4;
     QVERIFY(!workspace.publish(server));
     QCOMPARE(ProposalDecisions::storedClaims(workspace.database()).size(), 1);
     QVERIFY(workspace.state().value(QStringLiteral("pending_publication")).toObject().contains(QStringLiteral("proposal_decisions")));
     QVERIFY(workspace.publish(server));
-    QCOMPARE(server.publications.size(), 3);
-    QCOMPARE(server.publications.at(2), server.publications.at(1));
+    // The first publication, the four refused sendings and the one that arrived.
+    QCOMPARE(server.publications.size(), 6);
+    for (int sending = 2; sending < 6; ++sending) {
+        QCOMPARE(server.publications.at(sending), server.publications.at(1));
+    }
     QVERIFY(ProposalDecisions::storedClaims(workspace.database()).isEmpty());
     QVERIFY(!workspace.state().contains(QStringLiteral("pending_publication_decisions")));
 }
@@ -927,6 +1038,198 @@ void ProposalDecisionsTest::testConflictResolutionCarriesClaims()
     // A resolution that keeps the wrapper undoes the decision: the claim is dropped.
     QVERIFY(ProposalDecisions::claimsForConflictResolution(workspace.database(), Relative, Base, &error).isEmpty());
     QVERIFY(ProposalDecisions::storedClaims(workspace.database()).isEmpty());
+}
+
+// The user accepted a proposal here while an agent proposed another edit
+// next to it on Fedora. This computer's merge conflicts, so the frozen source
+// goes to Fedora alone; Fedora's merge joins both and commits the result,
+// which becomes the file and its base, so the next Sync sends nothing. (On
+// 2026-11-13 the answer was refused as inconsistent and every automatic Sync
+// sent the change again, each time committed as one more revision.)
+void ProposalDecisionsTest::testFedoraMergeOfAConflictingSourceIsInstalled()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray accepted = "Intro.\nNew line.\nOutro.\n";
+    const QByteArray merged = (QStringLiteral("Intro.\nNew line.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (Base + SecondWrapper).toUtf8());
+    QVERIFY(write(workspace.source(), accepted));
+    server.applyResult = merged;
+
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 1);
+    QCOMPARE(server.applies.first().value(QStringLiteral("content_sha256")).toString(), sha(accepted));
+    QCOMPARE(server.applies.first().value(QStringLiteral("base_sha256")).toString(), sha(Base.toUtf8()));
+    QCOMPARE(server.publications.size(), 1);
+    QCOMPARE(read(workspace.source()), merged);
+    const QJsonObject base{{QStringLiteral("revision"), 3}, {QStringLiteral("sha256"), sha(merged)}, {QStringLiteral("object_sha256"), sha(merged)}};
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject(), base);
+    QVERIFY(!workspace.state().contains(QStringLiteral("conflicts")));
+    QVERIFY(!workspace.state().contains(QStringLiteral("pending_source_applies")));
+    const QString log = messages.join(QLatin1Char('\n'));
+    QVERIFY2(log.contains(QStringLiteral("The server merged source change %1 into revision 3.").arg(Relative)), qPrintable(log));
+    QVERIFY2(log.contains(QStringLiteral("1 updated")), qPrintable(log));
+
+    // The next Syncs, frozen or not, have nothing to send.
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 1);
+    QCOMPARE(server.publications.size(), 1);
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 3);
+    QCOMPARE(read(workspace.source()), merged);
+}
+
+// Fedora committed the source sent alone but its answer was lost, or came
+// back without the result's identity: the retry sends the same operation,
+// which Fedora answers from its record, so the change is committed once.
+void ProposalDecisionsTest::testUnansweredSourceApplyIsRepeated()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray accepted = "Intro.\nNew line.\nOutro.\n";
+    const QByteArray merged = (QStringLiteral("Intro.\nNew line.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (Base + SecondWrapper).toUtf8());
+    QVERIFY(write(workspace.source(), accepted));
+    server.applyResult = merged;
+    server.loseNextApplyAnswers = 1;
+
+    QVERIFY(!workspace.publishFrozen(server, &failure));
+    QVERIFY2(failure.contains(QStringLiteral("gateway timeout")), qPrintable(failure));
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 3);
+    QCOMPARE(read(workspace.source()), accepted);
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("revision")).toInt(), 1);
+    QCOMPARE(workspace.state().value(QStringLiteral("pending_source_applies")).toObject().value(Relative).toObject(), server.applies.first());
+
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 2);
+    QCOMPARE(server.applies.at(1), server.applies.at(0));
+    QVERIFY2(messages.join(QLatin1Char('\n')).contains(QStringLiteral("Repeating the unanswered source change %1").arg(Relative)), qPrintable(messages.join(QLatin1Char('\n'))));
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 3);
+    QCOMPARE(read(workspace.source()), merged);
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("sha256")).toString(), sha(merged));
+    QVERIFY(!workspace.state().contains(QStringLiteral("pending_source_applies")));
+
+    // An answer without the result's identity is refused and nothing is installed.
+    const QByteArray mine = (QStringLiteral("Intro.\nNew line, edited here.\n") + SecondWrapper).toUtf8();
+    const QByteArray both = (QStringLiteral("Intro.\nNew line, edited on both sides.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (QStringLiteral("Intro.\nNew line, edited on Fedora.\n") + SecondWrapper).toUtf8());
+    QVERIFY(write(workspace.source(), mine));
+    server.applyResult = both;
+    server.malformedApplyAnswer = true;
+    QVERIFY(!workspace.publishFrozen(server, &failure));
+    QVERIFY2(failure.contains(QStringLiteral("the server returned an inconsistent source merge result: ") + Relative), qPrintable(failure));
+    QCOMPARE(read(workspace.source()), mine);
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("revision")).toInt(), 3);
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 5);
+    // The retry is answered from Fedora's record.
+    server.malformedApplyAnswer = false;
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 4);
+    QCOMPARE(server.applies.at(3), server.applies.at(2));
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 5);
+    QCOMPARE(read(workspace.source()), both);
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 4);
+    QCOMPARE(server.publications.size(), 1);
+}
+
+// The user edited the file again while Fedora merged its frozen copy: the
+// newer edit stays, and so does the base it was written on, so the next Sync
+// merges it with Fedora's result instead of replacing that result.
+void ProposalDecisionsTest::testEditDuringFedoraMergeKeepsItsBase()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray accepted = "Intro.\nNew line.\nOutro.\n";
+    const QByteArray newer = "Intro.\nNew line.\nOutro.\nMore.\n";
+    const QByteArray merged = (QStringLiteral("Intro.\nNew line.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (Base + SecondWrapper).toUtf8());
+    QVERIFY(write(workspace.source(), accepted));
+    server.applyResult = merged;
+    server.whileApplying = [&] { QVERIFY(write(workspace.source(), newer)); };
+
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages), qPrintable(failure));
+    QCOMPARE(read(workspace.source()), newer);
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("sha256")).toString(), sha(Base.toUtf8()));
+    QVERIFY2(messages.join(QLatin1Char('\n')).contains(QStringLiteral("the next Sync merges the newer edit")), qPrintable(messages.join(QLatin1Char('\n'))));
+
+    server.whileApplying = nullptr;
+    server.applyResult = merged + "More.\n";
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 2);
+    QCOMPARE(server.applies.at(1).value(QStringLiteral("base_sha256")).toString(), sha(Base.toUtf8()));
+    QCOMPARE(server.applies.at(1).value(QStringLiteral("content_sha256")).toString(), sha(newer));
+    QCOMPARE(read(workspace.source()), merged + "More.\n");
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("revision")).toInt(), 4);
+}
+
+void ProposalDecisionsTest::testFrozenCopyOnDesktopsEarlierBase_data()
+{
+    QTest::addColumn<QByteArray>("localBefore");
+    QTest::addColumn<QByteArray>("editAfter");
+    QTest::addColumn<bool>("onInstalledBase");
+    // The installer merges Fedora's revision with a local edit; the file is edited again before Desktop records the merge.
+    QTest::newRow("merged, then edited") << QByteArray("a\nb\nc\nd\ne\nf\ng\nH\n") << QByteArray("A\nb\nc\nD\ne\nf\ng\nH\n") << true;
+    // The installer installs Fedora's revision; Desktop could not record it (the database was locked); then an edit.
+    QTest::newRow("installed, then edited") << QByteArray() << QByteArray("A\nb\nc\nD\ne\nf\ng\nh\n") << true;
+    // An editor saves its copy from before the merge over it: Fedora's "A" is missing.
+    QTest::newRow("older copy saved over the merge") << QByteArray("a\nb\nc\nd\ne\nf\ng\nH\n") << QByteArray("a\nb\nc\nD\ne\nf\ng\nH\n") << false;
+}
+
+// 13 Nov: the installer moved the publisher's base to Fedora's revision while
+// Desktop kept its own older base, and every frozen Sync was refused with
+// "frozen Desktop source has no matching authoring or server base". A frozen
+// copy on that earlier base is published against the installed base when it
+// holds every change Fedora made since, and merged against the earlier base
+// otherwise, so Fedora's changes are never taken back.
+void ProposalDecisionsTest::testFrozenCopyOnDesktopsEarlierBase()
+{
+    QFETCH(QByteArray, localBefore);
+    QFETCH(QByteArray, editAfter);
+    QFETCH(bool, onInstalledBase);
+    Workspace workspace;
+    const QByteArray first = "a\nb\nc\nd\ne\nf\ng\nh\n";
+    const QByteArray installed = "A\nb\nc\nd\ne\nf\ng\nh\n";
+    QVERIFY(workspace.prepare(QString::fromUtf8(first)));
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    server.commit(Relative, installed);
+    if (!localBefore.isEmpty()) QVERIFY(write(workspace.source(), localBefore));
+    QVERIFY2(workspace.install(server, &failure), qPrintable(failure));
+    QCOMPARE(workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("sha256")).toString(), sha(installed));
+    QVERIFY(write(workspace.source(), editAfter));
+
+    // A base Desktop never had stays refused.
+    QVERIFY(!workspace.publishFrozen(server, &failure, nullptr, sha("unrelated\n")));
+    QVERIFY2(failure.contains(QStringLiteral("frozen Desktop source has no matching authoring or server base: ") + Relative), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 1);
+
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages, sha(first)), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
+    const QJsonObject sent = server.publications.last().value(QStringLiteral("mutations")).toArray().first().toObject();
+    QCOMPARE(sent.value(QStringLiteral("content_sha256")).toString(), sha(editAfter));
+    QCOMPARE(sent.value(QStringLiteral("base_sha256")).toString(), onInstalledBase ? sha(installed) : sha(first));
+    QCOMPARE(sent.value(QStringLiteral("base_object_sha256")).toString(), onInstalledBase ? sha(installed) : sha(first));
+    const QString log = messages.join(QLatin1Char('\n'));
+    QVERIFY2(log.contains(onInstalledBase ? QStringLiteral("the file holds every change since") : QStringLiteral("merged against that earlier base")), qPrintable(log));
+    // Desktop then records the published bytes: nothing more to send.
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
+    QVERIFY(!workspace.state().value(QStringLiteral("superseded_bases")).toObject().contains(Relative));
 }
 
 void ProposalDecisionsTest::testDecideProposalCommand()

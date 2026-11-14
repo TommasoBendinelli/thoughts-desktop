@@ -50,6 +50,9 @@
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QTextBrowser>
+#include <QAbstractTextDocumentLayout>
+#include <QTextBlock>
+#include <QTextList>
 #include <QDir>
 #include <QDomDocument>
 #include <QFile>
@@ -144,6 +147,7 @@
 #include "../shell/shell.h"
 #include "../shell/agentdocumentdescription.h"
 #include "../shell/shellutils.h"
+#include "../shell/syncjournal.h"
 #include "../shell/thoughtscommandprotocol.h"
 #include "closedialoghelper.h"
 
@@ -278,8 +282,13 @@ public:
     };
 
     int conditionalFullSyncs = 0;
+    int remoteWorkChecks = 0;
     QList<TargetCall> targetCalls;
     QJsonArray sidebarCards;
+
+    // The question the shell asks the server through the gateway part; a test
+    // answers it by emitting fedoraRemoteWorkChecked.
+    Q_INVOKABLE void checkFedoraRemoteWork() { ++remoteWorkChecks; }
 
     Q_INVOKABLE void setSidebarReviewCards(const QJsonArray &cards) { sidebarCards = cards; }
 
@@ -303,15 +312,20 @@ public:
         return {};
     }
 
+    // What the repository reports about the Sync that just ended (its error code).
+    QVariantMap manualSyncState;
     Q_INVOKABLE QVariantMap fedoraManualSyncState() const
     {
-        return {};
+        return manualSyncState;
     }
 
     Q_INVOKABLE QVariantMap globalPendingChanges() const
     {
         return {};
     }
+
+Q_SIGNALS:
+    void fedoraRemoteWorkChecked(bool pending, const QString &stateKey);
 
 protected:
     bool saveFile() override
@@ -533,6 +547,7 @@ private Q_SLOTS:
     void testDocumentSyncSummaryDoesNotLoadHistory();
     void testLegacyEmbeddedJournalMigrationIsIdempotent();
     void testLogsStayResponsiveDuringTraceReplay();
+    void testLogsLoadOnePageAndRefreshInPlace();
     void testSourceConflictStaysOfferedAfterLaterSyncs();
     void testResolveSourceConflictCommand();
     void testSourceFilesNeedingMergeListsEachFileAndWhy();
@@ -545,6 +560,11 @@ private Q_SLOTS:
     void testSyncEndingWhileNoWindowListenedIsRecorded();
     void testOverviewTerminalStateWhileModalLogOpen();
     void testSyncDispatchRenderPolicies();
+    void testMenusCarryNoIconsOnMac();
+    void testAutomaticSyncWaitsAfterFailures();
+    void testAnEndedBuildStartsItsSyncAtOnce();
+    void testSucceededSyncKeepsItsBuildWarning();
+    void testProposalDecisionStartsOneSync();
     void testVisibleSyncButtonsUseGlobalScope_data();
     void testVisibleSyncButtonsUseGlobalScope();
     void testTargetSyncDispatchPolicies();
@@ -598,6 +618,12 @@ private Q_SLOTS:
     void testReviewBarStartsWithLastAnswerTags();
     void testReviewInTwoSteps();
     void testReviewAsksForARecallPrediction();
+    void testReviewMergeOfTheCardUnderReviewKeepsItsBeforeStep();
+    void testReviewReloadKeepsTheCardUnderReview();
+    void testReviewBeforeLineAndPencil();
+    void testReviewWithoutGroupsAskedBefore();
+    void testReviewTakeBackAnswerFromHistory();
+    void testReviewRefreshCostWithManyCards();
     void testReviewPanelSurvivesClosingItsReaderTab();
     void testReviewPanelFloatsOverANativeDocumentView();
     void testReviewOfAnAttachmentCardShowsTheStoredAnswerWhenNotFound();
@@ -635,6 +661,9 @@ private Q_SLOTS:
     void testHtmlAttachmentCardAndFeedbackOpenInItsTab();
 
 private:
+    // The review queue, the document filter and the counts come from a background refresh
+    // (ReviewOverview::requestQueueRefresh): whether the last one asked for has been applied.
+    static bool queueRefreshed(const Thoughts::ReviewOverview &overview);
 };
 
 QList<Shell *> getShells()
@@ -652,6 +681,31 @@ QList<Shell *> getShells()
 
 // A library-looking PDF path below the test home. The tests only label the
 // active document with it; the shell's state for it is set directly.
+// The Sync journal stores what the app reports on its own thread, a burst at a
+// time. A test that looks at the file waits until everything reported so far is
+// in it, and finishes each statement once it has read its row: a statement left
+// on a row keeps the test's connection on the journal as it was at that moment.
+static void flushSyncJournal()
+{
+    Thoughts::SyncJournal::instance()->flush();
+}
+
+// The journal's own connection belongs to its thread; tests read and prepare
+// the file through this one.
+static QSqlDatabase syncJournalDatabase()
+{
+    flushSyncJournal();
+    static const QString name = QStringLiteral("thoughts-sync-operations-test");
+    if (!QSqlDatabase::contains(name)) {
+        QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        database.setDatabaseName(Thoughts::SyncJournal::instance()->path());
+        if (database.open()) {
+            QSqlQuery(database).exec(QStringLiteral("PRAGMA busy_timeout=10000"));
+        }
+    }
+    return QSqlDatabase::database(name);
+}
+
 static QString libraryPdfLabel()
 {
     return QDir::home().filePath(QStringLiteral("docs/current_pdfs/concepts.pdf"));
@@ -3665,6 +3719,36 @@ void MainShellTest::testSidebarReviewCardsProjection()
     projections.insert(key, card);
     shell.refreshSidebarReviewCards(&part, projections);
     QVERIFY(part.sidebarCards.isEmpty());
+
+    // Retired on a version of the PDF: the Library's tab gets it as retired (it lists it only
+    // with the Retired filter), and that version, opened from History, gets it and no other card.
+    const QString version = QString(64, QLatin1Char('e'));
+    primary.insert(QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage"));
+    primary.insert(QStringLiteral("pdf_sha256"), version);
+    card.insert(QStringLiteral("primary"), primary);
+    projections.insert(key, card);
+    const QString otherId = QStringLiteral("0190a000-0000-7000-8000-0000000000c1");
+    QJsonObject other = card;
+    other.insert(QStringLiteral("card_id"), otherId);
+    projections.insert(QStringLiteral("review_card\ncards\n") + otherId, other);
+    const QString retireId = QStringLiteral("0190a000-0000-7000-8000-0000000000c2");
+    projections.insert(QStringLiteral("review_event\nevents\n") + retireId,
+                       QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), retireId}, {QStringLiteral("card_id"), id},
+                                   {QStringLiteral("queue_action"), QStringLiteral("retire")}, {QStringLiteral("reviewed_at"), QStringLiteral("2026-09-20T10:00:00Z")}});
+    shell.refreshSidebarReviewCards(&part, projections);
+    QCOMPARE(part.sidebarCards.size(), 2);
+    for (const QJsonValue &value : std::as_const(part.sidebarCards)) {
+        const QJsonObject listed = value.toObject();
+        QCOMPARE(listed.value(QStringLiteral("sidebar_schedule")).toObject().value(QStringLiteral("state")).toString(),
+                 listed.value(QStringLiteral("card_id")).toString() == id ? QStringLiteral("retired") : QStringLiteral("new"));
+    }
+    SyncDispatchProbe versionPart;
+    versionPart.setDocumentUrl(QUrl::fromLocalFile(Thoughts::PdfVersions::cachePath(Thoughts::PdfVersions::defaultCacheRoot(), version)));
+    shell.refreshSidebarReviewCards(&versionPart, projections);
+    QCOMPARE(versionPart.sidebarCards.size(), 1);
+    QCOMPARE(versionPart.sidebarCards.first().toObject().value(QStringLiteral("card_id")).toString(), id);
+    QCOMPARE(versionPart.sidebarCards.first().toObject().value(QStringLiteral("sidebar_schedule")).toObject().value(QStringLiteral("state")).toString(),
+             QStringLiteral("retired"));
 }
 
 void MainShellTest::testCommentsOverviewStartup()
@@ -4602,7 +4686,7 @@ void MainShellTest::testReadingToolbarStaysStillDuringSync()
     QVERIFY(!shell->m_pdfLibraryWidgetAction->menu());
 
     Shell::latestGlobalSyncOperationSummary();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     const QString id = QStringLiteral("reading-toolbar-test-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     const auto removeRun = qScopeGuard([&] {
         QSqlQuery remove(database);
@@ -4884,7 +4968,7 @@ void MainShellTest::testTargetBuildDispatch()
 void MainShellTest::testLastSuccessfulGlobalSyncUsesGlobalScope()
 {
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isValid());
     QVERIFY(database.isOpen());
 
@@ -4927,7 +5011,7 @@ void MainShellTest::testLastSuccessfulGlobalSyncUsesGlobalScope()
 void MainShellTest::testDocumentSyncSummaryDoesNotLoadHistory()
 {
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isValid());
     QVERIFY(database.isOpen());
 
@@ -5165,7 +5249,7 @@ void MainShellTest::testSourceConflictStaysOfferedAfterLaterSyncs()
     QVERIFY(shell->isValid());
     const auto deleteShell = qScopeGuard([shell] { delete shell; });
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isOpen());
     const QString statePath = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("thoughts-server/source-publication.json"));
     QVERIFY(QDir().mkpath(QFileInfo(statePath).absolutePath()));
@@ -5286,7 +5370,7 @@ void MainShellTest::testLogsStayResponsiveDuringTraceReplay()
     QVERIFY(shell->isValid());
     const auto deleteShell = qScopeGuard([shell] { delete shell; });
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isOpen());
     const QString prefix = QStringLiteral("logs-replay-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     const QString selectedId = prefix + QStringLiteral("325");
@@ -5439,10 +5523,114 @@ void MainShellTest::testLogsStayResponsiveDuringTraceReplay()
     QTRY_VERIFY(reopened.isNull());
 }
 
+// The Logs window reads one page of runs and, on a change, only the newest
+// runs and the changed ones: a journal with thousands of runs opens and
+// refreshes as fast as a small one.
+void MainShellTest::testLogsLoadOnePageAndRefreshInPlace()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    QSqlDatabase database = syncJournalDatabase();
+    QVERIFY(database.isOpen());
+    const QString prefix = QStringLiteral("logs-page-test-%1-").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const auto cleanup = qScopeGuard([&database, &prefix] {
+        for (const QString &table : {QStringLiteral("sync_events"), QStringLiteral("sync_runs")}) {
+            QSqlQuery remove(database);
+            remove.prepare(QStringLiteral("DELETE FROM %1 WHERE %2 LIKE ?").arg(table, table == QLatin1String("sync_events") ? QStringLiteral("run_id") : QStringLiteral("id")));
+            remove.addBindValue(QString(prefix + QLatin1Char('%')));
+            remove.exec();
+        }
+    });
+    // Newer than the runs of every other test.
+    const qint64 startedAt = QDateTime::currentDateTimeUtc().addYears(60).toMSecsSinceEpoch();
+    const auto idOf = [&prefix](int index) { return prefix + QStringLiteral("%1").arg(index, 3, 10, QLatin1Char('0')); };
+    const auto storeRun = [&database, &idOf, startedAt](int index, const QString &status) {
+        const QString id = idOf(index);
+        const qint64 atMs = startedAt + index * 1000;
+        const QJsonObject payload {{QStringLiteral("id"), id}, {QStringLiteral("trace_id"), id}, {QStringLiteral("kind"), QStringLiteral("sync")}, {QStringLiteral("created_at_ms"), atMs},
+                                   {QStringLiteral("started_at_ms"), atMs}, {QStringLiteral("updated_at_ms"), atMs}, {QStringLiteral("completed_at_ms"), atMs}};
+        QSqlQuery run(database);
+        run.prepare(QStringLiteral("INSERT OR REPLACE INTO sync_runs(id, trace_id, kind, status, phase, created_at_ms, started_at_ms, updated_at_ms, completed_at_ms, payload_json) VALUES(?, ?, 'sync', ?, ?, ?, ?, ?, ?, ?)"));
+        run.addBindValue(id);
+        run.addBindValue(id);
+        run.addBindValue(status);
+        run.addBindValue(status);
+        run.addBindValue(atMs);
+        run.addBindValue(atMs);
+        run.addBindValue(atMs);
+        run.addBindValue(atMs);
+        run.addBindValue(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        return run.exec();
+    };
+    constexpr int runs = 260;
+    QVERIFY(database.transaction());
+    for (int index = 0; index < runs; ++index) {
+        QVERIFY(storeRun(index, QStringLiteral("succeeded")));
+    }
+    QVERIFY(database.commit());
+
+    shell->showSyncOperationLogs(QString());
+    QPointer<QDialog> dialog = shell->findChild<QDialog *>(QStringLiteral("syncOperationsDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->isVisible());
+    auto *list = dialog->findChild<QListWidget *>(QStringLiteral("operationsList"));
+    auto *older = dialog->findChild<QPushButton *>(QStringLiteral("loadOlderOperations"));
+    QVERIFY(list);
+    QVERIFY(older);
+    const int page = Thoughts::SyncJournal::LogsPageSize;
+    QCOMPARE(list->count(), page);
+    QCOMPARE(list->item(0)->data(Qt::UserRole).toString(), idOf(runs - 1));
+    QCOMPARE(list->item(page - 1)->data(Qt::UserRole).toString(), idOf(runs - page));
+    QCOMPARE(list->currentRow(), 0);
+    QVERIFY(older->isVisibleTo(dialog));
+
+    // A run that ends and a run that starts change two rows; the list is not rebuilt.
+    QSignalSpy resets(list->model(), &QAbstractItemModel::modelReset);
+    list->setCurrentRow(5);
+    const QString selectedId = list->item(5)->data(Qt::UserRole).toString();
+    const QString unchangedText = list->item(1)->text();
+    const QString endedText = list->item(0)->text();
+    QVERIFY(storeRun(runs - 1, QStringLiteral("failed")));
+    QVERIFY(storeRun(runs, QStringLiteral("succeeded")));
+    Q_EMIT shell->syncOperationJournalChanged(idOf(runs - 1));
+    QTRY_COMPARE(list->count(), page + 1);
+    QCOMPARE(list->item(0)->data(Qt::UserRole).toString(), idOf(runs));
+    QCOMPARE(list->item(1)->data(Qt::UserRole).toString(), idOf(runs - 1));
+    QVERIFY(list->item(1)->text() != endedText);
+    QCOMPARE(list->item(2)->text(), unchangedText);
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), selectedId);
+    QCOMPARE(resets.count(), 0);
+
+    // Older runs come a page at a time, on request or at the end of the list.
+    older->click();
+    QTRY_COMPARE(list->count(), 2 * page + 1);
+    QCOMPARE(list->item(2 * page)->data(Qt::UserRole).toString(), idOf(runs - 2 * page));
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), selectedId);
+    list->verticalScrollBar()->setValue(list->verticalScrollBar()->maximum());
+    QTRY_VERIFY(list->count() >= runs + 1);
+    QCOMPARE(list->item(runs)->data(Qt::UserRole).toString(), idOf(0));
+    QCOMPARE(resets.count(), 0);
+    dialog->reject();
+    QTRY_VERIFY(dialog.isNull());
+
+    // A run beyond the first page is still found when it is asked for.
+    shell->showSyncOperationLogs(idOf(3));
+    dialog = shell->findChild<QDialog *>(QStringLiteral("syncOperationsDialog"));
+    QVERIFY(dialog);
+    list = dialog->findChild<QListWidget *>(QStringLiteral("operationsList"));
+    QVERIFY(list);
+    QCOMPARE(list->count(), page + 1);
+    QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), idOf(3));
+    QTRY_VERIFY(dialog->findChild<QDialog *>(QStringLiteral("syncOperationLogDialog")));
+    dialog->reject();
+    QTRY_VERIFY(dialog.isNull());
+}
+
 void MainShellTest::testLegacyEmbeddedJournalMigrationIsIdempotent()
 {
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isValid());
     QVERIFY(database.isOpen());
 
@@ -5512,11 +5700,13 @@ void MainShellTest::testLegacyEmbeddedJournalMigrationIsIdempotent()
     stored.prepare(QStringLiteral("SELECT payload_json, (SELECT COUNT(*) FROM sync_events WHERE run_id = ?) FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     const QJsonObject compactPayload = QJsonDocument::fromJson(stored.value(0).toString().toUtf8()).object();
     QVERIFY(!compactPayload.contains(QStringLiteral("events")));
     QCOMPARE(stored.value(1).toInt(), eventTotal);
+    stored.finish();
 
     // A second compatibility read is a no-op: history remains complete and no
     // journal row is appended again.
@@ -5524,9 +5714,11 @@ void MainShellTest::testLegacyEmbeddedJournalMigrationIsIdempotent()
     stored.finish();
     stored.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     QCOMPARE(stored.value(0).toInt(), eventTotal);
+    stored.finish();
 }
 
 void MainShellTest::testManyJournalEventsDoNotGrowRunPayload()
@@ -5535,7 +5727,7 @@ void MainShellTest::testManyJournalEventsDoNotGrowRunPayload()
     QVERIFY(shell->isValid());
     QTest::qWait(100);
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isOpen());
 
     const QString operationId = QStringLiteral("many-journal-events-test-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
@@ -5588,12 +5780,14 @@ void MainShellTest::testManyJournalEventsDoNotGrowRunPayload()
     stored.prepare(QStringLiteral("SELECT payload_json, (SELECT COUNT(*) FROM sync_events WHERE run_id = ?) FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     const QByteArray compactPayloadBytes = stored.value(0).toString().toUtf8();
     QVERIFY(compactPayloadBytes.size() < 2048);
     QVERIFY(!QJsonDocument::fromJson(compactPayloadBytes).object().contains(QStringLiteral("events")));
     QCOMPARE(stored.value(1).toInt(), eventTotal);
+    stored.finish();
 
     QJsonObject operation;
     for (const QJsonValue &value : Shell::recentSyncOperationsWithHistory()) {
@@ -5612,7 +5806,7 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     QVERIFY(shell->isValid());
     QTest::qWait(100);
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isValid());
     QVERIFY(database.isOpen());
 
@@ -5672,6 +5866,7 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     QSqlQuery stored(database);
     stored.prepare(QStringLiteral("SELECT transfer_metrics_recorded, uploaded_completed_bytes, uploaded_total_bytes, downloaded_completed_bytes, downloaded_total_bytes, payload_json FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     QCOMPARE(stored.value(0).toBool(), true);
@@ -5680,6 +5875,7 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     QCOMPARE(stored.value(3).toLongLong(), 300);
     QCOMPARE(stored.value(4).toLongLong(), 500);
     QJsonObject payload = QJsonDocument::fromJson(stored.value(5).toString().toUtf8()).object();
+    stored.finish();
     QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 420);
     QCOMPARE(payload.value(QStringLiteral("total_bytes")).toVariant().toLongLong(), 700);
 
@@ -5692,20 +5888,24 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     stored.finish();
     stored.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes, payload_json FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     QCOMPARE(stored.value(0).toLongLong(), 40);
     QCOMPARE(stored.value(1).toLongLong(), 250);
     payload = QJsonDocument::fromJson(stored.value(2).toString().toUtf8()).object();
+    stored.finish();
     QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 290);
 
     QSqlQuery untouched(database);
     untouched.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes FROM sync_runs WHERE id = ?"));
     untouched.addBindValue(untouchedId);
+    flushSyncJournal();
     QVERIFY(untouched.exec());
     QVERIFY(untouched.next());
     QCOMPARE(untouched.value(0).toLongLong(), 0);
     QCOMPARE(untouched.value(1).toLongLong(), 0);
+    untouched.finish();
 
     QJsonObject invalidSnapshot = retryRollback;
     invalidSnapshot.insert(QStringLiteral("uploaded_completed_bytes"), 201);
@@ -5714,27 +5914,33 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     QSqlQuery eventCount(database);
     eventCount.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
     eventCount.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(eventCount.exec());
     QVERIFY(eventCount.next());
     QCOMPARE(eventCount.value(0).toInt(), 0);
+    eventCount.finish();
 
     shell->updateSyncOperationProgress(operationId, QStringLiteral("downloading"), 999, 1000, QStringLiteral("Legacy stage progress"));
     QCOMPARE(journalSpy.count(), 3);
     stored.finish();
     stored.prepare(QStringLiteral("SELECT uploaded_completed_bytes, downloaded_completed_bytes, payload_json FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     QCOMPARE(stored.value(0).toLongLong(), 40);
     QCOMPARE(stored.value(1).toLongLong(), 250);
     payload = QJsonDocument::fromJson(stored.value(2).toString().toUtf8()).object();
+    stored.finish();
     QCOMPARE(payload.value(QStringLiteral("bytes_transferred")).toVariant().toLongLong(), 290);
     eventCount.finish();
     eventCount.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
     eventCount.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(eventCount.exec());
     QVERIFY(eventCount.next());
     QCOMPARE(eventCount.value(0).toInt(), 1);
+    eventCount.finish();
 
     delete shell;
     Shell::reconcileInterruptedSyncOperationsForTesting(QDateTime::currentMSecsSinceEpoch());
@@ -5745,9 +5951,11 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
                                  restartedState.finish();
                                  restartedState.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
                                  restartedState.addBindValue(operationId);
+                                 flushSyncJournal();
                                  return restartedState.exec() && restartedState.next() && restartedState.value(0).toString() == QLatin1String("interrupted") && restartedState.value(1).toString() == QLatin1String("interrupted");
                              }()),
                              3000);
+    restartedState.finish();
 
     QJsonObject restoredOperation;
     for (const QJsonValue &value : Shell::recentSyncOperationsWithHistory()) {
@@ -5765,9 +5973,11 @@ void MainShellTest::testAbsoluteDirectionalTransferProgressPersistence()
     stored.finish();
     stored.prepare(QStringLiteral("SELECT payload_json FROM sync_runs WHERE id = ?"));
     stored.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(stored.exec());
     QVERIFY(stored.next());
     QVERIFY(!QJsonDocument::fromJson(stored.value(0).toString().toUtf8()).object().contains(QStringLiteral("events")));
+    stored.finish();
     delete restartedShell;
 }
 
@@ -5778,13 +5988,14 @@ void MainShellTest::testSyncCommandServiceSurvivesMultipleWindows()
     // Let the one process-start reconciliation finish before creating a live operation.
     QTest::qWait(100);
     Shell::lastSuccessfulGlobalSyncAt();
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isValid());
     QVERIFY(database.isOpen());
 
     const auto runIds = [&database] {
         QSet<QString> ids;
         QSqlQuery query(database);
+        flushSyncJournal();
         if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
             while (query.next()) {
                 ids.insert(query.value(0).toString());
@@ -5832,10 +6043,12 @@ void MainShellTest::testSyncCommandServiceSurvivesMultipleWindows()
     QSqlQuery state(database);
     state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
     state.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(state.exec());
     QVERIFY(state.next());
     QCOMPARE(state.value(0).toString(), QStringLiteral("running"));
     QCOMPARE(state.value(1).toString(), QStringLiteral("queued"));
+    state.finish();
 
     // The singleton repository is forwarded through both Parts. Only the owning Shell may journal it.
     Okular::FedoraRepository *repository = nullptr;
@@ -5866,16 +6079,20 @@ void MainShellTest::testSyncCommandServiceSurvivesMultipleWindows()
     QSqlQuery runningEvents(database);
     runningEvents.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
     runningEvents.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(runningEvents.exec());
     QVERIFY(runningEvents.next());
     QCOMPARE(runningEvents.value(0).toInt(), 1);
+    runningEvents.finish();
     state.finish();
     state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
     state.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(state.exec());
     QVERIFY(state.next());
     QCOMPARE(state.value(0).toString(), QStringLiteral("running"));
     QCOMPARE(state.value(1).toString(), QStringLiteral("downloading"));
+    state.finish();
     QVERIFY(secondShell->m_activeManualSyncOperationId.isEmpty());
 
     delete firstShell;
@@ -5898,10 +6115,12 @@ void MainShellTest::testSyncCommandServiceSurvivesMultipleWindows()
     state.finish();
     state.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
     state.addBindValue(operationId);
+    flushSyncJournal();
     QVERIFY(state.exec());
     QVERIFY(state.next());
     QCOMPARE(state.value(0).toString(), QStringLiteral("succeeded"));
     QCOMPARE(state.value(1).toString(), QStringLiteral("succeeded"));
+    state.finish();
     QVERIFY(secondShell->m_activeManualSyncOperationId.isEmpty());
     QVERIFY(!secondShell->hasProcessManualSyncOperation());
     QCOMPARE(runIds() - existingRunIds, QSet<QString> {operationId});
@@ -5917,12 +6136,13 @@ void MainShellTest::testSyncEndingWhileNoWindowListenedIsRecorded()
     auto *firstShell = new Shell;
     QVERIFY(firstShell->isValid());
     QTest::qWait(100);
-    QSqlDatabase database = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+    QSqlDatabase database = syncJournalDatabase();
     QVERIFY(database.isOpen());
     const auto runStatus = [&database](const QString &id) {
         QSqlQuery query(database);
         query.prepare(QStringLiteral("SELECT status FROM sync_runs WHERE id = ?"));
         query.addBindValue(id);
+        flushSyncJournal();
         return query.exec() && query.next() ? query.value(0).toString() : QString();
     };
     QString operationId;
@@ -6036,6 +6256,531 @@ void MainShellTest::testOverviewTerminalStateWhileModalLogOpen()
     QVERIFY(completedWhileDialogOpen);
 }
 
+// On a Mac every action's icon went to the native menu as one image with all
+// of the icon's sizes, which cost well over a hundred megabytes. Menus carry no
+// icons there now; the toolbar's buttons keep theirs.
+void MainShellTest::testMenusCarryNoIconsOnMac()
+{
+#ifndef Q_OS_MACOS
+    QSKIP("Menus show their icons on this platform.");
+#else
+    const bool before = QCoreApplication::testAttribute(Qt::AA_DontShowIconsInMenus);
+    const auto restore = qScopeGuard([before] { QCoreApplication::setAttribute(Qt::AA_DontShowIconsInMenus, before); });
+    Shell::applyMenuIconPolicy();
+    QVERIFY(QCoreApplication::testAttribute(Qt::AA_DontShowIconsInMenus));
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto deleteShell = qScopeGuard([shell] { delete shell; });
+    shell->show();
+    int actionsWithIcon = 0;
+    for (QAction *action : shell->actionCollection()->actions()) {
+        if (!action->icon().isNull()) {
+            ++actionsWithIcon;
+            QVERIFY2(!action->isIconVisibleInMenu(), qPrintable(action->objectName()));
+        }
+    }
+    QVERIFY(actionsWithIcon > 0);
+    int buttonsWithIcon = 0;
+    for (const QToolBar *toolBar : shell->findChildren<QToolBar *>()) {
+        for (const QToolButton *button : toolBar->findChildren<QToolButton *>()) {
+            buttonsWithIcon += button->icon().isNull() ? 0 : 1;
+        }
+    }
+    QVERIFY(buttonsWithIcon > 0);
+
+    // What the developer log gets after each Sync.
+    Shell::recordCacheSizes();
+#endif
+}
+
+// The server has work for this computer: the app starts a Sync by itself. When
+// that Sync fails, the state it leaves on the server starts no other, the next
+// automatic Sync waits, the status area says until when, and the user's own
+// Sync is never held back.
+void MainShellTest::testAutomaticSyncWaitsAfterFailures()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    Shell::resetAutomaticSyncForTesting();
+    QSqlDatabase database = syncJournalDatabase();
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        flushSyncJournal();
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRuns = runIds();
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restore = qScopeGuard([&] {
+            if (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation()) {
+                shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+            }
+            shell->m_tabs[activeTab].part = originalPart;
+            Shell::resetAutomaticSyncForTesting();
+            for (const QString &id : runIds() - existingRuns) {
+                for (const QString &statement : {QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"), QStringLiteral("DELETE FROM sync_runs WHERE id = ?")}) {
+                    QSqlQuery remove(database);
+                    remove.prepare(statement);
+                    remove.addBindValue(id);
+                    remove.exec();
+                }
+            }
+        });
+        const auto detail = [shell] {
+            shell->updatePdfSyncStatus();
+            return shell->m_pdfSyncDetailMenuAction->text();
+        };
+        const auto initiationOf = [&database](const QString &operationId) {
+            flushSyncJournal();
+            QSqlQuery query(database);
+            query.prepare(QStringLiteral("SELECT initiation_control FROM sync_runs WHERE id = ?"));
+            query.addBindValue(operationId);
+            return query.exec() && query.next() ? query.value(0).toString() : QString();
+        };
+
+        // The server has work: a Sync starts by itself, once for this state.
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 1);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("101/aa/1"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        const QString first = shell->m_activeManualSyncOperationId;
+        QCOMPARE(initiationOf(first), QStringLiteral("remote_change"));
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        QVERIFY(!detail().contains(QStringLiteral("Next automatic Sync")));
+
+        // It fails. The app asks for the state it left; that state is not news.
+        shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("The server could not build the Library."), QString());
+        QVERIFY(!shell->hasProcessManualSyncOperation());
+        QTRY_COMPARE_WITH_TIMEOUT(probe.remoteWorkChecks, 2, 5000);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("102/aa/2"));
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 3);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("102/aa/2"));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+
+        // Another device writes within the wait: not yet, and the status area says until when.
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 4);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("103/aa/2"));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+        const QString waiting = detail();
+        QVERIFY2(waiting.contains(QStringLiteral("Next automatic Sync not before ")), qPrintable(waiting));
+        auto *overviewTimestamp = Shell::s_commentsOverview->findChild<QLabel *>(QStringLiteral("commentsOverviewPdfSyncTimestamp"));
+        QVERIFY(overviewTimestamp);
+        QVERIFY2(overviewTimestamp->text().contains(QStringLiteral("Next automatic Sync not before ")), qPrintable(overviewTimestamp->text()));
+
+        // The user's own Sync starts at once and ends the wait.
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("pdf_toolbar_sync"));
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        QVERIFY(!detail().contains(QStringLiteral("Next automatic Sync")));
+        QVERIFY(!overviewTimestamp->text().contains(QStringLiteral("Next automatic Sync")));
+
+        // News from the server starts a Sync by itself again.
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 5);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("104/aa/2"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 3);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("remote_change"));
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+    }
+    delete Shell::s_commentsOverview.data();
+    delete shell;
+}
+
+// A PDF build that a Sync left running on the server has ended: the part says
+// so without having been asked, and the Sync that fetches the PDF starts at
+// once, also while automatic Syncs wait after failures. One Sync for each ended
+// build, however many parts relay it, and none for a state a Sync already ran
+// against.
+void MainShellTest::testAnEndedBuildStartsItsSyncAtOnce()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    Shell::resetAutomaticSyncForTesting();
+    QSqlDatabase database = syncJournalDatabase();
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        flushSyncJournal();
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRuns = runIds();
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    QVERIFY(originalPart);
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restore = qScopeGuard([&] {
+            if (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation()) {
+                probe.manualSyncState.clear();
+                shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+            }
+            shell->m_tabs[activeTab].part = originalPart;
+            Shell::resetAutomaticSyncForTesting();
+            for (const QString &id : runIds() - existingRuns) {
+                for (const QString &statement : {QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"), QStringLiteral("DELETE FROM sync_runs WHERE id = ?")}) {
+                    QSqlQuery remove(database);
+                    remove.prepare(statement);
+                    remove.addBindValue(id);
+                    remove.exec();
+                }
+            }
+        });
+        const auto detail = [shell] {
+            shell->updatePdfSyncStatus();
+            return shell->m_pdfSyncDetailMenuAction->text();
+        };
+        const auto initiationOf = [&database](const QString &operationId) {
+            flushSyncJournal();
+            QSqlQuery query(database);
+            query.prepare(QStringLiteral("SELECT initiation_control FROM sync_runs WHERE id = ?"));
+            query.addBindValue(operationId);
+            return query.exec() && query.next() ? query.value(0).toString() : QString();
+        };
+        // As the window's own part relays the repository's announcement: the
+        // shell listens to every part it holds, not only to the one it asks.
+        const auto announce = [originalPart](bool pending, const QString &stateKey) {
+            return QMetaObject::invokeMethod(originalPart, "fedoraRemoteWorkFound", Qt::DirectConnection, Q_ARG(bool, pending), Q_ARG(QString, stateKey));
+        };
+
+        // An automatic Sync fails, and the next automatic one waits.
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 1);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("201/aa/1"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        probe.manualSyncState = {{QStringLiteral("failure_kind"), QStringLiteral("bug")}};
+        shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("The server could not build the Library."), QString());
+        probe.manualSyncState.clear();
+        QTRY_COMPARE_WITH_TIMEOUT(probe.remoteWorkChecks, 2, 5000);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("202/aa/1"));
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 3);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("203/aa/1"));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+        QVERIFY(detail().contains(QStringLiteral("Next automatic Sync not before ")));
+
+        // Announced or not, the state the failed Sync left is not news, and
+        // neither is an announcement with nothing to fetch.
+        QVERIFY(announce(true, QStringLiteral("202/aa/1")));
+        QVERIFY(announce(false, QStringLiteral("204/aa/2")));
+        QVERIFY(announce(true, QString()));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+
+        // The build has ended: the Sync that fetches its PDF starts now, although
+        // automatic Syncs wait, and once although a second part says the same.
+        QVERIFY(announce(true, QStringLiteral("204/aa/2")));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("remote_change"));
+        QVERIFY(announce(true, QStringLiteral("204/aa/2")));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 2);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        QVERIFY(announce(true, QStringLiteral("204/aa/2")));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 2);
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        // It succeeded: nothing waits any more.
+        QVERIFY(!detail().contains(QStringLiteral("Next automatic Sync")));
+
+        // The state it ran against starts no other Sync, announced or asked for.
+        QVERIFY(announce(true, QStringLiteral("204/aa/2")));
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 4);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("204/aa/2"));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 2);
+
+        // A build that ends while the user's Sync runs starts no second Sync
+        // beside it; the periodic check finds what that Sync did not fetch.
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 3);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        QVERIFY(announce(true, QStringLiteral("205/aa/3")));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 3);
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        shell->checkRemoteWork();
+        QTRY_COMPARE(probe.remoteWorkChecks, 5);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("205/aa/3"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 4);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("remote_change"));
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+    }
+    delete Shell::s_commentsOverview.data();
+    delete shell;
+}
+
+// A Sync whose changes arrived succeeds also when the server could not build a
+// PDF, and says so as a warning. Whoever asks about that Sync afterwards
+// (thoughtsctl, and through it the proposal commands) is told.
+void MainShellTest::testSucceededSyncKeepsItsBuildWarning()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    Shell::resetAutomaticSyncForTesting();
+    QSqlDatabase database = syncJournalDatabase();
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        flushSyncJournal();
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRuns = runIds();
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restore = qScopeGuard([&] {
+            if (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation()) {
+                probe.manualSyncState.clear();
+                shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+            }
+            shell->m_tabs[activeTab].part = originalPart;
+            Shell::resetAutomaticSyncForTesting();
+            for (const QString &id : runIds() - existingRuns) {
+                for (const QString &statement : {QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"), QStringLiteral("DELETE FROM sync_runs WHERE id = ?")}) {
+                    QSqlQuery remove(database);
+                    remove.prepare(statement);
+                    remove.addBindValue(id);
+                    remove.exec();
+                }
+            }
+        });
+        const QString warning = QStringLiteral("PDF build failed\nYour changes are synced with the server. The last successful PDF remains available.\npaper.pdf: latex_error");
+
+        const QString warned = shell->startSyncCommand(QString()).value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!warned.isEmpty());
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        QVERIFY(!shell->syncCommandStatus(warned).contains(QStringLiteral("warning_code")));
+        probe.manualSyncState = {{QStringLiteral("warning_code"), QStringLiteral("pdf_build_failed")}, {QStringLiteral("warning"), warning}};
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        const QJsonObject status = shell->syncCommandStatus(warned);
+        QCOMPARE(status.value(QStringLiteral("state")).toString(), QStringLiteral("succeeded"));
+        QVERIFY(status.value(QStringLiteral("terminal")).toBool());
+        QVERIFY(status.value(QStringLiteral("sources_synced")).toBool());
+        QVERIFY(!status.contains(QStringLiteral("failure_code")));
+        QCOMPARE(status.value(QStringLiteral("warning_code")).toString(), QStringLiteral("pdf_build_failed"));
+        QCOMPARE(status.value(QStringLiteral("warning")).toString(), warning);
+        // What a proposal command reports for the Sync before it.
+        const QJsonObject reported = Thoughts::syncCommandBuildWarning(status, QStringLiteral("before"));
+        QCOMPARE(reported.value(QStringLiteral("code")).toString(), QStringLiteral("pdf_build_failed"));
+        QCOMPARE(reported.value(QStringLiteral("message")).toString(), warning);
+        QCOMPARE(reported.value(QStringLiteral("operation_id")).toString(), warned);
+        // A Sync that succeeds with a warning is a Sync that succeeded: nothing waits.
+        QVERIFY(!shell->m_pdfSyncDetailMenuAction->text().contains(QStringLiteral("Next automatic Sync")));
+
+        // The next Sync has nothing to say.
+        probe.manualSyncState.clear();
+        const QString clean = shell->startSyncCommand(QString()).value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!clean.isEmpty());
+        QVERIFY(clean != warned);
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        const QJsonObject cleanStatus = shell->syncCommandStatus(clean);
+        QCOMPARE(cleanStatus.value(QStringLiteral("state")).toString(), QStringLiteral("succeeded"));
+        QVERIFY(!cleanStatus.contains(QStringLiteral("warning_code")));
+        QVERIFY(Thoughts::syncCommandBuildWarning(cleanStatus, QStringLiteral("before")).isEmpty());
+        // The earlier one keeps its warning.
+        QCOMPARE(shell->syncCommandStatus(warned).value(QStringLiteral("warning_code")).toString(), QStringLiteral("pdf_build_failed"));
+    }
+    delete Shell::s_commentsOverview.data();
+    delete shell;
+}
+
+// The user accepts or rejects proposals on this computer: a Sync sends the
+// decisions by itself a few seconds after the last one. One Sync for a run of
+// decisions, none while a Sync runs (one follows), none without a server, and
+// none while the last failure needs the user.
+void MainShellTest::testProposalDecisionStartsOneSync()
+{
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    constexpr int delay = 300;
+    Shell::resetAutomaticSyncForTesting();
+    Shell::resetProposalDecisionSyncForTesting(delay);
+    const QByteArray savedServer = qgetenv("THOUGHTS_SERVER_URL");
+    qputenv("THOUGHTS_SERVER_URL", "https://thoughts.example.org");
+    QSqlDatabase database = syncJournalDatabase();
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        flushSyncJournal();
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRuns = runIds();
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restore = qScopeGuard([&] {
+            if (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation()) {
+                probe.manualSyncState.clear();
+                shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+            }
+            shell->m_tabs[activeTab].part = originalPart;
+            Shell::resetAutomaticSyncForTesting();
+            Shell::resetProposalDecisionSyncForTesting();
+            if (savedServer.isEmpty()) {
+                qunsetenv("THOUGHTS_SERVER_URL");
+            } else {
+                qputenv("THOUGHTS_SERVER_URL", savedServer);
+            }
+            for (const QString &id : runIds() - existingRuns) {
+                for (const QString &statement : {QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"), QStringLiteral("DELETE FROM sync_runs WHERE id = ?")}) {
+                    QSqlQuery remove(database);
+                    remove.prepare(statement);
+                    remove.addBindValue(id);
+                    remove.exec();
+                }
+            }
+        });
+        const auto initiationOf = [&database](const QString &operationId) {
+            flushSyncJournal();
+            QSqlQuery query(database);
+            query.prepare(QStringLiteral("SELECT initiation_control FROM sync_runs WHERE id = ?"));
+            query.addBindValue(operationId);
+            return query.exec() && query.next() ? query.value(0).toString() : QString();
+        };
+        int decision = 0;
+        const auto decide = [&](const QString &action = QStringLiteral("accept"), const QString &status = QStringLiteral("applied")) {
+            shell->updateCommentsOverviewAgentProposalResolution(QStringLiteral("decision-%1").arg(++decision), {QStringLiteral("proposal-%1").arg(decision)}, action, status, QString());
+        };
+        const auto endSync = [&](int state) {
+            shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+            shell->updateCommentsOverviewManualSyncState(state, state == 3 ? QStringLiteral("The Sync failed.") : QString(), QString());
+        };
+
+        // A run of decisions: one Sync, the delay counted from the last.
+        QElapsedTimer sinceLast;
+        for (int index = 0; index < 4; ++index) {
+            decide(index % 2 ? QStringLiteral("reject") : QStringLiteral("accept"));
+            sinceLast.start();
+            QTest::qWait(delay / 3);
+            QCOMPARE(probe.conditionalFullSyncs, 0);
+        }
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        QVERIFY2(sinceLast.elapsed() >= delay - 20, qPrintable(QString::number(sinceLast.elapsed())));
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("proposal_decision"));
+
+        // Decisions while that Sync runs wait for its end; then one Sync sends them.
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        decide();
+        decide();
+        QTest::qWait(3 * delay);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("proposal_decision"));
+        // A decision that waited for the server and is delivered by this Sync is no new decision.
+        const int waited = ++decision;
+        shell->updateCommentsOverviewAgentProposalResolution(QStringLiteral("decision-%1").arg(waited), {QStringLiteral("proposal-%1").arg(waited)}, QStringLiteral("accept"), QStringLiteral("applied"), QString());
+        endSync(2);
+        QTRY_COMPARE(probe.conditionalFullSyncs, 3);
+        shell->updateCommentsOverviewAgentProposalResolution(QStringLiteral("decision-%1").arg(waited), {QStringLiteral("proposal-%1").arg(waited)}, QStringLiteral("accept"), QStringLiteral("applied"), QString());
+        endSync(2);
+        QTest::qWait(3 * delay);
+        QCOMPARE(probe.conditionalFullSyncs, 3);
+
+        // What the overview's own decisions and their Undo, and thoughtsctl's, call.
+        Shell::proposalDecided();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 4);
+        endSync(2);
+
+        // No server: the decision stays on this computer.
+        qputenv("THOUGHTS_SERVER_URL", "not an address");
+        decide();
+        QTest::qWait(3 * delay);
+        QCOMPARE(probe.conditionalFullSyncs, 4);
+        qputenv("THOUGHTS_SERVER_URL", "https://thoughts.example.org");
+
+        // A failure of which the repository says that it needs the user (a source file
+        // needs a merge, say): no Sync by itself ...
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 5);
+        probe.manualSyncState = {{QStringLiteral("error_code"), QStringLiteral("invalid_source_publication")}, {QStringLiteral("failure_kind"), QStringLiteral("needs_user")}};
+        endSync(3);
+        decide();
+        QTest::qWait(3 * delay);
+        QCOMPARE(probe.conditionalFullSyncs, 5);
+        // ... until the user's own Sync got through.
+        probe.manualSyncState.clear();
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 6);
+        endSync(2);
+        decide();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 7);
+        QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("proposal_decision"));
+        // A failure of another kind holds no decision back; an error code alone says nothing about the kind.
+        probe.manualSyncState = {{QStringLiteral("error_code"), QStringLiteral("invalid_source_publication")}, {QStringLiteral("failure_kind"), QStringLiteral("bug")}};
+        endSync(3);
+        probe.manualSyncState.clear();
+        decide();
+        QTRY_COMPARE(probe.conditionalFullSyncs, 8);
+        endSync(2);
+    }
+    delete Shell::s_commentsOverview.data();
+    delete shell;
+}
+
 void MainShellTest::testSyncDispatchRenderPolicies()
 {
     QTemporaryDir docsRoot;
@@ -6058,18 +6803,20 @@ void MainShellTest::testSyncDispatchRenderPolicies()
         QTRY_COMPARE(probe.conditionalFullSyncs, 1);
         QVERIFY(!shell->m_activeManualSyncOperationId.isEmpty());
         const QString overviewOperationId = shell->m_activeManualSyncOperationId;
-        QSqlDatabase operationDatabase = QSqlDatabase::database(QStringLiteral("thoughts-sync-operations"));
+        QSqlDatabase operationDatabase = syncJournalDatabase();
         QVERIFY(operationDatabase.isOpen());
         const auto eventCount = [&operationDatabase](const QString &operationId) {
             QSqlQuery query(operationDatabase);
             query.prepare(QStringLiteral("SELECT COUNT(*) FROM sync_events WHERE run_id = ?"));
             query.addBindValue(operationId);
+            flushSyncJournal();
             return query.exec() && query.next() ? query.value(0).toInt() : -1;
         };
         const auto initiationControl = [&operationDatabase](const QString &operationId) {
             QSqlQuery query(operationDatabase);
             query.prepare(QStringLiteral("SELECT initiation_control, payload_json FROM sync_runs WHERE id = ?"));
             query.addBindValue(operationId);
+            flushSyncJournal();
             if (!query.exec() || !query.next()) {
                 return QPair<QString, QString>();
             }
@@ -6080,6 +6827,7 @@ void MainShellTest::testSyncDispatchRenderPolicies()
             QSqlQuery query(operationDatabase);
             query.prepare(QStringLiteral("SELECT metadata_json FROM sync_events WHERE run_id = ? ORDER BY id LIMIT 1"));
             query.addBindValue(operationId);
+            flushSyncJournal();
             return query.exec() && query.next() ? QJsonDocument::fromJson(query.value(0).toString().toUtf8()).object().value(QStringLiteral("initiation_control")).toString() : QString();
         };
         QCOMPARE(eventCount(overviewOperationId), 1);
@@ -6088,9 +6836,11 @@ void MainShellTest::testSyncDispatchRenderPolicies()
         QSqlQuery operationTarget(operationDatabase);
         operationTarget.prepare(QStringLiteral("SELECT target FROM sync_runs WHERE id = ?"));
         operationTarget.addBindValue(overviewOperationId);
+        flushSyncJournal();
         QVERIFY(operationTarget.exec());
         QVERIFY(operationTarget.next());
         QVERIFY(operationTarget.value(0).toString().isEmpty());
+        operationTarget.finish();
         shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
         QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
         QCOMPARE(eventCount(overviewOperationId), 2);
@@ -6105,9 +6855,11 @@ void MainShellTest::testSyncDispatchRenderPolicies()
         operationTarget.finish();
         operationTarget.prepare(QStringLiteral("SELECT target FROM sync_runs WHERE id = ?"));
         operationTarget.addBindValue(documentButtonOperationId);
+        flushSyncJournal();
         QVERIFY(operationTarget.exec());
         QVERIFY(operationTarget.next());
         QVERIFY(operationTarget.value(0).toString().isEmpty());
+        operationTarget.finish();
         shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
         QVERIFY(shell->m_activeManualSyncOperationId.isEmpty());
 
@@ -6117,13 +6869,15 @@ void MainShellTest::testSyncDispatchRenderPolicies()
         QCOMPARE(initiationControl(fullSyncOperationId), qMakePair(QStringLiteral("command_api"), QStringLiteral("command_api")));
         QCOMPARE(startedEventInitiationControl(fullSyncOperationId), QStringLiteral("command_api"));
         QCOMPARE(eventCount(fullSyncOperationId), 1);
-        QSqlQuery storedLifecycle(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        QSqlQuery storedLifecycle(syncJournalDatabase());
         storedLifecycle.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
         storedLifecycle.addBindValue(fullSyncOperationId);
+        flushSyncJournal();
         QVERIFY(storedLifecycle.exec());
         QVERIFY(storedLifecycle.next());
         QCOMPARE(storedLifecycle.value(0).toString(), QStringLiteral("running"));
         QCOMPARE(storedLifecycle.value(1).toString(), QStringLiteral("queued"));
+        storedLifecycle.finish();
         QTRY_COMPARE(probe.conditionalFullSyncs, 3);
         const QString failureSummary = QStringLiteral("The complete source dependency closure could not be frozen safely.");
         const QString failureDetails = QStringLiteral(
@@ -6133,17 +6887,21 @@ void MainShellTest::testSyncDispatchRenderPolicies()
         storedLifecycle.finish();
         storedLifecycle.prepare(QStringLiteral("SELECT status, phase FROM sync_runs WHERE id = ?"));
         storedLifecycle.addBindValue(fullSyncOperationId);
+        flushSyncJournal();
         QVERIFY(storedLifecycle.exec());
         QVERIFY(storedLifecycle.next());
         QCOMPARE(storedLifecycle.value(0).toString(), QStringLiteral("failed"));
         QCOMPARE(storedLifecycle.value(1).toString(), QStringLiteral("failed"));
+        storedLifecycle.finish();
         QCOMPARE(eventCount(fullSyncOperationId), 2);
-        QSqlQuery storedFailure(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        QSqlQuery storedFailure(syncJournalDatabase());
         storedFailure.prepare(QStringLiteral("SELECT message FROM sync_events WHERE run_id = ? AND state = 'failed' ORDER BY id DESC LIMIT 1"));
         storedFailure.addBindValue(fullSyncOperationId);
+        flushSyncJournal();
         QVERIFY(storedFailure.exec());
         QVERIFY(storedFailure.next());
         QCOMPARE(storedFailure.value(0).toString(), failureSummary + QLatin1Char(' ') + failureDetails);
+        storedFailure.finish();
         shell->retrySyncOperation(fullSyncOperationId);
         QTRY_COMPARE(probe.conditionalFullSyncs, 4);
         const QString retryOperationId = shell->m_activeManualSyncOperationId;
@@ -6200,9 +6958,10 @@ void MainShellTest::testVisibleSyncButtonsUseGlobalScope()
     setSnapshot();
 
     const auto storedOperation = [](const QString &operationId) {
-        QSqlQuery query(QSqlDatabase::database(QStringLiteral("thoughts-sync-operations")));
+        QSqlQuery query(syncJournalDatabase());
         query.prepare(QStringLiteral("SELECT target, initiation_control, payload_json FROM sync_runs WHERE id = ?"));
         query.addBindValue(operationId);
+        flushSyncJournal();
         if (!query.exec() || !query.next()) {
             return QJsonObject();
         }
@@ -8550,6 +9309,11 @@ void MainShellTest::testReviewBrowseHeaderSorting()
             << "reorder only" << timer.nsecsElapsed() / 50.0 / 1000000.0;
 }
 
+bool MainShellTest::queueRefreshed(const Thoughts::ReviewOverview &overview)
+{
+    return !overview.m_queueRefreshRunning && !overview.m_queueRefreshPending && !overview.m_queueRefreshTimer->isActive();
+}
+
 void MainShellTest::testDeletedReviewCardsDoNotShowLocationWarnings()
 {
     QTemporaryDir temporary;
@@ -8581,6 +9345,7 @@ void MainShellTest::testDeletedReviewCardsDoNotShowLocationWarnings()
         temporary.path(), [] { return QVariantMap{}; },
         [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
     overview.refreshDueQueue();
+    QTRY_VERIFY(queueRefreshed(overview));
     QVERIFY(!overview.m_attentionPanel->isHidden());
     QVERIFY(overview.m_attentionSummary->text().contains(QStringLiteral("2 cards unavailable")));
     QCOMPARE(overview.m_attentionBrowserState, QStringLiteral("unavailable"));
@@ -8588,6 +9353,7 @@ void MainShellTest::testDeletedReviewCardsDoNotShowLocationWarnings()
         QVERIFY(overview.m_store.recordRating(id, QStringLiteral("delete")));
     }
     overview.refreshDueQueue();
+    QTRY_VERIFY(queueRefreshed(overview));
     QVERIFY(overview.m_attentionPanel->isHidden());
     QVERIFY(overview.m_dueCards.isEmpty());
     QCOMPARE(overview.m_store.cards().size(), 3);
@@ -8688,6 +9454,7 @@ void MainShellTest::testReviewColdOpenDuringSync()
     const auto document = [] { return QVariantMap{}; };
     if (savedCounts) {
         Thoughts::ReviewOverview previous(root, document, presenter, [] {});
+        QTRY_VERIFY(queueRefreshed(previous));
         QCOMPARE(previous.m_newCount->text(), QStringLiteral("1"));
         QVERIFY(QFileInfo::exists(previous.dashboardSnapshotPath()));
     }
@@ -8714,6 +9481,7 @@ void MainShellTest::testReviewColdOpenDuringSync()
         Thoughts::installSourceLocationIndex(root, index);
         cold.reloadFromProjections();
     }
+    QTRY_VERIFY(queueRefreshed(cold));
     QCOMPARE(cold.m_newCount->text(), QStringLiteral("0")); // A verified zero is now meaningful.
     QVERIFY(cold.m_documentFilter->isEnabled());
     QVERIFY(!cold.m_attentionPanel->isHidden());
@@ -8754,6 +9522,7 @@ void MainShellTest::testReviewCountsWaitForSyncAndSourceScan()
     Thoughts::installSourceLocationIndex(temporary.path(), index);
     Thoughts::ReviewOverview overview(temporary.path(), [] { return QVariantMap{}; },
         [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+    QTRY_VERIFY(queueRefreshed(overview));
     QCOMPARE(overview.m_dueCards.size(), 1);
     const QString beforeDue = overview.m_dueSummary->text();
     const QString beforeNew = overview.m_newCount->text();
@@ -8785,6 +9554,7 @@ void MainShellTest::testReviewCountsWaitForSyncAndSourceScan()
         Thoughts::installSourceLocationIndex(temporary.path(), index);
         overview.reloadFromProjections(); // The completed scanner emits projectionsChanged.
     }
+    QTRY_VERIFY(queueRefreshed(overview));
     QCOMPARE(overview.m_dueCards.size(), 0);
     QCOMPARE(overview.m_newCount->text(), QStringLiteral("0"));
     QVERIFY(!overview.m_attentionPanel->isHidden());
@@ -8794,6 +9564,7 @@ void MainShellTest::testReviewCountsWaitForSyncAndSourceScan()
     Thoughts::invalidateSourceLocationIndex(temporary.path()); overview.reload();
     QCOMPARE(overview.m_dueCards.size(), 0);
     Thoughts::installSourceLocationIndex(temporary.path(), index); overview.reloadFromProjections();
+    QTRY_VERIFY(queueRefreshed(overview));
     QCOMPARE(overview.m_dueCards.size(), 1);
     QVERIFY(overview.m_attentionPanel->isHidden());
 }
@@ -8818,6 +9589,7 @@ void MainShellTest::testReviewCanStartDuringSync()
     {
         Thoughts::ReviewOverview overview(temporary.path(), [] { return QVariantMap{}; },
             [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+        QTRY_VERIFY(queueRefreshed(overview));
         QCOMPARE(overview.m_dueCards.size(), 1);
         const QString beforeDue = overview.m_dueSummary->text();
         overview.setSyncInProgress(true);
@@ -8864,6 +9636,7 @@ void MainShellTest::testReviewStartEnabledAfterSyncAndSourceScan()
     {
         // Cached counts, then Sync starts after the constructor (as Shell does it).
         Thoughts::ReviewOverview previous(root, [] { return QVariantMap{}; }, presenter, [] {});
+        QTRY_VERIFY(queueRefreshed(previous));
         QVERIFY(QFileInfo::exists(previous.dashboardSnapshotPath()));
     }
     Thoughts::ReviewOverview overview(root, [] { return QVariantMap{}; }, presenter, [] {});
@@ -8895,6 +9668,7 @@ void MainShellTest::testReviewStartEnabledAfterSyncAndSourceScan()
     record.insert(QStringLiteral("status"), QStringLiteral("approved"));
     QVERIFY(save());
     overview.reload();
+    QTRY_VERIFY(queueRefreshed(overview));
     QCOMPARE(overview.m_dueCards.size(), 1);
     QVERIFY(overview.m_startButton->isEnabled());
     overview.close();
@@ -10612,7 +11386,7 @@ void MainShellTest::testReviewInTwoSteps()
     QCOMPARE(recall->property("reviewTagScaleValue").toInt(), -1);
     QVERIFY(overview.m_beforeNote->isVisible());
     QVERIFY(overview.m_beforeNote->toPlainText().isEmpty());
-    QVERIFY(overview.m_beforeSummary->isHidden());
+    QVERIFY(overview.m_beforeSummaryRow->isHidden());
     // The after step starts from the last answer without its Feeling.
     QCOMPARE(overview.m_selectedTags, (QStringList{QStringLiteral("Recalled"), QStringLiteral("I get it")}));
     // A prediction is never shown before the answer.
@@ -10635,7 +11409,7 @@ void MainShellTest::testReviewInTwoSteps()
     QVERIFY(!overview.m_beforeGroups->isVisible());
     QVERIFY(!overview.m_beforeNote->isVisible());
     QVERIFY(overview.m_beforeSummary->isVisible());
-    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Before: Meh · Partly recalled — not sure"));
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Feeling: Meh · Recall: Partly recalled — not sure"));
     QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent: predicting…"));
     QVERIFY(overview.m_predictionLine->isVisible());
     QCOMPARE(overview.m_selectedTags, (QStringList{QStringLiteral("I get it"), QStringLiteral("Partly recalled")}));
@@ -10762,6 +11536,746 @@ void MainShellTest::testReviewInTwoSteps()
     const QJsonObject plain = cardOf(fresh).history.constLast();
     QVERIFY(!plain.contains(QStringLiteral("review_phases")));
     QVERIFY(!plain.value(QStringLiteral("review_group_notes")).toObject().contains(QStringLiteral("before_note")));
+}
+
+namespace
+{
+// The records Merge cards writes (ReviewStore::mergeCards) for cards of twoStepCards: @p merged's
+// deletion naming @p kept in merged_into, and @p kept with one area more and @p question.
+bool writeCardMerge(const QString &root, Thoughts::ReviewStore &store, const QString &merged, const QString &kept, const QString &question)
+{
+    QString error, eventId;
+    if (!store.recordRating(merged, QStringLiteral("delete"), QDateTime::currentDateTimeUtc(), &error, {}, &eventId)) return false;
+    const auto patch = [](const QString &path, const std::function<void(QJsonObject &)> &change) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return false;
+        QJsonObject record = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        change(record);
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(QJsonDocument(record).toJson(QJsonDocument::Compact)) > 0;
+    };
+    return patch(QDir(root).filePath(QStringLiteral("reviews/events/mac-okular/%1.json").arg(eventId)),
+                 [&kept](QJsonObject &event) { event.insert(QStringLiteral("merged_into"), kept); })
+        && patch(QDir(root).filePath(QStringLiteral("reviews/cards/%1.json").arg(kept)), [&question](QJsonObject &card) {
+               QJsonObject primary = card.value(QStringLiteral("primary")).toObject();
+               primary.insert(QStringLiteral("question"), question);
+               // Its own areas, then the merged card's (on the same page, further down).
+               QJsonArray regions = primary.value(QStringLiteral("regions")).toArray();
+               if (regions.isEmpty()) regions.append(QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), primary.value(QStringLiteral("rect"))}});
+               const double top = 0.4 + 0.1 * regions.size();
+               regions.append(QJsonObject{{QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, top, 0.5, top + 0.05}}});
+               primary.insert(QStringLiteral("regions"), regions);
+               card.insert(QStringLiteral("primary"), primary);
+               card.insert(QStringLiteral("revision"), card.value(QStringLiteral("revision")).toInt(1) + 1);
+           });
+}
+
+int beforeValue(QWidget *panel, const QString &groupId)
+{
+    QWidget *scale = beforeScale(panel, groupId);
+    return scale ? scale->property("reviewTagScaleValue").toInt() : -2;
+}
+}
+
+// Merging the card under review into another (Merge cards in a reader's Cards list, 13 Nov) put
+// the merged card under the bar without its before step. The review goes on with the card the
+// merge kept, masked, from its own before step: the picks and note made carry over while the
+// answer was not shown yet; once it was, the kept card starts afresh.
+void MainShellTest::testReviewMergeOfTheCardUnderReviewKeepsItsBeforeStep()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    QCOMPARE(twoStepCards(temporary.path(), 6, &pdfSha256).size(), 6);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups(twoStepGroups(), &error), qPrintable(error));
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    QList<QPair<QString, int>> presented; // card, areas: masked
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; },
+        [&presented](const Thoughts::ReviewCard &card, bool masked, QString *) {
+            if (masked) presented.append({card.id(), int(card.regions().size())});
+            return true;
+        },
+        [] {}, nullptr, {}, {}, [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    const QStringList queue = [&] {
+        QStringList ids;
+        for (const auto &card : std::as_const(overview.m_dueCards)) ids.append(card.id());
+        return ids;
+    }();
+    QCOMPARE(queue.size(), 6);
+    const auto shown = [&overview] { return overview.m_dueCards.at(overview.m_currentReview).id(); };
+    auto *panel = overview.m_beforePanel;
+
+    // The first card, its before step half done: Good and Partly recalled, and a note.
+    QCOMPARE(shown(), queue.at(0));
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Home);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Right);
+    overview.m_beforeNote->setPlainText(QStringLiteral("the second lemma?"));
+    QCOMPARE(overview.m_before.tags, (QStringList{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+
+    // Merged into the next card of the queue, which is kept; the shell reloads the review.
+    QVERIFY(writeCardMerge(temporary.path(), store, queue.at(0), queue.at(1), QStringLiteral("Introduction")));
+    presented.clear();
+    overview.reload();
+    QCOMPARE(shown(), queue.at(1));
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Introduction"));
+    // Shown masked, with both cards' areas.
+    QCOMPARE(presented, (QList<QPair<QString, int>>{{queue.at(1), 2}}));
+    QVERIFY(overview.m_ratingPanel->isHidden() && !overview.m_answerPeeked);
+    // Its before step, with what was picked and typed for the card it was made of.
+    QCOMPARE(overview.m_before.cardId, queue.at(1));
+    QVERIFY(panel->isVisible());
+    QVERIFY(overview.m_beforeGroups->isVisible() && overview.m_beforeNote->isVisible());
+    QVERIFY(!overview.m_before.answerShownAt.isValid());
+    QCOMPARE(overview.m_before.tags, (QStringList{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-f")), 1);
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-r")), 1);
+    QCOMPARE(overview.m_beforeNote->toPlainText(), QStringLiteral("the second lemma?"));
+    // Sync's refresh changes nothing more.
+    presented.clear();
+    overview.reloadFromProjections();
+    QCOMPARE(shown(), queue.at(1));
+    QVERIFY(presented.isEmpty());
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible());
+    QCOMPARE(overview.m_before.tags, (QStringList{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+    // The answer records the before step for the kept card.
+    overview.revealAnswer();
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Feeling: Good · Recall: Partly recalled — the second lemma?"));
+    overview.m_nextButton->click();
+    const auto cardOf = [&store](const QString &id) {
+        for (const auto &card : store.cards())
+            if (card.id() == id) return card;
+        return Thoughts::ReviewCard{};
+    };
+    const QJsonObject answer = cardOf(queue.at(1)).history.constLast();
+    QCOMPARE(answer.value(QStringLiteral("review_phases")).toObject().value(QStringLiteral("before")).toObject().value(QStringLiteral("tags")).toArray(),
+             (QJsonArray{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(answer.value(QStringLiteral("review_group_notes")).toObject().value(QStringLiteral("before_note")).toString(), QStringLiteral("the second lemma?"));
+
+    // The next card, its answer already shown, merged into a card further on: that card starts afresh.
+    QCOMPARE(shown(), queue.at(2));
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Home);
+    overview.revealAnswer();
+    QVERIFY(overview.m_before.answerShownAt.isValid());
+    QVERIFY(writeCardMerge(temporary.path(), store, queue.at(2), queue.at(4), QStringLiteral("Merged after the answer")));
+    presented.clear();
+    overview.reload();
+    QCOMPARE(shown(), queue.at(4));
+    QCOMPARE(presented, (QList<QPair<QString, int>>{{queue.at(4), 2}}));
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QVERIFY(!overview.m_answerRow->isHidden());
+    QCOMPARE(overview.m_before.cardId, queue.at(4));
+    QVERIFY(overview.m_before.tags.isEmpty() && overview.m_before.note.isEmpty() && !overview.m_before.answerShownAt.isValid());
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible());
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-f")), -1);
+
+    // Another card merged into the one under review: still that card and its before step, masked
+    // again with the places it gained.
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    QVERIFY(writeCardMerge(temporary.path(), store, queue.at(5), queue.at(4), QStringLiteral("Both of them")));
+    presented.clear();
+    overview.reload();
+    QCOMPARE(shown(), queue.at(4));
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Both of them"));
+    QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Good")});
+    QVERIFY(overview.m_beforeGroups->isVisible());
+    QCOMPARE(presented, (QList<QPair<QString, int>>{{queue.at(4), 3}}));
+    QVERIFY(overview.m_ratingPanel->isHidden());
+}
+
+// Any reload during a review (a card made or merged elsewhere, thoughtsctl, Sync) keeps the card
+// under the bar and its before step: before, a new queue was read by position, and after an
+// answer the bar's index named the card after the one shown. Skip and Undo start each card's
+// own before step; Review now keeps its one card through Sync.
+void MainShellTest::testReviewReloadKeepsTheCardUnderReview()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 4, &pdfSha256);
+    QCOMPARE(ids.size(), 4);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups(twoStepGroups(), &error), qPrintable(error));
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.startReview();
+    QStringList queue;
+    for (const auto &card : std::as_const(overview.m_dueCards)) queue.append(card.id());
+    const auto shown = [&overview] { return overview.m_dueCards.at(overview.m_currentReview).id(); };
+    auto *panel = overview.m_beforePanel;
+
+    // The first card answered: the second is shown, at index 1 of the session's queue.
+    overview.revealAnswer();
+    overview.m_nextButton->click();
+    QCOMPARE(shown(), queue.at(1));
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_End);
+    overview.m_beforeNote->setPlainText(QStringLiteral("sure"));
+    // A reload (here: another card's question changed) reads a queue without the answered card.
+    QVERIFY(store.updateQuestion(queue.at(3), QStringLiteral("Changed elsewhere?"), &error));
+    overview.reload();
+    QCOMPARE(shown(), queue.at(1));
+    QCOMPARE(overview.m_reviewQuestion->text(), overview.m_dueCards.at(overview.m_currentReview).question());
+    overview.reloadFromProjections();
+    QCOMPARE(shown(), queue.at(1));
+    QCOMPARE(overview.m_before.cardId, queue.at(1));
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible());
+    QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Recalled")});
+    QCOMPARE(overview.m_beforeNote->toPlainText(), QStringLiteral("sure"));
+
+    // Skip: the next card with its own, empty before step; Undo: the skipped one, afresh.
+    overview.skipWithDefaults();
+    QCOMPARE(shown(), queue.at(2));
+    QCOMPARE(overview.m_before.cardId, queue.at(2));
+    QVERIFY(panel->isVisible() && overview.m_before.tags.isEmpty());
+    overview.undoPrevious();
+    QCOMPARE(shown(), queue.at(1));
+    QCOMPARE(overview.m_before.cardId, queue.at(1));
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible() && overview.m_before.tags.isEmpty());
+
+    // Review now of a card that is not due: Sync's refresh keeps it, and only it.
+    overview.revealAnswer();
+    overview.m_nextButton->click();
+    const QString later = queue.at(1);
+    for (const auto &card : overview.m_store.cards())
+        if (card.id() == later) QVERIFY(!Thoughts::ReviewStore::isDueNow(card, QDateTime::currentDateTimeUtc()));
+    overview.reviewCard(later);
+    QCOMPARE(shown(), later);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Home);
+    overview.reloadFromProjections();
+    QVERIFY(!overview.m_sessionComplete);
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QCOMPARE(shown(), later);
+    QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Meh")});
+    QVERIFY(panel->isVisible());
+    overview.revealAnswer();
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+}
+
+// Once the answer is shown, the bar's line under the question names each group asked before with
+// the step picked, and the note shortened; the pencil opens the rows again as the phone's "Before:
+// … · Tap to change" does (the answer covered again until it is shown again). The answer records
+// the changed picks with the time the answer was first shown, nothing else, as the phone does.
+void MainShellTest::testReviewBeforeLineAndPencil()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 1, &pdfSha256);
+    QCOMPARE(ids.size(), 1);
+    const QString cardId = ids.constFirst();
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    const auto slider = [](const char *id, const char *name, const QStringList &steps, const QString &phase) {
+        Thoughts::ReviewTags::TagGroup group{QString::fromLatin1(id), QString::fromLatin1(name), steps, steps};
+        group.phase = phase;
+        return group;
+    };
+    // As the user has them: Recall, Feeling and Setup asked before only, Understanding after.
+    QVERIFY2(store.saveTagGroups({slider("g-r", "Recall", {QStringLiteral("Forgot"), QStringLiteral("Partly recalled"), QStringLiteral("Recalled")}, Thoughts::ReviewTags::beforePhase()),
+                                  slider("g-u", "Understanding", {QStringLiteral("Lost"), QStringLiteral("I get it")}, QString()),
+                                  slider("g-f", "Feeling", {QStringLiteral("Bad"), QStringLiteral("OK"), QStringLiteral("Good")}, Thoughts::ReviewTags::beforePhase()),
+                                  slider("g-s", "Setup", {QStringLiteral("Mac"), QStringLiteral("Phone"), QStringLiteral("Glasses")}, Thoughts::ReviewTags::beforePhase())},
+                                 &error), qPrintable(error));
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    int masked = 0;
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; },
+        [&masked](const Thoughts::ReviewCard &, bool mask, QString *) {
+            masked += mask ? 1 : 0;
+            return true;
+        },
+        [] {}, nullptr, {}, {}, [&reviewHost] { return &reviewHost; });
+    QSignalSpy revealed(&overview, &Thoughts::ReviewOverview::answerRevealed);
+    overview.reviewCard(cardId);
+    auto *panel = overview.m_beforePanel;
+    auto *pencil = overview.m_beforeEditButton;
+    // Before the answer: the rows and the note; no line, no pencil, no pages line.
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible() && overview.m_beforeNote->isVisible());
+    QVERIFY(overview.m_beforeSummaryRow->isHidden() && !pencil->isVisible());
+    QVERIFY(overview.m_reviewStatus->isHidden());
+
+    // Nothing picked: "Before: not rated".
+    overview.toggleReveal();
+    QVERIFY(overview.m_beforeSummaryRow->isVisible() && pencil->isVisible());
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Before: not rated"));
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Change what you picked before seeing the answer"));
+    QVERIFY(!overview.m_beforeGroups->isVisible() && !overview.m_beforeNote->isVisible());
+    const QDateTime shownAt = overview.m_before.answerShownAt;
+    QVERIFY(shownAt.isValid());
+
+    // The pencil after Reveal: covered again, Reveal shown, the rows open on the picks (none).
+    const int maskedBefore = masked;
+    QTest::mouseClick(pencil, Qt::LeftButton);
+    QCOMPARE(masked, maskedBefore + 1);
+    QVERIFY(!overview.m_answerPeeked);
+    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
+    QVERIFY(overview.m_before.reopened && !overview.m_before.locked());
+    QVERIFY(overview.m_beforeGroups->isVisible() && overview.m_beforeNote->isVisible());
+    QVERIFY(overview.m_beforeSummaryRow->isHidden());
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-r")), -1);
+    // Picked now, then the answer shown again with Set knowledge: back to the line.
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Home);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Right);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Home);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Right);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-s")), Qt::Key_Home);
+    const QString note = QStringLiteral("Thought it was the one about the GPU count, not the interconnect, and not the memory either");
+    overview.m_beforeNote->setPlainText(note);
+    overview.revealAnswer();
+    QVERIFY(overview.m_before.locked() && !overview.m_before.reopened);
+    QCOMPARE(overview.m_before.answerShownAt, shownAt); // When the answer was first shown.
+    QVERIFY(overview.m_beforeSummaryRow->isVisible() && pencil->isVisible());
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Recall: Partly recalled · Feeling: OK · Setup: Mac — %1…").arg(note.left(59).trimmed()));
+    QCOMPARE(overview.m_beforeSummary->toolTip(), QStringLiteral("Recall: Partly recalled · Feeling: OK · Setup: Mac — %1").arg(note));
+    // One line, no higher than its text: the pencil does not make the bar taller.
+    QTRY_COMPARE(overview.m_beforeSummaryRow->height(), overview.m_beforeSummary->sizeHint().height());
+    QVERIFY(pencil->height() <= overview.m_beforeSummary->sizeHint().height());
+    QVERIFY(overview.m_currentState->isVisible());
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+    // A narrow bar elides the line instead of wrapping it.
+    reviewHost.resize(420, 700);
+    QTRY_VERIFY(overview.m_beforeSummary->text().size() < overview.m_beforeSummaryText.size());
+    QVERIFY(overview.m_beforeSummary->text().endsWith(QStringLiteral("…")));
+    QCOMPARE(overview.m_beforeSummaryRow->height(), overview.m_beforeSummary->sizeHint().height());
+    reviewHost.resize(1000, 700);
+    QTRY_COMPARE(overview.m_beforeSummary->text(), overview.m_beforeSummaryText);
+
+    // The after step chosen; the pencil from Set knowledge hides the rating row until the answer
+    // is shown again, and keeps the after step.
+    overview.m_selectedTags = {QStringLiteral("I get it")};
+    overview.m_groupNotes = {{Thoughts::ReviewTags::answerNoteKey(), QStringLiteral("clear now")}};
+    QTest::mouseClick(pencil, Qt::LeftButton);
+    QVERIFY(overview.m_ratingPanel->isHidden() && !overview.m_answerRow->isHidden());
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-r")), 1);
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-f")), 1);
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-s")), 0);
+    QCOMPARE(overview.m_beforeNote->toPlainText(), note);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-s")), Qt::Key_Right);
+    overview.m_beforeNote->setPlainText(QStringLiteral("on the phone after all"));
+    const int revealedBefore = revealed.count();
+    overview.revealAnswer();
+    QCOMPARE(revealed.count(), revealedBefore + 1);
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Recall: Partly recalled · Feeling: Good · Setup: Phone — on the phone after all"));
+    QCOMPARE(overview.m_selectedTags, QStringList{QStringLiteral("I get it")});
+    QCOMPARE(overview.m_before.answerShownAt, shownAt);
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+
+    // Recorded as the phone records it: the picks as changed, the first time the answer was shown,
+    // and no field that marks the change.
+    Thoughts::ReviewCard card;
+    for (const auto &item : store.cards())
+        if (item.id() == cardId) card = item;
+    const QJsonObject event = card.history.constLast();
+    QCOMPARE(event.value(QStringLiteral("review_tags")).toArray(),
+             (QJsonArray{QStringLiteral("Partly recalled"), QStringLiteral("Good"), QStringLiteral("Phone"), QStringLiteral("I get it")}));
+    QCOMPARE(event.value(QStringLiteral("review_group_notes")).toObject(),
+             (QJsonObject{{QStringLiteral("before_note"), QStringLiteral("on the phone after all")}, {QStringLiteral("note"), QStringLiteral("clear now")}}));
+    const QJsonObject phases = event.value(QStringLiteral("review_phases")).toObject();
+    QCOMPARE(phases.keys(), (QStringList{QStringLiteral("after"), QStringLiteral("before"), QStringLiteral("schema_version")}));
+    const QJsonObject before = phases.value(QStringLiteral("before")).toObject();
+    QCOMPARE(before.keys(), (QStringList{QStringLiteral("answer_shown_at"), QStringLiteral("tags")}));
+    QCOMPARE(before.value(QStringLiteral("tags")).toArray(), (QJsonArray{QStringLiteral("Partly recalled"), QStringLiteral("Good"), QStringLiteral("Phone")}));
+    QCOMPARE(before.value(QStringLiteral("answer_shown_at")).toString(), shownAt.toString(Qt::ISODateWithMs));
+    QCOMPARE(phases.value(QStringLiteral("after")).toObject().value(QStringLiteral("tags")).toArray(), QJsonArray{QStringLiteral("I get it")});
+
+    // Undo, then Edit: the same card shown again keeps what was picked (and when the answer was shown).
+    overview.undoPrevious();
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-s")), Qt::Key_End);
+    overview.toggleReveal();
+    const QDateTime again = overview.m_before.answerShownAt;
+    QTimer::singleShot(0, &overview, [&overview] {
+        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardRegionDialog"));
+        QVERIFY(dialog);
+        dialog->findChild<QPlainTextEdit *>()->setPlainText(QStringLiteral("Edited during the review?"));
+        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    overview.editCurrentCard();
+    QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Edited during the review?"));
+    QCOMPARE(overview.m_before.cardId, cardId);
+    QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Glasses")});
+    QCOMPARE(overview.m_before.answerShownAt, again);
+    QVERIFY(overview.m_beforeSummaryRow->isVisible());
+    QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Setup: Glasses"));
+}
+
+// Without a group asked before the answer there is no before step: no rows before the answer, no
+// line or pencil after it, and the answer is recorded in one step.
+void MainShellTest::testReviewWithoutGroupsAskedBefore()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 1, &pdfSha256);
+    QCOMPARE(ids.size(), 1);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    auto groups = twoStepGroups();
+    for (auto &group : groups) group.phase.clear();
+    QVERIFY2(store.saveTagGroups(groups, &error), qPrintable(error));
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    overview.reviewCard(ids.constFirst());
+    QVERIFY(!overview.m_beforePanel->isVisible());
+    QVERIFY(overview.m_reviewStatus->isHidden());
+    QVERIFY(overview.m_reviewQuestion->toolTip().isEmpty()); // One page: nothing to say where.
+    overview.revealAnswer();
+    QVERIFY(!overview.m_beforePanel->isVisible());
+    QVERIFY(!overview.m_beforeSummaryRow->isVisible() && !overview.m_beforeEditButton->isVisible());
+    QVERIFY(overview.m_currentState->isVisible() && !overview.m_ratingPanel->isHidden());
+    // The pencil's action does nothing without a before step.
+    overview.reopenBeforeStep();
+    QVERIFY(!overview.m_ratingPanel->isHidden());
+    QVERIFY(!overview.m_beforePanel->isVisible());
+    overview.m_nextButton->click();
+    QVERIFY(overview.m_sessionComplete);
+    Thoughts::ReviewCard card;
+    for (const auto &item : store.cards())
+        if (item.id() == ids.constFirst()) card = item;
+    QVERIFY(!card.history.constLast().contains(QStringLiteral("review_phases")));
+}
+
+// An answer out of Undo's reach (saved on the wrong card after a merge, 13 Nov) is taken back from
+// its card's History: right-click › "Take back this answer…", confirmed with its date, tags and
+// note. It writes the retraction Undo writes, so the card's schedule and tags come from its other
+// answers, as after Undo; skips, retractions and answers taken back offer nothing.
+void MainShellTest::testReviewTakeBackAnswerFromHistory()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 2, &pdfSha256);
+    QCOMPARE(ids.size(), 2);
+    const QString taken = ids.at(0), undone = ids.at(1);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime olderDue = now.addDays(-10);
+    // Both cards: an older answer, due again since; the first also has a skip that ended.
+    QHash<QString, QString> olderIds;
+    for (const QString &id : ids) {
+        QString eventId;
+        QVERIFY2(store.recordRating(id, QStringLiteral("custom_interval"), now.addDays(-30), &error, olderDue, &eventId, {}, {QStringLiteral("Good")},
+                                    {{QStringLiteral("note"), QStringLiteral("first read")}}),
+                 qPrintable(error));
+        olderIds.insert(id, eventId);
+    }
+    Thoughts::ReviewSkipBatch batch;
+    QVERIFY2(store.skip(taken, Thoughts::ReviewSkipScope::Card, now.addDays(-15), &batch, &error, now.addDays(-20)), qPrintable(error));
+    // The newer answer of the first card, saved outside any session.
+    QString newerId;
+    const QDateTime newerAt = now.addSecs(-3600);
+    QVERIFY2(store.recordRating(taken, QStringLiteral("custom_interval"), newerAt, &error, newerAt.addDays(34), &newerId, {},
+                                {QStringLiteral("Interesting"), QStringLiteral("Studied"), QStringLiteral("Deeply")},
+                                {{QStringLiteral("note"), QStringLiteral("Publish the essay as a blog post")}}),
+             qPrintable(error));
+    const auto cardOf = [&store](const QString &id) {
+        for (const auto &card : store.cards())
+            if (card.id() == id) return card;
+        return Thoughts::ReviewCard{};
+    };
+    QCOMPARE(cardOf(taken).currentTags(), (QStringList{QStringLiteral("Interesting"), QStringLiteral("Studied"), QStringLiteral("Deeply")}));
+    QCOMPARE(cardOf(taken).schedule.dueAt.toSecsSinceEpoch(), newerAt.addDays(34).toSecsSinceEpoch());
+    QVERIFY(Thoughts::ReviewStore::answerInEffect(cardOf(taken), newerId));
+    QVERIFY(Thoughts::ReviewStore::answerInEffect(cardOf(taken), olderIds.value(taken)));
+    QVERIFY(!Thoughts::ReviewStore::answerInEffect(cardOf(taken), batch.id));
+
+    // The second card's newer answer given in a review and taken back with Undo, for comparison.
+    {
+        QWidget reviewHost;
+        reviewHost.resize(1000, 700);
+        const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                                   {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+        Thoughts::ReviewOverview overview(
+            temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+            [&reviewHost] { return &reviewHost; });
+        overview.reviewCard(undone);
+        overview.revealAnswer();
+        overview.m_selectedTags = {QStringLiteral("Interesting")};
+        overview.m_nextButton->click();
+        QCOMPARE(cardOf(undone).currentTags(), QStringList{QStringLiteral("Interesting")});
+        overview.undoPrevious();
+    }
+    QCOMPARE(cardOf(undone).currentTags(), QStringList{QStringLiteral("Good")});
+
+    // The first card's History in Cards: older answer, skip, newer answer.
+    Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+    browser.resize(900, 760);
+    browser.show();
+    browser.selectCard(taken);
+    QTRY_VERIFY(browser.selectedBrowseCard());
+    QTest::mouseClick(browser.m_browseHistoryButton, Qt::LeftButton);
+    QTRY_VERIFY(browser.m_browseHistory->isVisible());
+    QCOMPARE(browser.m_browseHistoryAnswers, (QStringList{olderIds.value(taken), QString(), newerId}));
+    const auto itemPoint = [&browser](int index) {
+        QTextDocument *document = browser.m_browseHistory->document();
+        for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
+            if (!block.textList() || block.textList()->itemNumber(block) != index) continue;
+            const QRectF bounds = document->documentLayout()->blockBoundingRect(block);
+            return QPoint(int(bounds.center().x()), int(bounds.center().y()) - browser.m_browseHistory->verticalScrollBar()->value());
+        }
+        return QPoint(-1, -1);
+    };
+    QCOMPARE(browser.historyAnswerAt(itemPoint(0)), olderIds.value(taken));
+    QCOMPARE(browser.historyAnswerAt(itemPoint(1)), QString()); // The skip.
+    QCOMPARE(browser.historyAnswerAt(itemPoint(2)), newerId);
+    QCOMPARE(browser.historyAnswerAt(QPoint(5, browser.m_browseHistory->viewport()->height() - 2)), QString()); // Under the list.
+
+    // Right-click: the History's menu, with "Take back this answer…" only on an answer.
+    const auto rightClick = [&browser](const QPoint &at) -> QMenu * {
+        Q_EMIT browser.m_browseHistory->customContextMenuRequested(at);
+        for (QWidget *top : QApplication::topLevelWidgets()) {
+            auto *menu = qobject_cast<QMenu *>(top);
+            if (menu && menu->isVisible() && menu->objectName() == QLatin1String("reviewHistoryMenu")) return menu;
+        }
+        return nullptr;
+    };
+    const auto takeBackAction = [](QMenu *menu) { return menu->findChild<QAction *>(QStringLiteral("reviewHistoryTakeBackAction")); };
+    QMenu *menu = rightClick(itemPoint(1));
+    QVERIFY(menu);
+    QVERIFY(!takeBackAction(menu));
+    QVERIFY(!menu->actions().isEmpty()); // Copy, Select All…
+    menu->close();
+    // The confirmation: the answer's date, tags, interval and note; @p button answers it.
+    const auto answerConfirmation = [&browser](const QString &button, QString *asked) {
+        // The message box shows a little after the action: looked for until it does (5 s at most).
+        auto *poll = new QTimer(&browser);
+        poll->setInterval(20);
+        auto tries = std::make_shared<int>(0);
+        QObject::connect(poll, &QTimer::timeout, poll, [poll, button, asked, tries] {
+            for (QWidget *top : QApplication::topLevelWidgets()) {
+                auto *dialog = qobject_cast<QDialog *>(top);
+                if (!dialog || !dialog->isVisible()) continue;
+                for (QAbstractButton *candidate : dialog->findChildren<QAbstractButton *>()) {
+                    if (candidate->text().remove(QLatin1Char('&')) != button) continue;
+                    for (QLabel *label : dialog->findChildren<QLabel *>()) *asked += label->text() + QLatin1Char('\n');
+                    poll->stop();
+                    poll->deleteLater();
+                    candidate->click();
+                    return;
+                }
+                if (*tries > 250) dialog->reject();
+            }
+            if (++*tries > 260) {
+                poll->stop();
+                poll->deleteLater();
+            }
+        });
+        poll->start();
+    };
+    // Cancel writes nothing.
+    const qsizetype events = cardOf(taken).history.size();
+    menu = rightClick(itemPoint(2));
+    QVERIFY(menu && takeBackAction(menu));
+    QCOMPARE(takeBackAction(menu)->text(), QStringLiteral("Take back this answer…"));
+    QString asked;
+    answerConfirmation(QStringLiteral("Cancel"), &asked);
+    menu->close();
+    takeBackAction(menu)->trigger();
+    QVERIFY2(!asked.isEmpty(), "no confirmation");
+    QCOMPARE(cardOf(taken).history.size(), events);
+    // Taken back.
+    menu = rightClick(itemPoint(2));
+    QVERIFY(menu && takeBackAction(menu));
+    asked.clear();
+    answerConfirmation(QStringLiteral("Take Back"), &asked);
+    menu->close();
+    takeBackAction(menu)->trigger();
+    for (const QString &part : {QStringLiteral("Question 1?"), newerAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")), QStringLiteral("Interesting, Studied, Deeply"),
+                                QStringLiteral("34 days"), QStringLiteral("Publish the essay as a blog post")})
+        QVERIFY2(asked.contains(part), qPrintable(part + QStringLiteral(" not in: ") + asked));
+
+    // The card is back to its older answer, as the card whose answer was undone.
+    const Thoughts::ReviewCard after = cardOf(taken), compared = cardOf(undone);
+    QCOMPARE(after.currentTags(), QStringList{QStringLiteral("Good")});
+    QCOMPARE(after.schedule.dueAt.toSecsSinceEpoch(), olderDue.toSecsSinceEpoch());
+    QCOMPARE(after.schedule.reviewCount, compared.schedule.reviewCount);
+    QCOMPARE(after.schedule.dueAt, compared.schedule.dueAt);
+    QCOMPARE(after.schedule.intervalDays, compared.schedule.intervalDays);
+    QVERIFY(!Thoughts::ReviewStore::answerInEffect(after, newerId));
+    // The same retraction as Undo's: the same fields, naming the answer taken back.
+    const auto retractionOf = [](const Thoughts::ReviewCard &card) {
+        for (const QJsonObject &event : card.history)
+            if (event.contains(QStringLiteral("retracted_event_id"))) return event;
+        return QJsonObject{};
+    };
+    const QJsonObject mine = retractionOf(after), undo = retractionOf(compared);
+    QVERIFY(!mine.isEmpty() && !undo.isEmpty());
+    QCOMPARE(mine.keys(), undo.keys());
+    QCOMPARE(mine.value(QStringLiteral("retracted_event_id")).toString(), newerId);
+    QCOMPARE(mine.value(QStringLiteral("card_id")).toString(), taken);
+    for (const QString &key : {QStringLiteral("schema_version"), QStringLiteral("revision"), QStringLiteral("origin_id")})
+        QCOMPARE(mine.value(key), undo.value(key));
+    QCOMPARE(mine.value(QStringLiteral("reviewed_at")), mine.value(QStringLiteral("updated_at")));
+    QVERIFY(!Thoughts::ReviewStore::answerInEffect(after, mine.value(QStringLiteral("event_id")).toString()));
+    // The History lists it as Undo does, and offers nothing more on it.
+    QTRY_VERIFY(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Undo review")));
+    QCOMPARE(browser.m_browseHistoryAnswers, (QStringList{olderIds.value(taken), QString(), QString(), QString()}));
+    QCOMPARE(browser.historyAnswerAt(itemPoint(2)), QString());
+    QCOMPARE(browser.historyAnswerAt(itemPoint(3)), QString());
+    QCOMPARE(browser.historyAnswerAt(itemPoint(0)), olderIds.value(taken));
+}
+
+namespace
+{
+// A Library of @p count review cards of file1.pdf as Sync's projections hold them: each answered
+// three times (the newest due an hour ago for every other card), and likes on the first and the
+// last card's answers (so a card's feedback has home cards to find). Returns the card IDs.
+QStringList manyCardProjections(int count, QString *pdfSha256, QJsonObject *projections)
+{
+    QFile pdf(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    if (!pdf.open(QIODevice::ReadOnly)) return {};
+    *pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    QStringList ids;
+    for (int index = 0; index < count; ++index) {
+        const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), *pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), QStringLiteral("Question %1?").arg(index + 1)},
+                                  {QStringLiteral("selected_text"), QStringLiteral("Answer %1").arg(index + 1)}};
+        projections->insert(QStringLiteral("review_card\ncards\n") + cardId,
+                            QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("card_id"), cardId},
+                                        {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("revision"), 1}, {QStringLiteral("primary"), primary}});
+        for (int answer = 0; answer < 3; ++answer) {
+            const QDateTime at = now.addDays(-30 + answer * 10);
+            const QDateTime due = answer == 2 && index % 2 == 0 ? now.addSecs(-3600) : at.addDays(answer == 2 ? 20 : 9);
+            const QString eventId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            projections->insert(QStringLiteral("review_event\nevents\n") + eventId,
+                                QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("event_id"), eventId}, {QStringLiteral("card_id"), cardId},
+                                            {QStringLiteral("reviewed_at"), at.toString(Qt::ISODate)}, {QStringLiteral("updated_at"), at.toString(Qt::ISODate)},
+                                            {QStringLiteral("origin_id"), QStringLiteral("bench")}, {QStringLiteral("revision"), 1},
+                                            {QStringLiteral("rating"), QStringLiteral("custom_interval")}, {QStringLiteral("scheduled_due_at"), due.toString(Qt::ISODate)},
+                                            {QStringLiteral("review_tags"), QJsonArray{QStringLiteral("Recalled")}}});
+        }
+        ids.append(cardId);
+    }
+    for (const QString &home : {ids.constFirst(), ids.constLast()}) {
+        const QString feedbackId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        projections->insert(QStringLiteral("review_card_feedback\nreview-feedback\n") + feedbackId,
+                            QJsonObject{{QStringLiteral("feedback_id"), feedbackId}, {QStringLiteral("card_id"), home}, {QStringLiteral("polarity"), QStringLiteral("positive")},
+                                        {QStringLiteral("created_at"), now.toString(Qt::ISODate)}, {QStringLiteral("updated_at"), now.toString(Qt::ISODate)},
+                                        {QStringLiteral("revision"), 1}});
+    }
+    return ids;
+}
+}
+
+// The work a projection refresh does on the GUI thread with many cards, outside a review and
+// during one whose mask a PDF reload took away (as when Sync rebuilds the PDF): the freezes of
+// 13 Nov, about 3 s each, where every card was built two to four times on the GUI thread. Now
+// none is: only the card under review is read there, the rest in the background.
+void MainShellTest::testReviewRefreshCostWithManyCards()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    QJsonObject projections;
+    const int count = 1200;
+    const QStringList ids = manyCardProjections(count, &pdfSha256, &projections);
+    QCOMPARE(ids.size(), count);
+    // The Library's PDF is the one the cards are placed on.
+    QVERIFY(QDir().mkpath(QDir(temporary.path()).filePath(QStringLiteral("current_pdfs"))));
+    {
+        QFile index(QDir(temporary.path()).filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+        QVERIFY(index.open(QIODevice::WriteOnly));
+        index.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1},
+                                              {QStringLiteral("pdfs"), QJsonArray{QJsonObject{{QStringLiteral("filename"), QStringLiteral("file1.pdf")},
+                                                                                              {QStringLiteral("pdf_sha256"), pdfSha256}}}}}).toJson());
+    }
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    int restored = 0;
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr,
+        [&projections] { return projections; }, {}, [&reviewHost] { return &reviewHost; });
+    // As Shell::restoreReviewCard does: the reader shows the mask with the feedback's home cards.
+    QJsonObject homes;
+    overview.setPresentationRestorer([&overview, &restored, &homes](const Thoughts::ReviewCard &card, QString *) {
+        homes = overview.feedbackHomeCards(card);
+        ++restored;
+        return true;
+    });
+    const auto idle = [] { return QThreadPool::globalInstance()->activeThreadCount() == 0; };
+    QTRY_VERIFY_WITH_TIMEOUT(queueRefreshed(overview) && idle(), 30000);
+    const auto median = [](QList<qint64> values) {
+        std::sort(values.begin(), values.end());
+        return values.at(values.size() / 2);
+    };
+    const auto joined = [](const QList<qint64> &values) {
+        QStringList all;
+        for (qint64 value : values) all.append(QString::number(value));
+        return all.join(QLatin1Char(' '));
+    };
+    QList<qint64> outside, during;
+    quint64 loads = 0;
+    // Outside a review: Sync's refresh of the dashboard.
+    for (int round = 0; round < 5; ++round) {
+        const quint64 before = Thoughts::ReviewStore::guiThreadFullLoads();
+        QElapsedTimer timer;
+        timer.start();
+        overview.reloadFromProjections();
+        outside.append(timer.elapsed());
+        loads += Thoughts::ReviewStore::guiThreadFullLoads() - before;
+        QTRY_VERIFY_WITH_TIMEOUT(queueRefreshed(overview) && idle(), 30000);
+    }
+    QCOMPARE(loads, quint64(0));
+    QCOMPARE(overview.m_dueCards.size(), count / 2);
+    QCOMPARE(overview.m_newCount->text(), QStringLiteral("0"));
+    QCOMPARE(overview.m_reviewCount->text(), QString::number(count / 2));
+    QCOMPARE(overview.m_documentFilter->count(), 2); // All documents, file1
+    overview.startReview();
+    QVERIFY(overview.m_currentReview >= 0);
+    QTRY_VERIFY_WITH_TIMEOUT(queueRefreshed(overview) && idle(), 30000);
+    const QString current = overview.m_dueCards.at(overview.m_currentReview).id();
+    // During a review whose mask the PDF's reload took away.
+    for (int round = 0; round < 5; ++round) {
+        overview.m_lostPresentationCardId = current;
+        const quint64 before = Thoughts::ReviewStore::guiThreadFullLoads();
+        QElapsedTimer timer;
+        timer.start();
+        overview.reloadFromProjections();
+        during.append(timer.elapsed());
+        loads += Thoughts::ReviewStore::guiThreadFullLoads() - before;
+        QTRY_VERIFY_WITH_TIMEOUT(queueRefreshed(overview) && idle(), 30000);
+    }
+    QCOMPARE(loads, quint64(0));
+    // The review, its card and its mask as before.
+    QCOMPARE(overview.m_dueCards.at(overview.m_currentReview).id(), current);
+    QCOMPARE(overview.m_dueCards.size(), count / 2);
+    QCOMPARE(restored, 5);
+    QVERIFY(!homes.isEmpty());
+    qInfo().noquote() << QStringLiteral("GUI thread per refresh, %1 cards: outside a review %2 ms (%3), during a review %4 ms (%5); cards built on it: %6")
+                             .arg(count).arg(median(outside)).arg(joined(outside)).arg(median(during)).arg(joined(during)).arg(loads);
 }
 
 // review-phases spec, section 4: once per card of a due session, in the background, the agent
@@ -11089,7 +12603,8 @@ void MainShellTest::testCardHistoryInSidebar()
                                                           "- Liked: \"the KL term keeps the policy close\" — Clear explanation.\n")),
              qPrintable(copied));
     // The document's History, as the sidebar shows it (Shell::updateDocumentHistory). One more
-    // feedback, given on the earlier version on text the current answer still has (carried).
+    // feedback, given on the earlier version on text the current answer still has: it stays with that
+    // version (a like belongs to the version it was given on), never carried to the current one.
     {
         const QJsonObject anchor = Thoughts::ReviewCardFeedback::anchor(QStringLiteral("some random text put here"), QString(), QString(),
                                                                         QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"), earlierSha256, QJsonArray{});
@@ -11137,8 +12652,8 @@ void MainShellTest::testCardHistoryInSidebar()
                           + row->findChild<QLabel *>(QStringLiteral("reviewHistoryCardCounts"))->text());
         return result;
     };
-    // Feedback from an earlier version whose passage is still in the answer shows on the current one too.
-    QCOMPARE(rows(pdfSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 review · 1 feedback · 1 feedback from an earlier version")});
+    // Feedback from an earlier version stays there, even when its passage is still in the answer.
+    QCOMPARE(rows(pdfSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 review · 1 feedback")});
     QCOMPARE(rows(earlierSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 review · 2 feedback")});
     QCOMPARE(rows(prunedSha256), QStringList{QStringLiteral("Which fact should be recalled? | 1 feedback")});
     QCOMPARE(rows(QStringLiteral("unrecorded")), QStringList{QStringLiteral("Which fact should be recalled? | 1 review")});
@@ -11149,7 +12664,7 @@ void MainShellTest::testCardHistoryInSidebar()
     const auto row = [&](const QString &name) { return block(name)->findChild<QFrame *>(QStringLiteral("reviewHistoryCard")); };
     QVERIFY2(row(pdfSha256)->toolTip().contains(QStringLiteral("Liked “the KL term keeps the policy close”: Clear explanation.")), qPrintable(row(pdfSha256)->toolTip()));
     QVERIFY(row(prunedSha256)->toolTip().contains(longComment.toHtmlEscaped()));
-    QVERIFY(row(pdfSha256)->toolTip().contains(QStringLiteral("Still true.")));
+    QVERIFY(!row(pdfSha256)->toolTip().contains(QStringLiteral("Still true.")));
     QVERIFY(!row(pdfSha256)->toolTip().contains(QStringLiteral("Should be 0.05")));
     const QString screenshots = qEnvironmentVariable("THOUGHTS_TEST_SCREENSHOTS");
     if (!screenshots.isEmpty()) {
@@ -12717,10 +14232,12 @@ void MainShellTest::testReviewNamesThePagesOfAMultiPageAnswer()
     QTRY_VERIFY(overview.m_startButton->isEnabled());
     overview.startReview();
     QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Spread over two pages?"));
-    QVERIFY(!overview.m_reviewStatus->isHidden());
-    QCOMPARE(overview.m_reviewStatus->text(), QStringLiteral("Answer on pages 1, 2"));
+    // Where the answer is: the question's tooltip, not a line of the bar.
+    QVERIFY(overview.m_reviewStatus->isHidden());
+    QCOMPARE(overview.m_reviewQuestion->toolTip(), QStringLiteral("Answer on pages 1, 2"));
     overview.revealAnswer();
-    QVERIFY(!overview.m_reviewStatus->isHidden());
+    QVERIFY(overview.m_reviewStatus->isHidden());
+    QCOMPARE(overview.m_reviewQuestion->toolTip(), QStringLiteral("Answer on pages 1, 2"));
 
     // A card with several areas but no source markers (an imported PDF) is changed with Edit Areas…:
     // no VS Code marker button, no coordinates of its first area.
