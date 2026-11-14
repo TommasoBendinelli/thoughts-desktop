@@ -370,10 +370,11 @@ int main(int argc, char **argv)
     parser.setApplicationDescription(QStringLiteral("Open PDFs, manage pending proposals, and trigger or inspect Thoughts synchronization."));
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.addPositionalArgument(QStringLiteral("command"), QStringLiteral("open, sync, status, create-proposal, create-proposals, revise-proposal, remove-proposal, move-card-passage, create-review-card, list-review-cards, delete-review-card, set-review-card-interval, move-review-card, merge-review-cards, create-project, import-document, remove-project, open-agent-notes, delete-comment, list-todos, add-todo, edit-todo, decide-proposal, resolve-source-conflict, link-conversation, search-review-cards, knowledge-profile, knowledge-levels, review-tags or store-secret. "
+    parser.addPositionalArgument(QStringLiteral("command"), QStringLiteral("open, sync, status, create-proposal, create-proposals, revise-proposal, remove-proposal, move-card-passage, create-review-card, list-review-cards, delete-review-card, set-review-card-interval, move-review-card, merge-review-cards, create-project, import-document, remove-project, open-agent-notes, delete-comment, list-todos, add-todo, edit-todo, decide-proposal, resolve-source-conflict, link-conversation, search-review-cards, knowledge-profile, agent-context, knowledge-levels, review-tags or store-secret. "
                                                                            "decide-proposal accepts or rejects one whole proposal for an editor integration acting on the user's click; agents never decide proposals. resolve-source-conflict settles a recorded source conflict like the Resolve dialog: path plus keep (fedora or local) or content_file (absolute path of a finished merge). "
                                                                            "open-agent-notes brings Agent Notes to the front with one document's or project's notes: {\"document\": id, Library filename, PDF path or name} or {\"project\": id or name}, and/or {\"note_id\"} to select a note. "
-                                                                           "search-review-cards and knowledge-profile only read the review index and the Library, with or without Thoughts running. "
+                                                                           "search-review-cards, knowledge-profile and agent-context only read the review index and the Library, with or without Thoughts running. "
+                                                                           "agent-context TOPIC prints what the review cards say about the user and the topic, to paste into any chat app. "
                                                                            "list-document-feedback lists the likes, dislikes, questions, drawings and text boxes given while reading, with the text of their pages on the PDF version they were given on (fetched from the server when not here; comments are left out). "
                                                                            "knowledge-levels prints the tag-to-knowledge-level mapping; with --init it writes the default mapping to a file you can edit. "
                                                                            "review-tags plan FILE shows what a tag reorganization (merges and the group layout) would change, read-only; "
@@ -514,14 +515,18 @@ int main(int argc, char **argv)
         return failed ? failed : 1;
     }
     // Read-only: answered here from the review index, so they work without Thoughts running.
-    if (command == QLatin1String("search-review-cards") || command == QLatin1String("knowledge-profile")) {
-        if (positional.size() != 1 || parser.isSet(pageOption) || parser.isSet(targetOption) || parser.isSet(waitOption)
+    if (command == QLatin1String("search-review-cards") || command == QLatin1String("knowledge-profile") || command == QLatin1String("agent-context")) {
+        // agent-context also takes its topic as an argument instead of a JSON request.
+        const bool topicArgument = command == QLatin1String("agent-context") && positional.size() == 2;
+        if ((positional.size() != 1 && !topicArgument) || parser.isSet(pageOption) || parser.isSet(targetOption) || parser.isSet(waitOption)
             || parser.isSet(timeoutOption) || parser.isSet(initOption)) {
             errors << "error: this command takes [--json] and one JSON request from stdin\n";
             return 2;
         }
         QJsonObject request;
-        if (!readRequest(&request, command == QLatin1String("search-review-cards"))) {
+        if (topicArgument) {
+            request.insert(QStringLiteral("topic"), positional.at(1));
+        } else if (!readRequest(&request, command == QLatin1String("search-review-cards"))) {
             printResult(Thoughts::syncCommandError(QStringLiteral("invalid_request"), QStringLiteral("Provide a JSON object of at most 2 MiB without a command field.")), parser.isSet(jsonOption));
             return 2;
         }
@@ -531,6 +536,8 @@ int main(int argc, char **argv)
             printResult(result, true);
         } else if (command == QLatin1String("knowledge-profile") && result.value(QStringLiteral("accepted")).toBool()) {
             QTextStream(stdout) << result.value(QStringLiteral("summary")).toString() << Qt::endl;
+        } else if (command == QLatin1String("agent-context") && result.value(QStringLiteral("accepted")).toBool()) {
+            QTextStream(stdout) << result.value(QStringLiteral("text")).toString() << Qt::endl;
         } else {
             QTextStream(stdout) << QJsonDocument(result).toJson(QJsonDocument::Indented);
         }

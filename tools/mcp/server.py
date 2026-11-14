@@ -106,7 +106,8 @@ mcp = FastMCP(
     "Calibrate to the user's knowledge: before explaining a concept, answering a technical question, or writing or editing a passage "
     "on a topic the user may have studied in their Thoughts Library, call knowledge_profile once for that topic (one call per topic, not per sentence). "
     "Then skip or compress what is solid, explain shaky and not-understood points carefully, treat not-yet-reviewed cards as read but untested, "
-    "and mention a relevant card briefly when it helps. With no matching cards, answer normally. "
+    "and mention a relevant card briefly when it helps. With few or no matching cards, the result also says what the user's cards show about them in general "
+    "(its learner section and the end of its summary): connect new material to what they know well and find interesting. "
     "Use search_review_cards to look up specific cards. Both only read; never create, change or review cards because of what they return. "
     "When the user studies a review card with you and a picture would help (a diagram, a derivation, a sketch to annotate), "
     "send it to their phone with send_note (review_card_id from search_review_cards, list_review_cards or the user's \"Copy for agent\" text); "
@@ -999,6 +1000,7 @@ async def knowledge_profile(
     project: Project = None,
     document: Document = None,
     limit: Annotated[int, Field(strict=True, ge=1, le=200, description="At most this many matching cards are classified.")] = 40,
+    learner: Annotated[bool | None, Field(description="Include what all of the user's cards say about them in general (learner). Default: only when fewer than 3 cards match.")] = None,
 ) -> CallToolResult:
     """What the user knows about a topic, from their review cards (read-only).
 
@@ -1009,9 +1011,14 @@ async def knowledge_profile(
     Returns counts, the cards per class (question, document and a one-line reason such as
     "last 3 answers: Correct, Memorized, Correct; interval 25 d"), a short plain-language summary,
     and the tag-to-level mapping used (the user's knowledge-tag-levels.json, or the default mapping).
+    A card's signals give the tags of its last answer from the user's other tag groups, such as Interest
+    ("Very interesting") and Effort ("Studied"); the summary ends with how typical each one is.
+    When fewer than 3 cards match (or with learner), learner describes all of the user's cards: counts per
+    class, the documents studied most with their mix and typical interest, the groups' typical tags,
+    questions they know well and struggle with, and their latest liked and disliked answer passages.
     Call it once per topic before explaining or editing, then calibrate; never change cards because of it.
     """
-    payload = {k: v for k, v in dict(topic=topic, project=project, document=document, limit=limit).items() if v is not None}
+    payload = {k: v for k, v in dict(topic=topic, project=project, document=document, limit=limit, learner=learner).items() if v is not None}
     return tool_result(await knowledge_command("knowledge-profile", payload))
 
 
