@@ -156,17 +156,17 @@ All commands run in a normal (not administrator) PowerShell.
    powershell -ExecutionPolicy Bypass -File thoughts-desktop\tools\windows\register.ps1
    ```
 
-5. **Store the two tokens from step 1.3.** Each is read from standard input, so it doesn't end up in your history:
+5. **Save your server's address, then store the two tokens from step 1.3.** The address comes first: `store-secret` ties each token to the address saved at that moment, and the token is sent only there. Skip the address only if this build was made for your server (`-ServerUrl`).
+   ```powershell
+   C:\CraftRoot\bin\thoughtsctl.exe set-server https://thoughts.example.org
+   ```
+   Each token is read from standard input, so it doesn't end up in your history:
    ```powershell
    Read-Host 'Desktop token (thoughts-windows)' | C:\CraftRoot\bin\thoughtsctl.exe store-secret --account thoughts-windows
    Read-Host 'Publisher token (thoughts-windows-source-sync)' | C:\CraftRoot\bin\thoughtsctl.exe store-secret --account thoughts-source-sync
    ```
-   They appear in Credential Manager as `thoughts-server/thoughts-windows` and `thoughts-server/thoughts-source-sync`.
-   Thoughts uses them with the build's default server unless you save another address under **File › Server…** or with `C:\CraftRoot\bin\thoughtsctl.exe set-server https://…`; `THOUGHTS_SERVER_URL` overrides both.
-   With your own server, save its address now, before Thoughts first starts: Thoughts contacts its server as soon as it starts.
-   ```powershell
-   C:\CraftRoot\bin\thoughtsctl.exe set-server https://thoughts.example.org
-   ```
+   Each command names the server the token is now stored for. They appear in Credential Manager as `thoughts-server/thoughts-windows` and `thoughts-server/thoughts-source-sync`.
+   Do this before Thoughts first starts: Thoughts contacts its server as soon as it starts. `THOUGHTS_SERVER_URL` overrides the saved address.
 
 6. **Unpack the sources** from step 1.2 (only when moving an existing Library) into the docs folder, which is `%USERPROFILE%\Thoughts\docs` unless `THOUGHTS_HOME` says otherwise:
    ```powershell
@@ -224,7 +224,7 @@ To run all of `parttest` on the PC (it takes a while): `ctest -R parttest --outp
 
 ## Troubleshooting
 
-- **"The Thoughts server is not configured or its credentials are unavailable":** a token is missing. Repeat step 3.5.
+- **"The server is not configured or its credentials are unavailable":** a token is missing. Repeat step 3.5.
 - **Sync says the source publisher is unavailable:** `thoughts-publish-sources.exe` is missing next to `thoughts.exe`. Run `build.ps1` again, which checks for it.
 - **"current_pdfs is in use":** `current_pdfs` existed as an ordinary folder before the first Sync. Close the PDFs opened from it and Sync again. Thoughts sets the old folder aside as `.thoughts-library-legacy-*`; it deletes nothing.
 - **Logs:**
