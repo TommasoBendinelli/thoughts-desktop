@@ -18,9 +18,12 @@ class QLabel;
 class QPlainTextEdit;
 class QListWidget;
 class QListWidgetItem;
+class QMenu;
 class QPushButton;
 class QScrollArea;
 class QStackedWidget;
+class QTimer;
+class QToolButton;
 class QVBoxLayout;
 
 class AgentNotesTest;
@@ -76,6 +79,8 @@ private:
 // The notes, newest first with unread ones marked, and the chosen note with its picture,
 // links and the replies from the phone. Two layouts: Split (the Agent Notes window: the list
 // beside the note) and Sidebar (a reader's sidebar: the list, or one note in its place).
+// Above an agent's note, always in view, one line says which agent listens for a reply, and
+// "Change" lets the user choose who answers.
 class AgentNotesView : public QWidget
 {
     Q_OBJECT
@@ -142,6 +147,11 @@ public:
 
     enum Roles { NoteIdRole = Qt::UserRole + 1, UnreadRole, MetaRole, PreviewRole };
 
+    // How often a view asks who listens for replies to the note it shows.
+    static constexpr int ListeningRefreshMs = 60 * 1000;
+    // How long the line says that a choice was not saved.
+    static constexpr int AnswerFailureShownMs = 12 * 1000;
+
 protected:
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
@@ -163,8 +173,21 @@ private:
     bool readsNow() const;
     void openLarge();
     void updateReplyBox();
-    // The warning over the reply field while no agent listens for replies to the note shown.
-    void updateListening();
+    QWidget *createAnswerLine(QWidget *parent);
+    // The line above the note shown: whether an agent listens for a reply, which one, and
+    // "Change" (AgentNotes::answerLine). No line for a page the user sent, nor while the server
+    // has not said or cannot tell.
+    void updateAnswerLine();
+    // The agent's note on screen whose line is kept up to date; empty when there is none.
+    QString answerNoteId() const;
+    // The list "Change" opens: Automatic and the agents that could answer now, the current
+    // choice checked. The caller owns it; null when the server said nothing about the note.
+    QMenu *createAnswerMenu();
+    void showAnswerMenu();
+    // Sends the choice; the line follows the server's answer, and after a failure it says so
+    // and the choice stays as it was.
+    void chooseAnswerer(const QString &noteId, const std::optional<AgentNotes::Agent> &agent);
+    void showAnswerFailure(const QString &noteId, const QString &text);
     void showListMenu(const QPoint &position);
     void rebuildFilterMenu();
     void filterChosen(int index);
@@ -209,8 +232,17 @@ private:
     QLabel *m_message = nullptr;
     AgentNoteImageView *m_image = nullptr;
     QWidget *m_replyBox = nullptr;
-    QLabel *m_listeningWarning = nullptr;
-    // Asks now and then whether the note's agent still listens, while a note is on screen.
+    // Split: the line that says who listens, over the note (m_scroll).
+    QWidget *m_notePane = nullptr;
+    QWidget *m_answerLine = nullptr;
+    QLabel *m_answerMark = nullptr;
+    QLabel *m_answerText = nullptr;
+    QToolButton *m_answerChange = nullptr;
+    // What to tell the user after a choice that was not saved, for a while.
+    QLabel *m_answerFailure = nullptr;
+    QTimer *m_answerFailureTimer = nullptr;
+    QString m_answerFailureNoteId;
+    // Asks every minute who listens, while an agent's note is on screen and Thoughts is in front.
     QTimer *m_listeningTimer = nullptr;
     QPlainTextEdit *m_replyField = nullptr;
     QPushButton *m_drawButton = nullptr;

@@ -30,9 +30,11 @@ set(okular_SRCS
    reviewdocumenttools.cpp
    reviewcardeditor.cpp
    reviewcardmerge.cpp
+   serverlink.cpp
    shell.cpp
    shellutils.cpp
    syncjournal.cpp
+   syncstatewatch.cpp
    thoughtscommandprotocol.cpp
    todocommands.cpp
    updatecheck.cpp

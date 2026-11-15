@@ -150,11 +150,11 @@ int main(int argc, char **argv)
     aboutData.processCommandLine(&parser);
 
 #ifdef Q_OS_WIN
-    QStringList thoughtsLinks;
     if (forwardToRunningThoughts(parser.positionalArguments())) {
         return 0;
     }
 #endif
+    QStringList thoughtsLinks;
 
     // Settle the server address before anything can synchronize: the first
     // run of this version keeps an installation that synchronized before on
@@ -168,14 +168,13 @@ int main(int argc, char **argv)
         // no session.. just start up normally
         QStringList paths;
         for (int i = 0; i < parser.positionalArguments().count(); ++i) {
-#ifdef Q_OS_WIN
             // macOS delivers thoughts:// links as file-open events; Windows
-            // passes them on the command line. Replay them once a window exists.
+            // passes them on the command line, as does anyone who starts the
+            // executable with one. Replay them once a window exists.
             if (parser.positionalArguments().at(i).startsWith(QLatin1String("thoughts:"), Qt::CaseInsensitive)) {
                 thoughtsLinks << parser.positionalArguments().at(i);
                 continue;
             }
-#endif
             paths << parser.positionalArguments().at(i);
         }
         Okular::Status status = Okular::main(paths, ShellUtils::serializeOptions(parser));
@@ -188,14 +187,12 @@ int main(int argc, char **argv)
             // Do nothing
             break;
         }
-#ifdef Q_OS_WIN
         for (const QString &link : std::as_const(thoughtsLinks)) {
             QTimer::singleShot(0, &app, [link] {
                 QFileOpenEvent event{QUrl(link)};
                 QCoreApplication::sendEvent(qApp, &event);
             });
         }
-#endif
     }
 
     if (!parser.isSet(QStringLiteral("presentation")) && !parser.isSet(QStringLiteral("print-and-exit"))) {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "agentnotedrawing.h"
+#include "serverlink.h"
 
 #include <QByteArray>
 #include <QDateTime>
@@ -65,6 +66,116 @@ struct Reply {
 // reply"): Unknown when the sender's agents never say, or before the server answered.
 enum class Listening { Unknown, Listening, NotListening };
 Listening listeningFromJson(const QJsonObject &json);
+
+// An agent that can answer the user's reply to a note (protocol/agent-notes.md "The user's
+// choice"): an agent of the device that sent it ("sender"), a topic owner ("owner", with the
+// topic's label) or the Thoughts reply agent ("responder").
+struct Agent {
+    QString role;
+    QString deviceId;
+    QString conversationId;  // empty: none (a device-wide sender, a responder)
+    QString ownerId;  // an owner's
+    QString label;  // an owner's topic
+    bool live = false;  // it is listening right now
+
+    // The same agent, whatever its label or whether it is live says now.
+    bool isSameAgent(const Agent &other) const;
+    // How the view names it, at the start of a sentence or as a list entry: "Thoughts reply
+    // agent", "Course notes agent", "The agent that sent it".
+    QString name() const;
+    // The agent as PUT /v1/agent-notes/{id}/answer-by names it: its identity only.
+    QJsonObject toChoiceJson() const;
+    // Nothing for what is not an agent the view can name (an unknown role, no device).
+    static std::optional<Agent> fromJson(const QJsonObject &json);
+};
+
+// The session a reply waker would wake for a reply arriving now (protocol/agent-notes.md
+// "Wakers", "wake" in every listening answer, server agent_note_wakers_v1): the note's own session
+// ("sender"), a topic owner's ("owner") or the fallback session that answers what has no other
+// home ("responder", the study session), on the waker's machine. While that machine is offline the
+// fallback answers at fallbackAt instead.
+struct Wake {
+    QString state;  // "will_be_woken" or "waker_offline"
+    QString role;
+    QString machine;
+    QString title;  // the session's; empty when the server has none
+    QString sessionState;  // idle, busy (running a task) or closed
+    QString label;  // an owner's topic
+    QDateTime fallbackAt;  // UTC; invalid when the server gave none
+
+    bool willBeWoken() const;
+    // How the view names the session: the study session for the fallback, else its title, or its
+    // agent's name when it has none.
+    QString name() const;
+    // What the line under the note says: "<title> will be woken on the Mac", "The study session will be
+    // woken", "<title> answers when it finishes its current task" while it runs a task, or "The Mac
+    // is offline; the study session answers at <local time> if it is still offline".
+    QString text() const;
+    // The reply box after Send: "Sent ✓ · <title> will be woken".
+    QString sentText() const;
+    // Nothing for what the view cannot say (an unknown state or role, no machine).
+    static std::optional<Wake> fromJson(const QJsonObject &json);
+};
+// The machine a reply waker runs on, as the view names it: "the Mac", else "the server" (there
+// are two wakers, and a text never names a host).
+QString wakerMachineName(const QString &machine);
+
+// The server's answer about who listens for replies to a note (GET …/listening, the answer to
+// PUT …/answer-by). With agent_note_answer_by_v1 it also says which agent the user chose to answer
+// (answerBy; none is automatic: the agent that sent the note first, then the Thoughts reply
+// agent) and which agents could answer now (candidates); with a choice, the state is Listening
+// exactly while the chosen agent is live. With agent_note_wakers_v1, wake is the session a reply
+// waker would wake for a reply now.
+struct ListeningAnswer {
+    Listening state = Listening::Unknown;
+    // The live listener that answers first while the state is Listening: the sender's agent,
+    // then a topic owner, then the reply agent. None when nobody listens or none is named.
+    std::optional<Agent> coverer;
+    std::optional<Agent> answerBy;
+    QList<Agent> candidates;
+    std::optional<Wake> wake;
+
+    static ListeningAnswer fromJson(const QJsonObject &json);
+};
+
+// The server capability for choosing who answers a note (answer_by, candidates, the PUT).
+QString answerByCapability();
+
+// The line a view shows with an agent's note: whether an agent listens for a reply, which one,
+// and "Change".
+struct AnswerLine {
+    enum class Mark {
+        Listening,  // an agent is listening and answers a reply
+        Woken,  // a reply waker wakes the session that answers a reply (or messages it while it runs)
+        Offline,  // the machine of the session that answers is offline; the study session answers later instead
+        Waiting,  // the chosen agent is not listening; the Thoughts reply agent answers after a while
+        Nobody,  // nobody listens: a reply is kept, but no agent acts on it
+    };
+    Mark mark = Mark::Nobody;
+    QString text;
+    bool warning = false;  // nobody will act on a reply
+    bool muted = false;  // the machine that answers is offline, so the answer comes later
+    bool changeOffered = false;  // the server lets the user choose who answers
+    bool changeEnabled = false;  // and it answered the last request
+};
+// What the line says for @p answer, or nothing for no line (no answer yet, or a server that
+// cannot tell). @p canChange: the server has agent_note_answer_by_v1; an older one gets the line
+// without "Change". @p reachable: the last request about who listens reached the server.
+// An agent that listens is named as before. Otherwise, when a reply waker would wake the session
+// that answers, the line names it (Wake::text); without a wake the line is as before.
+std::optional<AnswerLine> answerLine(const std::optional<ListeningAnswer> &answer, bool canChange, bool reachable);
+
+// One entry of the list "Change" opens.
+struct AnswerChoice {
+    std::optional<Agent> agent;  // none: Automatic
+    QString title;
+    QString detail;  // a line under the title; only Automatic has one
+    bool checked = false;
+};
+// Automatic first, then every agent that could answer now, by the names the line uses; the
+// current choice is checked. A chosen agent that is not listening (so not among the candidates)
+// is listed too, marked as such. Two agents that would read the same get a number.
+QList<AnswerChoice> answerChoices(const ListeningAnswer &answer);
 
 struct Note {
     QString id;
@@ -196,8 +307,8 @@ public:
     // asked for, the request says so and an unchanged list comes back without its notes.
     void list(int limit, QObject *context, std::function<void(const Result &)> done, const QString &documentId = {});
 
-    // A write: POST (with a JSON body) or DELETE. @p status is the HTTP status (0 when the
-    // server was not reached); @p json its answer; @p errorCode the server's error_code.
+    // A write: POST or PUT (with a JSON body) or DELETE. @p status is the HTTP status (0 when
+    // the server was not reached); @p json its answer; @p errorCode the server's error_code.
     struct WriteResult {
         int status = 0;
         QJsonObject json;
@@ -206,10 +317,21 @@ public:
         QString errorCode;
     };
     void post(const QString &path, const QJsonObject &body, QObject *context, std::function<void(const WriteResult &)> done);
+    void put(const QString &path, const QJsonObject &body, QObject *context, std::function<void(const WriteResult &)> done);
     void remove(const QString &path, QObject *context, std::function<void(const WriteResult &)> done);
-    // GET /v1/agent-notes/{id}/listening. @p ok is false when the server was not reached or failed
-    // (the caller keeps what it knew); a server without the endpoint answers Unknown.
-    void listening(const QString &noteId, QObject *context, std::function<void(bool ok, Listening state)> done);
+    // GET /v1/agent-notes/{id}/listening. A failure (the server was not reached, or failed)
+    // leaves the answer empty and the caller keeps what it knew; a server without the endpoint
+    // answers Unknown.
+    struct ListeningResult {
+        Failure failure = Failure::None;
+        ListeningAnswer answer;
+    };
+    void listening(const QString &noteId, QObject *context, std::function<void(const ListeningResult &)> done);
+    // PUT /v1/agent-notes/{id}/answer-by: the agent that answers replies to the note, or none
+    // for automatic. The answer's json is the note's listening answer as it is then.
+    void setAnswerBy(const QString &noteId, const std::optional<Agent> &agent, QObject *context, std::function<void(const WriteResult &)> done);
+    // What the server can do (GET /v1/health). @p ok is false when it did not say.
+    void capabilities(QObject *context, std::function<void(bool ok, const QStringList &capabilities)> done);
     // A note's or reply's picture (image_url of a record), from the cache when present.
     void image(const QString &url, const QString &sha256, const QString &mediaType, QObject *context,
                std::function<void(const QImage &, const QString &error)> done);
@@ -222,9 +344,7 @@ private:
     void pruneCache();
 
     QString m_cacheRoot;
-    QUrl m_baseUrl;
-    QByteArray m_token;
-    bool m_explicitServer = false;
+    ServerLink m_link;
     QNetworkAccessManager *m_network = nullptr;
     int m_downloadsSincePrune = 0;
     // The ETag of the last answer to each list request (by its query).
@@ -283,12 +403,36 @@ public:
     // A notification was clicked: windows show this note.
     void requestOpen(const QString &noteId);
 
-    // Whether the agent that sent a note listens for replies, as last asked (Unknown before).
-    Listening listening(const QString &noteId) const { return m_listening.value(noteId, Listening::Unknown); }
+    // Whether an agent listens for replies to a note, as last asked (Unknown before).
+    Listening listening(const QString &noteId) const;
+    // The server's last answer about who listens, with the user's choice and the agents to
+    // choose from; nothing before any.
+    std::optional<ListeningAnswer> answer(const QString &noteId) const;
     // Asks the server (a view showing the note asks now and then); listeningChanged follows.
     void checkListening(const QString &noteId);
-    // Records an answer (tests, and the answer to a reply). Emits listeningChanged when it changed.
-    void setListening(const QString &noteId, Listening state);
+    // The same, unless the server answered about this note less than @p maximumAgeMs ago.
+    void checkListeningIfOlder(const QString &noteId, int maximumAgeMs);
+    // Records an answer (tests). Emits listeningChanged when it changed.
+    void setAnswer(const QString &noteId, const ListeningAnswer &answer);
+    // Records what the server said when it took a reply: whether an agent listens and which, and
+    // who a reply waker wakes for it.
+    // The choice and the candidates of the answer kept so far stay with it.
+    void setListening(const QString &noteId, Listening state, const std::optional<Agent> &coverer = std::nullopt,
+                      const std::optional<Wake> &wake = std::nullopt);
+    // What the reply box says after the last reply to a note was sent, while no new one is
+    // started: "Sent ✓ · <title> will be woken" when the server named a session a waker wakes for
+    // it; empty otherwise (as before).
+    QString sentStatus(const QString &noteId) const;
+    // Whether the server lets the user choose who answers (agent_note_answer_by_v1); asked with
+    // the first check and kept.
+    bool canChangeAnswerer() const { return m_canChangeAnswerer; }
+    // False once a request about who listens did not reach the server, until one does.
+    bool serverReachable() const { return m_serverReachable; }
+    // Sends the user's choice of who answers replies to a note (none: automatic). The answer
+    // kept for the note follows the server's; after a failure it is as it was, and @p error says
+    // what to tell the user.
+    void chooseAnswerer(const QString &noteId, const std::optional<Agent> &agent, std::function<void(bool ok, const QString &error)> done = {});
+    bool isChoosingAnswerer(const QString &noteId) const { return m_choosing.contains(noteId); }
 
     // A note on screen on this Mac: seen here, and "opened" on the server when nobody opened
     // it yet (once per note and run; a page the user sent is never opened).
@@ -353,6 +497,9 @@ public:
     static constexpr int WatchingMaximumIntervalMs = 30 * 1000;
     static constexpr int IdleLimit = 20;
     static constexpr int WatchingLimit = 100;
+    // A server without the capability to choose who answers is asked again after this long
+    // (it may be updated meanwhile); one that has it is not asked again.
+    static constexpr int CapabilitiesKeptSeconds = 10 * 60;
 
 Q_SIGNALS:
     // The list changed (new, changed or deleted notes); polls that change nothing are silent.
@@ -366,7 +513,11 @@ Q_SIGNALS:
     void openRequested(const QString &noteId);
     // A draft changed (its message, drawing, or sending state).
     void draftChanged(const QString &noteId);
+    // What the server said about who listens for replies to a note changed.
     void listeningChanged(const QString &noteId);
+    // Whether "Change" is offered, can be used now, or a choice is on its way changed.
+    void answerOptionsChanged();
+    void foregroundChanged(bool foreground);
 
 private:
     void poll();
@@ -405,8 +556,19 @@ private:
     QHash<QString, qint64> m_documentFetched;  // document id -> msecs since epoch
     QHash<QString, std::shared_ptr<Draft>> m_drafts;
     QHash<QString, std::function<void(bool, const QString &)>> m_replyCallbacks;
-    QHash<QString, Listening> m_listening;
+    QHash<QString, QString> m_sentStatus;  // note id -> sentStatus()
+    void learnWhetherTheChoiceIsOffered();
+    void setServerReachable(bool reachable);
+
+    QHash<QString, ListeningAnswer> m_answers;
+    QHash<QString, QDateTime> m_answeredAt;
     QSet<QString> m_listeningAsked;  // requests in flight
+    QSet<QString> m_choosing;  // choices on their way
+    QHash<QString, int> m_choices;  // counts the choices sent and answered, per note
+    bool m_canChangeAnswerer = false;
+    bool m_capabilitiesAsked = false;  // a request in flight
+    QDateTime m_capabilitiesAnsweredAt;
+    bool m_serverReachable = true;
 };
 
 // Human labels shared by the window and notifications.

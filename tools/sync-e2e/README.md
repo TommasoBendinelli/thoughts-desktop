@@ -17,7 +17,7 @@ To test a server change, stage it on Fedora (`thoughts-test-environment update`)
 | 1 | A Project published from another device builds its PDF and Project reading. |
 | 2 | A rebuild republishes the Project reading with the new PDF. |
 | 3 | A Project with an unbuilt document and an imported PDF pinned to an older copy still republishes its reading on every rebuild. |
-| 4 | The desktop's own Sync engine (`autotests/syncdriver.cpp`) against another device: new Project, merged edits, conflicts on two files resolved as Keep this computer's version and Keep server version, a saved hand merge, added/renamed/deleted files on both sides, the rebuilt PDF and reading reaching the Mac, and repeated Syncs that change nothing. |
+| 4 | The desktop's own Sync engine (`autotests/syncdriver.cpp`) against another device: new Project, merged edits, conflicts on two files resolved as Keep this computer's version and Keep the server's version, a saved hand merge, added/renamed/deleted files on both sides, the rebuilt PDF and reading reaching the Mac, and repeated Syncs that change nothing. |
 
 The Mac side is `build-thoughts/bin/thoughts-sync-driver`, built by
 `run_all.py`. It runs with a private `HOME`, refuses to start if any Thoughts

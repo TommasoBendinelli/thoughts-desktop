@@ -34,7 +34,7 @@
 #include <kparts/readwritepart.h>
 #include <functional>
 #include <memory>
-namespace Thoughts { class ReaderDisplayTitleStore; }
+namespace Thoughts { class ReaderDisplayTitleStore; class SyncStateWatch; }
 
 #if HAVE_DBUS
 #include <QDBusAbstractAdaptor> // for Q_NOREPLY
@@ -132,6 +132,10 @@ public:
     static void showWindowOnReactivation();
     // Brings the Library forward on its Review Card tab with this card selected.
     static void showReviewCardInLibrary(const QString &cardId);
+    // A page link (thoughts://open/document/<id>?page=N&first=F&version=<sha256>, see
+    // thoughtspagelink.h): the Library PDF at that page, with a note when the page was not
+    // there or the PDF changed since the link was made; a message when it cannot be opened.
+    static void openPageLink(const QUrl &url);
     // File › Agent Notes: the notes agents sent to the phone, with this note selected if given.
     static void showAgentNotes(const QString &noteId = QString());
     // Agent Notes in front, showing only @p filter's notes (empty: all), @p noteId selected.
@@ -516,8 +520,10 @@ private:
     void connectSourceConflictSignals(KParts::ReadWritePart *part);
     void triggerFedoraSyncWithInitiationControl(const QString &initiationControl);
     // An agent's proposals and new PDF builds reach Fedora without this computer knowing. One
-    // timer per process asks the server every 20 seconds, through the first window.
+    // watch per process asks the server, through the first window: every 20 seconds, or at once
+    // when a server with sync_state_wait_v1 says its state changed (SyncStateWatch).
     static void startRemoteWorkWatch();
+    static Thoughts::SyncStateWatch *remoteWorkWatchForTesting();
     // The Syncs the app starts by itself (automaticsyncpolicy.h).
     // `manualSync` is the part's fedoraManualSyncState of the Sync that ended.
     void automaticSyncEnded(bool success, const QVariantMap &manualSync);

@@ -8,6 +8,7 @@
 #include "proposaldecisions.h"
 #include "../part/proposalhistory.h"
 #include "../part/currentannotationindex.h"
+#include "../part/sourceowner.h"
 #include "../part/thoughtignore.h"
 
 #include <QCryptographicHash>
@@ -1179,35 +1180,80 @@ QStringList newPair()
 }
 }
 
+namespace
+{
+// A source of the Library (relative to its root): a file of a connected
+// folder docs-<name> or of a Project's default folder
+// (.thoughts/projects/<64 hex>/default, or /documents before the rename),
+// anywhere in it but in a hidden or generated part. A review card's passage
+// lives only there (reviewstore.cpp, editableReviewSource). Everything else
+// is a copy: staging copies and snapshots in hidden folders, builds and
+// scratch copies in build/, tmp/ and the like, archives outside the folders.
+bool isLibraryProposalSource(const QString &relative)
+{
+    static const QStringList generated{QStringLiteral("__pycache__"), QStringLiteral("build"), QStringLiteral("current_pdfs"),
+        QStringLiteral("node_modules"), QStringLiteral("pdf"), QStringLiteral("tmp"), QStringLiteral("venv")};
+    const QString owner = SourceOwner::of(relative);
+    if (owner.isEmpty() || relative.size() <= owner.size() + 1) return false;
+    const QStringList parts = relative.mid(owner.size() + 1).split(QLatin1Char('/'));
+    for (qsizetype index = 0; index < parts.size(); ++index) {
+        const QString &part = parts.at(index);
+        if (part.isEmpty() || part.startsWith(QLatin1Char('.')) || (index + 1 < parts.size() && generated.contains(part))) return false;
+    }
+    return true;
+}
+
+// The folders that hold the Library's sources, as absolute paths below the
+// canonical root: each docs-* folder, then each Project's default folder (the
+// one on disk; default/ wins when both spellings exist). Symbolic links are
+// not followed, as a walk of the whole Library would not follow them.
+QStringList librarySourceFolders(const QString &root)
+{
+    QStringList folders;
+    const QDir library(root);
+    for (const QString &name : library.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks, QDir::Name))
+        if (SourceOwner::isConnectedFolder(name)) folders.append(library.filePath(name));
+    const QDir projects(DefaultFolderLocation::projectsDirectory(root));
+    for (const QString &hash : projects.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks, QDir::Name)) {
+        if (hash.size() != SourceOwner::HashLength || !SourceOwner::isLowerHex(hash)) continue;
+        const QString folder = DefaultFolderLocation::existing(root, hash);
+        if (!folder.isEmpty() && !QFileInfo(library.filePath(folder)).isSymLink()) folders.append(library.filePath(folder));
+    }
+    return folders;
+}
+}
+
 AgentProposalLocation locateAgentProposal(const QString &docsRoot, const QString &id, const QStringList &skipPaths)
 {
     AgentProposalLocation location;
     const QString root = QFileInfo(docsRoot).canonicalFilePath();
     if (root.isEmpty() || !isValidAgentProposalId(id)) return location;
     const QByteArray needle = id.toUtf8();
-    QDirIterator files(root, {QStringLiteral("*.tex"), QStringLiteral("*.md"), QStringLiteral("*.markdown")}, QDir::Files, QDirIterator::Subdirectories);
-    while (files.hasNext()) {
-        const QString path = files.next();
-        const QString relative = QDir(root).relativeFilePath(path);
-        // Hidden folders hold staging copies and snapshots, not the Library's sources.
-        if (relative.startsWith(QLatin1Char('.')) || relative.contains(QLatin1String("/."))) continue;
-        const QString canonical = QFileInfo(path).canonicalFilePath();
-        if (canonical.isEmpty() || !canonical.startsWith(root + QLatin1Char('/')) || skipPaths.contains(canonical)) continue;
-        QFile file(canonical);
-        if (!file.open(QIODevice::ReadOnly)) continue;
-        const QByteArray bytes = file.readAll();
-        if (!bytes.contains(needle)) continue;
-        const AgentProposalParse parse = parseAgentProposals(canonical, QString::fromUtf8(bytes));
-        const AgentProposedEdit *proposal = parse.refusalCode(id).isEmpty() ? parse.proposal(id) : nullptr;
-        if (!proposal) continue;
-        if (location.found && location.path != canonical) {
-            location.ambiguous = true;
-            return location;
+    // A Project's default folder is inside the hidden .thoughts folder, so it is
+    // walked on its own; without QDir::Hidden no walk enters a hidden folder.
+    for (const QString &folder : librarySourceFolders(root)) {
+        QDirIterator files(folder, {QStringLiteral("*.tex"), QStringLiteral("*.md"), QStringLiteral("*.markdown")}, QDir::Files, QDirIterator::Subdirectories);
+        while (files.hasNext()) {
+            const QString path = files.next();
+            const QString canonical = QFileInfo(path).canonicalFilePath();
+            if (canonical.isEmpty() || !canonical.startsWith(root + QLatin1Char('/')) || skipPaths.contains(canonical)) continue;
+            if (!isLibraryProposalSource(QDir(root).relativeFilePath(path)) || !isLibraryProposalSource(QDir(root).relativeFilePath(canonical))) continue;
+            QFile file(canonical);
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            const QByteArray bytes = file.readAll();
+            if (!bytes.contains(needle)) continue;
+            const AgentProposalParse parse = parseAgentProposals(canonical, QString::fromUtf8(bytes));
+            const AgentProposedEdit *proposal = parse.refusalCode(id).isEmpty() ? parse.proposal(id) : nullptr;
+            if (!proposal) continue;
+            if (location.found && location.path != canonical) {
+                location.ambiguous = true;
+                return location;
+            }
+            location.found = true;
+            location.path = canonical;
+            location.bytes = bytes;
+            location.proposal = *proposal;
         }
-        location.found = true;
-        location.path = canonical;
-        location.bytes = bytes;
-        location.proposal = *proposal;
     }
     return location;
 }

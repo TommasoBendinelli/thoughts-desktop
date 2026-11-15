@@ -128,9 +128,12 @@ QStringList newPair();
 }
 
 // The pending proposal `id` in the sources of the Library `docsRoot`: its
-// canonical path and parse, searched in every .tex/.md/.markdown file outside
-// hidden folders. `found` is false when none has it; `ambiguous` when more
-// than one valid wrapper does.
+// canonical path and parse, searched in the .tex/.md/.markdown files of the
+// docs-* folders and of the Projects' default folders (.thoughts/projects/
+// <hex>/default or /documents), outside their hidden and generated parts
+// (build/, tmp/, ...). Other hidden folders hold staging copies and
+// snapshots, never a pending half. `found` is false when none has it;
+// `ambiguous` when more than one valid wrapper does.
 struct AgentProposalLocation {
     bool found = false;
     bool ambiguous = false;

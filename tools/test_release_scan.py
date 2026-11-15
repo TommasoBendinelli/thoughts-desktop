@@ -66,6 +66,30 @@ class ScanTest(unittest.TestCase):
             else:
                 os.environ["THOUGHTS_RELEASE_ACCEPTED"] = old
 
+    def test_accepted_lines_copied_to_a_builder_judge_as_here(self):
+        accepted = self.root / "accepted.txt"
+        accepted.write_text("# upstream build paths in bundled libraries\n\n  /home/alex/  \n/Users/sam/\n", encoding="utf-8")
+        lines = release_scan.accepted_lines(accepted)
+        self.assertEqual(lines, ["/home/alex/", "/Users/sam/"])
+        self.assertEqual(release_scan.accepted_lines(self.root / "missing.txt"), [])
+        # What a release copies to its builder, which scans with THOUGHTS_RELEASE_ACCEPTED pointing at the copy.
+        copy = self.root / "builder-accepted.txt"
+        copy.write_text("\n".join(lines), encoding="utf-8")
+        marker = self.root / "markers.txt"
+        marker.write_text("/Users/sam/\n", encoding="utf-8")
+        (self.root / "runtime").mkdir()
+        (self.root / "runtime" / "lib.dll").write_bytes(b"\0/home/alex/src/x.c\0")
+        script = str(Path(release_scan.__file__))
+        env = {**os.environ, "THOUGHTS_RELEASE_ACCEPTED": str(copy)}
+        run = lambda *args: subprocess.run([sys.executable, script, "scan", *args], capture_output=True, text=True, env=env)
+        self.assertEqual(run("--patterns", str(self.patterns), str(self.root / "runtime")).returncode, 0)
+        # An accepted line never accepts a private marker.
+        (self.root / "runtime" / "app.exe").write_bytes(b"\0/Users/sam/x\0")
+        result = run("--patterns", str(marker), str(self.root / "runtime"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("private marker (line 1): '/Users/sam/'", result.stderr)
+        self.assertNotIn("/home/alex/", result.stderr)
+
     def test_zip_members_are_scanned(self):
         archive = self.root / "out.zip"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:

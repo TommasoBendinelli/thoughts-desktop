@@ -5250,7 +5250,7 @@ void FedoraRepository::requestSourceConflictResolutionBundle(const QString &path
         return;
     }
     if (!ensureClient()) {
-        Q_EMIT sourceConflictResolutionBundleReady({}, QStringLiteral("The Thoughts server is not configured or its credentials are unavailable."));
+        Q_EMIT sourceConflictResolutionBundleReady({}, QStringLiteral("The server is not configured or its credentials are unavailable."));
         return;
     }
 
@@ -6606,7 +6606,7 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
     if (!ensureClient()) {
         QString addressError;
         if (Thoughts::ServerAddress::normalized(Thoughts::ServerAddress::configured(), &addressError).isEmpty()) {
-            failManualSync(QStringLiteral("The Thoughts server address is invalid."),
+            failManualSync(QStringLiteral("The server address is invalid."),
                            Thoughts::ServerAddress::overriddenByEnvironment()
                                ? QStringLiteral("%1 Correct THOUGHTS_SERVER_URL.").arg(addressError)
                                : QStringLiteral("%1 Correct it in Server… (Thoughts menu on macOS, File menu elsewhere).").arg(addressError));
@@ -6618,10 +6618,10 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
             return;
         }
 #ifdef Q_OS_WIN
-        failManualSync(QStringLiteral("The Thoughts server is not configured or its credentials are unavailable."),
+        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."),
                        QStringLiteral("Store this computer's device token with: %1").arg(Thoughts::Platform::storeSecretCommand(QStringLiteral("thoughts-server"), Thoughts::Platform::desktopDeviceAccount())));
 #else
-        failManualSync(QStringLiteral("The Thoughts server is not configured or its credentials are unavailable."));
+        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."));
 #endif
         return;
     }
@@ -6707,7 +6707,7 @@ void FedoraRepository::synchronizeLibraryProjects()
             if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) {
                 reply->deleteLater();
                 if (operation.isEmpty()) { m_projectSyncRunning = false; m_projectSyncReady = true; continueManualSyncAfterOverleaf(); }
-                else fail(QStringLiteral("Project changes are saved on this device. Install the server update for Projects, then click Sync."));
+                else fail(QStringLiteral("Project changes are saved on this device. Install the Project update on the server, then click Sync."));
                 return;
             }
             if (reply->error() != QNetworkReply::NoError) {
@@ -9371,7 +9371,7 @@ void FedoraRepository::processNextManualLibraryMutation()
 {
     if (m_libraryMutationRunning || !m_client) {
         if (!m_client) {
-            failManualSync(QStringLiteral("The connection to the Thoughts server is unavailable."));
+            failManualSync(QStringLiteral("The server connection is unavailable."));
         }
         return;
     }
@@ -10157,7 +10157,7 @@ void FedoraRepository::uploadSpecialOutboxOperation(const QJsonObject &operation
                         // The publisher follows the successor at its next run.
                         qWarning().noquote() << "The successor of source conflict" << conflictId << "was not recorded:" << recordError;
                     }
-                    const QString message = QStringLiteral("The file changed again on the server while the resolution was open. A new guarded conflict was preserved; resolve it again.");
+                    const QString message = QStringLiteral("The source changed again on the server while the resolution was open. A new guarded conflict was preserved; resolve it again.");
                     Q_EMIT sourceConflictResolutionStatusChanged(operationId, QStringLiteral("conflict"), message);
                     if (manual) {
                         failManualSync(message);
@@ -10338,7 +10338,7 @@ void FedoraRepository::pollAgentProposalResolution(const QString &operationId, b
 void FedoraRepository::pullManualProjectionSnapshot()
 {
     if (!m_client || m_libraryReaderPlan.isEmpty() || !m_libraryPulling) {
-        failManualSync(QStringLiteral("The connection to the Thoughts server is unavailable."));
+        failManualSync(QStringLiteral("The server connection is unavailable."));
         return;
     }
     m_pulling = true;
@@ -10370,7 +10370,7 @@ void FedoraRepository::pullManualProjectionSnapshot()
 void FedoraRepository::pullManualChangePage()
 {
     if (!m_client || m_libraryReaderPlan.isEmpty() || !m_libraryPulling) {
-        failManualSync(QStringLiteral("The connection to the Thoughts server is unavailable."));
+        failManualSync(QStringLiteral("The server connection is unavailable."));
         return;
     }
     const qint64 cursor = m_outbox->cursor();
@@ -10461,7 +10461,7 @@ void FedoraRepository::startManualRenderCheck()
         return;
     }
     if (!m_client) {
-        failManualSync(QStringLiteral("The connection to the Thoughts server is unavailable."));
+        failManualSync(QStringLiteral("The server connection is unavailable."));
         return;
     }
     const QString target = m_syncCoordinator.conditionalRenderTarget();
@@ -10734,7 +10734,7 @@ bool FedoraRepository::applyManualRenderCheckResponse(const QJsonObject &respons
             trackingTarget,
             QJsonObject {{QStringLiteral("status"), QStringLiteral("building")}, {QStringLiteral("reason"), QStringLiteral("The server is updating this PDF because its rendered inputs changed.")}, {QStringLiteral("build"), build}});
     }
-    emitSyncProgress(QStringLiteral("building"), 0, 0, QStringLiteral("Waiting for the server to update the PDF"));
+    emitSyncProgress(QStringLiteral("building"), 0, 0, QStringLiteral("Waiting for the PDF update on the server"));
     if (!m_activeTraceId.isEmpty()) {
         Q_EMIT syncJournalEvent(m_activeTraceId,
                                 QJsonObject {{QStringLiteral("at_ms"), QDateTime::currentMSecsSinceEpoch()},
@@ -13829,7 +13829,7 @@ void FedoraRepository::activatePublishedPdf(const QString &target)
     if (localPublicationState(target, publication) == QLatin1String("current")) {
         QJsonObject current = remote;
         current.insert(QStringLiteral("local_state"), QStringLiteral("current"));
-        current.insert(QStringLiteral("reason"), QStringLiteral("This computer has the verified publication from the server."));
+        current.insert(QStringLiteral("reason"), QStringLiteral("This computer has the verified server publication."));
         storeRenderStatus(target, current);
         return;
     }
@@ -14750,7 +14750,7 @@ void FedoraRepository::refreshRenderStateAfterExplicitOperation()
         if (!writeRenderStatusSnapshot(state)) {
             QJsonObject retained = m_renderState;
             retained.insert(QStringLiteral("refreshed"), false);
-            retained.insert(QStringLiteral("refresh_error"), QStringLiteral("The PDF status snapshot from the server could not be persisted."));
+            retained.insert(QStringLiteral("refresh_error"), QStringLiteral("The server PDF status snapshot could not be persisted."));
             Q_EMIT renderStateChanged(retained);
             return;
         }
@@ -15022,7 +15022,7 @@ void FedoraRepository::startPendingSourcePublication()
             Q_EMIT connectionStateChanged(true, QString());
             if (!requestedTarget.isEmpty()) {
                 if (!ensureClient()) {
-                    failPermanently(QStringLiteral("The Thoughts server is not configured or its credentials are unavailable."));
+                    failPermanently(QStringLiteral("The server is not configured or its credentials are unavailable."));
                 } else {
                     pollBuilds();
                 }

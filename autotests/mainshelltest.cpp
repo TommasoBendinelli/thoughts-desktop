@@ -17,6 +17,9 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include "../shell/readerdisplaytitlestore.h"
+#include "../shell/syncstatewatch.h"
+#include <QTcpServer>
+#include <QTcpSocket>
 #include "../part/sourceannotationindex.h"
 #include "../part/thoughtsserveraddress.h"
 #include <QContextMenuEvent>
@@ -525,6 +528,7 @@ private Q_SLOTS:
     void testCommentsOverviewStartup();
     void testLibraryDocumentPageActivation();
     void testOpenDocumentCommand();
+    void testOpenPageLink();
     void testDeleteCommentCommand();
     void testTodoCommands();
     void testDecideProposalCommand();
@@ -563,6 +567,7 @@ private Q_SLOTS:
     void testMenusCarryNoIconsOnMac();
     void testAutomaticSyncWaitsAfterFailures();
     void testAnEndedBuildStartsItsSyncAtOnce();
+    void testAServerChangeRunsTheCheckAtOnce();
     void testSucceededSyncKeepsItsBuildWarning();
     void testProposalDecisionStartsOneSync();
     void testVisibleSyncButtonsUseGlobalScope_data();
@@ -3216,6 +3221,69 @@ void MainShellTest::testOpenDocumentCommand()
     }
 }
 
+// A page link from a chat (thoughts://open/document/<id>?page=N&first=F&version=<sha256>)
+// opens the Library PDF of that document at page F+N-1, kept within the PDF, with a note on
+// the page when the PDF is not the version the link was made from.
+void MainShellTest::testOpenPageLink()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(QFileInfo(library.path()).canonicalFilePath());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")));
+    const QString pdf = root.filePath(QStringLiteral("current_pdfs/paper.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), pdf));
+    QFile bytes(pdf);
+    QVERIFY(bytes.open(QIODevice::ReadOnly));
+    const QString sha256 = QString::fromLatin1(QCryptographicHash::hash(bytes.readAll(), QCryptographicHash::Sha256).toHex());
+    bytes.close();
+    const QString documentId = QStringLiteral("5e0c7a1b-2d3f-4a6b-9c8d-7e6f5a4b3c2d");
+    QFile index(root.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+    QVERIFY(index.open(QIODevice::WriteOnly));
+    index.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1},
+                                           {QStringLiteral("pdfs"), QJsonArray {QJsonObject {{QStringLiteral("filename"), QStringLiteral("paper.pdf")},
+                                                                                             {QStringLiteral("document_id"), documentId},
+                                                                                             {QStringLiteral("pdf_sha256"), sha256}}}}})
+                    .toJson());
+    index.close();
+    const auto pageLink = [&documentId](int page, int first, const QString &version) {
+        return QUrl(QStringLiteral("thoughts://open/document/%1?page=%2&first=%3&version=%4").arg(documentId).arg(page).arg(first).arg(version));
+    };
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    Shell::openPageLink(pageLink(2, 2, sha256));
+    Shell *destination = Shell::shellForCommentsOverview(pdf);
+    QVERIFY(destination);
+    const int tab = destination->findTabIndex(QUrl::fromLocalFile(pdf));
+    QVERIFY(tab >= 0);
+    QCOMPARE(destination->m_tabWidget->currentIndex(), tab);
+    auto *part = qobject_cast<Okular::Part *>(destination->m_tabs.at(tab).part);
+    QVERIFY(part);
+    QCOMPARE(partDocument(part)->currentPage(), 2u);
+
+    // A page past the end opens the last page, in the same tab. (The notes shown with it are
+    // thoughtspagelinktest's.)
+    const int tabs = destination->m_tabs.size();
+    const uint pages = partDocument(part)->pages();
+    QVERIFY(pages > 1);
+    Shell::openPageLink(pageLink(1, int(pages) + 5, sha256));
+    QCOMPARE(destination->m_tabs.size(), tabs);
+    QCOMPARE(partDocument(part)->currentPage(), pages - 1);
+
+    // Another version of the PDF still opens at the page.
+    Shell::openPageLink(pageLink(1, 1, QString(64, QLatin1Char('b'))));
+    QCOMPARE(destination->m_tabs.size(), tabs);
+    QCOMPARE(partDocument(part)->currentPage(), 0u);
+}
+
 // `thoughtsctl link-conversation`: an agent conversation is linked to the Project of a
 // project name, a source or a Library document (spec section 5.4).
 void MainShellTest::testLinkConversationCommand()
@@ -4178,7 +4246,7 @@ void MainShellTest::testBuildTerminalLauncher()
     launchedProgram.clear();
     for (const QString &server : {QStringLiteral("http://thoughts.example.org"), QStringLiteral("https://user@thoughts.example.org"), QStringLiteral("https://thoughts.example.org/?x=1")}) {
         QVERIFY2(!launcher.openBuild(rejectedBuildId, QStringLiteral("manual.pdf"), watcher, server, &error), qPrintable(server));
-        QCOMPARE(error, QStringLiteral("The Thoughts server URL is invalid."));
+        QCOMPARE(error, QStringLiteral("The build server URL is invalid."));
     }
     QVERIFY(launchedProgram.isEmpty());
     // A token issued for another server is not handed to a viewer of this one.
@@ -6539,6 +6607,145 @@ void MainShellTest::testAnEndedBuildStartsItsSyncAtOnce()
         QTRY_COMPARE(probe.conditionalFullSyncs, 4);
         QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("remote_change"));
         shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+    }
+    delete Shell::s_commentsOverview.data();
+    delete shell;
+}
+
+// A server with sync_state_wait_v1 holds the app's question until its state
+// changes: the change runs the check at once, long before a plain pause would
+// end, and whether that starts a Sync is still the policy's decision.
+void MainShellTest::testAServerChangeRunsTheCheckAtOnce()
+{
+    // GET /v1/health with the capability; GET /v2/sync/state answers at once for
+    // another version, and holds a request on the current one until change().
+    struct HeldServer {
+        QTcpServer server;
+        QByteArray version = "\"s1\"";
+        QList<QPointer<QTcpSocket>> held;
+        static void reply(QTcpSocket *socket, int code, const QByteArray &body, const QByteArray &version)
+        {
+            socket->write("HTTP/1.1 " + QByteArray::number(code) + " X\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size())
+                          + "\r\nETag: " + version + "\r\nConnection: close\r\n\r\n" + body);
+            socket->disconnectFromHost();
+        }
+        void change(const QByteArray &next)
+        {
+            version = next;
+            for (const QPointer<QTcpSocket> &socket : std::exchange(held, {})) {
+                if (socket) reply(socket, 200, R"({"contract_version":2})", version);
+            }
+        }
+    } fake;
+    QVERIFY(fake.server.listen(QHostAddress::LocalHost));
+    QObject::connect(&fake.server, &QTcpServer::newConnection, &fake.server, [&fake] {
+        while (QTcpSocket *socket = fake.server.nextPendingConnection()) {
+            QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+            QObject::connect(socket, &QTcpSocket::readyRead, socket, [&fake, socket] {
+                const QByteArray head = socket->peek(socket->bytesAvailable());
+                if (!head.contains("\r\n\r\n")) {
+                    return;
+                }
+                socket->readAll();
+                if (head.startsWith("GET /v1/health")) {
+                    HeldServer::reply(socket, 200, R"({"status":"ok","capabilities":["sync_state_wait_v1"]})", fake.version);
+                } else if (head.startsWith("GET /v2/sync/state") && head.contains(QByteArray(QByteArray("If-None-Match: ") + fake.version))) {
+                    fake.held.append(socket);
+                } else {
+                    HeldServer::reply(socket, 200, R"({"contract_version":2})", fake.version);
+                }
+            });
+        }
+    });
+
+    QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    Shell::s_commentsOverview = new Thoughts::CommentsOverview(docsRoot.path());
+    Shell::s_commentsOverviewShell = shell;
+    Shell::resetAutomaticSyncForTesting();
+    QSqlDatabase database = syncJournalDatabase();
+    const auto runIds = [&database] {
+        QSet<QString> ids;
+        flushSyncJournal();
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT id FROM sync_runs"))) {
+            while (query.next()) {
+                ids.insert(query.value(0).toString());
+            }
+        }
+        return ids;
+    };
+    const QSet<QString> existingRuns = runIds();
+    const int activeTab = shell->m_tabWidget->currentIndex();
+    QVERIFY(activeTab >= 0);
+    KParts::ReadWritePart *const originalPart = shell->m_tabs.at(activeTab).part;
+    Thoughts::SyncStateWatch *watch = Shell::remoteWorkWatchForTesting();
+    QVERIFY(watch);
+    {
+        SyncDispatchProbe probe;
+        shell->m_tabs[activeTab].part = &probe;
+        const auto restore = qScopeGuard([&] {
+            // The watch goes back to what the other tests have: no server, plain pauses.
+            watch->stop();
+            watch->setServer(QUrl(), QByteArray());
+            watch->setTimingForTesting(0, 0, 0, 0);
+            watch->start();
+            if (shell->m_fedoraManualSyncState == 1 || shell->hasProcessManualSyncOperation()) {
+                shell->updateCommentsOverviewManualSyncState(3, QStringLiteral("test cleanup"), QString());
+            }
+            shell->m_tabs[activeTab].part = originalPart;
+            Shell::resetAutomaticSyncForTesting();
+            for (const QString &id : runIds() - existingRuns) {
+                for (const QString &statement : {QStringLiteral("DELETE FROM sync_events WHERE run_id = ?"), QStringLiteral("DELETE FROM sync_runs WHERE id = ?")}) {
+                    QSqlQuery remove(database);
+                    remove.prepare(statement);
+                    remove.addBindValue(id);
+                    remove.exec();
+                }
+            }
+        });
+        // One window: the watch asks through it.
+        QCOMPARE(findShell(), shell);
+        watch->stop();
+        watch->setServer(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(fake.server.serverPort())), "secret");
+        // The first pause is a plain one; from then on the server holds the question (20 s,
+        // longer than any wait below: only a change ends it in time).
+        watch->setTimingForTesting(300, 20 * 1000, 100, 50);
+        watch->start();
+        QTRY_COMPARE(probe.remoteWorkChecks, 1);
+        Q_EMIT probe.fedoraRemoteWorkChecked(false, QStringLiteral("300/aa/1"));
+        QTRY_COMPARE(int(fake.held.size()), 1);
+        QCOMPARE(watch->pause(), Thoughts::SyncStateWatch::Pause::Held);
+        QTest::qWait(500);
+        QCOMPARE(probe.remoteWorkChecks, 1);
+
+        // Another device writes: the check runs at once, and its answer starts a Sync.
+        fake.change("\"s2\"");
+        QTRY_COMPARE_WITH_TIMEOUT(probe.remoteWorkChecks, 2, 3000);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("301/aa/1"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 1);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+
+        // The next change names a state a Sync already ran against: the policy starts nothing.
+        QTRY_COMPARE(int(fake.held.size()), 1);
+        fake.change("\"s3\"");
+        QTRY_COMPARE_WITH_TIMEOUT(probe.remoteWorkChecks, 3, 3000);
+        Q_EMIT probe.fedoraRemoteWorkChecked(true, QStringLiteral("301/aa/1"));
+        QTest::qWait(50);
+        QCOMPARE(probe.conditionalFullSyncs, 1);
+
+        // While a Sync runs, a change starts no second one beside it.
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 2);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        QTRY_COMPARE(int(fake.held.size()), 1);
+        fake.change("\"s4\"");
+        QTRY_COMPARE(int(fake.held.size()), 1);
+        QCOMPARE(probe.remoteWorkChecks, 3);
         shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
     }
     delete Shell::s_commentsOverview.data();

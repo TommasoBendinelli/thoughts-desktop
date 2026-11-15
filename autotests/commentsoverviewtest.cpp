@@ -10236,7 +10236,7 @@ void CommentsOverviewTest::testDocumentSyncActivityPresentation()
                           {QStringLiteral("origin"), QStringLiteral("desktop")},
                           {QStringLiteral("component"), QStringLiteral("desktop")},
                           {QStringLiteral("phase"), QStringLiteral("building")},
-                          {QStringLiteral("message"), QStringLiteral("Waiting for the server to update the PDF")}},
+                          {QStringLiteral("message"), QStringLiteral("Waiting for the PDF update on the server")}},
              QJsonObject {{QStringLiteral("at_ms"), 151000},
                           {QStringLiteral("origin"), QStringLiteral("server")},
                           {QStringLiteral("component"), QStringLiteral("renderer")},
@@ -10257,7 +10257,7 @@ void CommentsOverviewTest::testDocumentSyncActivityPresentation()
     QVERIFY(measuredPhaseLines.at(1).endsWith(QStringLiteral("Validating build inputs · 15.0 s")));
     QVERIFY(measuredPhaseLines.at(2).endsWith(QStringLiteral("Checking whether the server needs to update any PDFs · 15.0 s")));
     QVERIFY(measuredPhaseLines.at(3).endsWith(QStringLiteral("Preparing comment sidecars · 15.0 s")));
-    QVERIFY(measuredPhaseLines.at(4).endsWith(QStringLiteral("Waiting for the server to update the PDF · 15.5 s")));
+    QVERIFY(measuredPhaseLines.at(4).endsWith(QStringLiteral("Waiting for the PDF update on the server · 15.5 s")));
     QVERIFY(measuredPhaseLines.at(5).endsWith(QStringLiteral("Compiling documentation projects · 7.3 s")));
     QVERIFY(measuredPhaseLines.at(6).endsWith(QStringLiteral("Confirming the Library state")));
     for (const QString &line : measuredPhaseLines) {
@@ -10427,7 +10427,7 @@ void CommentsOverviewTest::testDocumentSyncActivityPresentation()
     QVERIFY(!unusedInputActivity.contains(QStringLiteral("[sync_failed]")));
     QVERIFY(unusedInputActivity.contains(
         QStringLiteral("The previous failed server build c539ab8e-caa3-4f18-932a-ceb8832e0249 was reused; no new build was run.")));
-    // Older servers say "Reusing Fedora build" (above), newer ones "Reusing server build".
+    // Older servers say "Reusing Fedora build" (above) or "Reusing server build".
     QJsonObject newerServerReuse = unusedInputFailure;
     QJsonArray newerServerEvents = newerServerReuse.value(QStringLiteral("events")).toArray();
     QJsonObject reuseEvent = newerServerEvents.last().toObject();
@@ -10438,6 +10438,17 @@ void CommentsOverviewTest::testDocumentSyncActivityPresentation()
     QVERIFY(newerServerActivity.contains(
         QStringLiteral("The previous failed server build c539ab8e-caa3-4f18-932a-ceb8832e0249 was reused; no new build was run.")));
     QVERIFY(!newerServerActivity.contains(QStringLiteral("Reusing server build")));
+    // The server now names itself so in the trace; journals saved before keep the form above.
+    QJsonObject serverWordedFailure = unusedInputFailure;
+    QJsonArray serverWordedEvents = serverWordedFailure.value(QStringLiteral("events")).toArray();
+    QJsonObject serverWordedReuse = serverWordedEvents.at(1).toObject();
+    serverWordedReuse.insert(QStringLiteral("message"), QStringLiteral("Reusing the server's build 7d2f0c1e-0b4e-4a3c-9f21-5e8d6a7b9c10."));
+    serverWordedEvents.replace(1, serverWordedReuse);
+    serverWordedFailure.insert(QStringLiteral("events"), serverWordedEvents);
+    const QString serverWordedActivity = Thoughts::syncOperationActivityLines(serverWordedFailure).join(QLatin1Char('\n'));
+    QVERIFY2(serverWordedActivity.contains(
+                 QStringLiteral("The previous failed server build 7d2f0c1e-0b4e-4a3c-9f21-5e8d6a7b9c10 was reused; no new build was run.")),
+             qPrintable(serverWordedActivity));
 
     const QString emptyDocumentLog = QStringLiteral("ae75cce44b058b28f3d66bf9d9591a77550db3ce53dc16f1ee42540433a7f0f4");
     const QString emptyDocumentRaw = QStringLiteral(

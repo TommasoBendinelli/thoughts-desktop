@@ -3343,8 +3343,8 @@ bool ReviewStore::writeServerJson(const QString &relativePath, const QJsonObject
     if (entityId.isEmpty() || !queueReady || m_outbox->enqueue(entityType, entityId, collection, revision - 1, object, timestamp).isEmpty()) {
         if (error) {
             *error = queueError.isEmpty()
-                ? QStringLiteral("Review was saved locally but could not be queued for the Thoughts server.")
-                : QStringLiteral("Review was saved locally but could not be queued for the Thoughts server: %1").arg(queueError);
+                ? QStringLiteral("Review was saved locally but could not be queued for the server.")
+                : QStringLiteral("Review was saved locally but could not be queued for the server: %1").arg(queueError);
         }
         return false;
     }

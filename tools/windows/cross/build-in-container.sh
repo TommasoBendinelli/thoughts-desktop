@@ -13,6 +13,12 @@ export LD_LIBRARY_PATH="$WINCROSS/craft-host/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_
 # Only the Windows libraries' pkg-config files, never the container's own.
 export PKG_CONFIG_LIBDIR="$WINCROSS/craft-win/lib/pkgconfig" PKG_CONFIG_PATH=
 export CCACHE_DIR="$WINCROSS/ccache" CCACHE_BASEDIR="$(dirname "$SRC")" CCACHE_MAXSIZE=20G
+# The programs carry no builder paths: __FILE__ (and debug info) name src\... for the
+# sources and wincross\... for everything else in the builder's tree (the longest prefix
+# wins). clang-cl needs the /clang: spelling; it would drop a bare -ffile-prefix-map
+# silently, since the toolchain sets -Wno-unknown-argument. Passed on every configure, so
+# an existing build folder picks it up too.
+RELEASE_FLAGS="/O2 /Ob2 /DNDEBUG -Wno-error=undef /clang:-ffile-prefix-map=$WINCROSS=wincross /clang:-ffile-prefix-map=$SRC=src"
 overlay="$WINCROSS/craft-include-overlay.json"
 if [ ! -f "$overlay" ] || [ -n "$(find "$WINCROSS/craft-win/include" -newer "$overlay" -print -quit)" ]; then
     python3 "$(dirname "$0")/case-insensitive-overlay.py" "$overlay" "$WINCROSS/craft-win/include"
@@ -21,8 +27,8 @@ if [ ! -f "$BUILD/build.ninja" ]; then
     cmake -S "$SRC" -B "$BUILD" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$SRC/tools/windows/cross/clangcl-toolchain.cmake" \
         -DCMAKE_BUILD_TYPE=Release \
-        "-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG -Wno-error=undef" \
-        "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG -Wno-error=undef" \
+        "-DCMAKE_C_FLAGS_RELEASE=$RELEASE_FLAGS" \
+        "-DCMAKE_CXX_FLAGS_RELEASE=$RELEASE_FLAGS" \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DCMAKE_INSTALL_PREFIX="$STAGE" \
         -DBUILD_TESTING=OFF -DBUILD_DESKTOP=ON \
@@ -35,7 +41,8 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -DTHOUGHTS_DEFAULT_SERVER_URL="$SERVER_URL" \
         -DTHOUGHTS_LEGACY_SERVER_URL="$LEGACY_SERVER_URL"
 else
-    cmake "$BUILD" -DTHOUGHTS_RELEASE_VERSION="$VERSION" -DTHOUGHTS_UPDATE_REPOSITORY="$REPOSITORY" \
+    cmake "$BUILD" "-DCMAKE_C_FLAGS_RELEASE=$RELEASE_FLAGS" "-DCMAKE_CXX_FLAGS_RELEASE=$RELEASE_FLAGS" \
+        -DTHOUGHTS_RELEASE_VERSION="$VERSION" -DTHOUGHTS_UPDATE_REPOSITORY="$REPOSITORY" \
         -DTHOUGHTS_DEFAULT_SERVER_URL="$SERVER_URL" -DTHOUGHTS_LEGACY_SERVER_URL="$LEGACY_SERVER_URL" >/dev/null
 fi
 nice -n 10 ninja -C "$BUILD" -j "$JOBS"

@@ -185,6 +185,12 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Core Qt6::Test
     )
 
+    # On-screen texts of shell/ and part/ say "the server", never Fedora.
+    ecm_add_test(serverwordingtest.cpp
+        TEST_NAME "serverwordingtest"
+        LINK_LIBRARIES Qt6::Core Qt6::Test
+    )
+
     ecm_add_test(sourcefoldermigrationtest.cpp
         TEST_NAME "sourcefoldermigrationtest"
         LINK_LIBRARIES Qt6::Core Qt6::Sql Qt6::Test Qt6::Widgets thoughtsdesktopsync thoughtsplatform thoughtspublisher
@@ -250,7 +256,7 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Core Qt6::Gui Qt6::Network Qt6::Test thoughtsreadaloud
     )
 
-    ecm_add_test(agentnotestest.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/developerlog.cpp
+    ecm_add_test(agentnotestest.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/developerlog.cpp ../shell/serverlink.cpp
         TEST_NAME "agentnotestest"
         LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n thoughtsplatform
     )
@@ -312,7 +318,7 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Core Qt6::Test okulardocscommentsync
     )
 
-    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
+    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
         TEST_NAME "mainshelltest"
         LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
     )
@@ -351,7 +357,7 @@ if(BUILD_DESKTOP)
 endif()
 
 if(BUILD_DESKTOP)
-    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
+    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
         TEST_NAME "annotationtoolbartest"
         LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
     )
@@ -412,6 +418,12 @@ ecm_add_test(automaticsyncpolicytest.cpp
     LINK_LIBRARIES Qt6::Core Qt6::Test
 )
 
+# The pause between two checks for the server's work: a held request (shell/syncstatewatch.h).
+ecm_add_test(syncstatewatchtest.cpp ../shell/syncstatewatch.cpp ../shell/serverlink.cpp
+    TEST_NAME "syncstatewatchtest"
+    LINK_LIBRARIES Qt6::Core Qt6::Network Qt6::Test thoughtsplatform
+)
+
 if(BUILD_DESKTOP)
     # The Sync journal: its worker thread, paged reads, retention and compaction.
     ecm_add_test(syncjournaltest.cpp ../shell/syncjournal.cpp ../shell/developerlog.cpp ../shell/thoughtscommandprotocol.cpp
@@ -443,6 +455,14 @@ ecm_add_test(documentidentitytest.cpp
     TEST_NAME "documentidentitytest"
     LINK_LIBRARIES Qt6::Core Qt6::Test thoughtsplatform
 )
+
+if(BUILD_DESKTOP)
+    # Page links agents put in chats (shell/thoughtspagelink.h), parsed as the phone parses them.
+    ecm_add_test(thoughtspagelinktest.cpp
+        TEST_NAME "thoughtspagelinktest"
+        LINK_LIBRARIES Qt6::Core Qt6::Test KF6::I18n thoughtsplatform
+    )
+endif()
 
 ecm_add_test(thoughtsplatformtest.cpp
     TEST_NAME "thoughtsplatformtest"

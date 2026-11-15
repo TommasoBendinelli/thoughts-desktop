@@ -7319,7 +7319,7 @@ void Part::finishDocsCommentMutationFlush()
     const auto *child = reading ? reading->forStem(result.pdfStem) : nullptr;
     const auto capturedSha = child ? child->document.pdfSha256 : m_docsOpenedPdfSha256;
     if (!m_fedoraRepository->captureCommentRecords(result.docsRoot, result.pdfStem, result.changedRecords, capturedSha, result.createdCommentIds)) {
-        retry(i18n("the server delivery outbox could not be updated"));
+        retry(i18n("the outbox for the server could not be updated"));
         return;
     }
     QString error;
@@ -8065,7 +8065,7 @@ void Part::resolveAgentProposalFromCard(const QString &proposalId, const QString
         m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Applying the proposal decision…"));
         const QString operationId = resolveAgentProposals(proposal.bundleId, action, {proposal.id});
         if (operationId.isEmpty()) {
-            error = i18n("The proposal decision could not be written to the durable server queue.");
+            error = i18n("The proposal decision could not be written to the durable queue for the server.");
         } else {
             m_pageView->setAgentProposalOperationPending(proposalId, true, i18n("Decision saved locally — the next Sync sends it to the server."));
             showAgentProposalStatus(i18n("Decision saved locally — the next Sync sends it to the server."), KMessageWidget::Information, false);
@@ -8142,7 +8142,7 @@ void Part::resolveAgentProposalsFromSidebar(const QStringList &proposalIds, cons
     for (auto bundle = bundles.cbegin(); bundle != bundles.cend(); ++bundle) {
         if (resolveAgentProposals(bundle.key(), action, bundle.value()).isEmpty()) {
             refused += bundle.value().size();
-            reason = i18n("The proposal decision could not be written to the durable server queue.");
+            reason = i18n("The proposal decision could not be written to the durable queue for the server.");
             continue;
         }
         for (const QString &proposalId : bundle.value()) {
@@ -8407,7 +8407,7 @@ void Part::undoLastAgentProposalResolution()
         }
         const QString undoOperationId = m_fedoraRepository->undoAgentProposalResolution(undo.resolutionId);
         if (undoOperationId.isEmpty()) {
-            showAgentProposalStatus(i18n("The proposal Undo could not be written to the durable server queue."), KMessageWidget::Error, true);
+            showAgentProposalStatus(i18n("The proposal Undo could not be written to the durable queue for the server."), KMessageWidget::Error, true);
             return;
         }
         m_pendingAgentProposalResolutions.insert(undoOperationId, {undo.proposalIds, undo.action, true});
@@ -8460,7 +8460,7 @@ QVariantMap Part::fedoraManualSyncState() const
                        {QStringLiteral("warning_code"), m_fedoraRepository->manualSyncWarningCode()},
                        {QStringLiteral("warning"), m_fedoraRepository->manualSyncWarning()}}
         : QVariantMap {{QStringLiteral("state"), static_cast<int>(FedoraRepository::ManualSyncState::Failed)},
-                       {QStringLiteral("message"), QStringLiteral("The server is unavailable.")},
+                       {QStringLiteral("message"), QStringLiteral("Sync with the server is unavailable.")},
                        {QStringLiteral("details"), QString()}};
 }
 

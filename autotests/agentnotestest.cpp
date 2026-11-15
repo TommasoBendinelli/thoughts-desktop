@@ -12,6 +12,8 @@
 #include <QComboBox>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -23,6 +25,7 @@
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 #include <QToolButton>
 #include <QUrlQuery>
 
@@ -103,6 +106,74 @@ Note note(const QJsonObject &record)
     return *Note::fromJson(record);
 }
 
+// An agent as the server names it (protocol/agent-notes.md, "The user's choice").
+QJsonObject agentRecord(const QString &role, const QString &device, const QString &conversation = {}, const QString &owner = {}, const QString &label = {}, bool live = true)
+{
+    return {{QStringLiteral("role"), role},
+            {QStringLiteral("device_id"), device},
+            {QStringLiteral("conversation_id"), conversation.isEmpty() ? QJsonValue() : QJsonValue(conversation)},
+            {QStringLiteral("owner_id"), owner.isEmpty() ? QJsonValue() : QJsonValue(owner)},
+            {QStringLiteral("label"), label.isEmpty() ? QJsonValue() : QJsonValue(label)},
+            {QStringLiteral("live"), live}};
+}
+
+const QString ConversationA = QStringLiteral("0190a000-0000-7000-8000-00000000000a");
+const QString ConversationB = QStringLiteral("0190a000-0000-7000-8000-00000000000b");
+const QString TopicOwner = QStringLiteral("0190a000-0000-7000-8000-00000000000c");
+
+QJsonObject replyAgentRecord(bool live = true)
+{
+    return agentRecord(QStringLiteral("responder"), QStringLiteral("example-reply-host"), {}, {}, {}, live);
+}
+
+QJsonObject topicAgentRecord(bool live = true)
+{
+    return agentRecord(QStringLiteral("owner"), QStringLiteral("example-laptop"), {}, TopicOwner, QStringLiteral("Example topic"), live);
+}
+
+// The session a reply waker would wake (a listening answer's "wake"), as the server sends it.
+QJsonObject wakeRecord(const QString &state, const QString &role, const QString &machine, const QString &title, const QString &sessionState = QStringLiteral("closed"),
+                       const QString &fallbackAt = {})
+{
+    return {{QStringLiteral("state"), state},
+            {QStringLiteral("role"), role},
+            {QStringLiteral("device_id"), QStringLiteral("example-laptop")},
+            {QStringLiteral("machine"), machine},
+            {QStringLiteral("conversation_id"), ConversationA},
+            {QStringLiteral("title"), title.isEmpty() ? QJsonValue() : QJsonValue(title)},
+            {QStringLiteral("session_state"), sessionState},
+            {QStringLiteral("owner_id"), QJsonValue()},
+            {QStringLiteral("label"), QJsonValue()},
+            {QStringLiteral("waker_live"), state == QLatin1String("will_be_woken")},
+            {QStringLiteral("fallback_at"), fallbackAt.isEmpty() ? QJsonValue() : QJsonValue(fallbackAt)}};
+}
+
+// The identity of an agent, as PUT …/answer-by names it.
+QJsonObject choiceOf(const QJsonObject &agent)
+{
+    return {{QStringLiteral("role"), agent.value(QStringLiteral("role"))},
+            {QStringLiteral("device_id"), agent.value(QStringLiteral("device_id"))},
+            {QStringLiteral("conversation_id"), agent.value(QStringLiteral("conversation_id"))},
+            {QStringLiteral("owner_id"), agent.value(QStringLiteral("owner_id"))}};
+}
+
+QStringList actionTitles(const QMenu *menu)
+{
+    QStringList titles;
+    for (const QAction *action : menu->actions()) {
+        if (!action->isSeparator()) titles.append(action->text());
+    }
+    return titles;
+}
+
+QAction *actionTitled(const QMenu *menu, const QString &title)
+{
+    for (QAction *action : menu->actions()) {
+        if (action->text() == title) return action;
+    }
+    return nullptr;
+}
+
 // The agent-notes endpoints the Mac reads; everything else is 404.
 class FakeServer : public QObject
 {
@@ -149,6 +220,15 @@ public:
     // note id -> "listening" / "not_listening" (GET …/listening, and the answer to a reply); a note
     // without an entry answers 404, as a server before agent_note_listening_v1.
     QHash<QString, QString> listening;
+    // note id -> the whole answer of GET …/listening (state, listeners, answer_by, candidates), as
+    // a server with agent_note_answer_by_v1 gives it; it goes before `listening`. A PUT
+    // …/answer-by changes it: a candidate (by its identity) or null, else 409.
+    QHash<QString, QJsonObject> answers;
+    // note id -> the state while nobody was chosen (the answer to {"agent": null}).
+    QHash<QString, QString> automaticState;
+    int putStatus = 0;  // set: every PUT answers it
+    // GET /v1/health: {"status": "ok", "capabilities": [...]}.
+    QStringList capabilities;
     QString device = QStringLiteral("thoughts-mac");
 
     QJsonObject *noteRecordOf(const QString &id)
@@ -212,9 +292,16 @@ private:
                 extraHeaders = QByteArray("ETag: ") + version + QByteArray("\r\n");
             }
             listBytes += body.size();
+        } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/health")) {
+            code = 200;
+            body = QJsonDocument(QJsonObject{{QStringLiteral("status"), QStringLiteral("ok")}, {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)}})
+                       .toJson(QJsonDocument::Compact);
         } else if (method == QLatin1String("GET") && target.path().endsWith(QLatin1String("/listening"))) {
             const QString id = target.path().section(QLatin1Char('/'), -2, -2);
-            if (listening.contains(id)) {
+            if (answers.contains(id)) {
+                code = 200;
+                body = QJsonDocument(answers.value(id)).toJson(QJsonDocument::Compact);
+            } else if (listening.contains(id)) {
                 code = 200;
                 body = QJsonDocument(QJsonObject{{QStringLiteral("note_id"), id}, {QStringLiteral("state"), listening.value(id)},
                                                  {QStringLiteral("listeners"), QJsonArray()}})
@@ -224,6 +311,45 @@ private:
             code = 200;
             body = files.value(target.path());
             type = "image/png";
+        } else if (method == QLatin1String("PUT")) {
+            const QJsonObject payload = QJsonDocument::fromJson(requestBody).object();
+            bodies.append(payload);
+            const QStringList parts = target.path().split(QLatin1Char('/'), Qt::SkipEmptyParts);  // v1 agent-notes <id> answer-by
+            const QString id = parts.value(2);
+            if (putStatus) {
+                code = putStatus;
+                body = putStatus == 409 ? QByteArray(R"({"detail":"unknown agent","error_code":"agent_note_answerer_unknown"})")
+                                        : QByteArray(R"({"detail":"try later","error_code":"busy"})");
+            } else if (parts.size() == 4 && parts.at(3) == QLatin1String("answer-by") && answers.contains(id)) {
+                QJsonObject answer = answers.value(id);
+                const QJsonValue chosen = payload.value(QStringLiteral("agent"));
+                const auto same = [](const QJsonObject &a, const QJsonObject &b) {
+                    for (const QString &key : {QStringLiteral("role"), QStringLiteral("device_id"), QStringLiteral("conversation_id"), QStringLiteral("owner_id")}) {
+                        if (a.value(key).toString() != b.value(key).toString()) return false;
+                    }
+                    return true;
+                };
+                QJsonObject match;
+                if (chosen.isObject()) {
+                    for (const QJsonValue &candidate : answer.value(QStringLiteral("candidates")).toArray()) {
+                        if (same(candidate.toObject(), chosen.toObject())) match = candidate.toObject();
+                    }
+                    if (match.isEmpty() && same(answer.value(QStringLiteral("answer_by")).toObject(), chosen.toObject())) match = answer.value(QStringLiteral("answer_by")).toObject();
+                }
+                if (chosen.isObject() && match.isEmpty()) {
+                    code = 409;
+                    body = R"({"detail":"unknown agent","error_code":"agent_note_answerer_unknown"})";
+                } else {
+                    answer.insert(QStringLiteral("answer_by"), match.isEmpty() ? QJsonValue() : QJsonValue(match));
+                    answer.insert(QStringLiteral("state"), match.isEmpty() ? automaticState.value(id, QStringLiteral("not_listening"))
+                                                                           : match.value(QStringLiteral("live")).toBool() ? QStringLiteral("listening") : QStringLiteral("not_listening"));
+                    answers.insert(id, answer);
+                    code = 200;
+                    body = QJsonDocument(answer).toJson(QJsonDocument::Compact);
+                }
+            } else {
+                body = R"({"detail":"note not found","error_code":"agent_note_not_found"})";
+            }
         } else if ((method == QLatin1String("POST") || method == QLatin1String("DELETE")) && writeStatus) {
             if (method == QLatin1String("POST")) bodies.append(QJsonDocument::fromJson(requestBody).object());
             code = writeStatus;
@@ -276,7 +402,15 @@ private:
                         storeScratch();
                     }
                     QJsonObject answer = reply;
-                    if (listening.contains(parts.at(2))) answer.insert(QStringLiteral("listening"), QJsonObject{{QStringLiteral("state"), listening.value(parts.at(2))}});
+                    if (answers.contains(parts.at(2))) {
+                        const QJsonObject known = answers.value(parts.at(2));
+                        QJsonObject heard{{QStringLiteral("state"), known.value(QStringLiteral("state"))},
+                                          {QStringLiteral("listeners"), known.value(QStringLiteral("listeners"))}};
+                        if (known.contains(QStringLiteral("wake"))) heard.insert(QStringLiteral("wake"), known.value(QStringLiteral("wake")));
+                        answer.insert(QStringLiteral("listening"), heard);
+                    } else if (listening.contains(parts.at(2))) {
+                        answer.insert(QStringLiteral("listening"), QJsonObject{{QStringLiteral("state"), listening.value(parts.at(2))}});
+                    }
                     body = QJsonDocument(answer).toJson(QJsonDocument::Compact);
                 }
             } else {
@@ -349,6 +483,12 @@ private Q_SLOTS:
     void filtersFollowTheLibrary();
     void viewShowsOneProjectWithItsOlderNotes();
     void viewWarnsWhileNoAgentListens();
+    void answerLineSaysWhoListens();
+    void clientChoosesWhoAnswers();
+    void centerAsksWhoListensOncePerMinute();
+    void viewLetsTheUserChooseWhoAnswers();
+    void answerLineSaysWhoWillBeWoken();
+    void viewSaysWhoWillBeWoken();
     void replyPhotoIsShownWithTheReply();
 
 private:
@@ -1877,6 +2017,7 @@ void AgentNotesTest::viewShowsOneProjectWithItsOlderNotes()
 
 void AgentNotesTest::viewWarnsWhileNoAgentListens()
 {
+    // A server before agent_note_answer_by_v1: the line, from the state it sends, without Change.
     FakeServer server;
     const QByteArray picture = png(QSize(200, 500), QColor(30, 90, 200));
     const QDateTime now = QDateTime::currentDateTimeUtc();
@@ -1897,16 +2038,34 @@ void AgentNotesTest::viewWarnsWhileNoAgentListens()
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     window.showNote(QStringLiteral("n1"));
-    auto *warning = window.findChild<QLabel *>(QStringLiteral("agentNoteNotListening"));
-    QVERIFY(warning);
-    QVERIFY(waitFor([&] { return warning->isVisible(); }));
-    QVERIFY(warning->text().contains(QStringLiteral("No agent is listening")));
+    auto *line = window.findChild<QWidget *>(QStringLiteral("agentNoteAnswerLine"));
+    auto *text = window.findChild<QLabel *>(QStringLiteral("agentNoteAnswerText"));
+    auto *change = window.findChild<QToolButton *>(QStringLiteral("agentNoteAnswerChange"));
+    QVERIFY(line && text && change);
+    QVERIFY(waitFor([&] { return line->isVisible() && text->text() == QStringLiteral("No agent is listening right now"); }));
+    QVERIFY(line->property("warning").toBool());
     QCOMPARE(center.listening(QStringLiteral("n1")), Listening::NotListening);
+    // The server was asked what it can do: without the capability there is no Change.
+    QVERIFY(waitFor([&] { return server.requests.contains(QStringLiteral("GET /v1/health")); }));
+    QTest::qWait(100);
+    QVERIFY(!change->isVisible());
+    // The bar over the reply field is gone: the same thing is never said twice.
+    QVERIFY(!window.findChild<QLabel *>(QStringLiteral("agentNoteNotListening")));
+    const auto saidListening = [&] {
+        int count = 0;
+        for (const QLabel *label : window.findChildren<QLabel *>()) {
+            if (label->isVisible() && label->text().contains(QStringLiteral("listening"), Qt::CaseInsensitive)) ++count;
+        }
+        return count;
+    };
+    QCOMPARE(saidListening(), 1);
 
-    // The agent starts listening: the next check takes the warning away.
+    // The agent starts listening: the next check says so.
     server.listening.insert(QStringLiteral("n1"), QStringLiteral("listening"));
     center.checkListening(QStringLiteral("n1"));
-    QVERIFY(waitFor([&] { return !warning->isVisible(); }));
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("An agent is listening"); }));
+    QVERIFY(!line->property("warning").toBool());
+    QCOMPARE(line->findChild<QLabel *>(QStringLiteral("agentNoteAnswerMark"))->property("mark").toString(), QStringLiteral("listening"));
 
     // The answer to a reply says whether it was heard.
     server.listening.insert(QStringLiteral("n1"), QStringLiteral("not_listening"));
@@ -1915,7 +2074,7 @@ void AgentNotesTest::viewWarnsWhileNoAgentListens()
     center.sendReply(QStringLiteral("n1"), [&](bool ok, const QString &) { sent = ok; });
     QVERIFY(waitFor([&] { return sent; }));
     QCOMPARE(center.listening(QStringLiteral("n1")), Listening::NotListening);
-    QVERIFY(waitFor([&] { return warning->isVisible(); }));
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("No agent is listening right now"); }));
 
     // A page the user sent is not asked about; a server that cannot tell (404) shows nothing.
     const int asked = server.requests.filter(QStringLiteral("/p1/listening")).size();
@@ -1923,13 +2082,521 @@ void AgentNotesTest::viewWarnsWhileNoAgentListens()
     QVERIFY(waitFor([&] { return window.shownNoteId() == QStringLiteral("p1"); }));
     QTest::qWait(200);
     QCOMPARE(server.requests.filter(QStringLiteral("/p1/listening")).size(), asked);
-    QVERIFY(!warning->isVisible());
+    QVERIFY(!line->isVisible());
     server.listening.remove(QStringLiteral("n1"));
     center.setListening(QStringLiteral("n1"), Listening::NotListening);
     window.showNote(QStringLiteral("n1"));
     QVERIFY(waitFor([&] { return window.shownNoteId() == QStringLiteral("n1"); }));
     QVERIFY(waitFor([&] { return center.listening(QStringLiteral("n1")) == Listening::Unknown; }));
-    QVERIFY(waitFor([&] { return !warning->isVisible(); }));
+    QVERIFY(waitFor([&] { return !line->isVisible(); }));
+}
+
+// Who answers, as the phone says it (AgentNoteCoverage.kt): the line's texts and the list behind Change.
+void AgentNotesTest::answerLineSaysWhoListens()
+{
+    const QJsonObject sender = agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationA, {}, {}, false);
+    // Listeners name who answers first: the sender's agent, a topic owner, the reply agent.
+    // Candidates the view cannot name (an unknown role, no device) are left out.
+    const ListeningAnswer parsed = ListeningAnswer::fromJson(
+        {{QStringLiteral("state"), QStringLiteral("listening")},
+         {QStringLiteral("listeners"), QJsonArray{QJsonObject{{QStringLiteral("role"), QStringLiteral("responder")}, {QStringLiteral("device_id"), QStringLiteral("example-reply-host")}},
+                                                   QJsonObject{{QStringLiteral("role"), QStringLiteral("owner")}, {QStringLiteral("device_id"), QStringLiteral("example-laptop")},
+                                                               {QStringLiteral("owner_id"), TopicOwner}, {QStringLiteral("label"), QStringLiteral("Example topic")}}}},
+         {QStringLiteral("answer_by"), QJsonValue()},
+         {QStringLiteral("candidates"), QJsonArray{replyAgentRecord(), topicAgentRecord(),
+                                                   QJsonObject{{QStringLiteral("role"), QStringLiteral("observer")}, {QStringLiteral("device_id"), QStringLiteral("example-laptop")}},
+                                                   QJsonObject{{QStringLiteral("role"), QStringLiteral("sender")}}}}});
+    QCOMPARE(parsed.state, Listening::Listening);
+    QVERIFY(parsed.coverer);
+    QCOMPARE(parsed.coverer->role, QStringLiteral("owner"));
+    QVERIFY(!parsed.answerBy);
+    QCOMPARE(parsed.candidates.size(), 2);
+    QCOMPARE(parsed.candidates.at(1).label, QStringLiteral("Example topic"));
+    QVERIFY(parsed.candidates.at(1).live);
+    // A listener of a server before topic owners: "responder": true is the reply agent.
+    const ListeningAnswer older = ListeningAnswer::fromJson(
+        {{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("listeners"), QJsonArray{QJsonObject{{QStringLiteral("responder"), true}}}}});
+    QVERIFY(older.coverer);
+    QCOMPARE(older.coverer->role, QStringLiteral("responder"));
+
+    // No line before an answer, nor while the server cannot tell.
+    QVERIFY(!answerLine(std::nullopt, true, true));
+    QVERIFY(!answerLine(ListeningAnswer{}, true, true));
+
+    auto line = answerLine(parsed, false, true);
+    QVERIFY(line);
+    QCOMPARE(line->text, QStringLiteral("Example topic agent is listening"));
+    QCOMPARE(line->mark, AnswerLine::Mark::Listening);
+    QVERIFY(!line->warning);
+    QVERIFY(!line->changeOffered);
+    QCOMPARE(answerLine(older, true, true)->text, QStringLiteral("Thoughts reply agent is listening"));
+    ListeningAnswer anyone;
+    anyone.state = Listening::Listening;
+    QCOMPARE(answerLine(anyone, true, true)->text, QStringLiteral("An agent is listening"));
+
+    ListeningAnswer nobody;
+    nobody.state = Listening::NotListening;
+    line = answerLine(nobody, true, true);
+    QCOMPARE(line->text, QStringLiteral("No agent is listening right now"));
+    QCOMPARE(line->mark, AnswerLine::Mark::Nobody);
+    QVERIFY(line->warning);
+    QVERIFY(line->changeOffered);
+    QVERIFY(line->changeEnabled);
+    // Change needs the server.
+    line = answerLine(nobody, true, false);
+    QVERIFY(line->changeOffered);
+    QVERIFY(!line->changeEnabled);
+
+    // A chosen agent that is not listening: the reply agent answers after a while.
+    ListeningAnswer waiting = nobody;
+    waiting.answerBy = Agent::fromJson(sender);
+    waiting.candidates = {*Agent::fromJson(replyAgentRecord())};
+    line = answerLine(waiting, true, true);
+    QCOMPARE(line->text, QStringLiteral("The agent that sent it is not listening right now. The Thoughts reply agent answers after 10 minutes."));
+    QCOMPARE(line->mark, AnswerLine::Mark::Waiting);
+    QVERIFY(!line->warning);
+    // A chosen agent that is live: the server says listening, and the line names the choice.
+    ListeningAnswer chosen;
+    chosen.state = Listening::Listening;
+    chosen.coverer = Agent::fromJson(topicAgentRecord());
+    chosen.answerBy = Agent::fromJson(replyAgentRecord());
+    QCOMPARE(answerLine(chosen, true, true)->text, QStringLiteral("Thoughts reply agent is listening"));
+
+    // Change: Automatic with who answers then, and each agent by the line's name; the choice checked.
+    QList<AnswerChoice> choices = answerChoices(parsed);
+    QCOMPARE(choices.size(), 3);
+    QCOMPARE(choices.at(0).title, QStringLiteral("Automatic"));
+    QCOMPARE(choices.at(0).detail, QStringLiteral("The agent that sent the note answers first, then the Thoughts reply agent"));
+    QVERIFY(!choices.at(0).agent);
+    QVERIFY(choices.at(0).checked);
+    QCOMPARE(choices.at(1).title, QStringLiteral("Thoughts reply agent"));
+    QCOMPARE(choices.at(2).title, QStringLiteral("Example topic agent"));
+    QVERIFY(!choices.at(1).checked && !choices.at(2).checked);
+    QVERIFY(choices.at(1).detail.isEmpty());
+    // Two agents that would read the same are numbered; the same agent twice is listed once.
+    ListeningAnswer two;
+    two.state = Listening::Listening;
+    const QJsonObject other = agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationB);
+    two.candidates = {*Agent::fromJson(agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationA)), *Agent::fromJson(other), *Agent::fromJson(other)};
+    two.answerBy = Agent::fromJson(other);
+    choices = answerChoices(two);
+    QCOMPARE(choices.size(), 3);
+    QCOMPARE(choices.at(1).title, QStringLiteral("The agent that sent it"));
+    QCOMPARE(choices.at(2).title, QStringLiteral("The agent that sent it (2)"));
+    QVERIFY(!choices.at(0).checked && !choices.at(1).checked && choices.at(2).checked);
+    // What is chosen is listed also when it could not answer now.
+    choices = answerChoices(waiting);
+    QCOMPARE(choices.size(), 3);
+    QCOMPARE(choices.last().title, QStringLiteral("The agent that sent it (not listening)"));
+    QVERIFY(choices.last().checked);
+    QVERIFY(!choices.first().checked);
+
+    // The PUT names the agent by its identity only.
+    QCOMPARE(Agent::fromJson(replyAgentRecord())->toChoiceJson(), choiceOf(replyAgentRecord()));
+    QCOMPARE(Agent::fromJson(topicAgentRecord())->toChoiceJson().value(QStringLiteral("owner_id")).toString(), TopicOwner);
+    QVERIFY(!Agent::fromJson(topicAgentRecord())->toChoiceJson().contains(QStringLiteral("label")));
+}
+
+void AgentNotesTest::clientChoosesWhoAnswers()
+{
+    FakeServer server;
+    server.capabilities = {QStringLiteral("agent_notes_v1"), answerByCapability()};
+    server.answers.insert(QStringLiteral("n1"), QJsonObject{{QStringLiteral("note_id"), QStringLiteral("n1")},
+                                                            {QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                            {QStringLiteral("listeners"), QJsonArray()},
+                                                            {QStringLiteral("answer_by"), QJsonValue()},
+                                                            {QStringLiteral("candidates"), QJsonArray{replyAgentRecord()}}});
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+
+    Client::WriteResult result;
+    bool done = false;
+    client.setAnswerBy(QStringLiteral("n1"), Agent::fromJson(replyAgentRecord()), &client, [&](const Client::WriteResult &answer) {
+        result = answer;
+        done = true;
+    });
+    QVERIFY(waitFor([&] { return done; }));
+    QCOMPARE(result.status, 200);
+    QCOMPARE(result.failure, Client::Failure::None);
+    QVERIFY(server.requests.contains(QStringLiteral("PUT /v1/agent-notes/n1/answer-by")));
+    QCOMPARE(server.bodies.last(), (QJsonObject{{QStringLiteral("agent"), choiceOf(replyAgentRecord())}}));
+    const ListeningAnswer answered = ListeningAnswer::fromJson(result.json);
+    QVERIFY(answered.answerBy);
+    QCOMPARE(answered.answerBy->role, QStringLiteral("responder"));
+    QCOMPARE(answered.state, Listening::Listening);
+
+    // Automatic: {"agent": null}.
+    done = false;
+    client.setAnswerBy(QStringLiteral("n1"), std::nullopt, &client, [&](const Client::WriteResult &answer) {
+        result = answer;
+        done = true;
+    });
+    QVERIFY(waitFor([&] { return done; }));
+    QCOMPARE(result.status, 200);
+    QCOMPARE(server.bodies.last(), (QJsonObject{{QStringLiteral("agent"), QJsonValue()}}));
+    QVERIFY(server.bodies.last().value(QStringLiteral("agent")).isNull());
+    QVERIFY(!ListeningAnswer::fromJson(result.json).answerBy);
+
+    // An agent the server does not know: 409 with its error_code.
+    done = false;
+    client.setAnswerBy(QStringLiteral("n1"), Agent::fromJson(topicAgentRecord()), &client, [&](const Client::WriteResult &answer) {
+        result = answer;
+        done = true;
+    });
+    QVERIFY(waitFor([&] { return done; }));
+    QCOMPARE(result.status, 409);
+    QCOMPARE(result.failure, Client::Failure::Failed);
+    QCOMPARE(result.errorCode, QStringLiteral("agent_note_answerer_unknown"));
+
+    // What the server can do.
+    bool known = false;
+    QStringList capabilities;
+    client.capabilities(&client, [&](bool ok, const QStringList &names) {
+        known = ok;
+        capabilities = names;
+        done = true;
+    });
+    QVERIFY(waitFor([&] { return known; }));
+    QVERIFY(capabilities.contains(answerByCapability()));
+}
+
+void AgentNotesTest::centerAsksWhoListensOncePerMinute()
+{
+    FakeServer server;
+    server.listening.insert(QStringLiteral("n1"), QStringLiteral("listening"));
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    QDateTime now(QDate(2026, 11, 14), QTime(9, 0), QTimeZone::UTC);
+    Center center(&client, statePath(), [&] { return now; });
+    const auto asked = [&] { return server.requests.filter(QStringLiteral("/n1/listening")).size(); };
+    center.checkListening(QStringLiteral("n1"));
+    QVERIFY(waitFor([&] { return center.listening(QStringLiteral("n1")) == Listening::Listening; }));
+    QCOMPARE(asked(), 1);
+    // Another view asked half a minute ago: not again.
+    now = now.addSecs(30);
+    center.checkListeningIfOlder(QStringLiteral("n1"), AgentNotesView::ListeningRefreshMs - 5000);
+    QTest::qWait(150);
+    QCOMPARE(asked(), 1);
+    now = now.addSecs(31);
+    center.checkListeningIfOlder(QStringLiteral("n1"), AgentNotesView::ListeningRefreshMs - 5000);
+    QVERIFY(waitFor([&] { return asked() == 2; }));
+    QVERIFY(center.serverReachable());
+
+    // A server that cannot be reached: Change waits for it.
+    QTcpServer closed;
+    QVERIFY(closed.listen(QHostAddress::LocalHost));
+    const quint16 port = closed.serverPort();
+    closed.close();
+    Client away(cachePath());
+    away.setServer(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(port)), "secret");
+    Center unreachable(&away, statePath());
+    unreachable.checkListening(QStringLiteral("n1"));
+    QVERIFY(waitFor([&] { return !unreachable.serverReachable(); }));
+    QVERIFY(!unreachable.answer(QStringLiteral("n1")));
+}
+
+// Who will be woken, as the phone says it (AgentNoteCoverage.kt): reply wakers ("Wakers" in protocol/agent-notes.md).
+void AgentNotesTest::answerLineSaysWhoWillBeWoken()
+{
+    const QString woken = QStringLiteral("will_be_woken");
+    const QString offline = QStringLiteral("waker_offline");
+    const auto withWake = [](const QString &state, const QJsonObject &wake, const QJsonArray &listeners = {}) {
+        return ListeningAnswer::fromJson({{QStringLiteral("state"), state}, {QStringLiteral("listeners"), listeners}, {QStringLiteral("wake"), wake}});
+    };
+    // The server's own waker listens as the reply agent, so older apps still see an agent listening.
+    const QJsonArray responder{QJsonObject{{QStringLiteral("role"), QStringLiteral("responder")}, {QStringLiteral("device_id"), QStringLiteral("example-reply-host")}}};
+    const ListeningAnswer mac = withWake(QStringLiteral("listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("  Chapter draft ")), responder);
+    QVERIFY(mac.wake);
+    QCOMPARE(mac.wake->title, QStringLiteral("Chapter draft"));
+    auto line = answerLine(mac, true, true);
+    QVERIFY(line);
+    QCOMPARE(line->text, QStringLiteral("Chapter draft will be woken on the Mac"));
+    QCOMPARE(line->mark, AnswerLine::Mark::Woken);
+    QVERIFY(!line->warning);
+    QVERIFY(!line->muted);
+    QVERIFY(line->changeOffered && line->changeEnabled);
+    // Nobody listens at all: not "No agent is listening", since the session will be woken.
+    line = answerLine(withWake(QStringLiteral("not_listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("example-server"), QStringLiteral("Figure review"), QStringLiteral("idle"))), true, true);
+    QCOMPARE(line->text, QStringLiteral("Figure review will be woken on the server"));
+    QVERIFY(!line->warning);
+    // The fallback session is named without its machine; a session without a title as its agent.
+    QCOMPARE(answerLine(withWake(QStringLiteral("listening"), wakeRecord(woken, QStringLiteral("responder"), QStringLiteral("example-server"), QStringLiteral("The study session"), QStringLiteral("idle")), responder), true, true)->text,
+             QStringLiteral("The study session will be woken"));
+    QCOMPARE(answerLine(withWake(QStringLiteral("not_listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), {})), true, true)->text,
+             QStringLiteral("The agent that sent it will be woken on the Mac"));
+    // A session busy with a task answers when it is done.
+    line = answerLine(withWake(QStringLiteral("listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"), QStringLiteral("busy")), responder), true, true);
+    QCOMPARE(line->text, QStringLiteral("Chapter draft answers when it finishes its current task"));
+    QCOMPARE(line->mark, AnswerLine::Mark::Woken);
+
+    // An offline machine: when the study session answers instead, at the local time, in the muted look.
+    const QDateTime fallbackAt = QDateTime::fromString(QStringLiteral("2026-11-15T02:14:00Z"), Qt::ISODate);
+    QVERIFY(fallbackAt.isValid());
+    const QString at = QLocale::system().toString(fallbackAt.toLocalTime().time(), QLocale::ShortFormat);
+    line = answerLine(withWake(QStringLiteral("listening"), wakeRecord(offline, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"), QStringLiteral("closed"),
+                                                                       QStringLiteral("2026-11-15T02:14:00.123456Z")), responder), true, true);
+    QCOMPARE(line->text, QStringLiteral("The Mac is offline; the study session answers at %1 if it is still offline").arg(at));
+    QCOMPARE(line->mark, AnswerLine::Mark::Offline);
+    QVERIFY(line->muted);
+    QVERIFY(!line->warning);
+    QVERIFY(line->changeOffered);
+    QCOMPARE(answerLine(withWake(QStringLiteral("not_listening"), wakeRecord(offline, QStringLiteral("sender"), QStringLiteral("example-server"), QStringLiteral("Figure review"), QStringLiteral("closed"),
+                                                                     QStringLiteral("2026-11-15T02:14:00Z"))), true, true)->text,
+             QStringLiteral("The server is offline; the study session answers at %1 if it is still offline").arg(at));
+    QCOMPARE(answerLine(withWake(QStringLiteral("not_listening"), wakeRecord(offline, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"))), true, true)->text,
+             QStringLiteral("The Mac is offline; the study session answers later if it is still offline"));
+
+    // An agent that listens by itself is still named first.
+    const QJsonArray sender{QJsonObject{{QStringLiteral("role"), QStringLiteral("sender")}, {QStringLiteral("device_id"), QStringLiteral("example-laptop")}}};
+    QCOMPARE(answerLine(withWake(QStringLiteral("listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft")), sender), true, true)->text,
+             QStringLiteral("The agent that sent it is listening"));
+    // A chosen agent a waker wakes: named instead of the ten minutes.
+    ListeningAnswer chosen = withWake(QStringLiteral("not_listening"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft")));
+    chosen.answerBy = Agent::fromJson(agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationA, {}, {}, false));
+    QCOMPARE(answerLine(chosen, true, true)->text, QStringLiteral("Chapter draft will be woken on the Mac"));
+    // A server that cannot tell who listens, but names a session to wake.
+    QCOMPARE(answerLine(withWake(QStringLiteral("unknown"), wakeRecord(woken, QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"))), true, true)->text,
+             QStringLiteral("Chapter draft will be woken on the Mac"));
+
+    // An older server has no wake, and one the view cannot say is none: the lines as before.
+    const ListeningAnswer older = ListeningAnswer::fromJson({{QStringLiteral("state"), QStringLiteral("not_listening")}, {QStringLiteral("listeners"), QJsonArray()}});
+    QVERIFY(!older.wake);
+    QCOMPARE(answerLine(older, true, true)->text, QStringLiteral("No agent is listening right now"));
+    QVERIFY(!withWake(QStringLiteral("not_listening"), wakeRecord(QStringLiteral("something new"), QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("x"))).wake);
+    QVERIFY(!withWake(QStringLiteral("not_listening"), wakeRecord(woken, QStringLiteral("observer"), QStringLiteral("mac"), QStringLiteral("x"))).wake);
+    QVERIFY(!withWake(QStringLiteral("not_listening"), wakeRecord(woken, QStringLiteral("sender"), {}, QStringLiteral("x"))).wake);
+    QVERIFY(!answerLine(ListeningAnswer{}, true, true));
+
+    // After Send.
+    QCOMPARE(mac.wake->sentText(), QStringLiteral("Sent ✓ · Chapter draft will be woken"));
+}
+
+void AgentNotesTest::viewSaysWhoWillBeWoken()
+{
+    FakeServer server;
+    server.capabilities = {QStringLiteral("agent_notes_v1"), answerByCapability()};
+    const QByteArray picture = png(QSize(200, 500), QColor(30, 90, 200));
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QJsonObject agentNote = noteRecord(QStringLiteral("n1"), 7, now.addSecs(-300), QStringLiteral("New drafter"), picture);
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    server.notes = {agentNote};
+    const QJsonArray responder{QJsonObject{{QStringLiteral("role"), QStringLiteral("responder")}, {QStringLiteral("device_id"), QStringLiteral("example-reply-host")}}};
+    QJsonObject answer{{QStringLiteral("note_id"), QStringLiteral("n1")},
+                       {QStringLiteral("state"), QStringLiteral("listening")},
+                       {QStringLiteral("listeners"), responder},
+                       {QStringLiteral("answer_by"), QJsonValue()},
+                       {QStringLiteral("candidates"), QJsonArray{replyAgentRecord()}},
+                       {QStringLiteral("wake"), wakeRecord(QStringLiteral("will_be_woken"), QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"))}};
+    server.answers.insert(QStringLiteral("n1"), answer);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    center.apply({note(agentNote)});
+
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.showNote(QStringLiteral("n1"));
+    auto *line = window.findChild<QWidget *>(QStringLiteral("agentNoteAnswerLine"));
+    auto *text = window.findChild<QLabel *>(QStringLiteral("agentNoteAnswerText"));
+    auto *mark = window.findChild<QLabel *>(QStringLiteral("agentNoteAnswerMark"));
+    auto *change = window.findChild<QToolButton *>(QStringLiteral("agentNoteAnswerChange"));
+    auto *status = window.findChild<QLabel *>(QStringLiteral("agentNoteReplyStatus"));
+    QVERIFY(line && text && mark && change && status);
+    QVERIFY(waitFor([&] { return line->isVisible() && text->text() == QStringLiteral("Chapter draft will be woken on the Mac"); }));
+    QVERIFY(!line->property("warning").toBool());
+    QCOMPARE(mark->property("mark").toString(), QStringLiteral("woken"));
+    QCOMPARE(mark->accessibleName(), QStringLiteral("Will be woken"));
+    QVERIFY(waitFor([&] { return change->isVisible() && change->isEnabled(); }));
+
+    // The reply's answer names the session too: the reply box says so after Send.
+    center.setDraftMessage(QStringLiteral("n1"), QStringLiteral("Give me a new version"));
+    bool sent = false;
+    center.sendReply(QStringLiteral("n1"), [&](bool ok, const QString &) { sent = ok; });
+    QVERIFY(waitFor([&] { return sent; }));
+    QVERIFY(waitFor([&] { return status->isVisible() && status->text() == QStringLiteral("Sent ✓ · Chapter draft will be woken"); }));
+    QCOMPARE(center.sentStatus(QStringLiteral("n1")), QStringLiteral("Sent ✓ · Chapter draft will be woken"));
+    // The next reply started: the status is about that one.
+    center.setDraftMessage(QStringLiteral("n1"), QStringLiteral("And another"));
+    QVERIFY(waitFor([&] { return !status->isVisible(); }));
+    QVERIFY(center.sentStatus(QStringLiteral("n1")).isEmpty());
+
+    // The Mac goes to sleep: the line says when the study session answers, muted.
+    answer.insert(QStringLiteral("wake"), wakeRecord(QStringLiteral("waker_offline"), QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Chapter draft"),
+                                                    QStringLiteral("closed"), QStringLiteral("2026-11-15T02:14:00Z")));
+    server.answers.insert(QStringLiteral("n1"), answer);
+    center.checkListening(QStringLiteral("n1"));
+    QVERIFY(waitFor([&] { return text->text().startsWith(QStringLiteral("The Mac is offline; the study session answers at ")); }));
+    QCOMPARE(mark->property("mark").toString(), QStringLiteral("offline"));
+    QVERIFY(!line->property("warning").toBool());
+    QVERIFY(change->isVisible());
+
+    // A reply without a wake (no waker would wake anyone): as before, no status after Send.
+    answer.remove(QStringLiteral("wake"));
+    server.answers.insert(QStringLiteral("n1"), answer);
+    sent = false;
+    center.sendReply(QStringLiteral("n1"), [&](bool ok, const QString &) { sent = ok; });
+    QVERIFY(waitFor([&] { return sent; }));
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("Thoughts reply agent is listening"); }));
+    QVERIFY(center.sentStatus(QStringLiteral("n1")).isEmpty());
+    QVERIFY(!status->isVisible());
+}
+
+void AgentNotesTest::viewLetsTheUserChooseWhoAnswers()
+{
+    FakeServer server;
+    server.capabilities = {QStringLiteral("agent_notes_v1"), answerByCapability()};
+    const QByteArray picture = png(QSize(200, 500), QColor(30, 90, 200));
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QJsonObject agentNote = noteRecord(QStringLiteral("n1"), 7, now.addSecs(-300), QStringLiteral("New drafter"), picture);
+    QJsonObject page = noteRecord(QStringLiteral("p1"), 6, now.addSecs(-400), QStringLiteral("Notes · page 2"), picture);
+    page.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("kind"), QStringLiteral("phone_page")}});
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    server.files.insert(QStringLiteral("/v1/agent-notes/p1/image"), picture);
+    server.notes = {agentNote, page};
+    server.answers.insert(QStringLiteral("n1"), QJsonObject{{QStringLiteral("note_id"), QStringLiteral("n1")},
+                                                            {QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                            {QStringLiteral("listeners"), QJsonArray()},
+                                                            {QStringLiteral("answer_by"), QJsonValue()},
+                                                            {QStringLiteral("candidates"), QJsonArray{replyAgentRecord(), topicAgentRecord()}}});
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    center.apply({note(agentNote), note(page)});
+
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.showNote(QStringLiteral("n1"));
+    auto *line = window.findChild<QWidget *>(QStringLiteral("agentNoteAnswerLine"));
+    auto *text = window.findChild<QLabel *>(QStringLiteral("agentNoteAnswerText"));
+    auto *change = window.findChild<QToolButton *>(QStringLiteral("agentNoteAnswerChange"));
+    auto *failure = window.findChild<QLabel *>(QStringLiteral("agentNoteAnswerFailure"));
+    QVERIFY(line && text && change && failure);
+    QVERIFY(waitFor([&] { return line->isVisible() && text->text() == QStringLiteral("No agent is listening right now"); }));
+    QVERIFY(line->property("warning").toBool());
+    // Change once the server said it has the capability (asked with the first check).
+    QVERIFY(waitFor([&] { return change->isVisible() && change->isEnabled(); }));
+    QCOMPARE(change->text(), QStringLiteral("Change"));
+    // Always in view: over the note, not part of what scrolls.
+    auto *scroll = window.findChild<QScrollArea *>(QStringLiteral("agentNoteScroll"));
+    QVERIFY(scroll);
+    QVERIFY(!scroll->isAncestorOf(line));
+    QVERIFY(line->geometry().bottom() <= window.findChild<QWidget *>(QStringLiteral("agentNotePane"))->mapFromGlobal(scroll->mapToGlobal(QPoint(0, 0))).y());
+    // It is refreshed every minute while the note is on screen.
+    auto *refresh = window.findChild<QTimer *>(QStringLiteral("agentNoteListeningTimer"));
+    QVERIFY(refresh && refresh->isActive());
+    QCOMPARE(refresh->interval(), 60 * 1000);
+
+    // Change: Automatic with who answers then, and each agent that could answer now.
+    {
+        std::unique_ptr<QMenu> menu(window.createAnswerMenu());
+        QVERIFY(menu);
+        QCOMPARE(actionTitles(menu.get()), (QStringList{QStringLiteral("Who answers your reply"), QStringLiteral("Automatic"),
+                                                       QStringLiteral("The agent that sent the note answers first, then the Thoughts reply agent"),
+                                                       QStringLiteral("Thoughts reply agent"), QStringLiteral("Example topic agent")}));
+        QVERIFY(actionTitled(menu.get(), QStringLiteral("Automatic"))->isChecked());
+        QVERIFY(!actionTitled(menu.get(), QStringLiteral("Example topic agent"))->isChecked());
+        QVERIFY(!actionTitled(menu.get(), QStringLiteral("The agent that sent the note answers first, then the Thoughts reply agent"))->isEnabled());
+        actionTitled(menu.get(), QStringLiteral("Example topic agent"))->trigger();
+    }
+    // The choice goes to the server; the line follows its answer.
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("Example topic agent is listening"); }));
+    QVERIFY(server.requests.contains(QStringLiteral("PUT /v1/agent-notes/n1/answer-by")));
+    QCOMPARE(server.bodies.last(), (QJsonObject{{QStringLiteral("agent"), choiceOf(topicAgentRecord())}}));
+    QVERIFY(!line->property("warning").toBool());
+    QVERIFY(center.answer(QStringLiteral("n1"))->answerBy);
+    QCOMPARE(center.answer(QStringLiteral("n1"))->answerBy->role, QStringLiteral("owner"));
+    QVERIFY(change->isEnabled());
+    QVERIFY(!failure->isVisible());
+
+    // The chosen agent stops listening: the reply agent answers later, and the list still shows the choice.
+    QJsonObject gone = server.answers.value(QStringLiteral("n1"));
+    gone.insert(QStringLiteral("state"), QStringLiteral("not_listening"));
+    gone.insert(QStringLiteral("answer_by"), topicAgentRecord(false));
+    gone.insert(QStringLiteral("candidates"), QJsonArray{replyAgentRecord()});
+    server.answers.insert(QStringLiteral("n1"), gone);
+    center.checkListening(QStringLiteral("n1"));
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("Example topic agent is not listening right now. The Thoughts reply agent answers after 10 minutes."); }));
+    QVERIFY(!line->property("warning").toBool());
+    QCOMPARE(line->findChild<QLabel *>(QStringLiteral("agentNoteAnswerMark"))->property("mark").toString(), QStringLiteral("waiting"));
+    {
+        std::unique_ptr<QMenu> menu(window.createAnswerMenu());
+        QCOMPARE(actionTitles(menu.get()).last(), QStringLiteral("Example topic agent (not listening)"));
+        QVERIFY(actionTitled(menu.get(), QStringLiteral("Example topic agent (not listening)"))->isChecked());
+        QVERIFY(!actionTitled(menu.get(), QStringLiteral("Automatic"))->isChecked());
+        // The server refuses: the user is told, and the choice stays.
+        server.putStatus = 409;
+        actionTitled(menu.get(), QStringLiteral("Automatic"))->trigger();
+    }
+    QVERIFY(waitFor([&] { return failure->isVisible(); }));
+    QCOMPARE(failure->text(), QStringLiteral("The server no longer knows that agent. The choice stays as it was."));
+    QCOMPARE(text->text(), QStringLiteral("Example topic agent is not listening right now. The Thoughts reply agent answers after 10 minutes."));
+    QCOMPARE(center.answer(QStringLiteral("n1"))->answerBy->role, QStringLiteral("owner"));
+    server.putStatus = 500;
+    {
+        std::unique_ptr<QMenu> menu(window.createAnswerMenu());
+        actionTitled(menu.get(), QStringLiteral("Thoughts reply agent"))->trigger();
+    }
+    QVERIFY(waitFor([&] { return failure->isVisible() && failure->text() == QStringLiteral("The server did not save the choice. It stays as it was."); }));
+    QCOMPARE(center.answer(QStringLiteral("n1"))->answerBy->role, QStringLiteral("owner"));
+    QVERIFY(change->isEnabled());
+
+    // Back to automatic: nobody listens now, and the failure is no longer said.
+    server.putStatus = 0;
+    {
+        std::unique_ptr<QMenu> menu(window.createAnswerMenu());
+        actionTitled(menu.get(), QStringLiteral("Automatic"))->trigger();
+    }
+    QVERIFY(waitFor([&] { return text->text() == QStringLiteral("No agent is listening right now"); }));
+    QVERIFY(server.bodies.last().value(QStringLiteral("agent")).isNull());
+    QVERIFY(!center.answer(QStringLiteral("n1"))->answerBy);
+    QVERIFY(!failure->isVisible());
+
+    // The reader's sidebar has the same line, over its note too.
+    AgentNotesView sidebar(AgentNotesView::Layout::Sidebar, &center, {}, {}, {});
+    sidebar.resize(320, 800);
+    sidebar.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&sidebar));
+    sidebar.selectNote(QStringLiteral("n1"));
+    auto *sidebarLine = sidebar.findChild<QWidget *>(QStringLiteral("agentNoteAnswerLine"));
+    QVERIFY(waitFor([&] { return sidebarLine->isVisible(); }));
+    QCOMPARE(sidebar.findChild<QLabel *>(QStringLiteral("agentNoteAnswerText"))->text(), QStringLiteral("No agent is listening right now"));
+    QVERIFY(!sidebar.findChild<QScrollArea *>(QStringLiteral("agentNoteScroll"))->isAncestorOf(sidebarLine));
+    QVERIFY(sidebar.findChild<QToolButton *>(QStringLiteral("agentNoteAnswerChange"))->isVisible());
+    sidebar.showList();
+    QVERIFY(!sidebarLine->isVisible());
+
+    // A page the user sent has no line, and is not asked about every minute.
+    window.showNote(QStringLiteral("p1"));
+    QVERIFY(waitFor([&] { return window.shownNoteId() == QStringLiteral("p1"); }));
+    QVERIFY(!line->isVisible());
+    QVERIFY(!refresh->isActive());
+
+    // A server without the capability: the line without Change.
+    FakeServer older;
+    older.notes = {agentNote};
+    older.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    older.answers.insert(QStringLiteral("n1"), QJsonObject{{QStringLiteral("note_id"), QStringLiteral("n1")},
+                                                           {QStringLiteral("state"), QStringLiteral("listening")},
+                                                           {QStringLiteral("listeners"), QJsonArray{QJsonObject{{QStringLiteral("role"), QStringLiteral("responder")},
+                                                                                                                {QStringLiteral("device_id"), QStringLiteral("example-reply-host")}}}}});
+    Client olderClient(cachePath());
+    olderClient.setServer(older.url(), "secret");
+    Center olderCenter(&olderClient, statePath());
+    olderCenter.apply({note(agentNote)});
+    AgentNotesWindow olderWindow(&olderCenter, {}, {}, {});
+    olderWindow.resize(1200, 800);
+    olderWindow.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&olderWindow));
+    olderWindow.showNote(QStringLiteral("n1"));
+    auto *olderText = olderWindow.findChild<QLabel *>(QStringLiteral("agentNoteAnswerText"));
+    QVERIFY(waitFor([&] { return olderText->isVisible() && olderText->text() == QStringLiteral("Thoughts reply agent is listening"); }));
+    QVERIFY(waitFor([&] { return older.requests.contains(QStringLiteral("GET /v1/health")); }));
+    QTest::qWait(100);
+    QVERIFY(!olderWindow.findChild<QToolButton *>(QStringLiteral("agentNoteAnswerChange"))->isVisible());
 }
 
 void AgentNotesTest::replyPhotoIsShownWithTheReply()

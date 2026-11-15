@@ -1161,8 +1161,9 @@ static QString userFacingJournalMessage(const QJsonObject &operation, const QJso
     if (failureMessage != message) {
         return failureMessage;
     }
-    // Older servers send "Reusing Fedora build <id>.", newer ones "Reusing server build <id>.".
-    static const QRegularExpression reusedBuildPattern(QStringLiteral("^Reusing (?:Fedora|server) build ([A-Za-z0-9-]+)\\.?$"));
+    // The server says "Reusing the server's build <id>."; earlier versions said "Reusing Fedora build <id>."
+    // or "Reusing server build <id>.", and journals saved then keep that form.
+    static const QRegularExpression reusedBuildPattern(QStringLiteral("^Reusing (?:Fedora|server|the server's) build ([A-Za-z0-9-]+)\\.?$"));
     const QRegularExpressionMatch reusedBuild = reusedBuildPattern.match(message);
     if (reusedBuild.hasMatch()
         && stableSyncOperationState(event.value(QStringLiteral("state")).toString()) == SyncOperationState::Failed) {
@@ -1420,7 +1421,7 @@ QStringList syncOperationActivityLines(const QJsonObject &operation)
         } else if (sourceDetail && !failed) {
             continue;
         }
-        // Journals recorded by earlier versions say "Fedora accepted …".
+        // Journals saved by earlier builds carry the older wording.
         if (message == QLatin1String("The server accepted the conditional PDF update.") || message == QLatin1String("Fedora accepted the conditional PDF update.")) {
             continue;
         }

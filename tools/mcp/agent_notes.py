@@ -320,7 +320,10 @@ class Client:
         self._ssl = ssl_context() if self.https else None
 
     def request(self, method: str, path: str, query: dict | None = None, body: dict | None = None,
-                read_timeout: float = 30.0, raw: bool = False, allow: tuple = ()):
+                read_timeout: float = 30.0, raw: bool = False, allow: tuple = (), headers: dict | None = None,
+                answer: dict | None = None):
+        """@p headers are added to the request; @p answer, when given, receives the response's headers
+        (lower-case names) and its status under ":status"."""
         target = self.base_path + path
         query = {k: v for k, v in (query or {}).items() if v is not None}
         if query:
@@ -336,16 +339,19 @@ class Client:
             except (OSError, http.client.HTTPException) as error:
                 raise AgentNoteError("server_unreachable", f"Cannot connect to {where}: {error}") from None
             connection.sock.settimeout(read_timeout)
-            headers = {"Authorization": "Bearer " + self.config.token, "Accept": "*/*" if raw else "application/json",
-                       "User-Agent": "thoughts-mcp-agent-notes/1"}
+            sent = {"Authorization": "Bearer " + self.config.token, "Accept": "*/*" if raw else "application/json",
+                    "User-Agent": "thoughts-mcp-agent-notes/1", **(headers or {})}
             data = None
             if body is not None:
                 data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-                headers["Content-Type"] = "application/json"
-            connection.request(method, target, body=data, headers=headers)
+                sent["Content-Type"] = "application/json"
+            connection.request(method, target, body=data, headers=sent)
             response = connection.getresponse()
             payload = response.read()
             status = response.status
+            if answer is not None:
+                answer.update({name.lower(): value for name, value in response.getheaders()})
+                answer[":status"] = status
         except AgentNoteError:
             raise
         except TimeoutError:
@@ -376,6 +382,16 @@ class Client:
         return self.request("GET", "/v1/agent-notes", query=dict(
             document_id=document_id, review_card_id=review_card_id,
             sent_by_me=None if sent_by_me is None else str(bool(sent_by_me)).lower(), limit=limit))
+
+    def notes_version(self, etag: str | None = None) -> tuple[int, str | None]:
+        """Whether anything about agent notes changed since @p etag, in one small request: the note list
+        (limit 1) with If-None-Match, which the server answers 304 while nothing changed (no note added,
+        delivered, opened or deleted, no reply added: the ETag covers every note, not only the first).
+        Returns (HTTP status, the list's ETag); the ETag is None from a server that sends none."""
+        seen: dict = {}
+        self.request("GET", "/v1/agent-notes", query={"limit": 1}, headers={"If-None-Match": etag} if etag else None,
+                     answer=seen)
+        return seen[":status"], seen.get("etag")
 
     def get_note(self, note_id: str) -> dict:
         return self.request("GET", f"/v1/agent-notes/{urllib.parse.quote(note_id)}")
@@ -1561,11 +1577,24 @@ def release_topic(owner_id: str | None, conversation_id: str | None, client: Cli
     return {"released": mine}
 
 
-def has_recent_note(root: Path, seconds: float = RECENT_SECONDS) -> bool:
-    """True when the folder has a note created (by the server clock in note.json) in the last `seconds`."""
-    if not root.is_dir():
-        return False
-    now = dt.datetime.now(dt.timezone.utc)
+_newest_note_cache: dict = {}   # str(root) -> (the folder's st_mtime_ns, newest note time or None)
+
+
+def newest_note_time(root: Path) -> dt.datetime | None:
+    """When the folder's newest note was created (the server clock in note.json, else the file's time).
+
+    Every process checks this every second or so, and the folder holds hundreds of notes: the answer is
+    kept in memory for as long as the folder itself is unchanged (its modification time moves whenever a
+    note folder is added or removed, by any process). A folder changed in the last two seconds is read
+    again next time, for file systems that keep modification times in whole seconds."""
+    try:
+        stamp = root.stat().st_mtime_ns
+    except OSError:
+        return None
+    cached = _newest_note_cache.get(str(root))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    newest = None
     for note_json in root.glob("*/note.json"):
         try:
             created = parse_time(json.loads(note_json.read_text(encoding="utf-8")).get("created_at"))
@@ -1574,38 +1603,259 @@ def has_recent_note(root: Path, seconds: float = RECENT_SECONDS) -> bool:
         if created is None:
             with contextlib.suppress(OSError):
                 created = dt.datetime.fromtimestamp(note_json.stat().st_mtime, dt.timezone.utc)
-        if created is not None and (now - created).total_seconds() < seconds:
-            return True
-    return False
+        if created is not None and (newest is None or created > newest):
+            newest = created
+    if time.time() - stamp / 1e9 >= 2:
+        _newest_note_cache[str(root)] = (stamp, newest)
+    return newest
+
+
+def has_recent_note(root: Path, seconds: float = RECENT_SECONDS) -> bool:
+    """True when the folder has a note created (by the server clock in note.json) in the last `seconds`."""
+    if not root.is_dir():
+        return False
+    newest = newest_note_time(root)
+    return newest is not None and (dt.datetime.now(dt.timezone.utc) - newest).total_seconds() < seconds
 
 
 FATAL = {"no_credentials", "no_server_config", "unauthorized"}
 
+# ---------------------------------------------------------------- the folder sync, one process at a time
+#
+# Every Claude Code or Codex session on this Mac runs its own MCP server, and each used to long-poll
+# the reply feed to keep the notes folder in step: some twenty pollers writing one folder. Now one
+# process, the holder, does that plain folder sync; the others make no requests for it and read
+# what it writes. The holder is whoever has the flock on .sync.lock in the folder, which the
+# operating system releases when the holder exits, however it exits; another process then takes
+# over within TAKEOVER_SECONDS. No daemon: the processes that run anyway take turns.
+#
+# Tool calls do not depend on the holder: list_notes, list_note_replies, get_note and get_note_reply
+# ask the server themselves (one request each, no loop), so they are never behind the server.
+# Listening polls (listen=true, per conversation: get_note_reply while it waits, thoughts-watch-replies)
+# are not part of the folder sync and are sent exactly as before.
+#
+# Copies of this file from before the holder go on polling beside it until their sessions end;
+# writers still serialize on .lock, the cursor only grows and a reply already on disk is never
+# written again, so old and new processes write the folder together safely.
 
-def watch_loop(stop: threading.Event, client_factory: Callable[[], Client] = default_client, root: Path | None = None,
-               only_while_recent: bool = True, wait: int = 25, on_reply: Callable[[dict], None] | None = None) -> None:
-    """Long-poll the reply feed and write replies until stopped (or, when only_while_recent, until no note is < 24 h old)."""
-    root = root or notes_root()
-    backoff = 2.0
+SYNC_LOCK = ".sync.lock"
+TAKEOVER_SECONDS = 1.0     # how often a process that is not the holder tries the lock
+REPLY_WAIT = 50            # the holder's long poll on the reply feed (the server allows up to 60 s)
+PAUSE_MIN, PAUSE_MAX = 2.0, 60.0   # the holder's pause between looks: doubled while nothing changes
+PAUSE_TICK = 1.0           # how often the folder is looked at during a pause
+
+
+class SyncHolder:
+    """The flock on <folder>/.sync.lock that makes one process the folder's syncer.
+
+    acquire() never waits. The holder writes its process ID into the file for people and tests to
+    read; the lock, not the content, decides. still_held() is False once the lock file in the folder
+    is another file than the one locked (the folder was deleted and made again)."""
+
+    def __init__(self, root: Path):
+        self.path = root / SYNC_LOCK
+        self.handle = None
+        self.held = False
+
+    def acquire(self) -> bool:
+        if self.held:
+            return True
+        if fcntl is None:     # Windows: one process at a time is assumed, as for folder_lock
+            self.held = True
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.path, "a+", encoding="utf-8")
+        except OSError:
+            return False
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        with contextlib.suppress(OSError):
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps({"pid": os.getpid(), "since": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}) + "\n")
+            handle.flush()
+        self.handle, self.held = handle, True
+        return True
+
+    def still_held(self) -> bool:
+        if self.handle is None:
+            return self.held
+        try:
+            mine, there = os.fstat(self.handle.fileno()), os.stat(self.path)
+        except OSError:
+            return False
+        return (mine.st_dev, mine.st_ino) == (there.st_dev, there.st_ino)
+
+    def release(self) -> None:
+        if self.handle is not None:
+            with contextlib.suppress(OSError):
+                self.handle.seek(0)
+                self.handle.truncate()
+            with contextlib.suppress(OSError):
+                fcntl.flock(self.handle, fcntl.LOCK_UN)
+            self.handle.close()
+        self.handle, self.held = None, False
+
+
+class JournalFollower:
+    """The replies that land in the folder, whoever wrote them: the new lines of replies.jsonl since it started."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.path = root / "replies.jsonl"
+        self.offset = self._size()
+
+    def _size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+    def new_entries(self) -> list:
+        size = self._size()
+        if size == self.offset:
+            return []
+        if size < self.offset:    # not written by this program: read it from the start
+            self.offset = 0
+        try:
+            with open(self.path, "rb") as journal:
+                journal.seek(self.offset)
+                data = journal.read()
+        except OSError:
+            return []
+        complete = data[:data.rfind(b"\n") + 1]
+        self.offset += len(complete)
+        entries = []
+        for line in complete.splitlines():
+            try:
+                item = json.loads(line)
+                record = json.loads((self.root / item["json"]).read_text(encoding="utf-8"))
+                entries.append(local_entry(self.root, self.root / item["json"].split("/")[0], record, new=True))
+            except (OSError, ValueError, KeyError, AttributeError, TypeError):
+                continue
+        return entries
+
+
+def _announce(journal: JournalFollower | None, on_reply: Callable[[dict], None] | None) -> None:
+    if journal is None or on_reply is None:
+        return
+    for entry in journal.new_entries():
+        try:
+            on_reply(entry)
+        except Exception as error:  # a broken callback must not end the sync
+            log(f"reply watcher: on_reply: {type(error).__name__}: {error}")
+
+
+def _folder_stamp(root: Path) -> int | None:
+    try:
+        return root.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _pause(stop: threading.Event, root: Path, seconds: float, tick: float, journal, on_reply) -> bool:
+    """The holder's pause. True when the folder changed meanwhile (a note sent from this Mac, a reply another
+    process wrote): that ends the pause early, since a reply may well follow."""
+    before = _folder_stamp(root)
+    deadline = time.monotonic() + seconds
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        stop.wait(min(tick, remaining))
+        _announce(journal, on_reply)
+        if _folder_stamp(root) != before:
+            return True
+    return False
+
+
+def _sync_while_holding(stop: threading.Event, holder: SyncHolder, client_factory: Callable[[], Client], root: Path,
+                        only_while_recent: bool, wait: int, journal, on_reply, pause_min: float, pause_max: float,
+                        tick: float) -> bool:
+    """The holder's loop. Each look first asks whether anything changed (the note list with If-None-Match,
+    answered 304 while nothing did); only then does it pull the reply feed, as one long poll that returns as
+    soon as a reply is there. Between looks it pauses, twice as long each time nothing changed (up to
+    pause_max), and pause_min again after any change. A server without list ETags is long-polled at every
+    look. After replies came, the next look pulls the feed whatever the list says (more may follow, and a
+    feed of more pages than one pull reads is read to its end). The list's ETag is kept only once the change
+    it shows was pulled, so a failed pull is pulled again at the next look.
+    False: stop (stopped, a fatal error, no recent note); True: the lock file is gone, contend again."""
+    pause, backoff, etag, etags, pull = pause_min, 2.0, None, True, True
     while not stop.is_set():
         if only_while_recent and not has_recent_note(root):
-            return
+            return False
+        if not holder.still_held():
+            return True
         try:
-            result = sync_replies(wait=wait, client=client_factory(), root=root)
+            client = client_factory()
+            changed, seen = None, etag      # changed None: unknown (no list ETag, or the list failed): pull
+            if etags:
+                try:
+                    status, tag = client.notes_version(etag)
+                except AgentNoteError as error:
+                    if error.error_code in FATAL:
+                        raise
+                    log(f"reply watcher: note list: {error.error_code}: {error.detail}")
+                    status, tag = None, None
+                if status == 304:
+                    changed = False
+                elif status is not None and tag:
+                    changed, seen = tag != etag, tag
+                elif status is not None:
+                    etags = False
+            if changed is not False or pull:
+                pulled = bool(sync_replies(wait=wait, client=client, root=root)["replies"])
+                changed, pull = bool(changed) or pulled, pulled
+            etag = seen
             backoff = 2.0
-            for entry in result["replies"]:
-                if entry.get("new") and on_reply:
-                    on_reply(entry)
         except AgentNoteError as error:
             log(f"reply watcher: {error.error_code}: {error.detail}")
             if error.error_code in FATAL:
-                return
+                return False
             stop.wait(backoff)
             backoff = min(60.0, backoff * 2)
+            continue
         except Exception as error:  # never let the watcher die silently on an unexpected bug
             log(f"reply watcher: {type(error).__name__}: {error}")
             stop.wait(backoff)
             backoff = min(60.0, backoff * 2)
+            continue
+        _announce(journal, on_reply)
+        pause = pause_min if changed else min(pause_max, pause * 2)
+        if _pause(stop, root, pause, tick, journal, on_reply):
+            pause = pause_min
+    return False
+
+
+def watch_loop(stop: threading.Event, client_factory: Callable[[], Client] = default_client, root: Path | None = None,
+               only_while_recent: bool = True, wait: int = REPLY_WAIT, on_reply: Callable[[dict], None] | None = None,
+               takeover: float = TAKEOVER_SECONDS, pause_min: float = PAUSE_MIN, pause_max: float = PAUSE_MAX,
+               tick: float = PAUSE_TICK) -> None:
+    """Keep the notes folder in step with the server while this process holds the folder's sync lock;
+    otherwise try the lock every @p takeover seconds, without any request. Runs until stopped, a fatal
+    error or, when only_while_recent, until no note in the folder is < 24 h old. @p on_reply gets every
+    reply that lands in the folder (replies.jsonl), whichever process wrote it."""
+    root = root or notes_root()
+    holder = SyncHolder(root)
+    journal = JournalFollower(root) if on_reply else None
+    try:
+        while not stop.is_set():
+            if only_while_recent and not has_recent_note(root):
+                return
+            if holder.acquire():
+                if not _sync_while_holding(stop, holder, client_factory, root, only_while_recent, wait, journal, on_reply,
+                                           pause_min, pause_max, tick):
+                    return
+                holder.release()
+                continue
+            _announce(journal, on_reply)
+            stop.wait(takeover)
+    finally:
+        holder.release()
 
 
 # ---------------------------------------------------------------- sending
@@ -1777,6 +2027,7 @@ def main(argv=None) -> int:
                 for entry in result["replies"]:
                     print(json.dumps(entry, ensure_ascii=False), flush=True)
                 return 0
+            # One line per reply that lands in the folder; this process syncs it only while no other one does.
             log(f"watching for replies into {notes_root()} (Ctrl-C stops)")
             stop = threading.Event()
             try:

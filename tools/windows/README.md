@@ -76,7 +76,7 @@ python3 tools/windows/release.py --no-publish   # only builds the installer
 
 - The build runs on a Linux builder, not on the Mac. It is cross-compiled with clang-cl against KDE Craft's Windows libraries; see `tools/windows/cross/README.md`.
 - The release goes to `TommasoBendinelli/thoughts-desktop` unless `--repository` or `THOUGHTS_RELEASE_REPOSITORY` names another; the installer checks that repository for updates.
-- Before the installer is packed, its files are scanned for personal or private strings (`tools/release_scan.py`: home folders, tailnet hosts, keys, tokens, and your own markers from `~/.config/thoughts/release-private-patterns.txt`). A hit stops a published release.
+- Before the installer is packed, its files are scanned for personal or private strings (`tools/release_scan.py`: home folders, tailnet hosts, keys, tokens, and your own markers from `~/.config/thoughts/release-private-patterns.txt`). A hit stops a published release. The scan runs on the builder with your markers and the generic hits you accept (`~/.config/thoughts/release-accepted.txt`), which the script copies there; a marker is never accepted. The programs are built with neutral source paths (`src\…`, `wincross\…`), so the builder's folder does not show up.
 - The release notes default to the commit subjects since the previous release.
 - The installer is kept in `~/.cache/thoughts-windows-releases`.
 

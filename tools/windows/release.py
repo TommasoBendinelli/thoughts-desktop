@@ -19,6 +19,7 @@ Settings (each also has an option, see --help):
     THOUGHTS_WINDOWS_BUILDER_ROOT  its tree (default: ~/thoughts-builder on the builder)
     THOUGHTS_RELEASE_REPOSITORY    GitHub owner/repository for the release (default: TommasoBendinelli/thoughts-desktop)
     THOUGHTS_RELEASE_PATTERNS      this computer's own markers for the scan (default: ~/.config/thoughts/release-private-patterns.txt)
+    THOUGHTS_RELEASE_ACCEPTED      generic hits the owner accepts in the scan (default: ~/.config/thoughts/release-accepted.txt)
     THOUGHTS_DEFAULT_SERVER_URL    the server new installations start with (required)
     THOUGHTS_LEGACY_SERVER_URL     an earlier fixed address that already synchronized installations keep (optional)"""
 import argparse
@@ -152,6 +153,11 @@ def main():
     # This computer's own markers for the scan (an empty list when it has none); never in the repository.
     markers = release_scan.private_patterns()
     run(["ssh", host, f"cat > {W}/wt/release-private-patterns.txt"], input="\n".join(p.decode() for p in markers.values()).encode())
+    # The generic hits this computer's owner accepts, so the builder's scan judges as this computer's
+    # would; a private marker is never accepted (release_scan.scan_bytes).
+    release_scan.accepted_patterns()  # A broken line stops here, before the build.
+    accepted = release_scan.accepted_lines()
+    run(["ssh", host, f"cat > {W}/wt/release-accepted.txt"], input="\n".join(accepted).encode())
 
     # Before packing: the installer may carry nothing personal. A build that is not published only warns.
     scan_outcome = " || echo 'These strings must be gone before this build may be published.'" if args.no_publish else ""
@@ -162,7 +168,7 @@ def main():
     {shlex.quote(args.server_url)} {shlex.quote(args.legacy_server_url)} > {W}/logs/release-{version}.log 2>&1 \\
   || {{ grep -nE 'error:|CMake Error|FAILED' {W}/logs/release-{version}.log | head -20; tail -5 {W}/logs/release-{version}.log; exit 1; }}
 {podman} --network none {IMAGE} python3 {W}/wt/src/tools/windows/cross/stage-runtime.py {W}/wt/stage {W}/craft-win {W}/vcredist/x64 {W}/xwin-sdk {W}/wt/runtime
-{podman} --network none {IMAGE} python3 {W}/wt/src/tools/release_scan.py scan --patterns {W}/wt/release-private-patterns.txt {W}/wt/runtime{scan_outcome}
+{podman} --network none -e THOUGHTS_RELEASE_ACCEPTED={W}/wt/release-accepted.txt {IMAGE} python3 {W}/wt/src/tools/release_scan.py scan --patterns {W}/wt/release-private-patterns.txt {W}/wt/runtime{scan_outcome}
 {podman} --network none {NSIS_IMAGE} makensis -V2 -DVERSION={version} -DSTAGE={W}/wt/runtime \\
     -DICON={W}/wt/src/icons/thoughts.ico -DOUTFILE={W}/dist/{setup} {W}/wt/src/tools/windows/installer/thoughts.nsi
 ls -l {W}/dist/{setup}

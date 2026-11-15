@@ -43,8 +43,10 @@
 #include "activeparttoolbarcontroller.h"
 #include "automaticsyncpolicy.h"
 #include "thoughtscommandprotocol.h"
+#include "thoughtspagelink.h"
 
 #include <atomic>
+#include <optional>
 
 // qt/kde includes
 #include <KActionCollection>
@@ -191,6 +193,7 @@
 #include "syncjournal.h"
 #include "syncoperationstate.h"
 #include "syncstatuslabels.h"
+#include "syncstatewatch.h"
 
 static const char *shouldShowMenuBarComingFromFullScreen = "shouldShowMenuBarComingFromFullScreen";
 static const char *shouldShowToolBarComingFromFullScreen = "shouldShowToolBarComingFromFullScreen";
@@ -209,10 +212,11 @@ static constexpr int TAB_DROP_ANIMATION_DURATION = 130;
 // A refresh of the Logs window asks the journal for this many of its newest
 // runs, besides the runs that reported a change.
 static constexpr int SyncLogsRefreshRows = 30;
-// How often the app asks the server whether it has work for this computer, and
-// how soon after a failed Sync it asks for the state that Sync left there.
-static constexpr int RemoteWorkWatchIntervalMs = 20 * 1000;
+// How soon after a failed Sync the app asks for the state that Sync left there.
+// How often it asks otherwise is the watch's (SyncStateWatch: 20 s, or at once
+// when the server holds the question until its state changes).
 static constexpr int StateAfterFailedSyncDelayMs = 1000;
+static QPointer<Thoughts::SyncStateWatch> s_remoteWorkWatch;
 // An ended build's Sync that could not start while the journal was rewritten is
 // tried again this much later.
 static constexpr int AnnouncedWorkRetryMs = 2000;
@@ -4608,7 +4612,7 @@ void Shell::handleFedoraRenderStatusChanged(const QString &target, const QJsonOb
                 updateSyncOperation(m_activeBuildOperationId, Thoughts::SyncOperationState::Failed, QStringLiteral("failed"), i18n("Build could not be started"));
                 m_activeBuildOperationId.clear();
                 m_activeBuildOperationTarget.clear();
-                KMessageBox::error(this, i18n("The server is unavailable for this document."), i18n("Rebuild PDF"));
+                KMessageBox::error(this, i18n("Sync with the server is unavailable for this document."), i18n("Rebuild PDF"));
             }
         }
     }
@@ -6124,7 +6128,7 @@ void Shell::sourceConflictResolutionBundleReady(const QVariantMap &bundle, const
         connect(savedMergeButton, &QPushButton::clicked, &dialog, [this, &dialog, bundle, savedMerge] {
             const auto answer = QMessageBox::question(&dialog,
                                                       i18n("Use Saved Merge?"),
-                                                      i18n("Submit the saved, marker-free merge to the server? The server will reject it safely if its copy changed since the conflict was prepared."),
+                                                      i18n("Submit the saved, marker-free merge to the server? The server will reject it safely if the file changed there since the conflict was prepared."),
                                                       QMessageBox::Yes | QMessageBox::Cancel,
                                                       QMessageBox::Yes);
             if (answer == QMessageBox::Yes && queueSourceConflictResolution(bundle, savedMerge)) {
@@ -6134,7 +6138,7 @@ void Shell::sourceConflictResolutionBundleReady(const QVariantMap &bundle, const
     }
     auto *vscodeButton = buttons->addButton(i18n("Edit conflict file in Visual Studio Code"), QDialogButtonBox::ActionRole);
     auto *keepMacButton = buttons->addButton(i18n("Keep this computer's version"), QDialogButtonBox::ActionRole);
-    auto *keepFedoraButton = buttons->addButton(i18n("Keep server version"), QDialogButtonBox::ActionRole);
+    auto *keepFedoraButton = buttons->addButton(i18n("Keep the server's version"), QDialogButtonBox::ActionRole);
     layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     connect(keepMacButton, &QPushButton::clicked, &dialog, [this, &dialog, bundle, macContents] {
@@ -6253,7 +6257,7 @@ void Shell::sourceConflictResolutionBundleReady(const QVariantMap &bundle, const
             }
             QMessageBox confirmation(QMessageBox::Question,
                                      i18n("Use Resolved TeX?"),
-                                     i18n("Submit the marker-free resolved file to the server? The server will reject it safely if its copy changed while the editor was open."),
+                                     i18n("Submit the marker-free resolved file to the server? The server will reject it safely if the file changed there while the editor was open."),
                                      QMessageBox::NoButton,
                                      this);
             QPushButton *submit = confirmation.addButton(i18n("Use resolved file"), QMessageBox::AcceptRole);
@@ -6380,7 +6384,7 @@ void Shell::removePdfFromLibrary(const QString &pdfPath, const QString &filename
     KParts::ReadWritePart *part = fedoraGatewayPart();
     if (!part) {
         KMessageBox::error(dialogParent,
-                           i18n("The server is unavailable."),
+                           i18n("Sync with the server is unavailable."),
                            i18n("Remove from Library"));
         return;
     }
@@ -6414,7 +6418,7 @@ void Shell::removePdfFromLibrary(const QString &pdfPath, const QString &filename
         m_pendingLibraryRemovalId.clear();
         m_pendingLibraryRemovalPath.clear();
         m_pendingLibraryRemovalSha256.clear();
-        KMessageBox::error(dialogParent, i18n("The server is unavailable."), i18n("Remove from Library"));
+        KMessageBox::error(dialogParent, i18n("Sync with the server is unavailable."), i18n("Remove from Library"));
     }
     updatePdfLibraryAction();
 }
@@ -8761,15 +8765,17 @@ void Shell::startSyncJournalUpkeep()
     });
 }
 
+// The pause between two checks is the watch's: a plain 20 s, or, with a server
+// that has sync_state_wait_v1, one request the server holds until its state
+// changes, so that a change runs the check at once (syncstatewatch.h). Whether
+// a check starts a Sync stays the policy's decision (remoteWorkChecked).
 void Shell::startRemoteWorkWatch()
 {
-    static QPointer<QTimer> timer;
-    if (timer) {
+    if (s_remoteWorkWatch) {
         return;
     }
-    timer = new QTimer(qApp);
-    timer->setInterval(RemoteWorkWatchIntervalMs);
-    QObject::connect(timer, &QTimer::timeout, qApp, [] {
+    s_remoteWorkWatch = new Thoughts::SyncStateWatch(qApp);
+    QObject::connect(s_remoteWorkWatch, &Thoughts::SyncStateWatch::checkDue, qApp, [] {
         const auto windows = KMainWindow::memberList();
         for (KMainWindow *window : windows) {
             if (auto *shell = qobject_cast<Shell *>(window)) {
@@ -8778,7 +8784,14 @@ void Shell::startRemoteWorkWatch()
             }
         }
     });
-    timer->start();
+    // A held request ends with the app; nothing is left waiting for the server.
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, s_remoteWorkWatch, &Thoughts::SyncStateWatch::stop);
+    s_remoteWorkWatch->start();
+}
+
+Thoughts::SyncStateWatch *Shell::remoteWorkWatchForTesting()
+{
+    return s_remoteWorkWatch;
 }
 
 void Shell::checkRemoteWork()
@@ -9115,6 +9128,50 @@ void Shell::showReviewCardInLibrary(const QString &cardId)
     overview->show();
     overview->raise();
     overview->activateWindow();
+}
+
+void Shell::openPageLink(const QUrl &url)
+{
+    Shell *shell = shellForCommentsOverview();
+    QWidget *parent = QApplication::activeWindow() ? QApplication::activeWindow() : static_cast<QWidget *>(shell);
+    const std::optional<Thoughts::PageLink> link = Thoughts::parsePageLink(url);
+    if (!link) {
+        KMessageBox::error(parent, Thoughts::pageLinkInvalidMessage(), i18n("Open Page Link"));
+        return;
+    }
+    const QString docsRoot = ShellUtils::docsRoot();
+    const QString path = Thoughts::pageLinkDocumentPath(docsRoot, link->documentId);
+    const QString currentVersion = path.isEmpty() ? QString() : Thoughts::pageLinkPdfSha256(docsRoot, path);
+    Shell *destination = path.isEmpty() ? nullptr : shellForCommentsOverview(path);
+    if (currentVersion.isEmpty() || !destination) {
+        KMessageBox::error(parent, Thoughts::pageLinkDocumentMissingMessage(), i18n("Open Page Link"));
+        return;
+    }
+    QString error;
+    KParts::ReadWritePart *part = destination->trackedCommentPart(path, true, &error);
+    uint pages = 0;
+    if (part && (!QMetaObject::invokeMethod(part, "pages", Qt::DirectConnection, Q_RETURN_ARG(uint, pages)) || !pages)) {
+        error = i18n("The PDF could not be opened: %1", QDir::toNativeSeparators(path));
+        part = nullptr;
+    }
+    if (!part) {
+        KMessageBox::error(parent, error, i18n("Open Page Link"));
+        return;
+    }
+    const Thoughts::PageLinkOpening opening = Thoughts::pageLinkOpening(link->targetPage(), int(pages), currentVersion != link->version);
+    QMetaObject::invokeMethod(part, "goToPage", Qt::DirectConnection, Q_ARG(uint, uint(opening.page)));
+    destination->selectReaderTitle(part, link->documentId, QString(), QString());
+    if (destination->isMinimized()) {
+        destination->showNormal();
+    } else {
+        destination->show();
+    }
+    destination->raise();
+    destination->activateWindow();
+    if (!opening.message.isEmpty()) {
+        // Like the other notes about a followed link: on the page, without stopping the reader.
+        QMetaObject::invokeMethod(part, "noticeMessage", Qt::DirectConnection, Q_ARG(QString, opening.message), Q_ARG(int, -1));
+    }
 }
 
 QString Shell::agentNoteDocumentPath(const QString &documentId, const QString &filename, QString *title)
@@ -9642,7 +9699,7 @@ void Shell::beginLibraryImport(const QString &sourcePath, const QString &filenam
         m_pendingLibraryImportPart.clear();
         m_pendingLibraryImportOriginalUrl = {};
         m_pendingLibraryImportPage = 0;
-        KMessageBox::error(this, i18n("The server is unavailable."), i18n("Add PDF to Library"));
+        KMessageBox::error(this, i18n("Sync with the server is unavailable."), i18n("Add PDF to Library"));
     }
     updatePdfLibraryAction();
 }
@@ -9808,7 +9865,7 @@ void Shell::publishSourceDocument()
     }
     const int activeTab = m_tabWidget ? m_tabWidget->currentIndex() : -1;
     if (activeTab < 0 || activeTab >= m_tabs.size()) {
-        KMessageBox::error(this, i18n("The server is unavailable."), i18n("Publish Source Document"));
+        KMessageBox::error(this, i18n("Sync with the server is unavailable."), i18n("Publish Source Document"));
         return;
     }
     m_pendingSourceProject = project;
@@ -9823,7 +9880,7 @@ void Shell::publishSourceDocument()
         m_activeBuildOperationTarget.clear();
         m_pendingSourceProject.clear();
         m_pendingSourceTarget.clear();
-        KMessageBox::error(this, i18n("The server is unavailable."), i18n("Publish Source Document"));
+        KMessageBox::error(this, i18n("Sync with the server is unavailable."), i18n("Publish Source Document"));
         return;
     }
     updatePdfLibraryAction();
@@ -9877,7 +9934,7 @@ void Shell::renameUnlinkedDocument(const QString &filename, const QString &sha25
     }
     const int activeTab = m_tabWidget ? m_tabWidget->currentIndex() : -1;
     if (activeTab < 0 || activeTab >= m_tabs.size()) {
-        KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, i18n("The server is unavailable."), i18n("Rename Document"));
+        KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, i18n("Sync with the server is unavailable."), i18n("Rename Document"));
         return;
     }
     m_pendingLibraryDisplayNameId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -9885,7 +9942,7 @@ void Shell::renameUnlinkedDocument(const QString &filename, const QString &sha25
         QMetaObject::invokeMethod(m_tabs.at(activeTab).part, "setLibraryDisplayName", Qt::DirectConnection, Q_ARG(QString, m_pendingLibraryDisplayNameId), Q_ARG(QString, filename), Q_ARG(QString, sha256), Q_ARG(QString, displayName));
     if (!invoked) {
         m_pendingLibraryDisplayNameId.clear();
-        KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, i18n("The server is unavailable."), i18n("Rename Document"));
+        KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, i18n("Sync with the server is unavailable."), i18n("Rename Document"));
     }
 }
 

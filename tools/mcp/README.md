@@ -107,13 +107,22 @@ Notes and replies are kept in `~/Thoughts/agent-notes/` (`THOUGHTS_AGENT_NOTES_D
   reply-1.png  reply-1.strokes.json  reply-1.json
 replies.jsonl     # one line per reply as it lands
 .state.json       # reply-feed cursor (only ever increases)
+.sync.lock        # flock of the one process that syncs the folder; holds its process ID
 ```
 
 Every file is written to a temporary name and renamed; a reply's PNG is written last, so a `reply-*.png` means its set is complete.
 Writers (several MCP servers, `watch`) serialize on `.lock`, and a reply already on disk (by `reply_id`) is never written twice; replies are numbered per note in the order they arrive.
 A note sent from elsewhere gets its folder (with `note.json` and the image from the server) when its first reply is fetched.
-While the MCP server runs and a note in the folder is younger than 24 hours, a background thread long-polls `/v1/agent-notes/replies?wait=25` and writes replies as they arrive (back-off 2 s to 60 s, log on stderr only), so an agent can also just watch the folder for `reply-*.png`.
+While the MCP server runs and a note in the folder is younger than 24 hours, a background thread keeps the folder in step with the server, so an agent can also just watch the folder for `reply-*.png`.
 It starts with the server when such a note exists and after any agent-note tool call.
+Every agent session runs its own MCP server, but only one process syncs the folder at a time: the one holding the `flock` on `.sync.lock`.
+The others make no requests for it; they try the lock every second, and since the operating system releases it when its holder exits, however it exits, another process takes over within about a second.
+The holder asks first whether anything changed: `GET /v1/agent-notes?limit=1` with `If-None-Match`, which the server answers 304 while no note was added, delivered, opened or deleted and no reply was added.
+Only after a change (and once more after replies came) does it pull the reply feed, as one long poll (`wait=50`) that returns as soon as a reply is there; the ETag is kept only once that pull succeeded.
+Between looks it pauses 2 s, doubled each time nothing changed, up to 60 s; a change, or a note sent from this Mac (the folder changes), starts it at 2 s again. A server without the list ETag is long-polled at every look. Errors back off 2 s to 60 s and are logged on stderr only.
+So the folder can be up to about a minute behind while nothing has happened for a while; tool calls never are: `list_notes`, `list_note_replies`, `get_note` and `get_note_reply` ask the server themselves (one request each, no loop).
+Listening polls (`listen=true`: `get_note_reply` while it waits, `thoughts-watch-replies`) belong to their conversation, not to the folder sync, and every listening conversation sends its own.
+MCP servers started before this change go on polling every 25 s beside the holder until their sessions end; both write the folder safely together.
 Outside MCP:
 
 ```sh
@@ -121,6 +130,8 @@ python3 tools/mcp/agent_notes.py watch [--once]
 python3 tools/mcp/agent_notes.py send --title "GRPO advantage" --markdown-file note.md --card CARD_ID
 python3 tools/mcp/agent_notes.py replies [--note NOTE_ID]
 ```
+
+`watch` prints one line per reply that lands in the folder, whichever process wrote it, and syncs the folder itself only while no other process does.
 
 ## Proposal authoring contract
 
@@ -183,6 +194,7 @@ It exists only in builds configured with `THOUGHTS_MACOS_PERSISTENT_SIGNING` on 
 ## Validation
 
 Run `python tools/mcp/test_server.py` and `python tools/mcp/test_agent_notes.py` using the MCP environment, and `python3 tools/hooks/test_thoughts_card_link.py` (standard library only).
+The folder-sync tests compare with the code before the sync had one holder (commit `32b727779`, read with `git show`) and are skipped in a clone without that history; `THOUGHTS_TEST_LOAD=1` adds a measurement of six minutes: the sync's requests per minute for 1, 5 and 20 processes, before and after.
 
 ## Review card prompt hook
 

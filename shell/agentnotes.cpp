@@ -2,7 +2,6 @@
 #include "agentnotes.h"
 
 #include "../part/thoughtsplatform.h"
-#include "../part/thoughtsserveraddress.h"
 #include "developerlog.h"
 
 #include <KLocalizedString>
@@ -23,7 +22,6 @@
 #include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QSaveFile>
-#include <QStandardPaths>
 #include <QTimer>
 #include <QUrlQuery>
 #include <QUuid>
@@ -130,6 +128,243 @@ Listening listeningFromJson(const QJsonObject &json)
     if (state == QLatin1String("listening")) return Listening::Listening;
     if (state == QLatin1String("not_listening")) return Listening::NotListening;
     return Listening::Unknown;
+}
+
+namespace
+{
+constexpr QLatin1StringView SenderRole{"sender"};
+constexpr QLatin1StringView OwnerRole{"owner"};
+constexpr QLatin1StringView ResponderRole{"responder"};
+
+QString agentLabel(const QJsonObject &json)
+{
+    return json.value(QLatin1String("label")).toString().trimmed().left(120);
+}
+
+// The live listener that answers first, from a listening answer's "listeners": the sender's
+// agent, then a topic owner, then the reply agent, which waits for both. A listener from a
+// server before topic owners has no "role": "responder": true is the reply agent, anything else
+// the sender's agent.
+std::optional<Agent> covererOf(const QJsonObject &json)
+{
+    if (listeningFromJson(json) != Listening::Listening) return std::nullopt;
+    QList<Agent> coverers;
+    for (const QJsonValue &value : json.value(QLatin1String("listeners")).toArray()) {
+        const QJsonObject listener = value.toObject();
+        if (listener.isEmpty()) continue;
+        Agent agent;
+        agent.role = listener.value(QLatin1String("role")).toString();
+        if (agent.role.isEmpty()) agent.role = listener.value(QLatin1String("responder")).toBool() ? ResponderRole : SenderRole;
+        if (agent.role != SenderRole && agent.role != OwnerRole && agent.role != ResponderRole) continue;
+        agent.deviceId = listener.value(QLatin1String("device_id")).toString();
+        agent.conversationId = listener.value(QLatin1String("conversation_id")).toString();
+        agent.ownerId = listener.value(QLatin1String("owner_id")).toString();
+        if (agent.role == OwnerRole) agent.label = agentLabel(listener);
+        agent.live = true;
+        coverers.append(agent);
+    }
+    for (const QLatin1StringView role : {SenderRole, OwnerRole, ResponderRole}) {
+        const auto found = std::find_if(coverers.cbegin(), coverers.cend(), [role](const Agent &agent) { return agent.role == role; });
+        if (found != coverers.cend()) return *found;
+    }
+    return std::nullopt;
+}
+
+bool sameRecord(const Agent &a, const Agent &b)
+{
+    return a.isSameAgent(b) && a.label == b.label && a.live == b.live;
+}
+
+bool sameRecord(const std::optional<Agent> &a, const std::optional<Agent> &b)
+{
+    return a.has_value() == b.has_value() && (!a || sameRecord(*a, *b));
+}
+
+bool sameWake(const std::optional<Wake> &a, const std::optional<Wake> &b)
+{
+    if (a.has_value() != b.has_value()) return false;
+    return !a
+        || (a->state == b->state && a->role == b->role && a->machine == b->machine && a->title == b->title && a->sessionState == b->sessionState
+            && a->label == b->label && a->fallbackAt == b->fallbackAt);
+}
+
+bool sameAnswer(const ListeningAnswer &a, const ListeningAnswer &b)
+{
+    return a.state == b.state && sameRecord(a.coverer, b.coverer) && sameRecord(a.answerBy, b.answerBy)
+        && std::equal(a.candidates.cbegin(), a.candidates.cend(), b.candidates.cbegin(), b.candidates.cend(),
+                      [](const Agent &x, const Agent &y) { return sameRecord(x, y); })
+        && sameWake(a.wake, b.wake);
+}
+
+// Whether the view names the listener rather than the session a waker wakes: an agent listens and
+// it is not only the responder. The server's own waker listens as the responder so that older
+// apps still see an agent listening; while it does, the session the waker wakes is who answers.
+bool namesTheListener(Listening state, const std::optional<Agent> &named, const std::optional<Wake> &wake)
+{
+    return state == Listening::Listening && (!wake || !named || named->role != ResponderRole);
+}
+}
+
+QString wakerMachineName(const QString &machine)
+{
+    return machine.compare(QLatin1String("mac"), Qt::CaseInsensitive) == 0 ? i18nc("@info the machine a session runs on", "the Mac")
+                                                                           : i18nc("@info the machine a session runs on", "the server");
+}
+
+bool Wake::willBeWoken() const
+{
+    return state == QLatin1String("will_be_woken");
+}
+
+QString Wake::name() const
+{
+    if (role == ResponderRole) return i18nc("@info the session that answers what has no other home", "The study session");
+    if (!title.isEmpty()) return title;
+    Agent agent;
+    agent.role = role;
+    agent.label = label;
+    return agent.name();
+}
+
+QString Wake::text() const
+{
+    if (!willBeWoken()) {
+        QString machineName = wakerMachineName(machine);
+        if (!machineName.isEmpty()) machineName[0] = machineName.at(0).toUpper();
+        if (!fallbackAt.isValid()) {
+            return i18nc("@info a machine", "%1 is offline; the study session answers later if it is still offline", machineName);
+        }
+        return i18nc("@info a machine, a time of day", "%1 is offline; the study session answers at %2 if it is still offline", machineName,
+                     QLocale::system().toString(fallbackAt.toLocalTime().time(), QLocale::ShortFormat));
+    }
+    if (sessionState == QLatin1String("busy")) return i18nc("@info a session's title", "%1 answers when it finishes its current task", name());
+    if (role == ResponderRole) return i18nc("@info a session's title", "%1 will be woken", name());
+    return i18nc("@info a session's title, a machine", "%1 will be woken on %2", name(), wakerMachineName(machine));
+}
+
+QString Wake::sentText() const
+{
+    return i18nc("@info a session's title", "Sent ✓ · %1 will be woken", name());
+}
+
+std::optional<Wake> Wake::fromJson(const QJsonObject &json)
+{
+    Wake wake;
+    wake.state = json.value(QLatin1String("state")).toString();
+    if (wake.state != QLatin1String("will_be_woken") && wake.state != QLatin1String("waker_offline")) return std::nullopt;
+    wake.role = json.value(QLatin1String("role")).toString();
+    if (wake.role != SenderRole && wake.role != OwnerRole && wake.role != ResponderRole) return std::nullopt;
+    wake.machine = json.value(QLatin1String("machine")).toString();
+    if (wake.machine.trimmed().isEmpty()) return std::nullopt;
+    wake.title = json.value(QLatin1String("title")).toString().trimmed().left(120);
+    wake.sessionState = json.value(QLatin1String("session_state")).toString();
+    wake.label = agentLabel(json);
+    wake.fallbackAt = parseTime(json.value(QLatin1String("fallback_at")));
+    return wake;
+}
+
+bool Agent::isSameAgent(const Agent &other) const
+{
+    return role == other.role && deviceId == other.deviceId && conversationId == other.conversationId && ownerId == other.ownerId;
+}
+
+QString Agent::name() const
+{
+    if (role == ResponderRole) return i18n("Thoughts reply agent");
+    if (role == OwnerRole) return label.isEmpty() ? i18n("The topic's agent") : i18nc("@info a topic's agent, by the topic", "%1 agent", label);
+    return i18n("The agent that sent it");
+}
+
+QJsonObject Agent::toChoiceJson() const
+{
+    return {{QStringLiteral("role"), role},
+            {QStringLiteral("device_id"), deviceId},
+            {QStringLiteral("conversation_id"), conversationId.isEmpty() ? QJsonValue() : QJsonValue(conversationId)},
+            {QStringLiteral("owner_id"), ownerId.isEmpty() ? QJsonValue() : QJsonValue(ownerId)}};
+}
+
+std::optional<Agent> Agent::fromJson(const QJsonObject &json)
+{
+    Agent agent;
+    agent.role = json.value(QLatin1String("role")).toString();
+    if (agent.role != SenderRole && agent.role != OwnerRole && agent.role != ResponderRole) return std::nullopt;
+    agent.deviceId = json.value(QLatin1String("device_id")).toString();
+    if (agent.deviceId.trimmed().isEmpty()) return std::nullopt;
+    agent.conversationId = json.value(QLatin1String("conversation_id")).toString();
+    agent.ownerId = json.value(QLatin1String("owner_id")).toString();
+    agent.label = agentLabel(json);
+    agent.live = json.value(QLatin1String("live")).toBool();
+    return agent;
+}
+
+ListeningAnswer ListeningAnswer::fromJson(const QJsonObject &json)
+{
+    ListeningAnswer answer;
+    answer.state = listeningFromJson(json);
+    answer.coverer = covererOf(json);
+    answer.answerBy = Agent::fromJson(json.value(QLatin1String("answer_by")).toObject());
+    for (const QJsonValue &value : json.value(QLatin1String("candidates")).toArray()) {
+        if (const auto agent = Agent::fromJson(value.toObject())) answer.candidates.append(*agent);
+    }
+    answer.wake = Wake::fromJson(json.value(QLatin1String("wake")).toObject());
+    return answer;
+}
+
+QString answerByCapability()
+{
+    return QStringLiteral("agent_note_answer_by_v1");
+}
+
+std::optional<AnswerLine> answerLine(const std::optional<ListeningAnswer> &answer, bool canChange, bool reachable)
+{
+    if (!answer || (answer->state == Listening::Unknown && !answer->wake)) return std::nullopt;
+    AnswerLine line;
+    line.changeOffered = canChange;
+    line.changeEnabled = canChange && reachable;
+    // With a choice the server says "listening" exactly while the chosen agent is live.
+    const std::optional<Agent> &named = answer->answerBy ? answer->answerBy : answer->coverer;
+    if (namesTheListener(answer->state, named, answer->wake)) {
+        line.mark = AnswerLine::Mark::Listening;
+        line.text = named ? i18nc("@info an agent's name", "%1 is listening", named->name()) : i18n("An agent is listening");
+    } else if (answer->wake) {
+        line.mark = answer->wake->willBeWoken() ? AnswerLine::Mark::Woken : AnswerLine::Mark::Offline;
+        line.text = answer->wake->text();
+        line.muted = !answer->wake->willBeWoken();
+    } else if (answer->answerBy) {
+        line.mark = AnswerLine::Mark::Waiting;
+        line.text = i18nc("@info an agent's name", "%1 is not listening right now. The Thoughts reply agent answers after 10 minutes.", answer->answerBy->name());
+    } else {
+        line.mark = AnswerLine::Mark::Nobody;
+        line.text = i18n("No agent is listening right now");
+        line.warning = true;
+    }
+    return line;
+}
+
+QList<AnswerChoice> answerChoices(const ListeningAnswer &answer)
+{
+    QList<Agent> agents;
+    for (const Agent &candidate : answer.candidates) {
+        if (std::none_of(agents.cbegin(), agents.cend(), [&candidate](const Agent &known) { return known.isSameAgent(candidate); })) agents.append(candidate);
+    }
+    QHash<QString, int> names;
+    const auto numbered = [&names](const QString &name) {
+        const int count = ++names[name];
+        return count == 1 ? name : QStringLiteral("%1 (%2)").arg(name).arg(count);
+    };
+    const std::optional<Agent> &chosen = answer.answerBy;
+    QList<AnswerChoice> choices;
+    choices.append({std::nullopt, i18nc("@item who answers a reply", "Automatic"),
+                    i18n("The agent that sent the note answers first, then the Thoughts reply agent"), !chosen});
+    bool listed = false;
+    for (const Agent &agent : std::as_const(agents)) {
+        const bool checked = chosen && agent.isSameAgent(*chosen);
+        listed = listed || checked;
+        choices.append({agent, numbered(agent.name()), QString(), checked});
+    }
+    // What is chosen is always in the list, also when it could not answer now.
+    if (chosen && !listed) choices.append({*chosen, i18nc("@item an agent's name", "%1 (not listening)", chosen->name()), QString(), true});
+    return choices;
 }
 
 std::optional<Note> Note::fromJson(const QJsonObject &json)
@@ -368,26 +603,12 @@ Client::Client(QString cacheRoot, QObject *parent)
 
 void Client::setServer(const QUrl &baseUrl, const QByteArray &token)
 {
-    m_baseUrl = baseUrl;
-    m_token = token;
-    m_explicitServer = true;
+    m_link.setServer(baseUrl, token);
 }
 
 bool Client::ensureServer(QString *error)
 {
-    // Read again while unset: the Mac may be paired (or re-paired) while Thoughts runs.
-    if (!m_explicitServer && (m_token.isEmpty() || !m_baseUrl.isValid() || m_baseUrl.isEmpty())) {
-        m_token = qgetenv("THOUGHTS_TOKEN").trimmed();
-        if (QStandardPaths::isTestModeEnabled() && (m_token.isEmpty() || !ServerAddress::overriddenByEnvironment())) {
-            m_token.clear();
-            m_baseUrl.clear();
-        } else {
-            const QString address = ServerAddress::configured();
-            if (m_token.isEmpty()) m_token = ServerAddress::storedToken(Platform::desktopDeviceAccount(), address);
-            m_baseUrl = QUrl(ServerAddress::normalized(address));
-        }
-    }
-    if (m_token.isEmpty() || !m_baseUrl.isValid() || m_baseUrl.isEmpty()) {
+    if (!m_link.ensure()) {
         if (error) *error = i18n("This Mac is not connected to a Thoughts server.");
         return false;
     }
@@ -397,19 +618,8 @@ bool Client::ensureServer(QString *error)
 
 QNetworkRequest Client::request(const QString &pathAndQuery, int timeoutMs) const
 {
-    QUrl url = m_baseUrl;
-    QString base = url.path();
-    if (base.endsWith(QLatin1Char('/'))) base.chop(1);
-    const QUrl relative(pathAndQuery);
-    url.setPath(base + relative.path());
-    url.setQuery(relative.query());
-    QNetworkRequest request(url);
-    request.setRawHeader("Authorization", "Bearer " + m_token);
-    // The token is this server's: a redirect to another origin is not followed.
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
+    QNetworkRequest request = m_link.request(pathAndQuery, timeoutMs, "thoughts-desktop-agent-notes/1");
     request.setRawHeader("Accept", "application/json, image/*");
-    request.setRawHeader("User-Agent", "thoughts-desktop-agent-notes/1");
-    request.setTransferTimeout(timeoutMs);
     return request;
 }
 
@@ -469,7 +679,7 @@ void Client::list(int limit, QObject *context, std::function<void(const Result &
         reply->deleteLater();
         const Failure failure = failureOf(reply);
         // A refused token is read again next time (the Mac may have been paired again).
-        if (failure == Failure::Unauthorized && !m_explicitServer) m_token.clear();
+        if (failure == Failure::Unauthorized) m_link.tokenRefused();
         if (failure != Failure::None) m_listVersions.remove(pathAndQuery);
         if (!guard) return;
         if (failure != Failure::None) {
@@ -514,6 +724,21 @@ void Client::post(const QString &path, const QJsonObject &body, QObject *context
     finishWrite(m_network->post(post, QJsonDocument(body).toJson(QJsonDocument::Compact)), context, std::move(done));
 }
 
+void Client::put(const QString &path, const QJsonObject &body, QObject *context, std::function<void(const WriteResult &)> done)
+{
+    QString error;
+    if (!ensureServer(&error)) {
+        QPointer<QObject> guard(context);
+        QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
+            if (guard) done({0, {}, Failure::NotConnected, error, {}});
+        });
+        return;
+    }
+    QNetworkRequest put = request(path, 30000);
+    put.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    finishWrite(m_network->put(put, QJsonDocument(body).toJson(QJsonDocument::Compact)), context, std::move(done));
+}
+
 void Client::remove(const QString &path, QObject *context, std::function<void(const WriteResult &)> done)
 {
     QString error;
@@ -539,7 +764,7 @@ void Client::finishWrite(QNetworkReply *reply, QObject *context, std::function<v
         result.failure = failureOf(reply);
         // A 404 that names the note is the note gone, not a server without agent notes.
         if (result.failure == Failure::Unsupported && !result.errorCode.isEmpty()) result.failure = Failure::Failed;
-        if (result.failure == Failure::Unauthorized && !m_explicitServer) m_token.clear();
+        if (result.failure == Failure::Unauthorized) m_link.tokenRefused();
         if (result.failure != Failure::None) {
             const QString detail = result.json.value(QLatin1String("detail")).toString();
             if (result.errorCode == QLatin1String("agent_note_not_found")) result.error = i18n("This note is no longer on the Thoughts server.");
@@ -556,31 +781,58 @@ QString Client::cachedImagePath(const QString &sha256, const QString &mediaType)
     return QDir(m_cacheRoot).filePath(sha256 + QLatin1Char('.') + extensionFor(mediaType));
 }
 
-void Client::listening(const QString &noteId, QObject *context, std::function<void(bool, Listening)> done)
+void Client::listening(const QString &noteId, QObject *context, std::function<void(const ListeningResult &)> done)
 {
     QPointer<QObject> guard(context);
     QString error;
     if (!ensureServer(&error)) {
         QTimer::singleShot(0, this, [guard, done = std::move(done)] {
-            if (guard) done(false, Listening::Unknown);
+            if (guard) done({Failure::NotConnected, {}});
         });
         return;
     }
     QNetworkReply *reply = get(QStringLiteral("/v1/agent-notes/%1/listening").arg(QString::fromLatin1(QUrl::toPercentEncoding(noteId))), 15000);
-    connect(reply, &QNetworkReply::finished, this, [reply, guard, done = std::move(done)] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, done = std::move(done)] {
         reply->deleteLater();
-        if (!guard) return;
         const Failure failure = failureOf(reply);
+        if (failure == Failure::Unauthorized) m_link.tokenRefused();
+        if (!guard) return;
         // A server before agent_note_listening_v1 has no such route: it cannot tell.
         if (failure == Failure::Unsupported) {
-            done(true, Listening::Unknown);
+            done({Failure::None, {}});
             return;
         }
         if (failure != Failure::None) {
-            done(false, Listening::Unknown);
+            done({failure, {}});
             return;
         }
-        done(true, listeningFromJson(QJsonDocument::fromJson(reply->readAll()).object()));
+        done({Failure::None, ListeningAnswer::fromJson(QJsonDocument::fromJson(reply->readAll()).object())});
+    });
+}
+
+void Client::setAnswerBy(const QString &noteId, const std::optional<Agent> &agent, QObject *context, std::function<void(const WriteResult &)> done)
+{
+    put(QStringLiteral("/v1/agent-notes/%1/answer-by").arg(QString::fromLatin1(QUrl::toPercentEncoding(noteId))),
+        {{QStringLiteral("agent"), agent ? QJsonValue(agent->toChoiceJson()) : QJsonValue()}}, context, std::move(done));
+}
+
+void Client::capabilities(QObject *context, std::function<void(bool, const QStringList &)> done)
+{
+    QPointer<QObject> guard(context);
+    QString error;
+    if (!ensureServer(&error)) {
+        QTimer::singleShot(0, this, [guard, done = std::move(done)] {
+            if (guard) done(false, {});
+        });
+        return;
+    }
+    QNetworkReply *reply = get(QStringLiteral("/v1/health"), 15000);
+    connect(reply, &QNetworkReply::finished, this, [reply, guard, done = std::move(done)] {
+        reply->deleteLater();
+        if (!guard) return;
+        const QByteArray body = reply->readAll();
+        const bool ok = failureOf(reply) == Failure::None && QJsonDocument::fromJson(body).object().value(QLatin1String("capabilities")).isArray();
+        done(ok, ok ? serverCapabilities(body) : QStringList());
     });
 }
 
@@ -752,6 +1004,7 @@ void Center::setForeground(bool foreground)
 {
     if (m_foreground == foreground) return;
     m_foreground = foreground;
+    Q_EMIT foregroundChanged(foreground);
     if (!foreground) return;
     // The user is back: the pace starts over, and a list older than the fast pace is asked for now.
     m_unchangedPolls = 0;
@@ -924,9 +1177,14 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
             finishReply(noteId, false, result.error);
             return;
         }
-        // Whether an agent hears it (the server's answer; older servers send none).
+        // Whether an agent hears it, and which, or who a reply waker wakes for it (the server's
+        // answer; older servers send none).
+        m_sentStatus.remove(noteId);
         if (result.json.contains(QLatin1String("listening"))) {
-            setListening(noteId, listeningFromJson(result.json.value(QLatin1String("listening")).toObject()));
+            const ListeningAnswer heard = ListeningAnswer::fromJson(result.json.value(QLatin1String("listening")).toObject());
+            setListening(noteId, heard.state, heard.coverer, heard.wake);
+            const std::optional<Agent> &named = heard.coverer;
+            if (heard.wake && !namesTheListener(heard.state, named, heard.wake)) m_sentStatus.insert(noteId, heard.wake->sentText());
         }
         // The reply belongs to the note now; the next list shows it.
         if (const auto reply = Reply::fromJson(result.json)) {
@@ -945,21 +1203,116 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
     });
 }
 
+Listening Center::listening(const QString &noteId) const
+{
+    const auto known = m_answers.constFind(noteId);
+    return known == m_answers.cend() ? Listening::Unknown : known->state;
+}
+
+std::optional<ListeningAnswer> Center::answer(const QString &noteId) const
+{
+    const auto known = m_answers.constFind(noteId);
+    return known == m_answers.cend() ? std::nullopt : std::optional<ListeningAnswer>(*known);
+}
+
 void Center::checkListening(const QString &noteId)
 {
     if (noteId.isEmpty() || m_listeningAsked.contains(noteId)) return;
     m_listeningAsked.insert(noteId);
-    m_client->listening(noteId, this, [this, noteId](bool ok, Listening state) {
+    learnWhetherTheChoiceIsOffered();
+    m_client->listening(noteId, this, [this, noteId, choices = m_choices.value(noteId)](const Client::ListeningResult &result) {
         m_listeningAsked.remove(noteId);
-        if (ok) setListening(noteId, state);
+        // A transport failure means the server cannot be reached now; a refusal does not.
+        if (result.failure == Client::Failure::Unreachable) setServerReachable(false);
+        else if (result.failure != Client::Failure::NotConnected) setServerReachable(true);
+        // An answer from before a choice the user made meanwhile is older than the answer to that choice.
+        if (result.failure == Client::Failure::None && choices == m_choices.value(noteId)) setAnswer(noteId, result.answer);
     });
 }
 
-void Center::setListening(const QString &noteId, Listening state)
+void Center::checkListeningIfOlder(const QString &noteId, int maximumAgeMs)
 {
-    const bool changed = listening(noteId) != state || !m_listening.contains(noteId);
-    m_listening.insert(noteId, state);
+    const QDateTime answered = m_answeredAt.value(noteId);
+    if (!answered.isValid() || answered.msecsTo(m_clock()) >= maximumAgeMs) checkListening(noteId);
+}
+
+void Center::setAnswer(const QString &noteId, const ListeningAnswer &answer)
+{
+    const auto known = m_answers.constFind(noteId);
+    const bool changed = known == m_answers.cend() || !sameAnswer(*known, answer);
+    m_answers.insert(noteId, answer);
+    m_answeredAt.insert(noteId, m_clock());
     if (changed) Q_EMIT listeningChanged(noteId);
+}
+
+void Center::setListening(const QString &noteId, Listening state, const std::optional<Agent> &coverer, const std::optional<Wake> &wake)
+{
+    ListeningAnswer merged = m_answers.value(noteId);
+    merged.state = state;
+    merged.coverer = coverer;
+    merged.wake = wake;
+    setAnswer(noteId, merged);
+}
+
+QString Center::sentStatus(const QString &noteId) const
+{
+    // A new reply started meanwhile: what it says is about that one.
+    return existingDraft(noteId) ? QString() : m_sentStatus.value(noteId);
+}
+
+void Center::learnWhetherTheChoiceIsOffered()
+{
+    if (m_canChangeAnswerer || m_capabilitiesAsked) return;
+    if (m_capabilitiesAnsweredAt.isValid() && m_capabilitiesAnsweredAt.secsTo(m_clock()) < CapabilitiesKeptSeconds) return;
+    m_capabilitiesAsked = true;
+    m_client->capabilities(this, [this](bool ok, const QStringList &capabilities) {
+        m_capabilitiesAsked = false;
+        if (!ok) return;  // asked again with the next check
+        m_capabilitiesAnsweredAt = m_clock();
+        if (!capabilities.contains(answerByCapability())) return;
+        m_canChangeAnswerer = true;
+        Q_EMIT answerOptionsChanged();
+    });
+}
+
+void Center::setServerReachable(bool reachable)
+{
+    if (m_serverReachable == reachable) return;
+    m_serverReachable = reachable;
+    Q_EMIT answerOptionsChanged();
+}
+
+void Center::chooseAnswerer(const QString &noteId, const std::optional<Agent> &agent, std::function<void(bool, const QString &)> done)
+{
+    if (noteId.isEmpty() || m_choosing.contains(noteId)) {
+        if (done) done(false, i18n("The choice before this one is still being sent."));
+        return;
+    }
+    m_choosing.insert(noteId);
+    ++m_choices[noteId];
+    Q_EMIT answerOptionsChanged();
+    m_client->setAnswerBy(noteId, agent, this, [this, noteId, done = std::move(done)](const Client::WriteResult &result) {
+        m_choosing.remove(noteId);
+        ++m_choices[noteId];
+        if (result.failure == Client::Failure::Unreachable) setServerReachable(false);
+        else if (result.failure != Client::Failure::NotConnected) setServerReachable(true);
+        if (result.failure != Client::Failure::None) {
+            DeveloperLog::record(QStringLiteral("agent_notes.answer_by.failed"), {{QStringLiteral("status"), result.status}});
+            Q_EMIT answerOptionsChanged();
+            const bool unknownAgent = result.errorCode == QLatin1String("agent_note_answerer_unknown");
+            // The agents to choose from are no longer the ones listed: list them again.
+            if (unknownAgent) checkListening(noteId);
+            if (done) {
+                done(false, unknownAgent ? i18n("The server no longer knows that agent. The choice stays as it was.")
+                                         : i18n("The server did not save the choice. It stays as it was."));
+            }
+            return;
+        }
+        // The server's answer is the note's listening answer from now on.
+        setAnswer(noteId, ListeningAnswer::fromJson(result.json));
+        Q_EMIT answerOptionsChanged();
+        if (done) done(true, {});
+    });
 }
 
 void Center::finishReply(const QString &noteId, bool ok, const QString &error)
@@ -1021,6 +1374,9 @@ void Center::deleteNote(const QString &noteId, std::function<void(bool, const QS
             const auto before = m_notes.size();
             m_notes.erase(std::remove_if(m_notes.begin(), m_notes.end(), [&](const Note &note) { return note.id == noteId; }), m_notes.end());
             m_drafts.remove(noteId);
+            m_answers.remove(noteId);
+            m_answeredAt.remove(noteId);
+            m_choices.remove(noteId);
             if (m_notes.size() != before) {
                 m_signature = signatureOf(m_notes);
                 Q_EMIT notesChanged();

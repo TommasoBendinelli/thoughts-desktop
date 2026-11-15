@@ -5,12 +5,14 @@
 
 #include <KLocalizedString>
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
 #include <QContextMenuEvent>
 #include <QDesktopServices>
 #include <QFileInfo>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QKeySequence>
@@ -378,6 +380,8 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
     m_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_scroll->setWidget(createDetail(m_scroll));
     m_scroll->installEventFilter(this);
+    // Who listens for a reply: over the note, so it stays in view while the note scrolls.
+    QWidget *answerLine = createAnswerLine(this);
 
     if (sidebar) {
         // The list, or one note in its place: a sidebar is too narrow for both.
@@ -421,6 +425,8 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         nav->addStretch(1);
         nav->addWidget(large);
         noteLayout->addLayout(nav);
+        answerLine->setParent(m_notePage);
+        noteLayout->addWidget(answerLine);
         m_scroll->setParent(m_notePage);
         noteLayout->addWidget(m_scroll, 1);
         m_pages->addWidget(m_notePage);
@@ -443,8 +449,17 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         splitter->setChildrenCollapsible(false);
         m_list->setMinimumWidth(260);
         m_detailStack = new QStackedWidget(splitter);
+        m_notePane = new QWidget(m_detailStack);
+        m_notePane->setObjectName(QStringLiteral("agentNotePane"));
+        auto *paneLayout = new QVBoxLayout(m_notePane);
+        paneLayout->setContentsMargins(0, 0, 0, 0);
+        paneLayout->setSpacing(0);
+        answerLine->setParent(m_notePane);
+        paneLayout->addWidget(answerLine);
+        m_scroll->setParent(m_notePane);
+        paneLayout->addWidget(m_scroll, 1);
         m_detailStack->addWidget(m_placeholder);
-        m_detailStack->addWidget(m_scroll);
+        m_detailStack->addWidget(m_notePane);
         splitter->addWidget(m_list);
         splitter->addWidget(m_detailStack);
         splitter->setStretchFactor(0, 0);
@@ -495,13 +510,21 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         });
         connect(m_center, &AgentNotes::Center::notesChanged, this, &AgentNotesView::rebuildList);
         connect(m_center, &AgentNotes::Center::listeningChanged, this, [this](const QString &noteId) {
-            if (noteId == m_shownNoteId) updateListening();
+            if (noteId == m_shownNoteId) updateAnswerLine();
         });
+        connect(m_center, &AgentNotes::Center::answerOptionsChanged, this, &AgentNotesView::updateAnswerLine);
         m_listeningTimer = new QTimer(this);
-        m_listeningTimer->setInterval(20 * 1000);
-        connect(m_listeningTimer, &QTimer::timeout, this, [this] {
-            // Only while Thoughts is in front: behind another application nobody waits for the answer.
-            if (m_center && m_center->isForeground() && readsNow() && !m_shownNoteId.isEmpty() && m_replyBox->isVisibleTo(m_detail)) m_center->checkListening(m_shownNoteId);
+        m_listeningTimer->setObjectName(QStringLiteral("agentNoteListeningTimer"));
+        m_listeningTimer->setInterval(ListeningRefreshMs);
+        // Only while Thoughts is in front: behind another application nobody looks at the line.
+        // Another view showing the same note may have asked a moment ago: one question a minute.
+        const auto refreshAnswer = [this] {
+            const QString id = answerNoteId();
+            if (m_center && m_center->isForeground() && readsNow() && !id.isEmpty()) m_center->checkListeningIfOlder(id, ListeningRefreshMs - 5000);
+        };
+        connect(m_listeningTimer, &QTimer::timeout, this, refreshAnswer);
+        connect(m_center, &AgentNotes::Center::foregroundChanged, this, [refreshAnswer](bool foreground) {
+            if (foreground) refreshAnswer();
         });
         connect(m_center, &AgentNotes::Center::seenChanged, this, [this] {
             updateUnreadMarks();
@@ -566,18 +589,6 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     auto *replyLayout = new QVBoxLayout(m_replyBox);
     replyLayout->setContentsMargins(0, 0, 0, 0);
     replyLayout->setSpacing(6);
-    // As on the phone: a reply nobody listens for is kept with the note, but no agent acts on it.
-    m_listeningWarning = wrappingLabel(QStringLiteral("agentNoteNotListening"), m_replyBox);
-    m_listeningWarning->setText(i18n("No agent is listening for your reply right now."));
-    m_listeningWarning->setToolTip(i18n("The agent that sent this note is not waiting for replies (its conversation ended or is busy). "
-                                        "A reply is kept with the note; Open Conversation continues the conversation that sent it."));
-    {
-        QPalette palette = m_listeningWarning->palette();
-        palette.setColor(QPalette::WindowText, QColor(0xb3, 0x26, 0x1e));
-        m_listeningWarning->setPalette(palette);
-    }
-    m_listeningWarning->hide();
-    replyLayout->addWidget(m_listeningWarning);
     m_replyField = new QPlainTextEdit(m_replyBox);
     m_replyField->setObjectName(QStringLiteral("agentNoteReplyField"));
     m_replyField->setPlaceholderText(i18n("Reply to the agent…"));
@@ -638,6 +649,61 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     return m_detail;
 }
 
+QWidget *AgentNotesView::createAnswerLine(QWidget *parent)
+{
+    const bool sidebar = m_layout == Layout::Sidebar;
+    m_answerLine = new QWidget(parent);
+    m_answerLine->setObjectName(QStringLiteral("agentNoteAnswerLine"));
+    auto *outer = new QVBoxLayout(m_answerLine);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+    auto *row = new QHBoxLayout;
+    if (sidebar) row->setContentsMargins(12, 5, 8, 5);
+    else row->setContentsMargins(24, 7, 20, 7);
+    row->setSpacing(8);
+    m_answerMark = new QLabel(m_answerLine);
+    m_answerMark->setObjectName(QStringLiteral("agentNoteAnswerMark"));
+    m_answerMark->setFixedSize(16, 16);
+    m_answerText = wrappingLabel(QStringLiteral("agentNoteAnswerText"), m_answerLine);
+    m_answerText->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    auto *change = new QToolButton(m_answerLine);
+    change->setObjectName(QStringLiteral("agentNoteAnswerChange"));
+    change->setText(i18nc("@action:button choose who answers a reply", "Change"));
+    change->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    m_answerChange = change;
+    row->addWidget(m_answerMark, 0, Qt::AlignVCenter);
+    row->addWidget(m_answerText, 1);
+    row->addWidget(m_answerChange, 0, Qt::AlignVCenter);
+    outer->addLayout(row);
+    // After a choice the server did not save: what happened, for a while.
+    m_answerFailure = wrappingLabel(QStringLiteral("agentNoteAnswerFailure"), m_answerLine);
+    m_answerFailure->setContentsMargins(sidebar ? 12 + 16 + 8 : 24 + 16 + 8, 0, 8, 6);
+    m_answerFailure->hide();
+    outer->addWidget(m_answerFailure);
+    auto *rule = new QFrame(m_answerLine);
+    rule->setObjectName(QStringLiteral("agentNoteAnswerRule"));
+    rule->setFrameShape(QFrame::HLine);
+    rule->setFrameShadow(QFrame::Plain);
+    {
+        QPalette palette = rule->palette();
+        QColor line = palette.color(QPalette::WindowText);
+        line.setAlphaF(0.12);
+        palette.setColor(QPalette::WindowText, line);
+        rule->setPalette(palette);
+    }
+    outer->addWidget(rule);
+    m_answerFailureTimer = new QTimer(this);
+    m_answerFailureTimer->setSingleShot(true);
+    m_answerFailureTimer->setInterval(AnswerFailureShownMs);
+    connect(m_answerFailureTimer, &QTimer::timeout, this, [this] {
+        m_answerFailureNoteId.clear();
+        updateAnswerLine();
+    });
+    connect(m_answerChange, &QToolButton::clicked, this, &AgentNotesView::showAnswerMenu);
+    m_answerLine->hide();
+    return m_answerLine;
+}
+
 AgentNotesView::~AgentNotesView()
 {
     if (m_center) m_center->setWatching(this, false);
@@ -687,6 +753,9 @@ void AgentNotesView::showEvent(QShowEvent *event)
     // What is on screen now counts as read.
     const QString shown = shownNoteId();
     if (!shown.isEmpty() && m_center) m_center->noteShown(shown);
+    // Back on screen: who listens may have changed meanwhile.
+    const QString answered = answerNoteId();
+    if (!answered.isEmpty() && m_center) m_center->checkListeningIfOlder(answered, ListeningRefreshMs - 5000);
     QTimer::singleShot(0, this, &AgentNotesView::fitImages);
 }
 
@@ -870,7 +939,7 @@ void AgentNotesView::markSeenSoon(const Note &note)
 
 void AgentNotesView::showDetail(const Note &note, bool sameNote)
 {
-    if (m_layout == Layout::Split) m_detailStack->setCurrentWidget(m_scroll);
+    if (m_layout == Layout::Split) m_detailStack->setCurrentWidget(m_notePane);
     m_shownNoteId = note.id;
     const QDateTime now = QDateTime::currentDateTimeUtc();
     m_title->setText(note.title);
@@ -916,13 +985,14 @@ void AgentNotesView::showDetail(const Note &note, bool sameNote)
     // The user's own pages are answered by the agent with a note of its own; agent notes get a reply box.
     m_replyBox->setVisible(!note.isPhonePage());
     if (m_center && !note.isPhonePage()) {
-        // Whether the agent that sent it still listens: now, and every 20 s while it is shown.
-        if (!sameNote) m_center->checkListening(note.id);
+        // Who listens for a reply: asked when the note is shown, then every minute while it is
+        // (a view out of sight asks when it comes back, see showEvent).
+        if (!sameNote && readsNow()) m_center->checkListening(note.id);
         if (m_listeningTimer && !m_listeningTimer->isActive()) m_listeningTimer->start();
     } else if (m_listeningTimer) {
         m_listeningTimer->stop();
     }
-    updateListening();
+    updateAnswerLine();
     if (!sameNote) {
         const auto draft = m_center ? m_center->existingDraft(note.id) : nullptr;
         m_settingReply = true;
@@ -934,11 +1004,176 @@ void AgentNotesView::showDetail(const Note &note, bool sameNote)
     if (!sameNote) m_scroll->verticalScrollBar()->setValue(0);
 }
 
-void AgentNotesView::updateListening()
+QString AgentNotesView::answerNoteId() const
 {
-    const auto note = m_center && !m_shownNoteId.isEmpty() ? m_center->note(m_shownNoteId) : std::nullopt;
-    const bool warn = note && !note->isPhonePage() && m_center->listening(note->id) == AgentNotes::Listening::NotListening;
-    m_listeningWarning->setVisible(warn);
+    const QString id = shownNoteId();
+    if (id.isEmpty() || !m_center) return {};
+    const auto note = m_center->note(id);
+    return note && !note->isPhonePage() ? id : QString();
+}
+
+void AgentNotesView::updateAnswerLine()
+{
+    if (!m_answerLine) return;
+    const QString id = answerNoteId();
+    const auto line = id.isEmpty() ? std::nullopt : AgentNotes::answerLine(m_center->answer(id), m_center->canChangeAnswerer(), m_center->serverReachable());
+    m_answerLine->setVisible(line.has_value());
+    if (!line) return;
+    const QPalette base = palette();
+    const bool dark = base.color(QPalette::Window).lightnessF() < 0.5;
+    // The warning look the bar over the reply field had: nobody will act on a reply.
+    const QColor warningText = dark ? QColor(0xf2, 0xb8, 0xb5) : QColor(0xb3, 0x26, 0x1e);
+    QPalette linePalette = base;
+    if (line->warning) {
+        QColor tint = warningText;
+        tint.setAlphaF(dark ? 0.16 : 0.10);
+        const QColor window = base.color(QPalette::Window);
+        const qreal alpha = tint.alphaF();
+        linePalette.setColor(QPalette::Window, QColor::fromRgbF(window.redF() * (1 - alpha) + tint.redF() * alpha, window.greenF() * (1 - alpha) + tint.greenF() * alpha,
+                                                                 window.blueF() * (1 - alpha) + tint.blueF() * alpha));
+    }
+    m_answerLine->setAutoFillBackground(line->warning);
+    m_answerLine->setPalette(linePalette);
+    m_answerLine->setProperty("warning", line->warning);
+
+    QPalette textPalette = base;
+    if (line->warning) textPalette.setColor(QPalette::WindowText, warningText);
+    else if (line->muted || line->mark == AgentNotes::AnswerLine::Mark::Waiting) textPalette.setColor(QPalette::WindowText, secondaryText(base));
+    m_answerText->setPalette(textPalette);
+    m_answerText->setText(line->text);
+    const auto note = m_center->note(id);
+    if (line->mark == AgentNotes::AnswerLine::Mark::Nobody) {
+        m_answerText->setToolTip(note && note->conversationUrl().isValid()
+                                     ? i18n("A reply is kept with the note, but no agent acts on it until one listens. Open Conversation continues the conversation that sent it.")
+                                     : i18n("A reply is kept with the note, but no agent acts on it until one listens."));
+    } else if (line->mark == AgentNotes::AnswerLine::Mark::Waiting) {
+        m_answerText->setToolTip(i18n("You chose this agent to answer your reply. While it does not listen, the Thoughts reply agent answers after 10 minutes."));
+    } else if (line->mark == AgentNotes::AnswerLine::Mark::Woken) {
+        m_answerText->setToolTip(i18n("A reply waker wakes this session with your reply, or gives it your reply when its current task is done."));
+    } else if (line->mark == AgentNotes::AnswerLine::Mark::Offline) {
+        m_answerText->setToolTip(i18n("The session that should answer is on a machine that is offline. It answers when the machine is back; if it stays offline, the study session answers instead."));
+    } else {
+        m_answerText->setToolTip(i18n("Your reply goes to this agent now."));
+    }
+
+    using Mark = AgentNotes::AnswerLine::Mark;
+    QIcon icon;
+    if (line->mark == Mark::Listening || line->mark == Mark::Woken) {
+        icon = QIcon::fromTheme(QStringLiteral("checkmark"), style()->standardIcon(QStyle::SP_DialogApplyButton));
+    } else if (line->mark == Mark::Offline) {
+        icon = QIcon::fromTheme(QStringLiteral("chronometer"), style()->standardIcon(QStyle::SP_MessageBoxInformation));
+    } else {
+        icon = QIcon::fromTheme(QStringLiteral("dialog-warning"), style()->standardIcon(QStyle::SP_MessageBoxWarning));
+    }
+    m_answerMark->setPixmap(icon.pixmap(QSize(16, 16), devicePixelRatioF()));
+    QString mark;
+    QString markName;
+    switch (line->mark) {
+    case Mark::Listening:
+        mark = QStringLiteral("listening");
+        markName = i18nc("@info the state of the agent that answers", "Listening");
+        break;
+    case Mark::Woken:
+        mark = QStringLiteral("woken");
+        markName = i18nc("@info the state of the agent that answers", "Will be woken");
+        break;
+    case Mark::Offline:
+        mark = QStringLiteral("offline");
+        markName = i18nc("@info the state of the agent that answers", "Offline");
+        break;
+    case Mark::Waiting:
+        mark = QStringLiteral("waiting");
+        markName = i18nc("@info the state of the agent that answers", "Not listening");
+        break;
+    case Mark::Nobody:
+        mark = QStringLiteral("nobody");
+        markName = i18nc("@info the state of the agent that answers", "Not listening");
+        break;
+    }
+    m_answerMark->setProperty("mark", mark);
+    m_answerMark->setAccessibleName(markName);
+    m_answerMark->setToolTip(markName);
+
+    const bool choosing = m_center->isChoosingAnswerer(id);
+    m_answerChange->setVisible(line->changeOffered);
+    m_answerChange->setEnabled(line->changeEnabled && !choosing);
+    m_answerChange->setToolTip(choosing                ? i18n("Sending your choice to the server…")
+                                   : line->changeEnabled ? i18n("Choose which agent answers your reply")
+                                                         : i18n("Change (needs the server)"));
+
+    const bool failed = !m_answerFailureNoteId.isEmpty() && m_answerFailureNoteId == id;
+    if (failed) {
+        QPalette failurePalette = base;
+        failurePalette.setColor(QPalette::WindowText, warningText);
+        m_answerFailure->setPalette(failurePalette);
+    }
+    m_answerFailure->setVisible(failed);
+}
+
+QMenu *AgentNotesView::createAnswerMenu()
+{
+    const QString id = answerNoteId();
+    const auto answer = id.isEmpty() ? std::nullopt : m_center->answer(id);
+    if (!answer) return nullptr;
+    auto *menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("agentNoteAnswerMenu"));
+    QAction *heading = menu->addAction(i18n("Who answers your reply"));
+    heading->setEnabled(false);
+    menu->addSeparator();
+    auto *group = new QActionGroup(menu);
+    group->setExclusive(true);
+    QFont detailFont = menu->font();
+    detailFont.setPointSizeF(detailFont.pointSizeF() * 0.85);
+    for (const AgentNotes::AnswerChoice &choice : AgentNotes::answerChoices(*answer)) {
+        QAction *action = menu->addAction(choice.title);
+        action->setObjectName(choice.agent ? QStringLiteral("agentNoteAnswerChoice") : QStringLiteral("agentNoteAnswerAutomatic"));
+        action->setCheckable(true);
+        action->setChecked(choice.checked);
+        group->addAction(action);
+        connect(action, &QAction::triggered, this, [this, id, choice] {
+            if (!choice.checked) chooseAnswerer(id, choice.agent);
+        });
+        if (!choice.detail.isEmpty()) {
+            // The line under Automatic: who answers when nobody was chosen.
+            action->setToolTip(choice.detail);
+            QAction *detail = menu->addAction(choice.detail);
+            detail->setObjectName(QStringLiteral("agentNoteAnswerDetail"));
+            detail->setEnabled(false);
+            detail->setFont(detailFont);
+        }
+    }
+    return menu;
+}
+
+void AgentNotesView::showAnswerMenu()
+{
+    QMenu *menu = createAnswerMenu();
+    if (!menu) return;
+    const QPointer<QMenu> guard(menu);
+    menu->exec(m_answerChange->mapToGlobal(QPoint(0, m_answerChange->height())));
+    if (guard) guard->deleteLater();
+}
+
+void AgentNotesView::chooseAnswerer(const QString &noteId, const std::optional<AgentNotes::Agent> &agent)
+{
+    if (!m_center || noteId.isEmpty()) return;
+    if (m_answerFailureNoteId == noteId) {
+        m_answerFailureNoteId.clear();
+        m_answerFailureTimer->stop();
+    }
+    const QPointer<AgentNotesView> guard(this);
+    m_center->chooseAnswerer(noteId, agent, [guard, noteId](bool ok, const QString &error) {
+        if (guard && !ok) guard->showAnswerFailure(noteId, error);
+    });
+    updateAnswerLine();
+}
+
+void AgentNotesView::showAnswerFailure(const QString &noteId, const QString &text)
+{
+    m_answerFailureNoteId = noteId;
+    m_answerFailure->setText(text);
+    m_answerFailureTimer->start();
+    updateAnswerLine();
 }
 
 void AgentNotesView::updateReplyBox()
@@ -959,6 +1194,8 @@ void AgentNotesView::updateReplyBox()
     if (sending) status = i18n("Sending…");
     else if (draft && !draft->error.isEmpty()) status = i18n("Not sent: %1", draft->error);
     else if (drawn) status = i18np("With your drawing (1 mark).", "With your drawing (%1 marks).", int(draft->drawing.strokes().size() + draft->drawing.markers().size()));
+    // The last reply went out: who a reply waker wakes for it ("Sent ✓ · … will be woken").
+    else if (!draft) status = m_center->sentStatus(m_shownNoteId);
     m_replyStatus->setText(status);
     m_replyStatus->setVisible(!status.isEmpty());
     m_replyField->setReadOnly(sending);

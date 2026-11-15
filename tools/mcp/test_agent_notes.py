@@ -7,14 +7,20 @@ server, Keychain, ~/Thoughts/agent-notes or Chrome profile, and never the networ
 Markdown page's files come from stand-ins). The real Chrome tests run only with
 THOUGHTS_TEST_CHROME=1; of those only test_real_chrome downloads KaTeX and marked.
 """
+import asyncio
 import base64
+import contextlib
 import datetime as dt
+import hashlib
 import html
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -111,6 +117,8 @@ class FakeThoughts:
         self.live = False
         self.reply_listening = None   # the create answer's reply_listening (None: an older server sends none)
         self.fail = {}            # path -> (status, body bytes), one shot
+        self.etags = True         # the note list's ETag and 304 answers (False: a server from before them)
+        self.held = self.most_held = 0   # folder-sync long polls (reply feed, wait > 0, not listening): now, at most
         self.condition = threading.Condition()
         fake = self
 
@@ -118,11 +126,13 @@ class FakeThoughts:
             def log_message(self, *args):
                 pass
 
-            def send(self, status, body=None, content_type='application/json'):
+            def send(self, status, body=None, content_type='application/json', headers=None):
                 data = b'' if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
                 self.send_response(status)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(data)))
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -133,14 +143,21 @@ class FakeThoughts:
                 body = json.loads(self.rfile.read(length)) if length else None
                 with fake.condition:
                     fake.requests.append(dict(method=method, path=parts.path, query=query, body=body,
-                                              authorization=self.headers.get('Authorization')))
+                                              authorization=self.headers.get('Authorization'),
+                                              if_none_match=self.headers.get('If-None-Match'), at=time.monotonic()))
                     failure = fake.fail.pop(parts.path, None)
                 if failure:
                     return self.send(failure[0], failure[1])
                 if self.headers.get('Authorization') != 'Bearer ' + TOKEN:
                     return self.send(401, {'detail': 'Invalid device token'})
+                headers = None
+                if method == 'GET' and parts.path == '/v1/agent-notes' and fake.etags:
+                    # As the server does since list ETags: 304 while nothing about any note changed.
+                    headers = {'ETag': fake.list_etag(query)}
+                    if self.headers.get('If-None-Match') == headers['ETag']:
+                        return self.send(304, None, headers=headers)
                 status, payload, content_type = fake.route(method, parts.path, query, body)
-                self.send(status, payload, content_type)
+                self.send(status, payload, content_type, headers if status == 200 else None)
 
             def do_GET(self):
                 self.handle_any('GET')
@@ -166,6 +183,20 @@ class FakeThoughts:
     def feed_requests(self):
         with self.condition:
             return [r for r in self.requests if r['path'] == '/v1/agent-notes/replies']
+
+    def sync_requests(self):
+        """The plain folder sync's requests: the reply feed without listen, and the note list."""
+        with self.condition:
+            return [r for r in self.requests if r['method'] == 'GET' and (
+                (r['path'] == '/v1/agent-notes/replies' and not r['query'].get('listen')) or r['path'] == '/v1/agent-notes')]
+
+    def list_etag(self, query):
+        """Like the server's: from what any note shows (counts and stamps), whatever the limit asks for."""
+        with self.condition:
+            state = (len(self.notes), self.sequence, len(self.replies), self.reply_sequence,
+                     sorted((n['note_id'], n.get('delivered_at'), n.get('opened_at'), n.get('deleted')) for n in self.notes.values()),
+                     sorted(query.items()))
+        return '"' + hashlib.sha256(repr(state).encode()).hexdigest() + '"'
 
     def note_view(self, note, with_replies=True):
         view = dict(note)
@@ -203,9 +234,9 @@ class FakeThoughts:
             self.condition.notify_all()
             return reply
 
-    def add_note(self, title='Older note', created_at=None, sender='thoughts-mac', origin=None):
+    def add_note(self, title='Older note', created_at=None, sender='thoughts-mac', origin=None, note_id=None):
         """A note sent earlier (e.g. by another Mac process, or the phone), not in the local folder."""
-        note_id = str(uuid.uuid4())
+        note_id = note_id or str(uuid.uuid4())
         with self.condition:
             self.sequence += 1
             self.blobs[f'/v1/agent-notes/{note_id}/image'] = (png(4, 4), 'image/png')
@@ -254,8 +285,16 @@ class FakeThoughts:
                     return [r for r in self.replies if r['sequence'] > after and (not note_id or r['note_id'] == note_id)
                             and (not conversation or (self.notes[r['note_id']].get('origin') or {}).get('conversation_id') == conversation)]
                 deadline = time.monotonic() + int(query.get('wait') or 0)
-                while not matching() and time.monotonic() < deadline:
-                    self.condition.wait(max(0.0, deadline - time.monotonic()))
+                folder_sync = int(query.get('wait') or 0) > 0 and not query.get('listen')
+                if folder_sync:
+                    self.held += 1
+                    self.most_held = max(self.most_held, self.held)
+                try:
+                    while not matching() and time.monotonic() < deadline:
+                        self.condition.wait(max(0.0, deadline - time.monotonic()))
+                finally:
+                    if folder_sync:
+                        self.held -= 1
                 found = matching()[:50]
                 replies = [{**r, 'note': {k: self.notes[r['note_id']].get(k) for k in ('note_id', 'title', 'document_id', 'review_card_id')}}
                            for r in found]
@@ -1030,6 +1069,492 @@ class WhoAnswersTest(FakeServerCase):
         pages = [line for line in lines if line.startswith('PAGE')]
         self.assertEqual(len(pages), 1, lines)
         self.assertIn(f'note={mine}', pages[0])
+
+
+# ---------------------------------------------------------------- one folder sync for the whole Mac
+
+HERE = Path(__file__).resolve().parent
+# The commit before the folder sync had one holder: the code that sessions started earlier keep running.
+BASE_COMMIT = '32b727779'
+SYNCED_NOTE = '0190a000-0000-7000-8000-00000000000a'
+# A process that does what the MCP server's background thread does (agent_notes.watch_loop), and nothing else.
+SYNC_WORKER = '''
+import json, sys, threading
+from pathlib import Path
+settings = json.loads(sys.argv[1])
+sys.path.insert(0, settings['modules'])
+import agent_notes
+client = agent_notes.Client(agent_notes.Config(settings['url'], settings['token']))
+agent_notes.watch_loop(threading.Event(), client_factory=lambda: client, root=Path(settings['root']), **settings['options'])
+'''
+
+
+def base_code(directory):
+    """agent_notes.py, server.py, conversation_identity.py and thoughts-watch-replies as of BASE_COMMIT, written
+    into @p directory/base; None without that history (a clone without it)."""
+    target = Path(directory) / 'base'
+    target.mkdir(exist_ok=True)
+    for name in ('agent_notes.py', 'server.py', 'conversation_identity.py', 'thoughts-watch-replies'):
+        try:
+            done = subprocess.run(['git', '-C', str(HERE), 'show', f'{BASE_COMMIT}:./{name}'], capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if done.returncode != 0 or not done.stdout:
+            return None
+        (target / name).write_bytes(done.stdout)
+    return target
+
+
+def wait_until(condition, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return condition()
+
+
+async def until(condition, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    return condition()
+
+
+def holder_pid(root):
+    """The process ID the folder's sync holder wrote into .sync.lock, or None."""
+    try:
+        return json.loads((Path(root) / agent_notes.SYNC_LOCK).read_text(encoding='utf-8'))['pid']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def read_lines(stream):
+    """The lines a child process prints, collected by a thread as they come."""
+    lines = []
+
+    def read():
+        for line in stream:
+            lines.append(line.rstrip('\n'))
+    threading.Thread(target=read, daemon=True).start()
+    return lines
+
+
+def child_pids():
+    """This test process's own child processes."""
+    done = subprocess.run(['pgrep', '-P', str(os.getpid())], capture_output=True, text=True, timeout=30)
+    return {int(pid) for pid in done.stdout.split()}
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def end_process(process):
+    if process.poll() is None:
+        process.kill()
+    process.wait(10)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream:
+            stream.close()
+
+
+def sync_workers(test, fake, root, count, modules=HERE, **options):
+    """@p count worker processes on one notes folder, each running watch_loop like an MCP server's thread."""
+    settings = json.dumps(dict(modules=str(modules), url=fake.url, token=TOKEN, root=str(root), options=options))
+    processes = [subprocess.Popen([sys.executable, '-c', SYNC_WORKER, settings], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(count)]
+    for process in processes:
+        test.addCleanup(end_process, process)
+    return processes
+
+
+def sent_note(fake, root, title='Group mean', directory=None):
+    """A note sent from this Mac a moment ago: it keeps the folder sync running (a note < 24 h old)."""
+    picture = Path(directory or root.parent) / f'picture-{uuid.uuid4().hex[:8]}.png'
+    picture.write_bytes(png())
+    return agent_notes.send_note(title, image_path=str(picture), client=agent_notes.Client(agent_notes.Config(fake.url, TOKEN)),
+                                 root=root)
+
+
+def check_folder(test, fake, root, expected):
+    """Every reply of @p expected on disk exactly once, complete, numbered per note in sequence order, journaled once."""
+    found = {}
+    for path in root.glob('*/reply-*.json'):
+        if re.fullmatch(r'reply-\d+\.json', path.name):
+            record = json.loads(path.read_text(encoding='utf-8'))
+            test.assertNotIn(record['reply_id'], found, f'{path} repeats a reply')
+            found[record['reply_id']] = (path, record)
+    test.assertEqual(set(found), {r['reply_id'] for r in expected})
+    for reply in expected:
+        path, record = found[reply['reply_id']]
+        image = path.parent / record['local']['image']
+        test.assertEqual(image.read_bytes(), fake.blobs[reply['image_url']][0], image)
+    for folder in {path.parent for path, _ in found.values()}:
+        numbered = sorted((int(re.fullmatch(r'reply-(\d+)\.json', p.name).group(1)), json.loads(p.read_text())['sequence'])
+                          for p in folder.glob('reply-*.json') if re.fullmatch(r'reply-\d+\.json', p.name))
+        test.assertEqual([n for n, _ in numbered], list(range(1, len(numbered) + 1)), folder)
+        test.assertEqual([s for _, s in numbered], sorted(s for _, s in numbered), f'{folder}: numbered in sequence order')
+    journal = [json.loads(line) for line in (root / 'replies.jsonl').read_text(encoding='utf-8').splitlines()]
+    test.assertEqual(sorted(j['reply_id'] for j in journal), sorted(r['reply_id'] for r in expected))
+    test.assertEqual(agent_notes.read_cursor(root), max(r['sequence'] for r in expected))
+    test.assertEqual(list(root.rglob('*.tmp')), [])
+
+
+class FolderSyncTest(FakeServerCase):
+    """One process on the Mac keeps the notes folder in step with the server; the others wait for its lock."""
+
+    def watch(self, **options):
+        stop = threading.Event()
+        thread = threading.Thread(target=agent_notes.watch_loop, args=(stop,), daemon=True,
+                                  kwargs=dict(client_factory=lambda: self.client, root=self.root, **options))
+        thread.start()
+        self.addCleanup(lambda: (stop.set(), thread.join(10)))
+        return stop, thread
+
+    def lists(self):
+        return [r for r in self.fake.sync_requests() if r['path'] == '/v1/agent-notes']
+
+    def long_polls(self):
+        return [r for r in self.fake.sync_requests() if r['path'] == '/v1/agent-notes/replies']
+
+    def test_the_holder_asks_whether_anything_changed_and_pauses_longer_while_nothing_does(self):
+        note = self.send()
+        self.watch(wait=1, pause_min=0.1, pause_max=0.8, tick=0.02)
+        # The first look pulls the feed (one long poll); after that, while nothing changes, only the
+        # note list is asked, with If-None-Match (304), and the pauses double up to pause_max.
+        self.assertTrue(wait_until(lambda: len(self.lists()) >= 7, 8), self.lists())
+        lists = self.lists()
+        self.assertIsNone(lists[0]['if_none_match'])
+        self.assertTrue(all(r['if_none_match'] for r in lists[1:]))
+        self.assertEqual(lists[0]['query'], {'limit': '1'})
+        self.assertEqual([r['query'] for r in self.long_polls()], [{'after': '0', 'wait': '1'}])
+        gaps = [b['at'] - a['at'] for a, b in zip(lists[1:], lists[2:])]   # nominally 0.2, 0.4, 0.8, 0.8, ...
+        self.assertLess(max(gaps[:2]), min(gaps[2:]), gaps)
+        self.assertGreater(min(gaps[2:]), 0.7, gaps)
+        self.assertLess(max(gaps), 1.5, gaps)
+        # A reply is a change: it lands in the folder at the next look, and the next looks come quickly again.
+        added_at = time.monotonic()
+        reply = self.fake.add_reply(note['note_id'], message='Here')
+        landed = Path(note['folder']) / 'reply-1.png'
+        self.assertTrue(wait_until(landed.exists, 3))
+        self.assertTrue(wait_until(lambda: len([r for r in self.lists() if r['at'] > added_at]) >= 2, 3))
+        after = [r for r in self.lists() if r['at'] > added_at]   # the look that saw the reply, and the next
+        self.assertLess(after[1]['at'] - after[0]['at'], 0.6, 'the pause starts short again after a change')
+        self.assertEqual(json.loads((Path(note['folder']) / 'reply-1.json').read_text())['reply_id'], reply['reply_id'])
+        # A note sent from this Mac (the folder changes) ends a pause at once: a reply may follow.
+        time.sleep(2.5)
+        sent_at = time.monotonic()
+        self.send(title='Second')
+        self.assertTrue(wait_until(lambda: any(r['at'] > sent_at for r in self.long_polls()), 3))
+        self.assertLess(min(r['at'] for r in self.lists() if r['at'] > sent_at) - sent_at, 0.5)
+        # A folder sync never says an agent listens.
+        self.assertFalse(any(r['query'].get('listen') for r in self.fake.feed_requests()))
+
+    def test_a_server_without_list_etags_is_long_polled_with_growing_pauses(self):
+        self.fake.etags = False
+        note = self.send()
+        self.watch(wait=1, pause_min=0.1, pause_max=0.4, tick=0.02)
+        self.assertTrue(wait_until(lambda: len(self.long_polls()) >= 4, 10), self.long_polls())
+        self.assertEqual(len(self.lists()), 1, 'without an ETag the list is not asked again')
+        starts = [r['at'] for r in self.long_polls()]
+        self.assertGreater(starts[3] - starts[2], 1.3)   # 1 s long poll + a pause grown to 0.4 s
+        self.fake.add_reply(note['note_id'])
+        self.assertTrue(wait_until((Path(note['folder']) / 'reply-1.png').exists, 3))
+
+    def test_the_list_failing_does_not_stop_the_folder_sync(self):
+        note = self.send()
+        self.fake.fail['/v1/agent-notes'] = (503, b'{"detail": "busy"}')
+        self.watch(wait=1, pause_min=0.1, pause_max=0.4, tick=0.02)
+        self.fake.add_reply(note['note_id'])
+        self.assertTrue(wait_until((Path(note['folder']) / 'reply-1.png').exists, 4))
+
+    def test_a_change_is_pulled_even_when_its_first_pull_failed(self):
+        note = self.send()
+        self.fake.add_reply(note['note_id'])
+        self.fake.fail['/v1/agent-notes/replies'] = (503, b'{"detail": "busy"}')
+        self.watch(wait=1, pause_min=0.1, pause_max=0.4, tick=0.02)
+        # The list said "changed", the feed failed: the next look must not take the list's 304 for "nothing new".
+        self.assertTrue(wait_until((Path(note['folder']) / 'reply-1.png').exists, 6))
+
+    def test_after_replies_the_feed_is_pulled_once_more(self):
+        note = self.send()
+        self.watch(wait=1, pause_min=0.1, pause_max=0.4, tick=0.02)
+        self.assertTrue(wait_until(lambda: len(self.lists()) >= 3, 5))
+        self.fake.add_reply(note['note_id'])
+        self.assertTrue(wait_until((Path(note['folder']) / 'reply-1.png').exists, 3))
+        pulled = len(self.long_polls())
+        # A second reply right after the first is caught by a long poll, not left for a later look.
+        self.assertTrue(wait_until(lambda: len(self.long_polls()) > pulled, 3))
+        self.fake.add_reply(note['note_id'])
+        self.assertTrue(wait_until((Path(note['folder']) / 'reply-2.png').exists, 2))
+
+    def test_five_processes_send_the_requests_of_one_and_a_killed_holder_hands_over(self):
+        options = dict(wait=2, pause_min=0.2, pause_max=2.0, takeover=0.2, tick=0.05)
+        alone = FakeThoughts()
+        self.addCleanup(alone.close)
+        alone_root = self.directory / 'alone' / 'agent-notes'
+        sent_note(alone, alone_root, directory=self.directory)
+        note = self.send()
+        sync_workers(self, alone, alone_root, 1, **options)
+        workers = sync_workers(self, self.fake, self.root, 5, **options)
+        self.assertTrue(wait_until(lambda: alone.sync_requests() and self.fake.sync_requests(), 10))
+        time.sleep(6)
+        one, five = len(alone.sync_requests()), len(self.fake.sync_requests())
+        self.assertGreaterEqual(one, 4)
+        self.assertLessEqual(abs(five - one), 2, (one, five))
+        self.assertEqual(self.fake.most_held, 1, 'one folder-sync long poll at a time')
+        holder = holder_pid(self.root)
+        self.assertIn(holder, [w.pid for w in workers])
+        # The holder dies: another process takes the lock within a few seconds and syncs.
+        next(w for w in workers if w.pid == holder).kill()
+        self.assertTrue(wait_until(lambda: holder_pid(self.root) not in (None, holder) and alive(holder_pid(self.root)), 5),
+                        holder_pid(self.root))
+        self.assertIn(holder_pid(self.root), [w.pid for w in workers])
+        reply = self.fake.add_reply(note['note_id'])
+        landed = Path(note['folder']) / 'reply-1.png'
+        self.assertTrue(wait_until(landed.exists, 5))
+        check_folder(self, self.fake, self.root, [reply])
+
+    def test_watch_prints_the_replies_another_process_writes(self):
+        note = self.send()
+        worker = sync_workers(self, self.fake, self.root, 1)[0]
+        self.assertTrue(wait_until(lambda: holder_pid(self.root) == worker.pid, 10))
+        environment = {**os.environ, 'THOUGHTS_SERVER_URL': self.fake.url, 'THOUGHTS_TOKEN': TOKEN,
+                       'THOUGHTS_AGENT_NOTES_DIR': str(self.root)}
+        process = subprocess.Popen([sys.executable, str(HERE / 'agent_notes.py'), 'watch'], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True, env=environment)
+        self.addCleanup(end_process, process)
+        lines = read_lines(process.stdout)
+        time.sleep(1.5)
+        before = len(self.fake.sync_requests())
+        reply = self.fake.add_reply(note['note_id'], message='Printed')
+        self.assertTrue(wait_until(lambda: lines, 5))
+        self.assertEqual(json.loads(lines[0])['reply_id'], reply['reply_id'])
+        self.assertTrue(Path(json.loads(lines[0])['image_path']).is_file())
+        self.assertEqual(holder_pid(self.root), worker.pid, 'watch did not take over a running holder')
+        self.assertLessEqual(len(self.fake.sync_requests()) - before, 2, 'watch sent no requests of its own')
+
+    def test_the_newest_note_is_read_again_when_the_folder_changes(self):
+        (self.root / '20261001-120000-old-0190a000').mkdir(parents=True)
+        note_json = self.root / '20261001-120000-old-0190a000' / 'note.json'
+        note_json.write_text(json.dumps({'note_id': SYNCED_NOTE, 'created_at': now_iso(-3 * 86400)}))
+        settled = time.time() - 30
+        os.utime(self.root, (settled, settled))
+        self.assertFalse(agent_notes.has_recent_note(self.root))
+        # A note.json changed in place does not change the folder: the answer kept in memory stands...
+        note_json.write_text(json.dumps({'note_id': SYNCED_NOTE, 'created_at': now_iso()}))
+        os.utime(self.root, (settled, settled))
+        self.assertFalse(agent_notes.has_recent_note(self.root))
+        # ...and any note folder added or removed (the folder's modification time) makes it read again.
+        (self.root / '20261114-090000-new-0190a000').mkdir()
+        self.assertTrue(agent_notes.has_recent_note(self.root))
+
+
+class ListeningAsBeforeTest(FakeServerCase):
+    """Listening polls (listen=true) are per conversation, not the folder sync: the same requests as the base code."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = base_code(self.directory)
+        if self.base is None:
+            self.skipTest(f'needs the history of commit {BASE_COMMIT}')
+
+    def base_module(self):
+        spec = importlib.util.spec_from_file_location('agent_notes_base', self.base / 'agent_notes.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module   # dataclasses look their module up there
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_waiting_for_a_reply_polls_as_the_base_code_does(self):
+        lines = {}
+        for name, module in (('base', self.base_module()), ('new', agent_notes)):
+            fake = FakeThoughts()
+            self.addCleanup(fake.close)
+            fake.add_note('Group mean', created_at=now_iso(), note_id=SYNCED_NOTE)
+            client, root = module.Client(module.Config(fake.url, TOKEN)), self.directory / name
+            self.assertIsNone(module.wait_for_reply(SYNCED_NOTE, 1, client=client, root=root))
+            timer = threading.Timer(0.5, fake.add_reply, args=(SYNCED_NOTE,))
+            timer.start()
+            self.addCleanup(timer.cancel)
+            self.assertIsNotNone(module.wait_for_reply(SYNCED_NOTE, 5, client=client, root=root))
+            self.assertIsNotNone(module.wait_for_reply(SYNCED_NOTE, 0, client=client, root=root))
+            lines[name] = [(r['method'], r['path'], sorted(r['query'].items())) for r in fake.requests
+                           if r['path'] in ('/v1/agent-notes/replies', f'/v1/agent-notes/{SYNCED_NOTE}')]
+        self.assertEqual(lines['new'], lines['base'])
+        self.assertIn(('GET', '/v1/agent-notes/replies', [('after', '0'), ('listen', 'true'), ('note_id', SYNCED_NOTE), ('wait', '1')]),
+                      lines['new'])
+
+    def test_the_watcher_listens_as_the_base_code_does(self):
+        polls = {}
+        for name, script in (('base', self.base / 'thoughts-watch-replies'), ('new', HERE / 'thoughts-watch-replies')):
+            fake = FakeThoughts()
+            self.addCleanup(fake.close)
+            WhoAnswersFake(fake)
+            ours = fake.add_note('New drafter', origin={'agent': 'mcp', 'conversation_id': CONVERSATION}, note_id=SYNCED_NOTE)
+            for _ in range(3):
+                fake.add_reply(ours, strokes=False)
+            environment = {**os.environ, 'THOUGHTS_SERVER_URL': fake.url, 'THOUGHTS_TOKEN': TOKEN,
+                           'THOUGHTS_AGENT_NOTES_DIR': str(self.directory / name), 'CLAUDE_CONFIG_DIR': str(self.directory / 'claude')}
+            process = subprocess.Popen([sys.executable, str(script), '--conversation', CONVERSATION], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True, env=environment)
+            self.addCleanup(end_process, process)
+            lines = read_lines(process.stdout)
+
+            def listening(count):
+                return len([r for r in fake.feed_requests() if r['query'].get('listen')]) >= count
+            self.assertTrue(wait_until(lambda: listening(1), 10), lines)
+            fake.add_reply(ours, strokes=False, message='Again')
+            self.assertTrue(wait_until(lambda: any(line.startswith('REPLY') for line in lines), 10), lines)
+            self.assertTrue(wait_until(lambda: listening(2), 10), lines)
+            end_process(process)
+            polls[name] = [(r['method'], r['path'], sorted(r['query'].items())) for r in fake.requests if r['query'].get('listen')]
+        self.assertEqual(polls['new'], polls['base'])
+        self.assertEqual(polls['new'][0], ('GET', '/v1/agent-notes/replies', [
+            ('after', '3'), ('conversation_id', CONVERSATION), ('listen', 'true'), ('wait', '50')]))
+
+
+class ToolProcessesTest(unittest.IsolatedAsyncioTestCase):
+    """Several MCP servers (one per agent session) on one notes folder against one counting fake server."""
+
+    async def asyncSetUp(self):
+        self.fake = FakeThoughts()
+        self.addCleanup(self.fake.close)
+        self.directory = Path(tempfile.mkdtemp(prefix='thoughts-tool-processes-'))
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.root = self.directory / 'agent-notes'
+        home = self.directory / 'home'
+        home.mkdir()
+        self.env = {**os.environ, 'HOME': str(home), 'CFFIXED_USER_HOME': str(home), 'CLAUDE_CONFIG_DIR': str(home / '.claude'),
+                    'CODEX_HOME': str(home / '.codex'), 'THOUGHTS_SERVER_URL': self.fake.url, 'THOUGHTS_TOKEN': TOKEN,
+                    'THOUGHTS_AGENT_NOTES_DIR': str(self.root), 'THOUGHTS_CHROME': str(self.directory / 'no-chrome'),
+                    'THOUGHTSCTL': '/nonexistent/thoughtsctl'}
+        self.errors = open(self.directory / 'servers.log', 'w')
+        self.addCleanup(self.errors.close)
+
+    async def tool_process(self, stack, server=HERE / 'server.py'):
+        """An MCP server as an agent session starts it, and its process ID (a child of this process)."""
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        params = StdioServerParameters(command=sys.executable, args=[str(server)], env=self.env)
+        before = await asyncio.to_thread(child_pids)
+        read, write = await stack.enter_async_context(stdio_client(params, errlog=self.errors))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        started = await asyncio.to_thread(child_pids) - before
+        self.assertEqual(len(started), 1, started)
+        return session, started.pop()
+
+    async def test_one_holder_every_process_sees_a_reply_and_a_killed_holder_hands_over(self):
+        note = sent_note(self.fake, self.root)
+        async with contextlib.AsyncExitStack() as stack:
+            processes = dict([await self.tool_process(stack) for _ in range(4)])   # session -> process ID
+            sessions = list(processes)
+            self.assertTrue(await until(lambda: holder_pid(self.root) in processes.values(), 10), holder_pid(self.root))
+            first = holder_pid(self.root)
+            await asyncio.sleep(2)   # every process has tried the lock by now
+            self.assertEqual(self.fake.most_held, 1, 'one folder-sync long poll for four processes')
+            self.assertEqual(len([r for r in self.fake.sync_requests() if r['path'] == '/v1/agent-notes']), 1)
+
+            # A reply lands in the folder within a few seconds, once, and every process's tools show it.
+            reply = self.fake.add_reply(note['note_id'], message='See the circle')
+            landed = Path(note['folder']) / 'reply-1.png'
+            self.assertTrue(await until(landed.exists, 5))
+            for session in sessions:
+                listed = await session.call_tool('list_note_replies', {})
+                self.assertEqual([r['reply_id'] for r in listed.structuredContent['replies']], [reply['reply_id']])
+                got = await session.call_tool('get_note_reply', {'note_id': note['note_id']})
+                self.assertEqual((got.structuredContent['status'], got.structuredContent['reply_id']), ('replied', reply['reply_id']))
+            check_folder(self, self.fake, self.root, [reply])
+
+            # The holder dies: another process takes over within a few seconds, and replies keep landing.
+            os.kill(first, signal.SIGKILL)   # one of this test's own servers (it holds this test's folder)
+            living = [s for s in sessions if processes[s] != first]
+            self.assertTrue(await until(lambda: holder_pid(self.root) in [processes[s] for s in living], 5), holder_pid(self.root))
+            second = self.fake.add_reply(note['note_id'], message='And this')
+            self.assertTrue(await until((Path(note['folder']) / 'reply-2.png').exists, 5))
+            check_folder(self, self.fake, self.root, [reply, second])
+
+            # Each listening conversation sends its own listening polls, as before.
+            self.assertEqual(len(living), 3)
+            notes = [sent_note(self.fake, self.root, title=f'Question {n}')['note_id'] for n in range(len(living))]
+            waited = await asyncio.gather(*(s.call_tool('get_note_reply', {'note_id': n, 'wait_seconds': 2})
+                                            for s, n in zip(living, notes)))
+            self.assertEqual([w.structuredContent['status'] for w in waited], ['no_reply_yet'] * 3)
+            for note_id in notes:
+                polls = [r['query'] for r in self.fake.feed_requests() if r['query'].get('note_id') == note_id and r['query'].get('listen')]
+                self.assertEqual(polls, [{'after': '0', 'wait': '2', 'note_id': note_id, 'listen': 'true'}])
+
+    async def test_an_old_copy_beside_new_ones_loses_nothing_and_corrupts_nothing(self):
+        base = await asyncio.to_thread(base_code, self.directory)
+        if base is None:
+            self.skipTest(f'needs the history of commit {BASE_COMMIT}')
+        here = sent_note(self.fake, self.root)
+        elsewhere = [self.fake.add_note(f'Sent elsewhere {n}') for n in range(2)]   # not in the folder yet
+        async with contextlib.AsyncExitStack() as stack:
+            old = (await self.tool_process(stack, base / 'server.py'))[0]
+            new = [(await self.tool_process(stack))[0] for _ in range(2)]
+            self.assertTrue(await until(lambda: alive(holder_pid(self.root)), 10))
+            await asyncio.sleep(1)
+            expected = []
+            for round_ in range(4):
+                for note_id in [here['note_id'], *elsewhere]:
+                    expected.append(self.fake.add_reply(note_id, message=f'Round {round_}',
+                                                        photo=jpeg_header(64, 48) if round_ == 2 else None, capture='IMG_0001'))
+                await asyncio.sleep(0.3)
+            self.assertTrue(await until(lambda: len(list(self.root.glob('*/reply-*.png'))) == len(expected), 20),
+                            sorted(p.name for p in self.root.glob('*/reply-*')))
+            await asyncio.sleep(1.5)   # a late or second write would show now
+            check_folder(self, self.fake, self.root, expected)
+            for session in [old, *new]:
+                listed = await session.call_tool('list_note_replies', {})
+                self.assertEqual([r['reply_id'] for r in listed.structuredContent['replies']], [r['reply_id'] for r in expected])
+            self.assertLessEqual(self.fake.most_held, 2, 'the old copy\'s long poll and the holder\'s')
+            # Both kinds polled the feed while the replies came: the old copy (25 s) and the holder (50 s).
+            waits = {r['query'].get('wait') for r in self.fake.sync_requests() if r['path'] == '/v1/agent-notes/replies'}
+            self.assertLessEqual({'25', '50'}, waits)
+
+
+@unittest.skipUnless(os.environ.get('THOUGHTS_TEST_LOAD'), 'Set THOUGHTS_TEST_LOAD=1 to measure two minutes of folder sync')
+class FolderSyncLoadTest(unittest.TestCase):
+    """Requests of the folder sync per minute, for 1, 5 and 20 processes, base code against this code, with the
+    defaults the MCP servers use (no tool calls, nothing changing)."""
+
+    def test_requests_per_minute(self):
+        directory = Path(tempfile.mkdtemp(prefix='thoughts-sync-load-'))
+        self.addCleanup(shutil.rmtree, directory, True)
+        base = base_code(directory)
+        if base is None:
+            self.skipTest(f'needs the history of commit {BASE_COMMIT}')
+        rows = []
+        for count in (1, 5, 20):
+            runs = {}
+            for name, modules in (('base', base), ('new', HERE)):
+                fake = FakeThoughts()
+                self.addCleanup(fake.close)
+                root = directory / f'{name}-{count}' / 'agent-notes'
+                sent_note(fake, root, directory=directory)
+                started = time.monotonic()
+                runs[name] = (fake, started, sync_workers(self, fake, root, count, modules))
+            time.sleep(120)
+            row = [count]
+            for name, (fake, started, processes) in runs.items():
+                for process in processes:
+                    end_process(process)
+                times = [r['at'] - started for r in fake.sync_requests()]
+                row += [len([t for t in times if t < 60]), len([t for t in times if 60 <= t < 120]), fake.most_held]
+            rows.append(row)
+            print(f'{count:>3} processes: base {row[1]:>3} + {row[2]:>3} requests (minute 1 + 2), {row[3]:>2} long polls held; '
+                  f'new {row[4]:>3} + {row[5]:>3}, {row[6]:>2} held', file=sys.stderr, flush=True)
+        for row in rows:
+            self.assertEqual(row[6], 1)
+            self.assertLessEqual(abs(row[4] - rows[0][4]) + abs(row[5] - rows[0][5]), 2, rows)
 
 
 def stub_assets(name):

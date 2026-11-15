@@ -4,15 +4,19 @@
 #include "../shell/proposalauthoring.h"
 #include "../shell/thoughtscommandprotocol.h"
 #include "../shell/agentproposalparser.h"
+#include "../shell/proposaldecisions.h"
 #include "../shell/reviewdocumenttools.h"
 #include "../part/proposalhistory.h"
+#include "../part/projectconfiguration.h"
 #include "../part/proposalprovenance.h"
+#include "../part/sourceowner.h"
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QTemporaryDir>
 #include <QTest>
+#include <algorithm>
 #include <numeric>
 
 class ProposalAuthoringTest : public QObject {
@@ -1029,6 +1033,137 @@ private Q_SLOTS:
                  qPrintable(error));
         QVERIFY(get(b).contains(Card));
         QCOMPARE(get(root.filePath(".stage/docs-a/b.tex")), pendingB);
+    }
+    // 2026-11-14: a Project's default folder (.thoughts/projects/<hex>/default, or /documents
+    // before the rename) holds Library sources although it is inside the hidden .thoughts
+    // folder. A move into it is decided from either half, in the app and through
+    // decide-proposal, and withdrawn whole. Copies of the half elsewhere (a hidden staging
+    // copy, a snapshot or build/ copy inside the folder) are never taken for it.
+    void movesIntoAProjectDefaultFolder_data() {
+        QTest::addColumn<QString>("segment");
+        QTest::newRow("default") << "default";
+        QTest::newRow("documents (legacy)") << "documents";
+    }
+    void movesIntoAProjectDefaultFolder() {
+        QFETCH(QString, segment);
+        QTemporaryDir directory;
+        const QString root = QFileInfo(directory.path()).canonicalFilePath();
+        const QString folder = Thoughts::SourceOwner::defaultFolder(Thoughts::SourceOwner::projectHash("project-one"),
+            segment == QLatin1String("default") ? Thoughts::SourceOwner::DefaultSegment : Thoughts::SourceOwner::LegacyDefaultSegment);
+        QVERIFY(Thoughts::SourceOwner::isDefaultFolder(folder));
+        QVERIFY(QDir(root).mkpath("docs-a/tex/source"));
+        QVERIFY(QDir(root).mkpath(folder + "/tex/source"));
+        const QString a = root + "/docs-a/tex/source/a.tex", b = root + "/" + folder + "/tex/source/b.tex";
+        const QByteArray originalA = marked("docs-a/tex/source/a.tex", "\\documentclass{article}\n\\begin{document}\nIntro.\n\nThe answer.\n\nOutro.\n\\end{document}\n", 5);
+        QVERIFY2(originalA.contains("ReviewCardMaskStart"), originalA.constData());
+        const QByteArray originalB = "\\documentclass{article}\n\\begin{document}\nFirst.\n\nSecond.\n\\end{document}\n";
+        put(a, originalA); put(b, originalB);
+        // The Project's own default folder and docs-a are its folders, so Sync manages both sources.
+        QJsonObject project = Thoughts::ProjectConfiguration::empty(root, "project-one", "Project One");
+        QCOMPARE(Thoughts::ProjectConfiguration::defaultFolderPath(project), folder);
+        QJsonArray folders = project["source_folders"].toArray();
+        folders.append(QJsonObject{{"folder_id", QUuid::createUuid().toString(QUuid::WithoutBraces)}, {"path", "docs-a"},
+                                   {"document_id", QUuid::createUuid().toString(QUuid::WithoutBraces)}});
+        project.insert("source_folders", folders);
+        QVERIFY(Thoughts::ProjectConfiguration::save(Thoughts::ProjectConfiguration::path(root, "project-one"), project).isEmpty());
+        const auto move = [&] {
+            const auto moved = Thoughts::authorCardMove(root, moveRequest(b, 5), "mcp", movable("docs-a/tex/source/a.tex"));
+            const auto proposals = moved["proposals"].toArray();
+            return std::pair(proposals[0].toObject()["proposal_id"].toString(), proposals[1].toObject()["proposal_id"].toString());
+        };
+        const auto [cut, paste] = move();
+        QVERIFY(cut.endsWith(".cut")); QVERIFY(paste.endsWith(".paste"));
+        const QByteArray pendingA = get(a), pendingB = get(b);
+        QVERIFY(Thoughts::parseAgentProposals(b, QString::fromUtf8(pendingB)).proposal(paste));
+        const QByteArray movedB = QByteArray("\\documentclass{article}\n\\begin{document}\nFirst.\n\n")
+            + Thoughts::parseAgentProposals(b, QString::fromUtf8(pendingB)).proposal(paste)->replacement.toUtf8() + "Second.\n\\end{document}\n";
+        // Copies of the pending insertion that are not the Library's: a staging copy of the
+        // Library, a snapshot and a build copy inside the default folder.
+        const QStringList decoys{root + "/.thoughts-library-stage-test/" + folder + "/tex/source/b.tex", root + "/" + folder + "/.snapshots/b.tex",
+                                 root + "/" + folder + "/build/tex/source/b.tex", root + "/.thoughts/staging/" + folder + "/tex/source/b.tex"};
+        for (const QString &decoy : decoys) {
+            QVERIFY(QDir().mkpath(QFileInfo(decoy).path()));
+            put(decoy, pendingB);
+        }
+        const auto decoysUntouched = [&] {
+            return std::all_of(decoys.cbegin(), decoys.cend(), [&](const QString &decoy) { return get(decoy) == pendingB; });
+        };
+
+        // Each half, accepted and rejected; Undo brings the pending move back.
+        for (const bool fromCut : {true, false}) {
+            for (const QString action : {"accept", "disregard"}) {
+                const QString source = fromCut ? a : b;
+                QByteArray previous; QString after, error, code;
+                QList<Thoughts::AgentProposalSourceChange> others;
+                QVERIFY2(Thoughts::resolveLiveAgentProposedEdits(root, source, Thoughts::ProposalHistory::digest(get(source)), {fromCut ? cut : paste}, action,
+                                                                 &error, &previous, &after, &code, {}, &others),
+                         qPrintable(QString(fromCut ? "cut " : "paste ") + action + ": " + code + " " + error));
+                QCOMPARE(others.size(), 1);
+                QCOMPARE(others[0].path, QFileInfo(fromCut ? b : a).canonicalFilePath());
+                QVERIFY(!get(a).contains("agentProposedEdit")); QVERIFY(!get(b).contains("agentProposedEdit"));
+                if (action == QLatin1String("accept")) {
+                    QVERIFY(!get(a).contains(Card));
+                    QCOMPARE(get(b), movedB);
+                    QVERIFY(Thoughts::readReviewSourceAnchor(folder + "/tex/source/b.tex", get(b), Card).error.isEmpty());
+                } else {
+                    QCOMPARE(get(a), originalA); QCOMPARE(get(b), originalB);
+                }
+                QVERIFY(decoysUntouched());
+                QVERIFY2(Thoughts::restoreLiveAgentProposalSources(root, source, after, previous, others, &error), qPrintable(error));
+                QCOMPARE(get(a), pendingA); QCOMPARE(get(b), pendingB);
+            }
+        }
+
+        // decide-proposal (an editor integration) from the insertion half: both halves get claims.
+        const QString claims = root + "/state/claims.sqlite";
+        const auto pasteProposal = *Thoughts::parseAgentProposals(b, QString::fromUtf8(pendingB)).proposal(paste);
+        const QJsonObject decision{{"command", "decide-proposal"}, {"request_id", QUuid::createUuid().toString(QUuid::WithoutBraces)}, {"source", b},
+                                   {"expected_source_sha256", Thoughts::ProposalHistory::digest(pendingB)}, {"proposal_id", paste},
+                                   {"wrapper_sha256", Thoughts::ProposalDecisions::wrapperSha256(QString::fromUtf8(pendingB), pasteProposal)},
+                                   {"action", "accept"}, {"origin", "thoughtsctl"}};
+        const auto decided = Thoughts::ProposalDecisions::decideProposal(root, decision, claims);
+        QVERIFY2(decided["accepted"].toBool(), qPrintable(QJsonDocument(decided).toJson()));
+        QCOMPARE(decided["other_sources"].toArray().size(), 1);
+        QCOMPARE(decided["other_sources"].toArray()[0].toObject()["source"].toString(), QFileInfo(a).canonicalFilePath());
+        QVERIFY(!get(a).contains(Card)); QCOMPARE(get(b), movedB);
+        QStringList claimed;
+        for (const auto &claim : Thoughts::ProposalDecisions::storedClaims(claims))
+            claimed.append(claim["proposal_id"].toString() + ":" + claim["action"].toString() + ":" + claim["source_file"].toString());
+        claimed.sort();
+        QCOMPARE(claimed, QStringList({cut + ":accept:docs-a/tex/source/a.tex", paste + ":accept:" + folder + "/tex/source/b.tex"}));
+        QVERIFY(decoysUntouched());
+
+        // Withdrawing the removal half withdraws the insertion in the default folder too.
+        put(a, originalA); put(b, originalB);
+        const auto [cut2, paste2] = move();
+        QVERIFY(get(b).contains(paste2.toUtf8()));
+        auto withdraw = request(a, false); withdraw.insert("command", "remove-proposal"); withdraw.remove("replacement");
+        withdraw.insert("proposal_id", cut2);
+        const auto withdrawn = Thoughts::authorProposal(root, withdraw, "mcp");
+        QVERIFY2(withdrawn["accepted"].toBool(), qPrintable(QJsonDocument(withdrawn).toJson()));
+        QCOMPARE(withdrawn["withdrawn_proposal_ids"].toArray().size(), 2);
+        QCOMPARE(withdrawn["other_source"].toString(), QFileInfo(b).canonicalFilePath());
+        QCOMPARE(get(a), originalA); QCOMPARE(get(b), originalB);
+
+        // The insertion gone from the default folder: only copies remain, so the removal is not decided alone.
+        const auto [cut3, paste3] = move();
+        const QByteArray lonelyA = get(a), copyB = get(b);
+        put(b, originalB);
+        for (const QString &decoy : decoys) put(decoy, copyB);
+        QString error, code;
+        QVERIFY(!Thoughts::resolveLiveAgentProposedEdits(root, a, Thoughts::ProposalHistory::digest(lonelyA), {cut3}, "accept", &error, nullptr, nullptr, &code));
+        QCOMPARE(code, "move_incomplete");
+        QCOMPARE(get(a), lonelyA);
+        for (const QString &decoy : decoys) QCOMPARE(get(decoy), copyB);
+        // Pending in two default folders: refused as ambiguous.
+        put(b, copyB);
+        const QString other = Thoughts::SourceOwner::defaultFolder(Thoughts::SourceOwner::projectHash("project-two"), Thoughts::SourceOwner::DefaultSegment);
+        QVERIFY(QDir(root).mkpath(other + "/tex/source"));
+        put(root + "/" + other + "/tex/source/b.tex", copyB);
+        QVERIFY(!Thoughts::resolveLiveAgentProposedEdits(root, a, Thoughts::ProposalHistory::digest(lonelyA), {cut3}, "accept", &error, nullptr, nullptr, &code));
+        QCOMPARE(code, "move_ambiguous");
+        QCOMPARE(get(a), lonelyA);
+        Q_UNUSED(paste3);
     }
     void movesWithinOneSourceAndInMarkdown_data() {
         QTest::addColumn<QString>("name"); QTest::addColumn<QByteArray>("text"); QTest::addColumn<int>("answer"); QTest::addColumn<int>("line");

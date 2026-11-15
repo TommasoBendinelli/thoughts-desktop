@@ -79,13 +79,19 @@ def private_patterns(path: str | os.PathLike | None = None) -> dict[str, bytes]:
     return patterns
 
 
-def accepted_patterns(path: str | os.PathLike | None = None) -> list[re.Pattern[bytes]]:
-    """Generic hits the owner accepts: one regular expression per line, # starts a comment."""
+def accepted_lines(path: str | os.PathLike | None = None) -> list[str]:
+    """Generic hits the owner accepts: one regular expression per line, # starts a comment.
+    A release that scans on a builder copies these lines there (THOUGHTS_RELEASE_ACCEPTED)."""
     file = Path(path or os.environ.get("THOUGHTS_RELEASE_ACCEPTED") or ACCEPTED_FILE)
     if not file.is_file():
         return []
     lines = (line.strip() for line in file.read_text(encoding="utf-8").splitlines())
-    return [re.compile(line.encode()) for line in lines if line and not line.startswith("#")]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def accepted_patterns(path: str | os.PathLike | None = None) -> list[re.Pattern[bytes]]:
+    """Generic hits the owner accepts, compiled (see accepted_lines)."""
+    return [re.compile(line.encode()) for line in accepted_lines(path)]
 
 
 def scan_bytes(data: bytes, label: str, patterns: dict[str, bytes]) -> list[Hit]:

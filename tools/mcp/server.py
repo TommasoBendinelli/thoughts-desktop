@@ -37,11 +37,14 @@ from conversation_identity import (  # noqa: E402
 
 # Background reply watcher (agent_notes.watch_loop) in a daemon thread: a blocking long-poll
 # never holds up the event loop or the process exit; the stop event ends it at shutdown.
+# Of all the MCP servers on this Mac only one syncs the notes folder at a time (the holder of
+# its .sync.lock); in the others this thread only tries that lock, without any request.
 _reply_watcher: dict = {"thread": None, "stop": threading.Event()}
 
 
 def ensure_reply_watcher() -> None:
-    """Write phone replies into the folder while this process lives and a note there is < 24 h old."""
+    """Keep phone replies coming into the folder while this process lives and a note there is < 24 h old:
+    this process syncs the folder when no other one does, and takes over when the one that does ends."""
     thread = _reply_watcher["thread"]
     if (thread is not None and thread.is_alive()) or _reply_watcher["stop"].is_set():
         return

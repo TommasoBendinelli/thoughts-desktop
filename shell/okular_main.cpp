@@ -13,6 +13,7 @@
 #include "aboutdata.h"
 #include "shell.h"
 #include "shellutils.h"
+#include "thoughtspagelink.h"
 #include <KLocalizedString>
 #include <KWindowSystem>
 #include <QApplication>
@@ -295,6 +296,23 @@ static void showReviewCardWhenReady(const QString &cardId, int attempts = 0)
     }
 }
 
+// Opens a page link (thoughts://open/document/...) once the first window exists, as
+// showReviewCardWhenReady does. Always from the event loop: a message box about the link
+// must not run inside the file-open event that brought it.
+static void openPageLinkWhenReady(const QUrl &url, int attempts = 0)
+{
+    const bool hasShell = std::any_of(QApplication::topLevelWidgets().cbegin(), QApplication::topLevelWidgets().cend(), [](QWidget *widget) {
+        return qobject_cast<Shell *>(widget);
+    });
+    if (hasShell && attempts > 0) {
+        Shell::openPageLink(url);
+    } else if (attempts < 300) {
+        QTimer::singleShot(attempts == 0 ? 0 : 100, qApp, [url, attempts] {
+            openPageLinkWhenReady(url, attempts + 1);
+        });
+    }
+}
+
 bool FileOpenEventHandler::eventFilter(QObject *object, QEvent *event)
 {
     if (event->type() != QEvent::FileOpen) {
@@ -311,6 +329,11 @@ bool FileOpenEventHandler::eventFilter(QObject *object, QEvent *event)
     const QJsonObject agentNotes = agentNotesRequestFromUrl(requestedUrl);
     if (!agentNotes.isEmpty()) {
         showAgentNotesWhenReady(agentNotes);
+        return true;
+    }
+    if (Thoughts::isPageLinkUrl(requestedUrl)) {
+        // Valid or not: an invalid page link says so.
+        openPageLinkWhenReady(requestedUrl);
         return true;
     }
     const QUrl openUrl = resolvedExternalOpenUrl(requestedUrl, ShellUtils::docsRoot());

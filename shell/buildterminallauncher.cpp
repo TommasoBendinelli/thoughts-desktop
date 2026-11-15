@@ -61,7 +61,7 @@ Write-Host "%4 (exit $ExitCode)."
 QString powerShellWatcher(const QString &watcherArguments)
 {
     return QStringLiteral(R"(    if (-not $env:THOUGHTS_TOKEN) {
-        Write-Host 'Could not read the source-publisher credential for the Thoughts server from Windows Credential Manager (thoughts-server/thoughts-source-sync).'
+        Write-Host 'Could not read the source-publisher credential for the server from Windows Credential Manager (thoughts-server/thoughts-source-sync).'
         $ExitCode = 1
     } else {
         & %1
@@ -189,7 +189,7 @@ print -r -- "$$" > "${ACTIVE_PID}.tmp"
 TOKEN=$(/usr/bin/security find-generic-password -s thoughts-server -a thoughts-source-sync -w)
 KEYCHAIN_EXIT=$?
 if [[ ${KEYCHAIN_EXIT} -ne 0 || -z "${TOKEN}" ]]; then
-    print -r -- "Could not read the source-publisher credential for the Thoughts server from macOS Keychain."
+    print -r -- "Could not read the source-publisher credential for the server from macOS Keychain."
     EXIT_CODE=1
 else
     export THOUGHTS_TOKEN="${TOKEN}"
@@ -253,7 +253,7 @@ print -r -- "$$" > "${ACTIVE_PID}.tmp"
 TOKEN=$(/usr/bin/security find-generic-password -s thoughts-server -a thoughts-source-sync -w)
 KEYCHAIN_EXIT=$?
 if [[ ${KEYCHAIN_EXIT} -ne 0 || -z "${TOKEN}" ]]; then
-    print -r -- "Could not read the source-publisher credential for the Thoughts server from macOS Keychain."
+    print -r -- "Could not read the source-publisher credential for the server from macOS Keychain."
     EXIT_CODE=1
 else
     export THOUGHTS_TOKEN="${TOKEN}"
@@ -322,7 +322,7 @@ bool BuildTerminalLauncher::openRuntime(const QString &runDirectory,
     Q_UNUSED(watcherExecutable)
     Q_UNUSED(serverUrl)
     if (error) {
-        *error = i18n("The server build output is available through Terminal.app on macOS only.");
+        *error = i18n("Server build output is available through Terminal.app on macOS only.");
     }
     return false;
 #else
@@ -341,7 +341,7 @@ bool BuildTerminalLauncher::openRuntime(const QString &runDirectory,
     }
     if (!localLog && Thoughts::ServerAddress::normalized(serverUrl).isEmpty()) {
         if (error) {
-            *error = i18n("The Thoughts server URL is invalid.");
+            *error = i18n("The build server URL is invalid.");
         }
         return false;
     }
@@ -439,7 +439,7 @@ bool BuildTerminalLauncher::open(const QString &runDirectory, const QString &wat
 {
     if (!QFileInfo::exists(QDir(runDirectory).filePath(QStringLiteral("request.json")))) {
         if (error) {
-            *error = i18n("The local build run is unavailable.");
+            *error = i18n("The local record of this server build is unavailable.");
         }
         return false;
     }
