@@ -82,7 +82,11 @@ bool updateLevels(const QString &path, const QList<QPair<QString, QString>> &lev
 QJsonObject search(const Library &library, const QJsonObject &request, const QDateTime &now = QDateTime::currentDateTimeUtc());
 QJsonObject profile(const Library &library, const QJsonObject &request, const Levels &levels,
                     const QDateTime &now = QDateTime::currentDateTimeUtc());
-// Reads the index and the levels and answers @p command (search-review-cards or knowledge-profile).
+// The profile as text to paste into any chat app before asking about the topic: what the user
+// knows about it, and (with "learner") what all their cards say about them in general.
+QString agentContext(const QJsonObject &profileResult);
+// Reads the index and the levels and answers @p command (search-review-cards, knowledge-profile
+// or agent-context, which is knowledge-profile with "learner" on by default plus "text").
 QJsonObject run(const QString &command, const QJsonObject &request, const QString &databasePath, const QString &docsRoot,
                 const QString &levelsFile, const QDateTime &now = QDateTime::currentDateTimeUtc());
 // Reads the index into @p library; a failure carries error_code and message, as run() returns them.

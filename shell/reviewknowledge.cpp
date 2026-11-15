@@ -1039,15 +1039,389 @@ QJsonObject search(const Library &library, const QJsonObject &request, const QDa
     return result;
 }
 
+namespace
+{
+// How well one card's answer is known: solid, shaky, unknown (not understood) or unreviewed.
+struct Assessment {
+    QString level;
+    QStringList reason;
+};
+
+Assessment assess(const ReviewCard &card, const QHash<QString, QString> &levelOf, const QDateTime &now)
+{
+    const Schedule schedule = scheduleOf(card, now);
+    Assessment result;
+    if (!card.wasAnswered()) {
+        result.level = QStringLiteral("unreviewed");
+        result.reason.append(QStringLiteral("never answered"));
+    } else {
+        // Newest first: each answer at the lowest level of its mapped tags.
+        struct Rated { double value; QStringList tags; };
+        QList<Rated> rated;
+        const auto answers = card.answers();
+        for (auto answer = answers.crbegin(); answer != answers.crend(); ++answer) {
+            std::optional<double> value;
+            QStringList shown;
+            for (const QString &tag : card.tagsOfEvent(*answer)) {
+                const QString tagLevel = levelOf.value(tag.toCaseFolded());
+                if (tagLevel.isEmpty() || tagLevel == QLatin1String("ignore")) continue;
+                value = std::min(value.value_or(1.0), levelValue(tagLevel));
+                shown.append(tagLabel(tag));
+            }
+            if (value) rated.append({*value, shown});
+        }
+        double score = 0;
+        if (rated.isEmpty()) {
+            // Answered, but never with a tag that says how well: only the interval chosen tells.
+            score = card.schedule.intervalDays >= 21 && card.schedule.lapseCount == 0 ? 0.8 : 0.5;
+            result.reason.append(QStringLiteral("%1 answer%2, none with an understanding tag").arg(answers.size()).arg(answers.size() == 1 ? QString() : QStringLiteral("s")));
+        } else {
+            // The latest answer weighs most: each older one half as much as the next.
+            double weight = 1, total = 0;
+            for (const auto &answer : std::as_const(rated)) {
+                score += weight * answer.value;
+                total += weight;
+                weight /= 2;
+            }
+            score /= total;
+            QStringList shown;
+            for (int i = 0; i < rated.size() && i < 3; ++i) shown.append(rated.at(i).tags.join(QLatin1Char('+')));
+            result.reason.append(rated.size() == 1 ? QStringLiteral("last answer: %1").arg(shown.first())
+                                                   : QStringLiteral("last %1 answers: %2").arg(shown.size()).arg(shown.join(QStringLiteral(", "))));
+        }
+        if (card.schedule.lapseCount > 0) score -= 0.1 * std::min(card.schedule.lapseCount, 3);
+        if (card.schedule.intervalDays >= 30) score += 0.1;
+        // Long past due: it may have faded since.
+        if (schedule.overdueDays > std::max(7, card.schedule.intervalDays)) score -= 0.15;
+        result.level = score >= 0.75 ? QStringLiteral("solid") : score >= 0.4 ? QStringLiteral("shaky") : QStringLiteral("unknown");
+        if (schedule.retained) result.reason.append(QStringLiteral("never asked again"));
+        else if (card.schedule.intervalDays > 0) result.reason.append(QStringLiteral("interval %1").arg(daysText(card.schedule.intervalDays)));
+        if (card.schedule.lapseCount > 0) result.reason.append(QStringLiteral("%1 lapse%2").arg(card.schedule.lapseCount).arg(card.schedule.lapseCount == 1 ? QString() : QStringLiteral("s")));
+    }
+    if (schedule.overdueDays > 0) result.reason.append(QStringLiteral("overdue %1 d").arg(schedule.overdueDays));
+    if (schedule.retired) result.reason.append(QStringLiteral("retired"));
+    return result;
+}
+
+// What the tags outside the knowledge levels say: the tag groups such as Interest, Effort or
+// Material, by the name each tag is shown under now.
+struct SignalGroups {
+    QHash<QString, QString> groupOf;     // case-folded tag -> group name
+    QHash<QString, QString> nameOf;      // case-folded tag -> the tag as the group spells it
+    QHash<QString, QStringList> scaleOf; // group name -> its slider steps, lowest first
+    QStringList order;                   // group names in the user's order
+};
+
+SignalGroups signalGroups(const Library &library, const QHash<QString, QString> &levelOf)
+{
+    SignalGroups result;
+    const auto knowledgeTag = [&levelOf](const QString &tag) {
+        const QString level = levelOf.value(tag.toCaseFolded());
+        return !level.isEmpty() && level != QLatin1String("ignore");
+    };
+    for (const auto &group : library.groups) {
+        // Groups that say how well the answer is known (Understanding, Recall) are the knowledge
+        // levels' job, including their tags without a level.
+        if (std::any_of(group.tags.cbegin(), group.tags.cend(), knowledgeTag) || std::any_of(group.scale.cbegin(), group.scale.cend(), knowledgeTag)) continue;
+        bool added = false;
+        for (const QString &tag : group.scale + group.tags) {
+            const QString key = tag.toCaseFolded();
+            if (result.groupOf.contains(key)) continue;
+            result.groupOf.insert(key, group.name);
+            result.nameOf.insert(key, tagLabel(tag));
+            added = true;
+        }
+        if (!added) continue;
+        if (!group.scale.isEmpty()) result.scaleOf.insert(group.name, group.scale);
+        if (!result.order.contains(group.name)) result.order.append(group.name);
+    }
+    return result;
+}
+
+// The signal tags of the card's latest answer that has any, as (group, tag) pairs.
+QList<QPair<QString, QString>> signalsOf(const ReviewCard &card, const SignalGroups &groups)
+{
+    const auto answers = card.answers();
+    for (auto answer = answers.crbegin(); answer != answers.crend(); ++answer) {
+        QList<QPair<QString, QString>> found;
+        for (const QString &tag : card.tagsOfEvent(*answer)) {
+            const QString group = groups.groupOf.value(tag.toCaseFolded());
+            if (!group.isEmpty()) found.append({group, groups.nameOf.value(tag.toCaseFolded())});
+        }
+        if (!found.isEmpty()) return found;
+    }
+    return {};
+}
+
+// Counts of each signal tag over some cards, per group.
+struct SignalTally {
+    QHash<QString, QHash<QString, int>> counts;
+
+    void add(const QList<QPair<QString, QString>> &signals)
+    {
+        for (const auto &[group, tag] : signals) ++counts[group][tag];
+    }
+    bool isEmpty() const { return counts.isEmpty(); }
+    // The step at the cards' mean position for a slider, the most frequent tag otherwise.
+    QString typical(const QString &group, const SignalGroups &groups) const
+    {
+        const auto tags = counts.value(group);
+        const QStringList scale = groups.scaleOf.value(group);
+        double sum = 0;
+        int n = 0;
+        for (auto it = tags.cbegin(); it != tags.cend(); ++it) {
+            const qsizetype position = scale.indexOf(it.key());
+            if (position < 0) continue;
+            sum += double(position) * it.value();
+            n += it.value();
+        }
+        if (n) return scale.at(qsizetype(std::lround(sum / n)));
+        QString best;
+        int most = 0;
+        for (auto it = tags.cbegin(); it != tags.cend(); ++it)
+            if (it.value() > most || (it.value() == most && it.key() < best)) best = it.key(), most = it.value();
+        return best;
+    }
+    QJsonObject json(const SignalGroups &groups) const
+    {
+        QJsonObject result;
+        for (const QString &group : groups.order) {
+            if (!counts.contains(group)) continue;
+            QJsonObject tags;
+            for (auto it = counts[group].cbegin(); it != counts[group].cend(); ++it) tags.insert(it.key(), it.value());
+            result.insert(group, QJsonObject{{QStringLiteral("typical"), typical(group, groups)}, {QStringLiteral("counts"), tags}});
+        }
+        return result;
+    }
+    // "Interest: mostly Interesting (Interesting 3, Somewhat 1)", one line per group.
+    QStringList lines(const SignalGroups &groups) const
+    {
+        QStringList result;
+        for (const QString &group : groups.order) {
+            if (!counts.contains(group)) continue;
+            QList<QPair<int, QString>> sorted;
+            for (auto it = counts[group].cbegin(); it != counts[group].cend(); ++it) sorted.append({it.value(), it.key()});
+            std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+            QStringList shown;
+            for (const auto &[count, tag] : sorted) shown.append(QStringLiteral("%1 %2").arg(tag).arg(count));
+            result.append(QStringLiteral("%1: typically %2 (%3)").arg(group, typical(group, groups), shown.join(QStringLiteral(", "))));
+        }
+        return result;
+    }
+};
+
+QString joinedSignals(const QList<QPair<QString, QString>> &signals, const QString &group)
+{
+    QStringList tags;
+    for (const auto &[name, tag] : signals)
+        if (name == group) tags.append(tag);
+    return tags.join(QLatin1Char('+'));
+}
+
+// Calibration: how sure the user was before seeing the answer (a "Confidence" slider, lowest step
+// first) against how well they turned out to know it. A gap of half the range or more counts as
+// over- or underconfident, as in Lee et al., CHI 2025: predicted minus actual.
+struct CalibrationTally {
+    QStringList overconfident, underconfident;
+    int calibrated = 0;
+
+    static QString group(const SignalGroups &groups)
+    {
+        for (const QString &name : groups.order)
+            if (name.compare(QLatin1String("Confidence"), Qt::CaseInsensitive) == 0 && groups.scaleOf.value(name).size() > 1) return name;
+        return {};
+    }
+    void add(const QList<QPair<QString, QString>> &signals, const QString &level, const QString &question, const SignalGroups &groups)
+    {
+        const QString name = group(groups);
+        if (name.isEmpty() || level == QLatin1String("unreviewed")) return;
+        const QStringList scale = groups.scaleOf.value(name);
+        for (const auto &[signalGroup, tag] : signals) {
+            if (signalGroup != name) continue;
+            const qsizetype step = scale.indexOf(tag);
+            if (step < 0) continue;
+            const double gap = double(step) / double(scale.size() - 1) - levelValue(level);
+            if (gap >= 0.5) overconfident.append(question);
+            else if (gap <= -0.5) underconfident.append(question);
+            else ++calibrated;
+            return;
+        }
+    }
+    int total() const { return int(overconfident.size() + underconfident.size()) + calibrated; }
+    QJsonObject json() const
+    {
+        return QJsonObject{{QStringLiteral("cards"), total()}, {QStringLiteral("calibrated"), calibrated},
+                           {QStringLiteral("overconfident"), QJsonArray::fromStringList(overconfident)},
+                           {QStringLiteral("underconfident"), QJsonArray::fromStringList(underconfident)}};
+    }
+    QStringList lines(int limit) const
+    {
+        if (total() == 0) return {};
+        QStringList result{QStringLiteral("Calibration (confidence before seeing the answer vs. the answer, %1 card%2): %3 overconfident, %4 underconfident, %5 about right.")
+                               .arg(total()).arg(total() == 1 ? QString() : QStringLiteral("s")).arg(overconfident.size()).arg(underconfident.size()).arg(calibrated)};
+        if (!overconfident.isEmpty()) result.append(QStringLiteral("Overconfident on: ") + overconfident.mid(0, limit).join(QStringLiteral("; ")));
+        if (!underconfident.isEmpty()) result.append(QStringLiteral("Underconfident on: ") + underconfident.mid(0, limit).join(QStringLiteral("; ")));
+        return result;
+    }
+};
+
+// How many questions a summary line lists: enough for an agent to see every weak point of a topic.
+constexpr int summaryListLimit = 10;
+
+QString cut(const QString &text, int length)
+{
+    const QString line = text.simplified();
+    return line.size() > length ? line.left(length - 2).trimmed() + QStringLiteral("…") : line;
+}
+
+// What all of the user's cards say about them as a learner, for topics no card covers yet: how
+// much they know and where, what they find interesting, how they study, and what they liked and
+// disliked in answers. Plain-language lines go to @p lines.
+QJsonObject learnerOverview(const Library &library, const QList<Entry> &all, const QHash<QString, QString> &levelOf, const SignalGroups &groups,
+                            const QDateTime &now, QStringList *lines)
+{
+    struct Document {
+        QString name, project;
+        QHash<QString, int> levels;
+        SignalTally signals;
+        int cards = 0;
+    };
+    QHash<QString, int> counts;
+    QHash<QString, Document> documents;
+    QStringList documentOrder;
+    SignalTally signals;
+    CalibrationTally calibration;
+    struct Example { QDateTime at; QString question; QString document; };
+    QList<Example> solid, weak;
+    for (const auto &entry : all) {
+        const ReviewCard &card = *entry.card;
+        const Assessment assessment = assess(card, levelOf, now);
+        ++counts[assessment.level];
+        const auto cardSignals = signalsOf(card, groups);
+        signals.add(cardSignals);
+        calibration.add(cardSignals, assessment.level, shortQuestion(card.question()), groups);
+        const QString name = entry.documentName.isEmpty() ? entry.pdfFilename : entry.documentName;
+        if (!documents.contains(name)) documentOrder.append(name);
+        Document &document = documents[name];
+        document.name = name;
+        document.project = entry.project;
+        ++document.cards;
+        ++document.levels[assessment.level];
+        document.signals.add(cardSignals);
+        const Example example{card.schedule.lastReviewedAt, shortQuestion(card.question()), name};
+        if (assessment.level == QLatin1String("solid")) solid.append(example);
+        else if (assessment.level == QLatin1String("unknown") || assessment.level == QLatin1String("shaky")) weak.append(example);
+    }
+    const auto newestFirst = [](const Example &a, const Example &b) {
+        if (a.at.isValid() != b.at.isValid()) return a.at.isValid();
+        return a.at > b.at;
+    };
+    std::stable_sort(solid.begin(), solid.end(), newestFirst);
+    std::stable_sort(weak.begin(), weak.end(), newestFirst);
+    std::stable_sort(documentOrder.begin(), documentOrder.end(), [&documents](const QString &a, const QString &b) {
+        return documents.value(a).cards > documents.value(b).cards;
+    });
+
+    const QStringList classes{QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("unreviewed")};
+    const auto mostly = [&classes](const QHash<QString, int> &levels) {
+        QString best;
+        int most = 0;
+        for (const QString &name : classes)
+            if (levels.value(name) > most) best = name, most = levels.value(name);
+        return best == QLatin1String("unknown") ? QStringLiteral("not understood") : best == QLatin1String("unreviewed") ? QStringLiteral("not yet reviewed") : best;
+    };
+
+    QJsonObject countsJson;
+    for (const QString &name : classes) countsJson.insert(name, counts.value(name));
+    QJsonArray documentsJson;
+    QStringList documentLines;
+    for (int i = 0; i < documentOrder.size() && i < 8; ++i) {
+        const Document &document = documents.value(documentOrder.at(i));
+        QJsonObject item{{QStringLiteral("document"), document.name}, {QStringLiteral("cards"), document.cards}};
+        if (!document.project.isEmpty()) item.insert(QStringLiteral("project"), document.project);
+        for (const QString &name : classes) item.insert(name, document.levels.value(name));
+        if (!document.signals.isEmpty()) item.insert(QStringLiteral("signals"), document.signals.json(groups));
+        documentsJson.append(item);
+        QString line = QStringLiteral("%1 (%2 card%3, mostly %4").arg(document.name).arg(document.cards).arg(document.cards == 1 ? QString() : QStringLiteral("s"), mostly(document.levels));
+        for (const QString &group : groups.order)
+            if (document.signals.counts.contains(group)) line += QStringLiteral(", %1 %2").arg(group.toLower(), document.signals.typical(group, groups));
+        documentLines.append(line + QLatin1Char(')'));
+    }
+    const auto questionsOf = [](const QList<Example> &examples) {
+        QJsonArray list;
+        for (int i = 0; i < examples.size() && i < 5; ++i)
+            list.append(QJsonObject{{QStringLiteral("question"), examples.at(i).question}, {QStringLiteral("document"), examples.at(i).document}});
+        return list;
+    };
+
+    // Answer feedback: the passages of answers the user liked or disliked, newest first.
+    int liked = 0, disliked = 0;
+    QList<QJsonObject> feedback;
+    for (auto it = library.feedback.cbegin(); it != library.feedback.cend(); ++it)
+        for (const auto &record : it.value()) {
+            if (record.value(QStringLiteral("deleted")).toBool()) continue;
+            (record.value(QStringLiteral("polarity")).toString() == QLatin1String("negative") ? disliked : liked) += 1;
+            feedback.append(record);
+        }
+    std::sort(feedback.begin(), feedback.end(), [](const QJsonObject &a, const QJsonObject &b) {
+        return a.value(QStringLiteral("updated_at")).toString() > b.value(QStringLiteral("updated_at")).toString();
+    });
+    QJsonArray feedbackJson;
+    QStringList feedbackLines;
+    for (int i = 0; i < feedback.size() && i < 3; ++i) {
+        const QJsonObject &record = feedback.at(i);
+        const QString polarity = record.value(QStringLiteral("polarity")).toString() == QLatin1String("negative") ? QStringLiteral("disliked") : QStringLiteral("liked");
+        const QString quote = cut(record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString(), 140);
+        const QString comment = cut(record.value(QStringLiteral("comment")).toString(), 160);
+        QJsonObject item{{QStringLiteral("polarity"), polarity}, {QStringLiteral("quote"), quote}};
+        if (!comment.isEmpty()) item.insert(QStringLiteral("comment"), comment);
+        feedbackJson.append(item);
+        feedbackLines.append(comment.isEmpty() ? QStringLiteral("%1 \"%2\"").arg(polarity, quote) : QStringLiteral("%1 \"%2\" (%3)").arg(polarity, quote, comment));
+    }
+
+    const int total = int(all.size());
+    if (total == 0) {
+        lines->append(QStringLiteral("The user has no review cards yet, so nothing is known about them as a learner."));
+    } else {
+        lines->append(QStringLiteral("In general (all %1 review card%2): %3 solid, %4 shaky, %5 not understood, %6 not yet reviewed.")
+                          .arg(total).arg(total == 1 ? QString() : QStringLiteral("s")).arg(counts.value(QStringLiteral("solid")))
+                          .arg(counts.value(QStringLiteral("shaky"))).arg(counts.value(QStringLiteral("unknown"))).arg(counts.value(QStringLiteral("unreviewed"))));
+        lines->append(QStringLiteral("Studied: ") + documentLines.join(QStringLiteral("; ")));
+        for (const QString &line : signals.lines(groups)) lines->append(line);
+        lines->append(calibration.lines(5));
+        QStringList knows, struggles;
+        for (int i = 0; i < solid.size() && i < 3; ++i) knows.append(solid.at(i).question);
+        for (int i = 0; i < weak.size() && i < 3; ++i) struggles.append(weak.at(i).question);
+        if (!knows.isEmpty()) lines->append(QStringLiteral("Knows well: ") + knows.join(QStringLiteral("; ")));
+        if (!struggles.isEmpty()) lines->append(QStringLiteral("Struggles with: ") + struggles.join(QStringLiteral("; ")));
+        if (liked + disliked > 0)
+            lines->append(QStringLiteral("Answer feedback: liked %1 passage%2, disliked %3; latest: %4").arg(liked).arg(liked == 1 ? QString() : QStringLiteral("s"))
+                              .arg(disliked).arg(feedbackLines.join(QStringLiteral("; "))));
+    }
+    return QJsonObject{{QStringLiteral("cards"), total}, {QStringLiteral("counts"), countsJson}, {QStringLiteral("documents"), documentsJson},
+                       {QStringLiteral("signals"), signals.json(groups)}, {QStringLiteral("calibration"), calibration.json()},
+                       {QStringLiteral("knows_well"), questionsOf(solid)},
+                       {QStringLiteral("struggles_with"), questionsOf(weak)},
+                       {QStringLiteral("answer_feedback"), QJsonObject{{QStringLiteral("liked"), liked}, {QStringLiteral("disliked"), disliked},
+                                                                       {QStringLiteral("latest"), feedbackJson}}}};
+}
+}
+
 QJsonObject profile(const Library &library, const QJsonObject &request, const Levels &levels, const QDateTime &now)
 {
     QString problem;
     QString topic;
     QJsonObject searchRequest;
     int limit = defaultProfileLimit;
-    if (!onlyKeys(request, {QStringLiteral("topic"), QStringLiteral("project"), QStringLiteral("document"), QStringLiteral("limit")}, &problem)
+    std::optional<bool> learner;
+    if (!onlyKeys(request, {QStringLiteral("topic"), QStringLiteral("project"), QStringLiteral("document"), QStringLiteral("limit"), QStringLiteral("learner")}, &problem)
         || !optionalString(request, QStringLiteral("topic"), &topic, &problem) || !optionalLimit(request, &limit, &problem))
         return error(QStringLiteral("invalid_request"), problem);
+    if (request.contains(QStringLiteral("learner"))) {
+        bool value = false;
+        if (!optionalBool(request, QStringLiteral("learner"), &value, &problem)) return error(QStringLiteral("invalid_request"), problem);
+        learner = value;
+    }
     if (topic.isEmpty()) return error(QStringLiteral("invalid_request"), QStringLiteral("topic must name what to profile, for example \"GRPO advantage\"."));
     searchRequest.insert(QStringLiteral("query"), topic);
     for (const QString &key : {QStringLiteral("project"), QStringLiteral("document")})
@@ -1081,69 +1455,34 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
         for (const QString &tag : understanding ? group.tags : group.scale)
             if (!levelOf.contains(tag.toCaseFolded()) && !unmapped.contains(tagLabel(tag))) unmapped.append(tagLabel(tag));
     }
+    // Interest, Effort and the other groups: what the user said besides how well they know it.
+    const SignalGroups groups = signalGroups(library, levelOf);
+    unmapped.removeIf([&groups](const QString &tag) { return groups.groupOf.contains(tag.toCaseFolded()) && groups.scaleOf.contains(groups.groupOf.value(tag.toCaseFolded())); });
 
     const QStringList classes{QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("unreviewed")};
     QHash<QString, QJsonArray> byClass;
     QHash<QString, QStringList> questions;
+    SignalTally topicSignals;
+    CalibrationTally topicCalibration;
     for (const auto &entry : std::as_const(entries)) {
         const ReviewCard &card = *entry.card;
-        const Schedule schedule = scheduleOf(card, now);
-        QString level;
-        QStringList reason;
-        if (!card.wasAnswered()) {
-            level = QStringLiteral("unreviewed");
-            reason.append(QStringLiteral("never answered"));
-        } else {
-            // Newest first: each answer at the lowest level of its mapped tags.
-            struct Rated { double value; QStringList tags; };
-            QList<Rated> rated;
-            const auto answers = card.answers();
-            for (auto answer = answers.crbegin(); answer != answers.crend(); ++answer) {
-                std::optional<double> value;
-                QStringList shown;
-                for (const QString &tag : card.tagsOfEvent(*answer)) {
-                    const QString tagLevel = levelOf.value(tag.toCaseFolded());
-                    if (tagLevel.isEmpty() || tagLevel == QLatin1String("ignore")) continue;
-                    value = std::min(value.value_or(1.0), levelValue(tagLevel));
-                    shown.append(tagLabel(tag));
-                }
-                if (value) rated.append({*value, shown});
-            }
-            double score = 0;
-            if (rated.isEmpty()) {
-                // Answered, but never with a tag that says how well: only the interval chosen tells.
-                score = card.schedule.intervalDays >= 21 && card.schedule.lapseCount == 0 ? 0.8 : 0.5;
-                reason.append(QStringLiteral("%1 answer%2, none with an understanding tag").arg(answers.size()).arg(answers.size() == 1 ? QString() : QStringLiteral("s")));
-            } else {
-                // The latest answer weighs most: each older one half as much as the next.
-                double weight = 1, total = 0;
-                for (const auto &answer : std::as_const(rated)) {
-                    score += weight * answer.value;
-                    total += weight;
-                    weight /= 2;
-                }
-                score /= total;
-                QStringList shown;
-                for (int i = 0; i < rated.size() && i < 3; ++i) shown.append(rated.at(i).tags.join(QLatin1Char('+')));
-                reason.append(rated.size() == 1 ? QStringLiteral("last answer: %1").arg(shown.first())
-                                                : QStringLiteral("last %1 answers: %2").arg(shown.size()).arg(shown.join(QStringLiteral(", "))));
-            }
-            if (card.schedule.lapseCount > 0) score -= 0.1 * std::min(card.schedule.lapseCount, 3);
-            if (card.schedule.intervalDays >= 30) score += 0.1;
-            // Long past due: it may have faded since.
-            if (schedule.overdueDays > std::max(7, card.schedule.intervalDays)) score -= 0.15;
-            level = score >= 0.75 ? QStringLiteral("solid") : score >= 0.4 ? QStringLiteral("shaky") : QStringLiteral("unknown");
-            if (schedule.retained) reason.append(QStringLiteral("never asked again"));
-            else if (card.schedule.intervalDays > 0) reason.append(QStringLiteral("interval %1").arg(daysText(card.schedule.intervalDays)));
-            if (card.schedule.lapseCount > 0) reason.append(QStringLiteral("%1 lapse%2").arg(card.schedule.lapseCount).arg(card.schedule.lapseCount == 1 ? QString() : QStringLiteral("s")));
-        }
-        if (schedule.overdueDays > 0) reason.append(QStringLiteral("overdue %1 d").arg(schedule.overdueDays));
-        if (schedule.retired) reason.append(QStringLiteral("retired"));
+        const Assessment assessment = assess(card, levelOf, now);
         QJsonObject item{{QStringLiteral("card_id"), card.id()}, {QStringLiteral("question"), card.question()},
-                         {QStringLiteral("document"), entry.documentName}, {QStringLiteral("reason"), reason.join(QStringLiteral("; "))}};
+                         {QStringLiteral("document"), entry.documentName}, {QStringLiteral("reason"), assessment.reason.join(QStringLiteral("; "))}};
         if (!entry.project.isEmpty()) item.insert(QStringLiteral("project"), entry.project);
-        byClass[level].append(item);
-        questions[level].append(shortQuestion(card.question()));
+        const auto cardSignals = signalsOf(card, groups);
+        topicCalibration.add(cardSignals, assessment.level, shortQuestion(card.question()), groups);
+        if (!cardSignals.isEmpty()) {
+            QJsonObject signalsJson;
+            for (const QString &group : groups.order) {
+                const QString tags = joinedSignals(cardSignals, group);
+                if (!tags.isEmpty()) signalsJson.insert(group, tags);
+            }
+            item.insert(QStringLiteral("signals"), signalsJson);
+            topicSignals.add(cardSignals);
+        }
+        byClass[assessment.level].append(item);
+        questions[assessment.level].append(shortQuestion(card.question()));
     }
 
     QJsonObject counts, cards;
@@ -1164,14 +1503,34 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
         for (const auto &[name, label] : labels) {
             const QStringList shown = questions.value(name);
             if (shown.isEmpty()) continue;
-            QString line = label + QStringLiteral(": ") + shown.mid(0, 3).join(QStringLiteral("; "));
-            if (shown.size() > 3) line += QStringLiteral(" (+%1 more)").arg(shown.size() - 3);
+            QString line = label + QStringLiteral(": ") + shown.mid(0, summaryListLimit).join(QStringLiteral("; "));
+            if (shown.size() > summaryListLimit) line += QStringLiteral(" (+%1 more)").arg(shown.size() - summaryListLimit);
             summary.append(line);
         }
+        for (const QString &line : topicSignals.lines(groups)) summary.append(line);
+        summary.append(topicCalibration.lines(summaryListLimit));
     }
     QJsonObject result{{QStringLiteral("schema_version"), 1}, {QStringLiteral("accepted"), true}, {QStringLiteral("topic"), topic},
                        {QStringLiteral("matched"), matched}, {QStringLiteral("counts"), counts}, {QStringLiteral("cards"), cards},
-                       {QStringLiteral("summary"), summary.join(QLatin1Char('\n'))}, {QStringLiteral("index"), indexJson(library)}};
+                       {QStringLiteral("index"), indexJson(library)}};
+    if (topicCalibration.total() > 0) result.insert(QStringLiteral("calibration"), topicCalibration.json());
+    // Cold start: when few cards cover the topic, what all the cards say about the user as a
+    // learner, so an explanation of something new can still build on what they know and like.
+    if (learner.value_or(matched < 3)) {
+        QJsonObject failureAll;
+        Query everything;
+        QString unused;
+        parseQuery(QJsonObject{}, &everything, library, &unused);
+        const QList<Entry> all = findCards(library, everything, now, &failureAll);
+        QStringList learnerLines;
+        result.insert(QStringLiteral("learner"), learnerOverview(library, all, levelOf, groups, now, &learnerLines));
+        if (!learnerLines.isEmpty()) {
+            summary.append(entries.isEmpty() ? QStringLiteral("Use what the cards say about the user in general instead:")
+                                             : QStringLiteral("What the cards say about the user in general:"));
+            summary.append(learnerLines);
+        }
+    }
+    result.insert(QStringLiteral("summary"), summary.join(QLatin1Char('\n')));
     QJsonObject mappingInfo{{QStringLiteral("source"), levels.source}, {QStringLiteral("levels"), mapping}};
     if (!unmapped.isEmpty()) mappingInfo.insert(QStringLiteral("unmapped_understanding_tags"), QJsonArray::fromStringList(unmapped));
     result.insert(QStringLiteral("mapping"), mappingInfo);
@@ -1180,18 +1539,47 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
     return result;
 }
 
+QString agentContext(const QJsonObject &profileResult)
+{
+    QStringList lines{
+        QStringLiteral("About me as a learner, from my own review cards in Thoughts (cards I made while reading, tagged with how well I understand "
+                       "and remember each answer, how sure I was before seeing it, how interesting I found it and how I studied it). Use it to pitch your explanation to me; "
+                       "don't repeat it back unless I ask."),
+        QString(),
+        profileResult.value(QStringLiteral("summary")).toString(),
+        QString(),
+        QStringLiteral("How to use this:"),
+        QStringLiteral("- Build on what I know solidly instead of explaining it again."),
+        QStringLiteral("- Go slowly on shaky and not-understood points, and check that I follow."),
+        QStringLiteral("- \"Not yet reviewed\" means I read it but have not tested myself on it."),
+        QStringLiteral("- For something new, connect it to what I know well and to what I find interesting."),
+        QStringLiteral("- Where answer feedback is listed, write more like what I liked and less like what I disliked."),
+        QStringLiteral("- Where I was overconfident, don't take my word that I know it: check first, and point me back to the source to fill the gap."),
+    };
+    return lines.join(QLatin1Char('\n'));
+}
+
 QJsonObject run(const QString &command, const QJsonObject &request, const QString &databasePath, const QString &docsRoot,
                 const QString &levelsFile, const QDateTime &now)
 {
     Levels levels;
     QString message;
-    if (command == QLatin1String("knowledge-profile") && !loadLevels(levelsFile, &levels, &message))
+    const bool profiling = command == QLatin1String("knowledge-profile") || command == QLatin1String("agent-context");
+    if (profiling && !loadLevels(levelsFile, &levels, &message))
         return error(QStringLiteral("invalid_levels"), message);
     IndexSnapshot snapshot;
     QString code;
     if (!readIndex(databasePath, &snapshot, &message, &code)) return error(code, message);
     const Library library = libraryFromSnapshot(snapshot, docsRoot);
-    return command == QLatin1String("knowledge-profile") ? profile(library, request, levels, now) : search(library, request, now);
+    if (command == QLatin1String("agent-context")) {
+        // The profile with the general picture always included, as text to paste into any chat.
+        QJsonObject profileRequest = request;
+        if (!profileRequest.contains(QStringLiteral("learner"))) profileRequest.insert(QStringLiteral("learner"), true);
+        QJsonObject result = profile(library, profileRequest, levels, now);
+        if (result.value(QStringLiteral("accepted")).toBool()) result.insert(QStringLiteral("text"), agentContext(result));
+        return result;
+    }
+    return profiling ? profile(library, request, levels, now) : search(library, request, now);
 }
 
 bool readLibrary(const QString &databasePath, const QString &docsRoot, Library *library, QJsonObject *failure)
