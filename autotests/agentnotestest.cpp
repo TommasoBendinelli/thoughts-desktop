@@ -24,6 +24,8 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QSettings>
+#include <QScopeGuard>
 #include <QTest>
 #include <QTimer>
 #include <QToolButton>
@@ -396,6 +398,7 @@ private:
                                             payload.value(QStringLiteral("strokes")).toObject().value(QStringLiteral("strokes")).toArray().size(), image);
                         reply.insert(QStringLiteral("device_id"), device);
                         reply.insert(QStringLiteral("media_type"), payload.value(QStringLiteral("image")).toObject().value(QStringLiteral("media_type")));
+                        if (payload.contains(QStringLiteral("sources"))) reply.insert(QStringLiteral("sources"), payload.value(QStringLiteral("sources")));
                         files.insert(reply.value(QStringLiteral("image_url")).toString(), image);
                         replies.append(reply);
                         m_scratch.insert(QStringLiteral("replies"), replies);
@@ -477,6 +480,8 @@ private Q_SLOTS:
     void centerPollsSlowlyBehindAnotherApplication();
     void drawingMatchesThePhone();
     void textReplySendsThePictureAsItIs();
+    void replyCarriesWhatTheAgentMayUse();
+    void noteLinksOpenWhenClicked();
     void drawnReplySendsTheComposite();
     void pageGoesToTheAgent();
     void deleteAsksFirst();
@@ -1628,6 +1633,109 @@ void AgentNotesTest::drawingMatchesThePhone()
 
 // A typed reply sends the note's picture unchanged, an empty stroke document and the comment,
 // as the phone does with no strokes; a failed send keeps everything and a retry is the same reply.
+void AgentNotesTest::noteLinksOpenWhenClicked()
+{
+    // A note's sources are rectangles of its picture: a click on one opens it, elsewhere nothing.
+    FakeServer server;
+    const QByteArray picture = png(QSize(400, 800), QColor(240, 240, 235));
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    QJsonObject record = noteRecord(QStringLiteral("n1"), 1, now.addSecs(-60), QStringLiteral("With sources"), picture);
+    record.insert(QStringLiteral("links"), QJsonArray{
+        QJsonObject{{QStringLiteral("rect"), QJsonArray{0.1, 0.25, 0.3, 0.05}}, {QStringLiteral("href"), QStringLiteral("https://example.org/paper.pdf")},
+                    {QStringLiteral("label"), QStringLiteral("pp. 9, 26")}},
+        QJsonObject{{QStringLiteral("rect"), QJsonArray{0.5, 0.75, 0.2, 0.05}}, {QStringLiteral("href"), QStringLiteral("thoughts-pdf-link:notes.pdf?page=3")},
+                    {QStringLiteral("label"), QStringLiteral("p. 4")}},
+        QJsonObject{{QStringLiteral("rect"), QJsonArray{0.5, 0.5}}, {QStringLiteral("href"), QStringLiteral("https://example.org/broken")}}});
+    server.notes.append(record);
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    AgentNotesWindow window(&center, {}, {}, {});
+    QStringList opened;
+    window.setLinkOpener([&opened](const QString &href) { opened.append(href); });
+    window.resize(1200, 900);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QVERIFY(waitFor([&] { return center.hasListed() && window.currentNoteId() == QLatin1String("n1"); }));
+    // A link without a full rectangle is dropped.
+    QCOMPARE(center.note(QStringLiteral("n1"))->links.size(), 2);
+    auto *image = window.findChild<AgentNoteImageView *>(QStringLiteral("agentNoteImage"));
+    QVERIFY(image);
+    QVERIFY(waitFor([&] { return !image->image().isNull() && image->width() > 0; }));
+    QCOMPARE(image->links().size(), 2);
+    const auto at = [image](double x, double y) { return QPoint(qRound(x * image->width()), qRound(y * image->height())); };
+    QCOMPARE(image->linkAt(at(0.2, 0.27)), 0);
+    QCOMPARE(image->linkAt(at(0.6, 0.77)), 1);
+    QCOMPARE(image->linkAt(at(0.9, 0.1)), -1);
+    QTest::mouseClick(image, Qt::LeftButton, {}, at(0.2, 0.27));
+    QTest::mouseClick(image, Qt::LeftButton, {}, at(0.9, 0.1));
+    QTest::mouseClick(image, Qt::LeftButton, {}, at(0.6, 0.77));
+    QCOMPARE(opened, (QStringList{QStringLiteral("https://example.org/paper.pdf"), QStringLiteral("thoughts-pdf-link:notes.pdf?page=3")}));
+    // Over a link the pointer is a hand.
+    QTest::mouseMove(image, at(0.2, 0.27));
+    QVERIFY(waitFor([&] { return image->cursor().shape() == Qt::PointingHandCursor; }));
+    QTest::mouseMove(image, at(0.9, 0.1));
+    QVERIFY(waitFor([&] { return image->cursor().shape() == Qt::ArrowCursor; }));
+}
+
+void AgentNotesTest::replyCarriesWhatTheAgentMayUse()
+{
+    // Sources: what the answering agent may use, sent with every reply and kept until changed.
+    QSettings().remove(QStringLiteral("AgentNotes/ReplySources"));
+    const auto restore = qScopeGuard([] { QSettings().remove(QStringLiteral("AgentNotes/ReplySources")); });
+    FakeServer server;
+    const QByteArray picture = png(QSize(120, 300), QColor(30, 90, 200));
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, now.addSecs(-60), QStringLiteral("Question"), picture));
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    QCOMPARE(center.replySources(), AgentNotes::ReplySources::LibraryAndMentalModel);
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.resize(1200, 900);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QVERIFY(waitFor([&] { return center.hasListed() && window.currentNoteId() == QLatin1String("n1"); }));
+    auto *field = window.findChild<QPlainTextEdit *>(QStringLiteral("agentNoteReplyField"));
+    auto *send = window.findChild<QPushButton *>(QStringLiteral("agentNoteSend"));
+    auto *sources = window.findChild<QComboBox *>(QStringLiteral("agentNoteReplySources"));
+    QVERIFY(field && send && sources && sources->isVisible());
+    QCOMPARE(sources->count(), 4);
+    QCOMPARE(sources->currentText(), QStringLiteral("All documents + Mental Model"));
+    // The default goes with a reply too.
+    field->setFocus();
+    QTest::keyClicks(field, QStringLiteral("First"));
+    send->click();
+    QVERIFY(waitFor([&] { return field->toPlainText().isEmpty(); }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("sources")).toString(), QStringLiteral("library_and_mental_model"));
+    // Chosen once, kept for the next replies and in the settings.
+    sources->setCurrentIndex(sources->findData(AgentNotes::ReplySources::LinkedPdf));
+    Q_EMIT sources->activated(sources->currentIndex());
+    QCOMPARE(center.replySources(), QStringLiteral("linked_pdf"));
+    QCOMPARE(QSettings().value(QStringLiteral("AgentNotes/ReplySources")).toString(), QStringLiteral("linked_pdf"));
+    QTest::keyClicks(field, QStringLiteral("Second"));
+    send->click();
+    QVERIFY(waitFor([&] { return field->toPlainText().isEmpty(); }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("sources")).toString(), QStringLiteral("linked_pdf"));
+    // The narrowed reply says so under the note; the default one does not.
+    QVERIFY(waitFor([&] { return center.note(QStringLiteral("n1"))->replies.size() == 2; }));
+    QStringList metas;
+    QVERIFY(waitFor([&] {
+        metas.clear();
+        for (auto *meta : window.findChildren<QLabel *>(QStringLiteral("agentNoteReplyMeta"))) metas.append(meta->text());
+        return metas.size() == 2;
+    }));
+    QCOMPARE(metas.filter(QStringLiteral("Linked PDF only")).size(), 1);
+    QCOMPARE(metas.filter(QStringLiteral("Mental Model")).size(), 0);
+    // Another Center (the next start) reads the choice back; an unknown value falls back to the default.
+    Center later(&client, statePath());
+    QCOMPARE(later.replySources(), QStringLiteral("linked_pdf"));
+    QSettings().setValue(QStringLiteral("AgentNotes/ReplySources"), QStringLiteral("everything"));
+    QCOMPARE(later.replySources(), AgentNotes::ReplySources::defaultValue());
+}
+
 void AgentNotesTest::textReplySendsThePictureAsItIs()
 {
     FakeServer server;

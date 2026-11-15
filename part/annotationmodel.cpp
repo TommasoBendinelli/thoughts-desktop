@@ -1052,6 +1052,7 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
         // When it is due, and why it is not offered.
         const QString when = scheduleDueState(dueAt, utcNow);
         const bool placement = schedule.value(QStringLiteral("not_offered")).toString() == QLatin1String("placement");
+        const bool source = schedule.value(QStringLiteral("not_offered")).toString() == QLatin1String("source");
         if (state == QLatin1String("unpublished")) {
             line.append(when.isEmpty() ? i18n("Not offered: document unpublished") : when);
             if (!when.isEmpty()) line.append(i18nc("why a review card is not offered", "not offered: document unpublished"));
@@ -1060,6 +1061,10 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
             line.append(when.isEmpty() ? (isNew ? i18n("New") : i18n("Not offered")) : when);
             line.append(i18nc("why a review card is not offered", "waiting for its place in the PDF"));
             details.append(i18n("Not offered for review until its answer is placed in this version of the PDF."));
+        } else if (source) {
+            line.append(when.isEmpty() ? (isNew ? i18n("New") : i18n("Not offered")) : when);
+            line.append(i18nc("why a review card is not offered", "its passage is not found in the source"));
+            details.append(i18n("Not offered for review until its marked passage is found in the source again."));
         } else {
             line.append(when.isEmpty() ? (isNew ? i18n("New") : i18n("Not offered")) : when);
             line.append(i18nc("why a review card is not offered", "not offered now"));
@@ -1079,12 +1084,14 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
         const QString in = scheduleIn(dueFrom, utcNow);
         const QString due = scheduleDue(dueFrom, utcNow);
         line.append(isNew ? i18nc("a new review card, first due", "New · due %1", due) : i18nc("a review card", "Due %1", due));
+        // "Due 28 Nov · in 2 weeks": how long until then, when the date alone does not say it
+        // (later today and tomorrow already do).
+        if (utcNow.toLocalTime().date().daysTo(dueFrom.toLocalTime().date()) >= 2) line.append(in);
         details.append(i18n("Due: %1 (%2)", scheduleWhen(dueAt.isValid() ? dueAt : dueFrom), in));
     }
     if (isNew) details.append(i18n("New: not answered yet"));
+    // The interval ("every 8 weeks") is in the details: on the line it read as when the card comes due.
     if (queued && state == QLatin1String("learning")) line.append(i18nc("a review card in its learning steps", "learning"));
-    else if (queued && state == QLatin1String("review") && schedule.value(QStringLiteral("repeats")).toBool() && !interval.isEmpty())
-        line.append(i18nc("the review interval of a card", "every %1", interval));
     if (reviews > 0) line.append(i18np("1 review", "%1 reviews", reviews));
     if (!interval.isEmpty()) details.append(i18n("Interval: %1", interval));
     details.append(i18n("Reviews: %1 · Lapses: %2", reviews, schedule.value(QStringLiteral("lapses")).toInt()));

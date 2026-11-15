@@ -22,6 +22,7 @@
 #include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSettings>
 #include <QTimer>
 #include <QUrlQuery>
 #include <QUuid>
@@ -110,6 +111,7 @@ std::optional<Reply> Reply::fromJson(const QJsonObject &json)
     reply.imageUrl = json.value(QLatin1String("image_url")).toString();
     reply.strokeCount = intValue(json, "stroke_count");
     reply.message = json.value(QLatin1String("message")).toString();
+    reply.sources = json.value(QLatin1String("sources")).toString();
     const QJsonObject photo = json.value(QLatin1String("photo")).toObject();
     if (!photo.isEmpty()) {
         reply.photoUrl = photo.value(QLatin1String("url")).toString();
@@ -389,6 +391,15 @@ std::optional<Note> Note::fromJson(const QJsonObject &json)
     note.origin = json.value(QLatin1String("origin")).toObject();
     note.openedAt = parseTime(json.value(QLatin1String("opened_at")));
     note.deleted = json.value(QLatin1String("deleted")).toBool();
+    for (const QJsonValue &value : json.value(QLatin1String("links")).toArray()) {
+        const QJsonObject link = value.toObject();
+        const QJsonArray rect = link.value(QLatin1String("rect")).toArray();
+        const QString href = link.value(QLatin1String("href")).toString();
+        if (rect.size() != 4 || href.isEmpty()) continue;
+        const QRectF area(rect.at(0).toDouble(), rect.at(1).toDouble(), rect.at(2).toDouble(), rect.at(3).toDouble());
+        if (!(area.width() > 0) || !(area.height() > 0)) continue;
+        note.links.append({area, href, link.value(QLatin1String("label")).toString()});
+    }
     for (const QJsonValue &value : json.value(QLatin1String("replies")).toArray()) {
         if (auto reply = Reply::fromJson(value.toObject())) note.replies.append(*reply);
     }
@@ -1148,6 +1159,44 @@ void Center::sendReply(const QString &noteId, std::function<void(bool, const QSt
                     });
 }
 
+QStringList ReplySources::all()
+{
+    return {None, LinkedPdf, Library, LibraryAndMentalModel};
+}
+
+QString ReplySources::label(const QString &value)
+{
+    if (value == None) return i18nc("what the agent may use to answer a reply", "No Thoughts documents");
+    if (value == LinkedPdf) return i18nc("what the agent may use to answer a reply", "Linked PDF only");
+    if (value == Library) return i18nc("what the agent may use to answer a reply", "All documents");
+    if (value == LibraryAndMentalModel) return i18nc("what the agent may use to answer a reply", "All documents + Mental Model");
+    return {};
+}
+
+QString ReplySources::description(const QString &value)
+{
+    if (value == None) return i18n("The agent answers without reading anything in your Thoughts Library or your Mental Model.");
+    if (value == LinkedPdf) return i18n("The agent reads only the PDF this note is linked to.");
+    if (value == Library) return i18n("The agent may read every document in your Library, but not your Mental Model.");
+    if (value == LibraryAndMentalModel) return i18n("The agent may read every document in your Library and your Mental Model.");
+    return {};
+}
+
+QString Center::replySources() const
+{
+    const QString value = QSettings().value(QStringLiteral("AgentNotes/ReplySources"), ReplySources::defaultValue()).toString();
+    return ReplySources::all().contains(value) ? value : ReplySources::defaultValue();
+}
+
+void Center::setReplySources(const QString &value)
+{
+    if (!ReplySources::all().contains(value) || value == replySources()) return;
+    QSettings settings;
+    settings.setValue(QStringLiteral("AgentNotes/ReplySources"), value);
+    settings.sync();
+    Q_EMIT replySourcesChanged();
+}
+
 void Center::postReply(const QString &noteId, const QByteArray &image, const QString &mediaType, const QSize &size)
 {
     const auto current = existingDraft(noteId);
@@ -1159,10 +1208,12 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
     // Without a drawing: an empty stroke document at the picture's size, as the phone sends.
     const AnnotationDocument strokes = !current->drawing.isNull() ? current->drawing : AnnotationDocument(size.width(), size.height());
     const QString message = current->message.trimmed();
+    const QString sources = replySources();
     QCryptographicHash hash(QCryptographicHash::Sha256);
     hash.addData(image);
     hash.addData(strokes.toJson());
     hash.addData(message.toUtf8());
+    hash.addData(sources.toUtf8());
     const QByteArray content = hash.result();
     // A retry of the same reply keeps its id: the server answers it once.
     if (current->replyId.isEmpty() || current->sentContent != content) current->replyId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -1172,6 +1223,8 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
                       QJsonObject{{QStringLiteral("media_type"), mediaType}, {QStringLiteral("data_base64"), QString::fromLatin1(image.toBase64())}}},
                      {QStringLiteral("strokes"), QJsonDocument::fromJson(strokes.toJson()).object()}};
     if (!message.isEmpty()) body.insert(QStringLiteral("message"), message);
+    // A server before agent_note_reply_sources_v1 ignores it, and its agents use everything.
+    body.insert(QStringLiteral("sources"), sources);
     m_client->post(QStringLiteral("/v1/agent-notes/%1/replies").arg(noteId), body, this, [this, noteId](const Client::WriteResult &result) {
         if (result.failure != Client::Failure::None) {
             finishReply(noteId, false, result.error);

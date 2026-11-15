@@ -1164,7 +1164,9 @@ async def list_note_replies(
 
     Without arguments: downloads what is new and lists the newest replies in the folder.
     Each reply has reply_id, note_id, note_title, sequence, created_at, stroke_count, message,
-    image_path (the annotated picture), strokes_path (the stroke JSON) and new (downloaded now).
+    sources and sources_rule (what the user lets your answer use: none, linked_pdf, library or
+    library_and_mental_model; follow sources_rule), image_path (the annotated picture),
+    strokes_path (the stroke JSON) and new (downloaded now).
     Use get_note_reply to look at one reply's image.
     """
     return tool_result(await agent_note_call(agent_notes.list_replies, note_id=note_id, after=after))
@@ -1262,6 +1264,10 @@ async def get_note_reply(
     (count, tools, colours) and the annotated image itself (when <= 4 MB) so you can look at it.
     When the user sent a picture with the reply (photo_path, photo_capture: taken with their
     glasses), it comes as a second image: act on their words with that picture.
+    sources says what the user lets your answer use (none: no Thoughts documents; linked_pdf:
+    only the note's PDF; library: any Library document but not the Mental Model;
+    library_and_mental_model: everything) and sources_rule says it in words: it narrows the
+    grounding the answering rules ask for, so follow it.
     When nothing arrived in time the result is not an error: status and error_code are
     no_reply_yet; call again later. Keep wait_seconds below the client's tool timeout.
     A reply it returns is claimed for this conversation when this conversation covers it (its

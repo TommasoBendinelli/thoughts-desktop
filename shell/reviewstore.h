@@ -629,7 +629,9 @@ public:
     };
     // The checks mergeCards makes before writing anything: empty when @p cards can be merged,
     // else why not. @p preview gets the cards' reading order and their source.
-    QString cardMergeProblem(const QList<ReviewCard> &cards, const QString &bundleRoot, CardMerge *preview = nullptr) const;
+    // @p syncFirst: set when the only obstacle is that the server lacks this Mac's latest source
+    // (unsent edits, or the source check after a Sync): a Sync, then the merge again.
+    QString cardMergeProblem(const QList<ReviewCard> &cards, const QString &bundleRoot, CardMerge *preview = nullptr, bool *syncFirst = nullptr) const;
     bool mergeCards(const QList<ReviewCard> &cards, const QString &keptId, const QString &question, const QString &bundleRoot,
                     QString *error = nullptr, CardMerge *result = nullptr);
     // The card that keeps its schedule unless the user chooses another: the one with the most
@@ -705,7 +707,7 @@ private:
     // in one outbox batch, in this order.
     bool writeServerRecords(const QJsonArray &records, QString *error) const;
     struct CardMergePlan;
-    QString prepareCardMerge(const QList<ReviewCard> &cards, QString keptId, const QString &bundleRoot, CardMergePlan *plan) const;
+    QString prepareCardMerge(const QList<ReviewCard> &cards, QString keptId, const QString &bundleRoot, CardMergePlan *plan, bool *syncFirst = nullptr) const;
     // @p projectionSnapshot, when given, is read instead of calling the projection provider again.
     QList<QJsonObject> records(const QString &entityType, const QString &collection, const QString &idField, QStringList *errors = nullptr, const QString &pdfStem = {},
                                const QJsonObject *projectionSnapshot = nullptr) const;

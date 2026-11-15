@@ -3069,7 +3069,7 @@ std::optional<CommentAnchorSpan> commentAnchorSpanAt(const QString &text, int co
     if (command.isEmpty()) {
         return std::nullopt;
     }
-    const int lineStart = text.lastIndexOf(QLatin1Char('\n'), commandStart - 1) + 1;
+    const int lineStart = commandStart > 0 ? text.lastIndexOf(QLatin1Char('\n'), commandStart - 1) + 1 : 0;
     const QString prefix = text.mid(lineStart, commandStart - lineStart);
     if (texLineWithoutComment(prefix).size() != prefix.size()) {
         return std::nullopt;
@@ -4012,7 +4012,7 @@ bool removeAnchor(const DocsAnchorOccurrence &occurrence, const QString &anchorI
     if (span.hasBody && !span.body.isEmpty()) {
         text.replace(span.commandStart, span.commandEnd - span.commandStart, span.body);
     } else {
-        int lineStart = text.lastIndexOf(QLatin1Char('\n'), span.commandStart - 1) + 1;
+        int lineStart = span.commandStart > 0 ? text.lastIndexOf(QLatin1Char('\n'), span.commandStart - 1) + 1 : 0;
         int lineEnd = text.indexOf(QLatin1Char('\n'), span.commandEnd);
         if (lineEnd < 0) {
             lineEnd = text.size();

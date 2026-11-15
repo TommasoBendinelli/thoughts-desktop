@@ -227,13 +227,6 @@ static constexpr int ProposalDecisionSyncDelayMs = 5 * 1000;
 // long Thoughts must not have been the active application before it is.
 static constexpr int SyncJournalUpkeepIntervalMs = 60 * 1000;
 static constexpr int SyncJournalCompactIdleMs = 2 * 60 * 1000;
-// The A/B rating page: THOUGHTS_AB_TESTING_URL in the environment, else the
-// build's (config-thoughts.h). Without one, File › A/B testing and its toolbar
-// button stay hidden. Desktop Thoughts has no web view, so it opens in the browser.
-static QString abTestingUrl()
-{
-    return qEnvironmentVariableIsSet("THOUGHTS_AB_TESTING_URL") ? qEnvironmentVariable("THOUGHTS_AB_TESTING_URL") : QString::fromUtf8(THOUGHTS_AB_TESTING_URL);
-}
 
 namespace
 {
@@ -1422,9 +1415,19 @@ private:
     bool m_unread = false;
 };
 
+// Removes every <Action name="name"/> directly inside container (a toolbar or a menu).
+static void removeNamedActions(QDomElement &container, const QString &name)
+{
+    for (QDomElement action = container.firstChildElement(QStringLiteral("Action")); !action.isNull();) {
+        const QDomElement next = action.nextSiblingElement(QStringLiteral("Action"));
+        if (action.attribute(QStringLiteral("name")) == name) container.removeChild(action);
+        action = next;
+    }
+}
+
 static void installAuthoritativeMainToolbarConfig()
 {
-    constexpr int layoutVersion = 45;
+    constexpr int layoutVersion = 46;
     KConfigGroup migrationState = KSharedConfig::openConfig()->group(QStringLiteral("ThoughtsToolbar"));
     const int previousLayoutVersion = migrationState.readEntry(QStringLiteral("LayoutVersion"), 0);
     if (previousLayoutVersion >= layoutVersion) {
@@ -1468,7 +1471,6 @@ static void installAuthoritativeMainToolbarConfig()
         "  <Action name=\"comments_overview\"/>\n"
         "  <Action name=\"review_overview\"/>\n"
         "  <Action name=\"agent_notes\"/>\n"
-        "  <Action name=\"ab_testing\"/>\n"
         " </ToolBar>");
     if (toolbarMatch.hasMatch() && previousLayoutVersion < 32) {
         shellXml.replace(toolbarMatch.capturedStart(), toolbarMatch.capturedLength(), authoritativeToolbar);
@@ -1487,9 +1489,7 @@ static void installAuthoritativeMainToolbarConfig()
             QDomElement overview;
             QDomElement view;
             QDomElement highlights;
-            QDomElement reviewElement;
             bool hasReview = false;
-            bool hasAbTesting = false;
             bool hasHighlights = false;
             bool hasSidebarDisplay = false;
             for (QDomElement action = toolbar.firstChildElement(QStringLiteral("Action")); !action.isNull(); action = action.nextSiblingElement(QStringLiteral("Action"))) {
@@ -1503,16 +1503,13 @@ static void installAuthoritativeMainToolbarConfig()
                 if (name == QLatin1String("sidebar_display")) hasSidebarDisplay = true;
                 if (name == QLatin1String("review_overview")) {
                     hasReview = true;
-                    reviewElement = action;
                 }
-                if (name == QLatin1String("ab_testing")) hasAbTesting = true;
             }
             if (!hasReview && previousLayoutVersion < 33) {
                 QDomElement review = document.createElement(QStringLiteral("Action"));
                 review.setAttribute(QStringLiteral("name"), QStringLiteral("review_overview"));
                 if (overview.isNull()) toolbar.appendChild(review);
                 else toolbar.insertAfter(review, overview);
-                reviewElement = review;
             }
             // v37: the "Sidebar" chooser hides the sidebar too; its toggle icon goes,
             // with the separator after it. (v37, not v36: A/B testing had already
@@ -1538,13 +1535,7 @@ static void installAuthoritativeMainToolbarConfig()
                     else toolbar.insertBefore(sidebarDisplay, highlights);
                 }
             }
-            // v36: "A/B testing" sits right after Review.
-            if (previousLayoutVersion < 36 && !hasAbTesting) {
-                QDomElement abTesting = document.createElement(QStringLiteral("Action"));
-                abTesting.setAttribute(QStringLiteral("name"), QStringLiteral("ab_testing"));
-                if (reviewElement.isNull()) toolbar.appendChild(abTesting);
-                else toolbar.insertAfter(abTesting, reviewElement);
-            }
+            // (v36 added an "A/B testing" button after Review; v46 removed it again.)
             // v38: "Visible markup" goes; the Annotations sidebar filters switch the
             // same Comments, Agent proposals and Review cards markup.
             if (previousLayoutVersion < 38 && hasHighlights) {
@@ -1675,6 +1666,8 @@ static void installAuthoritativeMainToolbarConfig()
                     toolbar.insertAfter(text, before);
                 }
             }
+            // v46: the "A/B testing" button goes; the rating page it opened is no longer used.
+            if (previousLayoutVersion < 46) removeNamedActions(toolbar, QStringLiteral("ab_testing"));
         }
     }
     const QDomElement menuBar = document.documentElement().firstChildElement(QStringLiteral("MenuBar"));
@@ -1717,6 +1710,8 @@ static void installAuthoritativeMainToolbarConfig()
                 else menu.insertAfter(copy, after);
             }
         }
+        // v46: File > A/B testing goes with its button.
+        if (previousLayoutVersion < 46) removeNamedActions(menu, QStringLiteral("ab_testing"));
         break;
     }
     document.documentElement().setAttribute(QStringLiteral("version"), QString::number(layoutVersion));
@@ -2667,9 +2662,9 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
                 fileMenu->addAction(reviewAction);
             }
         }
-        // "Agent Notes", then "A/B testing", follow Review in the File menu.
+        // "Agent Notes" follows Review in the File menu.
         QAction *after = reviewAction;
-        for (const QString &name : {QStringLiteral("agent_notes"), QStringLiteral("ab_testing")}) {
+        for (const QString &name : {QStringLiteral("agent_notes")}) {
             QAction *const action = actionCollection()->action(name);
             if (!fileMenu || !after || !action) break;
             if (!fileMenu->actions().contains(action)) {
@@ -4047,12 +4042,6 @@ void Shell::setupActions()
     agentNotesAction->setIconText(i18n("Agent Notes"));
     actionCollection()->setDefaultShortcut(agentNotesAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N));
     connect(agentNotesAction, &QAction::triggered, this, [] { Shell::showAgentNotes(); });
-    QAction *abTestingAction = actionCollection()->addAction(QStringLiteral("ab_testing"));
-    abTestingAction->setText(i18n("A/B testing"));
-    abTestingAction->setIconText(i18n("A/B testing"));
-    abTestingAction->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
-    const QString abTestingPage = abTestingUrl();
-    abTestingAction->setVisible(!abTestingPage.isEmpty());
 
     auto *windowButtonsSpace = new QWidget;
     windowButtonsSpace->setFixedSize(68, 1);
@@ -4076,12 +4065,6 @@ void Shell::setupActions()
     documentTitleAction->setText(i18n("Document title"));
     actionCollection()->addAction(QStringLiteral("document_title"), documentTitleAction);
     connect(this, &QWidget::windowTitleChanged, this, &Shell::updateDocumentTitle);
-    abTestingAction->setToolTip(i18n("Open the A/B rating page in your browser"));
-    connect(abTestingAction, &QAction::triggered, this, [this, abTestingPage] {
-        if (abTestingPage.isEmpty() || !QDesktopServices::openUrl(QUrl(abTestingPage))) {
-            KMessageBox::error(this, i18n("The A/B rating page could not be opened."), i18n("A/B testing"));
-        }
-    });
     auto *serverAction = actionCollection()->addAction(QStringLiteral("thoughts_storage"));
     serverAction->setText(i18n("Server…"));
     serverAction->setIcon(QIcon::fromTheme(QStringLiteral("network-server")));
@@ -6641,11 +6624,30 @@ void Shell::editSidebarReviewCard(const QString &cardId)
 
 void Shell::mergeSidebarReviewCards(const QStringList &cardIds)
 {
-    QPointer<KParts::ReadWritePart> part = qobject_cast<KParts::ReadWritePart *>(sender());
+    mergeReviewCardsIn(qobject_cast<KParts::ReadWritePart *>(sender()), cardIds, false);
+}
+
+void Shell::mergeReviewCardsIn(KParts::ReadWritePart *readerPart, const QStringList &cardIds, bool afterSync)
+{
+    QPointer<KParts::ReadWritePart> part = readerPart;
     if (!part || !part->url().isLocalFile() || cardIds.size() < 2) return;
-    // A merge writes the source and queues its cards; a running Sync would read them halfway.
+    // The server merges what it has: this Mac's unsent source goes first, by a Sync, and the merge
+    // dialog opens when that Sync ends (a merge never runs during one: it would be read halfway).
+    const auto mergeAfterSync = [this, part, &cardIds](bool start) {
+        m_mergeAfterSync = PendingCardMerge{part, cardIds};
+        QMetaObject::invokeMethod(part, "noticeMessage", Qt::DirectConnection,
+                                  Q_ARG(QString, i18n("Sending your latest changes to the server first. The merge opens when Sync ends.")), Q_ARG(int, -1));
+        if (start) triggerFedoraSyncWithInitiationControl(QStringLiteral("review_card_merge"));
+        // A Sync that never starts (no server, say) still ends the wait: the merge says why.
+        QTimer::singleShot(3 * 60 * 1000, this, [this, part] {
+            if (!m_mergeAfterSync || m_mergeAfterSync->part != part || m_fedoraManualSyncState == 1) return;
+            const PendingCardMerge pending = *m_mergeAfterSync;
+            m_mergeAfterSync.reset();
+            mergeReviewCardsIn(pending.part, pending.cardIds, true);
+        });
+    };
     if (m_fedoraManualSyncState == 1) {
-        KMessageBox::information(this, i18n("Wait for Sync to finish, then merge the cards."), i18n("Merge Review Cards"));
+        mergeAfterSync(false);
         return;
     }
     const QString stem = QFileInfo(part->url().toLocalFile()).completeBaseName();
@@ -6656,6 +6658,13 @@ void Shell::mergeSidebarReviewCards(const QStringList &cardIds)
     if (cards.size() != cardIds.size()) {
         KMessageBox::error(this, i18n("A selected review card is no longer available."), i18n("Cannot Merge Review Cards"));
         return;
+    }
+    if (!afterSync) {
+        bool syncFirst = false;
+        if (!store.cardMergeProblem(cards, Thoughts::defaultReviewSourceBundleRoot(), nullptr, &syncFirst).isEmpty() && syncFirst) {
+            mergeAfterSync(true);
+            return;
+        }
     }
     Thoughts::ReviewStore::CardMerge merged;
     if (!Thoughts::mergeReviewCards(this, store, cards, Thoughts::defaultReviewSourceBundleRoot(), &merged)) return;
@@ -7680,7 +7689,14 @@ void Shell::refreshSidebarReviewCards(KParts::ReadOnlyPart *part, const QJsonObj
                 unpublishedCard = !unpublished->isEmpty() && unpublished->contains(Thoughts::cardDocumentId(card, ShellUtils::docsRoot()));
             }
             QJsonObject record = card.record;
-            record.insert(QStringLiteral("sidebar_schedule"), Thoughts::sidebarReviewSchedule(card, queued, unpublishedCard));
+            QJsonObject schedule = Thoughts::sidebarReviewSchedule(card, queued, unpublishedCard);
+            // Why the queue leaves it out, when its passage is the reason (the tab adds "placement").
+            const QString link = card.linkingState();
+            if (!queued && schedule.value(QStringLiteral("state")).toString() == QLatin1String("unavailable") && !link.isEmpty()
+                && link != QLatin1String("linked") && link != QLatin1String("pdf_without_source")
+                && !card.sourceLocation.value(QStringLiteral("checking")).toBool())
+                schedule.insert(QStringLiteral("not_offered"), QStringLiteral("source"));
+            record.insert(QStringLiteral("sidebar_schedule"), schedule);
             cards.append(record);
         }
     }
@@ -8897,6 +8913,14 @@ void Shell::updateCommentsOverviewManualSyncState(int state, const QString &mess
     if (wasSyncing && state != 1) {
         const QJsonObject projections = effectiveFedoraProjections();
         for (const auto &tab : std::as_const(m_tabs)) { refreshSidebarReviewCards(tab.part, projections); }
+        // A merge waiting for this Sync: once only, so a Sync that did not send the source shows why.
+        if (m_mergeAfterSync) {
+            const PendingCardMerge pending = *m_mergeAfterSync;
+            m_mergeAfterSync.reset();
+            QTimer::singleShot(0, this, [this, pending] {
+                if (pending.part) mergeReviewCardsIn(pending.part, pending.cardIds, true);
+            });
+        }
     }
     QVariantMap manualSync;
     if (KParts::ReadWritePart *part = fedoraGatewayPart()) {
@@ -9191,6 +9215,43 @@ QString Shell::agentNoteDocumentPath(const QString &documentId, const QString &f
     return path;
 }
 
+void Shell::openAgentNoteLink(const QString &href)
+{
+    QWidget *parent = QApplication::activeWindow();
+    // A Library PDF page, as the note tool writes it and the phone opens it (0-based page).
+    static const QRegularExpression pdfLink(QStringLiteral(R"(^thoughts-pdf-link:([A-Za-z0-9][A-Za-z0-9_.-]*\.pdf)\?page=([0-9]{1,6})$)"));
+    if (const QRegularExpressionMatch match = pdfLink.match(href); match.hasMatch()) {
+        const QString filename = match.captured(1);
+        const QString path = agentNoteDocumentPath(QString(), filename, nullptr);
+        Shell *shell = path.isEmpty() ? nullptr : shellForCommentsOverview(path);
+        if (!shell) {
+            KMessageBox::information(parent, i18n("“%1” is not in this Mac's Library yet. Sync, then click the link again.", filename), i18n("Open Link"));
+            return;
+        }
+        QString error;
+        KParts::ReadWritePart *part = shell->trackedCommentPart(path, true, &error);
+        uint pages = 0;
+        if (!part || !QMetaObject::invokeMethod(part, "pages", Qt::DirectConnection, Q_RETURN_ARG(uint, pages)) || !pages) {
+            KMessageBox::error(parent, error.isEmpty() ? i18n("The PDF could not be opened: %1", QDir::toNativeSeparators(path)) : error, i18n("Open Link"));
+            return;
+        }
+        QMetaObject::invokeMethod(part, "goToPage", Qt::DirectConnection, Q_ARG(uint, uint(std::min<qint64>(match.captured(2).toLongLong(), pages - 1))));
+        const QString documentId = Thoughts::DocumentIdentityStore(ShellUtils::docsRoot()).forFile(path).value(QStringLiteral("document_id")).toString();
+        shell->selectReaderTitle(part, documentId, QString(), QString());
+        if (shell->isMinimized()) shell->showNormal();
+        else shell->show();
+        shell->raise();
+        shell->activateWindow();
+        return;
+    }
+    const QUrl url(href);
+    if ((url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("http")) && url.isValid()) {
+        if (!QDesktopServices::openUrl(url)) KMessageBox::error(parent, i18n("The link could not be opened: %1", href), i18n("Open Link"));
+        return;
+    }
+    KMessageBox::error(parent, i18n("Thoughts cannot open this link: %1", href), i18n("Open Link"));
+}
+
 void Shell::openAgentNoteDocument(const QString &documentId, const QString &path)
 {
     Shell *shell = shellForCommentsOverview(path);
@@ -9266,6 +9327,7 @@ Thoughts::AgentNotesView *Shell::createAgentNotesView(bool sidebar, KParts::Read
     if (!sidebar) {
         auto *window = new Thoughts::AgentNotesWindow(center, resolve, &Shell::openAgentNoteDocument, openCard);
         window->setLibraryProvider(agentNotesLibrary);
+        window->setLinkOpener(&Shell::openAgentNoteLink);
         // The window sends the page of the reader in front (never a new reader window).
         window->setPageProvider([capturePage]() -> std::optional<Thoughts::AgentNotesView::PageCapture> {
             Shell *shell = nullptr;
@@ -9287,6 +9349,7 @@ Thoughts::AgentNotesView *Shell::createAgentNotesView(bool sidebar, KParts::Read
     }
     auto *view = new Thoughts::AgentNotesView(Thoughts::AgentNotesView::Layout::Sidebar, center, resolve, &Shell::openAgentNoteDocument, openCard);
     view->setLibraryProvider(agentNotesLibrary);
+    view->setLinkOpener(&Shell::openAgentNoteLink);
     // Too big for the sidebar: the note in the Agent Notes window.
     view->setLargeOpener([](const QString &noteId) { Shell::showAgentNotes(noteId); });
     // A sidebar sends the page beside it.
@@ -11155,7 +11218,6 @@ void Shell::applyReaderIcons(KActionCollection *actions)
         {"go_document_forward", "chevron.right"},
         {"comments_overview", "list.bullet.rectangle"},
         {"review_overview", "rectangle.stack"},
-        {"ab_testing", "testtube.2"},
     };
     const QColor tint = palette().color(QPalette::ButtonText);
     for (const auto &[name, symbol] : symbols) {

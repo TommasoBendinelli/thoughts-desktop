@@ -39,7 +39,6 @@ Build options specific to Thoughts:
 | `THOUGHTS_SERVER_SDK_ROOT` | `../thoughts-server/sdk/cpp` | The thoughts-server C++ client SDK to build against. |
 | `THOUGHTS_DEFAULT_SERVER_URL` | `https://thoughts.example.org` | The server a new installation starts with. An installation keeps the address it saved (File › Server…, `thoughtsctl set-server`); `THOUGHTS_SERVER_URL` overrides it for one process. |
 | `THOUGHTS_LEGACY_SERVER_URL` | empty | An earlier fixed server address that installations which synchronized before saving an address keep. Empty: none. |
-| `THOUGHTS_AB_TESTING_URL` | empty | The page File › A/B testing opens in the browser. Empty: the entry is hidden. The environment variable of the same name overrides it. |
 | `THOUGHTS_HTML_VIEW` | on when Qt WebView is found | The HTML view of documents. |
 | `THOUGHTS_MACOS_PERSISTENT_SIGNING` | on when the identity of `tools/macos/setup-signing.py` exists | Sign the macOS app bundle on build and install. |
 | `THOUGHTS_RELEASE_VERSION`, `THOUGHTS_UPDATE_REPOSITORY` | empty | Version and GitHub repository of a published Windows or Mac release; Help › Check for Updates exists only with them. The release tools (`tools/windows/release.py`, `tools/macos/release.py`) set both, the repository to `TommasoBendinelli/thoughts-desktop` unless told otherwise. |

@@ -1265,11 +1265,33 @@ def next_reply_number(directory: Path) -> int:
     return max(numbers, default=0) + 1
 
 
+# What the user lets the answering agent use, chosen with each reply (server agent_note_reply_sources_v1).
+# A reply without it (older apps and servers) allows everything, as before.
+REPLY_SOURCES = {
+    "none": "Use no Thoughts documents at all: do not search or read the Library, the knowledge profile (review cards) "
+            "or the Mental Model, and give no Library links. Answer from the note, the reply and general knowledge.",
+    "linked_pdf": "Use only the PDF this note is linked to (its document_id): read and cite that document alone, with page "
+                  "links into it. No other Library document, no knowledge profile, no Mental Model. When the note has no "
+                  "linked document, use no Thoughts documents.",
+    "library": "Use any Library document (search, read, cite with page links) and the knowledge profile, but not the Mental Model.",
+    "library_and_mental_model": "Use the Library, the knowledge profile and the Mental Model, as the answering rules say.",
+}
+DEFAULT_REPLY_SOURCES = "library_and_mental_model"
+
+
+def reply_sources(value) -> tuple[str, str]:
+    """The reply's sources choice (the default when absent or unknown) and the rule it sets for the answer."""
+    chosen = value if value in REPLY_SOURCES else DEFAULT_REPLY_SOURCES
+    return chosen, REPLY_SOURCES[chosen]
+
+
 def local_entry(root: Path, directory: Path, record: dict, new: bool) -> dict:
     local = record.get("local") or {}
     note = record.get("note") or {}
     entry = {key: record.get(key) for key in ("reply_id", "note_id", "sequence", "created_at", "device_id", "media_type",
                                                "image_width", "image_height", "image_bytes", "stroke_count", "message")}
+    # What the user lets the answer use: follow sources_rule over the answering rules' grounding.
+    entry["sources"], entry["sources_rule"] = reply_sources(record.get("sources"))
     photo = record.get("photo") if isinstance(record.get("photo"), dict) else None
     entry.update(note_title=note.get("title"), review_card_id=note.get("review_card_id"), document_id=note.get("document_id"),
                  folder=str(directory), image_path=str(directory / local["image"]),
@@ -1317,6 +1339,7 @@ def store_reply(client: Client, root: Path, reply: dict) -> dict:
         line = {"reply_id": reply["reply_id"], "note_id": note_id, "sequence": reply.get("sequence"),
                 "created_at": reply.get("created_at"), "note_title": record["note"].get("title"),
                 "stroke_count": reply.get("stroke_count"), "message": reply.get("message"),
+                "sources": reply_sources(reply.get("sources"))[0],
                 "image": f"{directory.name}/{local['image']}",
                 "strokes": f"{directory.name}/{local['strokes']}" if local["strokes"] else None,
                 "photo": f"{directory.name}/{local['photo']}" if local.get("photo") else None,

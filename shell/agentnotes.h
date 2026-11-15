@@ -13,6 +13,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QRectF>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
@@ -57,10 +58,31 @@ struct Reply {
     QString photoCapture;  // the glasses' capture name (IMG_…)
     int photoWidth = 0;
     int photoHeight = 0;
+    // What the answering agent may use (ReplySources); empty when the sender did not say.
+    QString sources;
 
     bool hasPhoto() const { return !photoUrl.isEmpty(); }
     static std::optional<Reply> fromJson(const QJsonObject &json);
 };
+
+// What the agent answering a reply may use to ground its answer, sent with every reply
+// (server agent_note_reply_sources_v1): no Thoughts documents at all, only the PDF the note
+// is linked to, every Library document, or every document and the Mental Model too.
+namespace ReplySources
+{
+inline const QString None = QStringLiteral("none");
+inline const QString LinkedPdf = QStringLiteral("linked_pdf");
+inline const QString Library = QStringLiteral("library");
+inline const QString LibraryAndMentalModel = QStringLiteral("library_and_mental_model");
+// In the order the choice lists them.
+QStringList all();
+// What agents used before the choice existed, and the default.
+inline QString defaultValue() { return LibraryAndMentalModel; }
+// "Linked PDF only", "All documents + Mental Model"; empty for an unknown value.
+QString label(const QString &value);
+// One line on what the agent may use.
+QString description(const QString &value);
+}
 
 // Whether an agent waits to act on replies to a note (protocol/agent-notes.md "Who hears a
 // reply"): Unknown when the sender's agents never say, or before the server answered.
@@ -177,6 +199,15 @@ struct AnswerChoice {
 // is listed too, marked as such. Two agents that would read the same get a number.
 QList<AnswerChoice> answerChoices(const ListeningAnswer &answer);
 
+// A source the note's picture links to (server agent_note_links_v1): a rectangle of the picture
+// (normalized x, y, width, height, top-left origin) and where a click goes: a Library PDF page
+// (thoughts-pdf-link:<filename>.pdf?page=<0-based>) or a web page (https).
+struct NoteLink {
+    QRectF rect;
+    QString href;
+    QString label;
+};
+
 struct Note {
     QString id;
     qint64 sequence = 0;
@@ -197,6 +228,7 @@ struct Note {
     QDateTime openedAt;
     bool deleted = false;
     QList<Reply> replies;
+    QList<NoteLink> links;
 
     // A page the user sent to an agent from the phone's reader (or this Mac's): origin.kind
     // "phone_page".
@@ -456,6 +488,10 @@ public:
     // Sends the draft as a reply: the drawing on the note's picture (PNG), else the picture as it
     // is, with the stroke document and the message. The draft goes once the server has it.
     void sendReply(const QString &noteId, std::function<void(bool ok, const QString &error)> done = {});
+    // What the agent may use when it answers, sent with every reply; the user's last choice
+    // (kept in the app's settings), ReplySources::defaultValue() until they choose.
+    QString replySources() const;
+    void setReplySources(const QString &value);
 
     // A page of a document sent to the agent, as the phone's study mode sends one.
     struct Page {
@@ -518,6 +554,8 @@ Q_SIGNALS:
     // Whether "Change" is offered, can be used now, or a choice is on its way changed.
     void answerOptionsChanged();
     void foregroundChanged(bool foreground);
+    // The choice of what the agent may use changed (in any view).
+    void replySourcesChanged();
 
 private:
     void poll();

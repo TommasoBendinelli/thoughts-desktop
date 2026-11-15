@@ -283,6 +283,8 @@ private Q_SLOTS:
     void interruptedMergeIsRecovered();
     void mergeCommandIsOneRequestWithAReceipt();
     void mergeOfARealSourceCopy();
+    void mergeCardsWhosePassageStartsTheFile();
+    void mergeCardsWhoseHeadingsAreInTheContents();
     void mergingCardsKeepsPendingProposalsInsideTheirPassages();
     void mergingCardsRefusesAProposalThatHoldsACardMarker();
     void mergingCardsWhosePassageHoldsADefinition();
@@ -4519,6 +4521,19 @@ void ReviewStoreTest::manualRepairKeepsIdentityAndFollowsSource()
     Thoughts::invalidateSourceLocationIndex(dir.path());
     QVERIFY(!reopened.cards().first().schedule.deleted);
     QCOMPARE(reopened.cards().first().linkingState(), QStringLiteral("unavailable"));
+    // While the sources are being checked again, changes wait, but the card stays in review.
+    QCOMPARE(reopened.activeCards().size(), 1);
+    // So while its project's files are still settling...
+    Thoughts::installSourceLocationIndex(dir.path(), {{QStringLiteral("schema_version"), 1}, {QStringLiteral("files"), files},
+        {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), false}}}}, files);
+    QCOMPARE(reopened.cards().first().linkingState(), QStringLiteral("unavailable"));
+    QCOMPARE(reopened.activeCards().size(), 1);
+    // ...but not when its own file is broken.
+    QJsonObject broken = scanned;
+    broken.insert(QStringLiteral("valid"), false);
+    Thoughts::installSourceLocationIndex(dir.path(), {{QStringLiteral("schema_version"), 1}, {QStringLiteral("files"), QJsonObject{{movedId, broken}}},
+        {QStringLiteral("projects"), QJsonObject{{QStringLiteral("docs-test"), false}}}}, QJsonObject{{movedId, broken}});
+    QCOMPARE(reopened.activeCards().size(), 0);
 }
 
 void ReviewStoreTest::manualRepairAcceptsMarkdownMarkers()
@@ -5449,6 +5464,41 @@ void ReviewStoreTest::mergingCardsFollowsReadingOrderAndTheChosenCard()
     QCOMPARE(kept.pageVisualSha256(), QString(64, QLatin1Char('c')));
 }
 
+void ReviewStoreTest::mergeCardsWhoseHeadingsAreInTheContents()
+{
+    // A passage with section headings is also highlighted on their lines in the table of contents,
+    // pages before the card's own page: the merged card keeps the first card's own page, first.
+    QTemporaryDir dir;
+    MergeFixture doc;
+    const QString relative = QStringLiteral("docs-test/tex/source/main.tex");
+    QVERIFY(doc.start(dir.path(), relative, mergeNote));
+    const QString first = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString second = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QVERIFY(doc.mark(second, {{20, 24}}));
+    QVERIFY(doc.mark(first, {{5, 10}}));
+    const auto region = [](int page, double top) { return QJsonObject{{QStringLiteral("page"), page}, {QStringLiteral("rect"), QJsonArray{0.1, top, 0.9, top + 0.04}}}; };
+    doc.card(first, QStringLiteral("First?"), QJsonArray{region(2, 0.3), region(11, 0.2), region(12, 0.1)}, QString(64, QLatin1Char('c')), QStringLiteral("First"));
+    // Its own page is 11, as the server places it: the contents line on page 2 comes first in its areas.
+    auto record = doc.projection.value(QStringLiteral("review_card\ncards\n") + first).toObject();
+    auto primary = record.value(QStringLiteral("primary")).toObject();
+    primary.insert(QStringLiteral("page"), 11);
+    primary.insert(QStringLiteral("rect"), region(11, 0.2).value(QStringLiteral("rect")));
+    record.insert(QStringLiteral("primary"), primary);
+    doc.projection.insert(QStringLiteral("review_card\ncards\n") + first, record);
+    doc.card(second, QStringLiteral("Second?"), QJsonArray{region(2, 0.35), region(12, 0.5)}, QString(64, QLatin1Char('d')), QStringLiteral("Second"));
+    auto store = doc.store();
+    const auto cards = store->cards();
+    QString error;
+    QVERIFY2(store->mergeCards({cardWithId(cards, first), cardWithId(cards, second)}, second, QStringLiteral("Both?"), {}, &error), qPrintable(error));
+    const auto kept = cardWithId(store->cards(), second);
+    const QJsonObject merged = kept.record.value(QStringLiteral("primary")).toObject();
+    QCOMPARE(merged.value(QStringLiteral("page")).toInt(), 11);
+    QCOMPARE(kept.pageVisualSha256(), QString(64, QLatin1Char('c')));
+    // Every area kept: the first card's own page, its other pages, then the second card's.
+    QCOMPARE(merged.value(QStringLiteral("regions")).toArray(),
+             (QJsonArray{region(11, 0.2), region(2, 0.3), region(12, 0.1), region(2, 0.35), region(12, 0.5)}));
+}
+
 void ReviewStoreTest::mergingMarkdownCardsRelabelsTheirMarkers()
 {
     QTemporaryDir dir;
@@ -5663,7 +5713,8 @@ void ReviewStoreTest::mergeOfARealSourceCopy()
     QHash<QString, QSet<QString>> segments;
     QByteArray unmarked = source;
     for (const QString &cardId : ids) {
-        const auto anchor = readReviewSourceAnchor(relative, source, cardId);
+        // Pending proposals inside a passage are held whole, as Merge cards holds them.
+        const auto anchor = readReviewSourceAnchor(relative, source, cardId, true);
         QVERIFY2(anchor.error.isEmpty(), qPrintable(anchor.error));
         for (const auto &value : anchor.anchor.value(QStringLiteral("segments")).toArray())
             segments[cardId].insert(value.toObject().value(QStringLiteral("segment_id")).toString());
@@ -5681,6 +5732,38 @@ void ReviewStoreTest::mergeOfARealSourceCopy()
     QFile output(path + QStringLiteral(".merged"));
     QVERIFY(output.open(QIODevice::WriteOnly));
     output.write(plan.replacement);
+}
+
+void ReviewStoreTest::mergeCardsWhosePassageStartsTheFile()
+{
+    // A fragment whose first line is a card's start marker: its markers come off like any other.
+    const QString first = QStringLiteral("0190a000-0000-7000-8000-00000000001a"), second = QStringLiteral("0190a000-0000-7000-8000-00000000001b");
+    const QString relative = QStringLiteral("docs-test/tex/fragments/sync.tex");
+    const QByteArray source = QStringLiteral(
+        "\\ReviewCardMaskStart{%1}{0}%\n"
+        "\\section{Syncing}\n"
+        "First answer.\n"
+        "\\ReviewCardMaskEnd{%1}{0}%\n"
+        "\n"
+        "\\ReviewCardMaskStart{%2}{0}%\n"
+        "\\subsection{What Sync rebuilds}\n"
+        "Second answer.\n"
+        "\\ReviewCardMaskEnd{%2}{0}%\n").arg(first, second).toUtf8();
+    QString error;
+    const QByteArray withoutFirst = removeReviewCardMarkers(relative, source, first, {QStringLiteral("0")}, &error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QVERIFY(!withoutFirst.contains(first.toUtf8()));
+    QVERIFY(withoutFirst.startsWith("\\section{Syncing}\n"));
+    QCOMPARE(withoutFirst.count('\n'), source.count('\n') - 2);
+    const QHash<QString, QSet<QString>> segments{{first, {QStringLiteral("0")}}, {second, {QStringLiteral("0")}}};
+    for (const auto &kept : {first, second}) {
+        const QString merged = kept == first ? second : first;
+        const auto plan = planReviewCardMergeSource(relative, source, kept, {merged}, segments);
+        QVERIFY2(plan.error.isEmpty(), qPrintable(plan.error));
+        QVERIFY(!plan.replacement.contains(merged.toUtf8()));
+        QCOMPARE(plan.anchor.value(QStringLiteral("segments")).toArray().size(), 2);
+        QCOMPARE(stripReviewCardMarkers(relative, plan.replacement, kept).text, stripReviewCardMarkers(relative, withoutFirst, second).text);
+    }
 }
 
 // ---------------------------------------------------------------- merging around pending proposals

@@ -87,7 +87,7 @@ QJsonObject scanAnnotationLocations(const QString &path, const QByteArray &sourc
             starts.insert(segment, line);
             int bodyStart = match.capturedEnd();
             if (markdown) {
-                const int first = text.lastIndexOf(QLatin1Char('\n'), match.capturedStart() - 1) + 1;
+                const int first = match.capturedStart() > 0 ? text.lastIndexOf(QLatin1Char('\n'), match.capturedStart() - 1) + 1 : 0;
                 const int end = text.indexOf(QLatin1Char('\n'), bodyStart);
                 if (end >= 0 && text.mid(first, match.capturedStart() - first).trimmed().isEmpty()
                     && text.mid(bodyStart, end - bodyStart).trimmed().isEmpty()) bodyStart = end + 1;

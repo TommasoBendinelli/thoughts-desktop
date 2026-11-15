@@ -2562,6 +2562,8 @@ QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdf
     // A malformed merge is skipped; it must not make the cards themselves unavailable.
     const QHash<QString, QString> merges = ReviewTags::mergeMapping(
         records(ReviewTags::mergeEntityType(), ReviewTags::mergeCollection(), QStringLiteral("merge_id"), nullptr, {}, shared));
+    // One view of where the sources hold each card's passage, for every card.
+    const QJsonObject locationIndex = sourceLocationIndex(m_docsRoot);
     QList<ReviewCard> output;
     for (const QJsonObject &savedRecord : cardRecords) {
         QJsonObject record = savedRecord;
@@ -2635,8 +2637,25 @@ QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdf
             const auto segments = anchor.value(QStringLiteral("segments")).toArray();
             if (!segments.isEmpty()) {
                 QString relative = segments.first().toObject().value(QStringLiteral("source_file")).toString();
-                if (sourceLocationIndex(m_docsRoot).contains(QStringLiteral("files")))
-                    card.sourceLocation = annotationSourceLocation(m_docsRoot, QStringLiteral("review_card"), id, SourceOwner::of(relative), relative);
+                if (locationIndex.contains(QStringLiteral("files"))) {
+                    const QString project = SourceOwner::of(relative);
+                    card.sourceLocation = annotationSourceLocation(locationIndex, QStringLiteral("review_card"), id, project, relative);
+                    // While its project's sources are being checked (the scan after each Sync or edit,
+                    // or a file still settling) the index has no answer yet. Changes to the card wait
+                    // for the check (unavailable), but review does not: every card of the project would
+                    // otherwise drop out of review until the scan ends. A broken file that holds or
+                    // mentions the card is no check.
+                    if (!project.isEmpty() && !locationIndex.value(QStringLiteral("projects")).toObject().value(project).toBool()) {
+                        const QJsonObject files = locationIndex.value(QStringLiteral("files")).toObject();
+                        bool broken = false;
+                        for (auto it = files.begin(); it != files.end() && !broken; ++it) {
+                            const QJsonObject file = it.value().toObject();
+                            broken = !file.value(QStringLiteral("valid")).toBool()
+                                && (it.key() == relative || file.value(QStringLiteral("mentioned")).toArray().contains(id));
+                        }
+                        if (!broken) card.sourceLocation.insert(QStringLiteral("checking"), true);
+                    }
+                }
                 bool verifiedPendingSource = false;
                 if (record.value(QStringLiteral("creation_method")).toString() == QLatin1String("source_selection_v1")
                     && primaryObject(record).value(QStringLiteral("pdf_sha256")).toString().isEmpty()) {
@@ -2698,7 +2717,9 @@ QString ReviewCard::linkingState() const
 static bool hasReviewIssue(const ReviewCard &card, bool stale)
 {
     const QString reanchorState = card.record.value(QStringLiteral("reanchor")).toObject().value(QStringLiteral("state")).toString();
-    const QString link = card.linkingState();
+    // A passage only waiting for its project's source check keeps the card in review.
+    const QString link = card.linkingState() == QLatin1String("unavailable") && card.sourceLocation.value(QStringLiteral("checking")).toBool()
+        ? QStringLiteral("linked") : card.linkingState();
     return reanchorState == QLatin1String("needs_attention") || card.status() == QLatin1String("needs_reanchor")
         || QStringList{QStringLiteral("queued"), QStringLiteral("retry"), QStringLiteral("running"), QStringLiteral("updating")}.contains(reanchorState)
         || stale
@@ -4821,8 +4842,9 @@ QString ReviewStore::joinedMergeQuestion(const QList<ReviewCard> &cards)
     return questions.join(QLatin1Char(' '));
 }
 
-QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QString keptId, const QString &bundleRoot, CardMergePlan *plan) const
+QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QString keptId, const QString &bundleRoot, CardMergePlan *plan, bool *syncFirst) const
 {
+    if (syncFirst) *syncFirst = false;
     QStringList ids, documents;
     for (const ReviewCard &card : requested) {
         if (ids.contains(card.id())) continue;
@@ -4855,10 +4877,14 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
         const auto segments = primaryObject(record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray();
         if (found->isWholeDocument() || isBasicReviewCard(record) || segments.isEmpty())
             return QStringLiteral("Card “%1” is not linked to a source passage. Only cards whose answers are marked in the source can be merged.").arg(mergeCardLabel(card));
-        // Linked, but its markers are not where Thoughts last found them, or not checked yet.
-        if (const QString state = found->linkingState(); state != QLatin1String("linked"))
+        // Linked, but its markers are not where Thoughts last found them. While the sources are only
+        // being checked again (after each Sync) the merge goes on: it reads the markers in the file itself.
+        if (const QString state = found->linkingState();
+            state != QLatin1String("linked") && !(state == QLatin1String("unavailable") && found->sourceLocation.value(QStringLiteral("checking")).toBool())) {
+            if (syncFirst) *syncFirst = state == QLatin1String("unavailable");
             return QStringLiteral("The markers of card “%1” cannot be confirmed in its source right now (%2). Try again in a moment, or Sync first.")
                 .arg(mergeCardLabel(card), state);
+        }
         for (const auto &value : segments) {
             const auto segment = value.toObject();
             const QString file = segment.value(QStringLiteral("source_file")).toString();
@@ -4892,8 +4918,10 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
     QJsonObject owner;
     QString built;
     sourceDocumentOwner(root, relative, bundleRoot, &owner, &built);
-    if (built != sourceSha && !placedOn.contains(sourceSha))
+    if (built != sourceSha && !placedOn.contains(sourceSha)) {
+        if (syncFirst) *syncFirst = true;
         return QStringLiteral("%1 has changes the server does not have yet. Sync, then merge the cards.").arg(relative);
+    }
     const QDir transactions(QDir(rootPath()).filePath(QStringLiteral("source-transactions")));
     if (!transactions.entryList({QStringLiteral("merge-*.json")}, QDir::Files).isEmpty())
         return QStringLiteral("An earlier card merge is still awaiting recovery. Restart Thoughts and try again.");
@@ -4930,10 +4958,10 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
     return {};
 }
 
-QString ReviewStore::cardMergeProblem(const QList<ReviewCard> &cards, const QString &bundleRoot, CardMerge *preview) const
+QString ReviewStore::cardMergeProblem(const QList<ReviewCard> &cards, const QString &bundleRoot, CardMerge *preview, bool *syncFirst) const
 {
     CardMergePlan plan;
-    const QString problem = prepareCardMerge(cards, {}, bundleRoot, &plan);
+    const QString problem = prepareCardMerge(cards, {}, bundleRoot, &plan, syncFirst);
     if (problem.isEmpty() && preview) {
         *preview = {};
         preview->keptId = plan.keptId;
@@ -4964,7 +4992,12 @@ bool ReviewStore::mergeCards(const QList<ReviewCard> &cards, const QString &kept
     const ReviewCard *first = nullptr;
     for (const ReviewCard &card : std::as_const(plan.cards)) {
         if (!first) first = &card;
-        for (const QVariant &region : card.regions()) regions.append(QJsonObject::fromVariantMap(region.toMap()));
+        QVariantList own = card.regions();
+        // The kept card's page and page fingerprint are the first card's own page: its areas there
+        // lead, before the lines its passage's headings put in the table of contents earlier in the PDF.
+        if (&card == first)
+            std::stable_partition(own.begin(), own.end(), [&card](const QVariant &region) { return region.toMap().value(QStringLiteral("page")).toInt() == card.page(); });
+        for (const QVariant &region : std::as_const(own)) regions.append(QJsonObject::fromVariantMap(region.toMap()));
         const QString answer = primaryObject(card.record).value(QStringLiteral("answer_anchor")).toObject().value(QStringLiteral("normalized_text")).toString().trimmed();
         if (!answer.isEmpty()) answers.append(answer);
     }

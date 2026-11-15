@@ -24,6 +24,8 @@
 #include <QMimeType>
 #include <QPoint>
 #include <QPointer>
+
+#include <optional>
 #include <QRect>
 #include <QSet>
 #include <QStringList>
@@ -472,6 +474,8 @@ private:
     // (else no path), titled as the reader titles it.
     static QString agentNoteDocumentPath(const QString &documentId, const QString &filename, QString *title);
     static void openAgentNoteDocument(const QString &documentId, const QString &path);
+    // A link of an agent note's picture: a Library PDF at its page in a reader, or a web page in the browser.
+    static void openAgentNoteLink(const QString &href);
     // @p part: a sidebar's reader (its page goes to the agent); none: the window, which sends
     // the page of the reader in front.
     static Thoughts::AgentNotesView *createAgentNotesView(bool sidebar, KParts::ReadOnlyPart *part = nullptr);
@@ -629,6 +633,14 @@ private:
     QString m_pdfSyncIconName;
     QString m_pdfPrimaryMenuCommand;
     int m_fedoraManualSyncState = 0;
+    // Merge cards waiting for the Sync that sends this Mac's source first (its last edits, or
+    // proposal decisions): the merge dialog opens when that Sync ends.
+    struct PendingCardMerge {
+        QPointer<KParts::ReadWritePart> part;
+        QStringList cardIds;
+    };
+    std::optional<PendingCardMerge> m_mergeAfterSync;
+    void mergeReviewCardsIn(KParts::ReadWritePart *part, const QStringList &cardIds, bool afterSync);
     QString m_fedoraManualSyncTarget;
     QString m_fedoraManualSyncMessage;
     QString m_fedoraManualSyncDetails;

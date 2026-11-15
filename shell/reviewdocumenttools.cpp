@@ -1663,7 +1663,8 @@ QByteArray removeReviewCardMarkers(const QString &path, const QByteArray &source
         while (matches.hasNext()) {
             const auto match = matches.next();
             qsizetype start = match.capturedStart(), end = match.capturedEnd();
-            const qsizetype line = text.lastIndexOf(QLatin1Char('\n'), start - 1) + 1;
+            // From 0 (the file's first line) lastIndexOf would search back from the end.
+            const qsizetype line = start > 0 ? text.lastIndexOf(QLatin1Char('\n'), start - 1) + 1 : 0;
             const auto suffix = lineRest.match(text.mid(end));
             if (text.mid(line, start - line).trimmed().isEmpty() && suffix.hasMatch()) { start = line; end += suffix.capturedLength(); }
             ranges.append({start, end});

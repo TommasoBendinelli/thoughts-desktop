@@ -22124,30 +22124,31 @@ void PartTest::testReviewCardScheduleText()
     };
     const auto text = [&](const QJsonObject &schedule) { return AnnotationModel::reviewCardSchedule(schedule, now); };
 
-    // Coming due: when, how often, how many times; the last tags apart, the whole schedule in the tooltip.
+    // Coming due: when, how long until then, how many times; the last tags apart, the whole schedule (the
+    // interval too) in the tooltip.
     // Farther away its date, soon the exact time: within hours "in 3 h", later today or tomorrow by the clock.
     auto future = text(reviewCard(now.addDays(3)));
-    QCOMPARE(future.line, QStringLiteral("Due 15 Nov · every 2 weeks · 3 reviews"));
+    QCOMPARE(future.line, QStringLiteral("Due 15 Nov · in 3 days · 3 reviews"));
     QCOMPARE(future.tags, QStringLiteral("last: Correct, my tag"));
     QVERIFY(!future.due);
     QCOMPARE(future.details, QStringLiteral("Due: %1 (in 3 days)\nInterval: 2 weeks\nReviews: 3 · Lapses: 1\nLast reviewed: %2\nLast tags: Correct, my tag")
                                  .arg(local(now.addDays(3)), local(now.addDays(-11))));
-    QCOMPARE(text(reviewCard(now.addDays(1))).line, QStringLiteral("Due tomorrow 12:00 · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 13), QTime(8, 15)).toUTC())).line, QStringLiteral("Due tomorrow 08:15 · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addDays(20))).line, QStringLiteral("Due 2 Dec · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addDays(100))).line, QStringLiteral("Due 20 Feb 2027 · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 12), QTime(21, 40)).toUTC())).line, QStringLiteral("Due today 21:40 · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addSecs(3 * 3600 + 600))).line, QStringLiteral("Due in 3 h · every 2 weeks · 3 reviews"));
-    QCOMPARE(text(reviewCard(now.addSecs(25 * 60))).line, QStringLiteral("Due in 25 min · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(1))).line, QStringLiteral("Due tomorrow 12:00 · 3 reviews"));
+    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 13), QTime(8, 15)).toUTC())).line, QStringLiteral("Due tomorrow 08:15 · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(20))).line, QStringLiteral("Due 2 Dec · in 3 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(100))).line, QStringLiteral("Due 20 Feb 2027 · in 3 months · 3 reviews"));
+    QCOMPARE(text(reviewCard(QDateTime(QDate(2026, 11, 12), QTime(21, 40)).toUTC())).line, QStringLiteral("Due today 21:40 · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addSecs(3 * 3600 + 600))).line, QStringLiteral("Due in 3 h · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addSecs(25 * 60))).line, QStringLiteral("Due in 25 min · 3 reviews"));
 
     // Due: today's "Due now", earlier days overdue by calendar days.
     auto overdue = text(reviewCard(now.addDays(-8)));
-    QCOMPARE(overdue.line, QStringLiteral("Overdue 8 days · every 2 weeks · 3 reviews"));
+    QCOMPARE(overdue.line, QStringLiteral("Overdue 8 days · 3 reviews"));
     QVERIFY(overdue.due);
     QVERIFY(overdue.details.startsWith(QStringLiteral("Due: %1 (overdue 8 days)\n").arg(local(now.addDays(-8)))));
-    QCOMPARE(text(reviewCard(now.addDays(-1))).line, QStringLiteral("Overdue 1 day · every 2 weeks · 3 reviews"));
+    QCOMPARE(text(reviewCard(now.addDays(-1))).line, QStringLiteral("Overdue 1 day · 3 reviews"));
     auto dueNow = text(reviewCard(now.addSecs(-2 * 3600)));
-    QCOMPARE(dueNow.line, QStringLiteral("Due now · every 2 weeks · 3 reviews"));
+    QCOMPARE(dueNow.line, QStringLiteral("Due now · 3 reviews"));
     QVERIFY(dueNow.due);
     QVERIFY(dueNow.details.startsWith(QStringLiteral("Due: %1 (due now)\n").arg(local(now.addSecs(-2 * 3600)))));
     // At its due_from it is due, a second before it is not (the queue's rule, ReviewStore::dueFrom).
@@ -22176,15 +22177,15 @@ void PartTest::testReviewCardScheduleText()
     auto skipped = reviewCard(now.addDays(-1));
     skipped.insert(QStringLiteral("skipped_until"), utc(now.addDays(2)));
     skipped.insert(QStringLiteral("due_from"), utc(now.addDays(2)));
-    QCOMPARE(text(skipped).line, QStringLiteral("Skipped until %1 · every 2 weeks · 3 reviews").arg(now.addDays(2).toLocalTime().toString(QStringLiteral("yyyy-MM-dd"))));
+    QCOMPARE(text(skipped).line, QStringLiteral("Skipped until %1 · 3 reviews").arg(now.addDays(2).toLocalTime().toString(QStringLiteral("yyyy-MM-dd"))));
     QVERIFY(!text(skipped).due);
     QVERIFY(text(skipped).details.contains(QStringLiteral("Skipped until: %1").arg(local(now.addDays(2)))));
     skipped.insert(QStringLiteral("skipped_until"), utc(now.addSecs(3600)));
     skipped.insert(QStringLiteral("due_from"), utc(now.addSecs(3600)));
-    QCOMPARE(text(skipped).line, QStringLiteral("Skipped until %1 · every 2 weeks · 3 reviews").arg(now.addSecs(3600).toLocalTime().toString(QStringLiteral("HH:mm"))));
+    QCOMPARE(text(skipped).line, QStringLiteral("Skipped until %1 · 3 reviews").arg(now.addSecs(3600).toLocalTime().toString(QStringLiteral("HH:mm"))));
     // Past its skip it is due again; overdue days count from the skip's end (the knowledge profile's rule).
-    QCOMPARE(AnnotationModel::reviewCardSchedule(skipped, now.addSecs(7200)).line, QStringLiteral("Due now · every 2 weeks · 3 reviews"));
-    QCOMPARE(AnnotationModel::reviewCardSchedule(skipped, now.addDays(2)).line, QStringLiteral("Overdue 2 days · every 2 weeks · 3 reviews"));
+    QCOMPARE(AnnotationModel::reviewCardSchedule(skipped, now.addSecs(7200)).line, QStringLiteral("Due now · 3 reviews"));
+    QCOMPARE(AnnotationModel::reviewCardSchedule(skipped, now.addDays(2)).line, QStringLiteral("Overdue 2 days · 3 reviews"));
 
     // Not in review: never due, whatever its date says.
     auto retired = reviewCard(now.addDays(-8));
@@ -22226,11 +22227,11 @@ void PartTest::testReviewCardScheduleText()
     QCOMPARE(text(unpublished).line, QStringLiteral("Due 29 Nov · not offered: document unpublished · 3 reviews"));
     unpublished.remove(QStringLiteral("due_at"));
     QCOMPARE(text(unpublished).line, QStringLiteral("Not offered: document unpublished · 3 reviews"));
-    // A date chosen as the interval is no repetition.
+    // A date chosen as the interval: the line says when, like any other.
     auto byDate = reviewCard(now.addDays(3));
     byDate.insert(QStringLiteral("interval"), QStringLiteral("15/11/2026"));
     byDate.insert(QStringLiteral("repeats"), false);
-    QCOMPARE(text(byDate).line, QStringLiteral("Due 15 Nov · 3 reviews"));
+    QCOMPARE(text(byDate).line, QStringLiteral("Due 15 Nov · in 3 days · 3 reviews"));
     QVERIFY(text(byDate).details.contains(QStringLiteral("Interval: 15/11/2026")));
     // A card without a schedule (an older shell): nothing to show.
     QVERIFY(text({}).line.isEmpty());
@@ -22296,13 +22297,13 @@ void PartTest::testAnnotationSidebarReviewCardSchedule()
     // Three days away: its date.
     const QDate laterDate = now.addDays(3).addSecs(60).toLocalTime().date();
     const QString laterDue = QStringLiteral("Due ") + QLocale::c().toString(laterDate, laterDate.year() == now.toLocalTime().date().year() ? QStringLiteral("d MMM") : QStringLiteral("d MMM yyyy"));
-    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), laterDue + QStringLiteral(" · every 2 weeks · 3 reviews"));
+    QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleRole).toString(), laterDue + QStringLiteral(" · in 3 days · 3 reviews"));
     QCOMPARE(row(0).data(AnnotationModel::ReviewCardScheduleTagsRole).toString(), QStringLiteral("last: Correct"));
     // A narrow row shows the first parts that fit whole, the tags last.
     QCOMPARE(row(0).data(AnnotationModel::ReviewCardSchedulePartsRole).toStringList(),
-             (QStringList{laterDue, QStringLiteral("every 2 weeks"), QStringLiteral("3 reviews"), QStringLiteral("last: Correct")}));
+             (QStringList{laterDue, QStringLiteral("in 3 days"), QStringLiteral("3 reviews"), QStringLiteral("last: Correct")}));
     QVERIFY(!row(0).data(AnnotationModel::ReviewCardDueRole).toBool());
-    QCOMPARE(row(1).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Overdue 8 days · every 2 weeks · 3 reviews"));
+    QCOMPARE(row(1).data(AnnotationModel::ReviewCardScheduleRole).toString(), QStringLiteral("Overdue 8 days · 3 reviews"));
     QVERIFY(row(1).data(AnnotationModel::ReviewCardDueRole).toBool());
     const QString tooltip = row(1).data(Qt::ToolTipRole).toString();
     QVERIFY2(tooltip.startsWith(QStringLiteral("Review card: What does the second page say?\nDue: ")), qPrintable(tooltip));

@@ -204,7 +204,7 @@ class FakeThoughts:
             view['replies'] = [r for r in self.replies if r['note_id'] == note['note_id']]
         return view
 
-    def add_reply(self, note_id, image=None, strokes=True, message=None, photo=None, capture=None):
+    def add_reply(self, note_id, image=None, strokes=True, message=None, photo=None, capture=None, sources=None):
         image = image or png(12, 9, (20, 20, 220))
         with self.condition:
             self.reply_sequence += 1
@@ -230,6 +230,8 @@ class FakeThoughts:
                      'strokes_url': f'/v1/agent-notes/replies/{reply_id}/strokes' if strokes else None,
                      'stroke_count': len(document['strokes']) if document else 0, 'message': message,
                      'photo': photo_record}
+            if sources is not None:
+                reply['sources'] = sources
             self.replies.append(reply)
             self.condition.notify_all()
             return reply
@@ -769,6 +771,23 @@ class FolderTest(FakeServerCase):
         ids = [json.loads((folder / f'reply-{n}.json').read_text())['reply_id'] for n in range(1, 5)]
         self.assertEqual(ids, [r['reply_id'] for r in self.fake.replies], 'numbered in reply sequence order')
         self.assertEqual(len((self.root / 'replies.jsonl').read_text().splitlines()), 4)
+
+    def test_a_reply_says_what_the_answer_may_use(self):
+        note = self.send(title='Sources')
+        narrowed = self.fake.add_reply(note['note_id'], message='Only that PDF.', sources='linked_pdf')
+        plain = self.fake.add_reply(note['note_id'], message='Anything.')
+        odd = self.fake.add_reply(note['note_id'], message='Odd.', sources='everything')
+        entries = {e['reply_id']: e for e in agent_notes.sync_replies(client=self.client, root=self.root)['replies']}
+        self.assertEqual(entries[narrowed['reply_id']]['sources'], 'linked_pdf')
+        self.assertIn('only the PDF this note is linked to', entries[narrowed['reply_id']]['sources_rule'])
+        # Without a choice (older apps) or with one this tool does not know: everything, as before.
+        for reply in (plain, odd):
+            self.assertEqual(entries[reply['reply_id']]['sources'], 'library_and_mental_model')
+        journal = {j['reply_id']: j for j in map(json.loads, (self.root / 'replies.jsonl').read_text().splitlines())}
+        self.assertEqual(journal[narrowed['reply_id']]['sources'], 'linked_pdf')
+        # Read back from the folder, the choice is the same.
+        newest = agent_notes.wait_for_reply(note['note_id'], 0, client=self.client, root=self.root)
+        self.assertEqual((newest['reply_id'], newest['sources']), (odd['reply_id'], 'library_and_mental_model'))
 
     def test_reply_to_a_note_not_in_the_folder(self):
         older = self.fake.add_note('Sent last week')

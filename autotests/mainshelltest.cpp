@@ -583,7 +583,6 @@ private Q_SLOTS:
     void testPdfLibraryRefreshCoalescing();
     void testPdfStatusRejectsTransientReloadSnapshot();
     void testReviewActionAvailable();
-    void testAbTestingActionOpensRatingPage();
     void testAgentNotesActionOpensWindow();
     void testAgentNotesSidebarEntry();
     void testOpenAgentNotesForAgents();
@@ -1948,8 +1947,14 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     QVERIFY(oldMenu.contains("<Action name=\"agent_notes\"/>"));
     oldMenu.replace("  <Action name=\"agent_notes\"/>\n", "");
     oldMenu.replace("   <Action name=\"agent_notes\" append=\"open_merge\" />\n", "");
-    QVERIFY(oldMenu.contains("<gui version=\"45\""));
-    oldMenu.replace("<gui version=\"45\"", "<gui version=\"42\"");
+    QVERIFY(oldMenu.contains("<gui version=\"46\""));
+    oldMenu.replace("<gui version=\"46\"", "<gui version=\"42\"");
+    // A layout saved while "A/B testing" existed (v36-v45) has it in the toolbar and the File menu.
+    QVERIFY(!oldMenu.contains("ab_testing"));
+    oldMenu.replace("  <Action name=\"review_overview\"/>\n", "  <Action name=\"review_overview\"/>\n  <Action name=\"ab_testing\"/>\n");
+    oldMenu.replace("   <Action name=\"review_overview\" append=\"open_merge\" />\n",
+                    "   <Action name=\"review_overview\" append=\"open_merge\" />\n   <Action name=\"ab_testing\" append=\"open_merge\" />\n");
+    QCOMPARE(oldMenu.count("ab_testing"), 2);
     QVERIFY(!oldMenu.contains("copy_for_agent"));
     QVERIFY(!oldMenu.contains("mouse_text_box"));
     QVERIFY(!oldMenu.contains("agent_notes"));
@@ -1970,7 +1975,10 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     savedMenu.close();
     QVERIFY(migrated.contains("name=\"copy_for_agent\""));
     QVERIFY(migrated.indexOf("copy_for_agent") > migrated.indexOf("review_overview"));
-    QVERIFY(migrated.contains("version=\"45\""));
+    QVERIFY(migrated.contains("version=\"46\""));
+    // v46: the A/B testing button and menu entry are gone.
+    QVERIFY(!migrated.contains("ab_testing"));
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("ab_testing")));
     QCOMPARE(migrated.count("name=\"mouse_text_box\""), 1);
     QVERIFY(migrated.indexOf("mouse_text_box") > migrated.indexOf("mouse_draw"));
     QVERIFY(migrated.indexOf("mouse_text_box") < migrated.indexOf("document_title"));
@@ -1981,7 +1989,6 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     QVERIFY(migrated.indexOf("agent_notes") > migrated.indexOf("review_overview"));
     QVERIFY(migrated.indexOf("agent_notes") < toolbarStart);
     QVERIFY(migrated.indexOf("agent_notes", toolbarStart) > migrated.indexOf("review_overview", toolbarStart));
-    QVERIFY(migrated.indexOf("agent_notes", toolbarStart) < migrated.indexOf("ab_testing", toolbarStart));
     QAction *fileAgentNotes = shell->actionCollection()->action(QStringLiteral("agent_notes"));
     QVERIFY(fileAgentNotes);
     QCOMPARE(fileAgentNotes->text(), QStringLiteral("Agent Notes"));
@@ -2515,8 +2522,8 @@ void MainShellTest::testTrackedCommentActivatesExistingTab()
         }
     }
     const QStringList addedActions = hasHamburger
-        ? QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("ab_testing"), QStringLiteral("edit_undo"), QStringLiteral("edit_redo")}
-        : QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("ab_testing"), QStringLiteral("hamburger_menu"), QStringLiteral("edit_undo"),
+        ? QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("edit_undo"), QStringLiteral("edit_redo")}
+        : QStringList {QStringLiteral("review_overview"), QStringLiteral("agent_notes"), QStringLiteral("hamburger_menu"), QStringLiteral("edit_undo"),
                        QStringLiteral("edit_redo")};
     for (const QString &name : addedActions) {
         QDomElement actionElement = customizedToolbar.createElement(QStringLiteral("Action"));
@@ -2580,14 +2587,12 @@ void MainShellTest::testTrackedCommentActivatesExistingTab()
     QCOMPARE(toolbarActions.indexOf(pageNumberAction) < toolbarActions.indexOf(statusAction), true);
     QCOMPARE(toolbarActions.indexOf(overviewProxy), toolbarActions.indexOf(statusAction) + 1);
     QCOMPARE(toolbarActions.indexOf(reviewAction), toolbarActions.indexOf(overviewProxy) + 1);
-    QAction *abTestingAction = shell->actionCollection()->action(QStringLiteral("ab_testing"));
-    QVERIFY(abTestingAction);
+    QVERIFY(!shell->actionCollection()->action(QStringLiteral("ab_testing")));
     QAction *agentNotesAction = shell->actionCollection()->action(QStringLiteral("agent_notes"));
     QVERIFY(agentNotesAction);
     QCOMPARE(toolbarActions.indexOf(agentNotesAction), toolbarActions.indexOf(reviewAction) + 1);
-    QCOMPARE(toolbarActions.indexOf(abTestingAction), toolbarActions.indexOf(agentNotesAction) + 1);
     QVERIFY(!shell->m_activePartToolbar->action(QStringLiteral("publish_sources")));
-    QCOMPARE(toolbarActions.indexOf(hamburgerAction), toolbarActions.indexOf(abTestingAction) + 1);
+    QCOMPARE(toolbarActions.indexOf(hamburgerAction), toolbarActions.indexOf(agentNotesAction) + 1);
     // Rematerializing the toolbar replaces its buttons, so look them up on use.
     const auto button = [mainToolBar](QAction *action) { return qobject_cast<QToolButton *>(mainToolBar->widgetForAction(action)); };
     const auto visibleInToolBar = [&](QAction *action) {
@@ -2599,7 +2604,6 @@ void MainShellTest::testTrackedCommentActivatesExistingTab()
     QVERIFY(button(statusAction));
     QCOMPARE(button(overviewProxy)->toolButtonStyle(), Qt::ToolButtonIconOnly);
     QCOMPARE(button(reviewAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
-    QCOMPARE(button(abTestingAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
     QCOMPARE(button(agentNotesAction)->toolButtonStyle(), Qt::ToolButtonIconOnly);
     QVERIFY(!agentNotesAction->icon().isNull());
     QCOMPARE(button(statusAction)->toolButtonStyle(), Qt::ToolButtonTextBesideIcon);
@@ -8065,70 +8069,6 @@ void MainShellTest::testReviewActionAvailable()
     QVERIFY(overview->close());
     QVERIFY(Shell::s_commentsOverview->isVisible());
     QCOMPARE(overviewTabs->currentWidget(), summaryPage);
-}
-
-// "A/B testing" sits right after Review and Agent Notes in the File menu and the
-// toolbar, and opens the A/B rating page in the browser. A build without a page
-// (THOUGHTS_AB_TESTING_URL, which the environment overrides) hides it.
-void MainShellTest::testAbTestingActionOpensRatingPage()
-{
-    const bool hadPage = qEnvironmentVariableIsSet("THOUGHTS_AB_TESTING_URL");
-    const QByteArray savedPage = qgetenv("THOUGHTS_AB_TESTING_URL");
-    const auto restorePage = qScopeGuard([hadPage, savedPage] {
-        if (hadPage) {
-            qputenv("THOUGHTS_AB_TESTING_URL", savedPage);
-        } else {
-            qunsetenv("THOUGHTS_AB_TESTING_URL");
-        }
-    });
-    qputenv("THOUGHTS_AB_TESTING_URL", "https://ab.example.org:8445/");
-    auto *shell = new Shell;
-    // Agent Notes (v45) sits between Review and A/B testing.
-    QAction *const reviewAction = shell->actionCollection()->action(QStringLiteral("agent_notes"));
-    QAction *const action = shell->actionCollection()->action(QStringLiteral("ab_testing"));
-    QVERIFY(reviewAction);
-    QVERIFY(action);
-    QCOMPARE(action->text(), QStringLiteral("A/B testing"));
-    QVERIFY(!action->icon().isNull());
-    QVERIFY(action->isVisible());
-    bool followsReviewInMenu = false;
-    for (QAction *menuAction : shell->menuBar()->actions()) {
-        QMenu *const menu = menuAction->menu();
-        if (menu && menu->actions().contains(action)) {
-            followsReviewInMenu = menu->actions().indexOf(action) == menu->actions().indexOf(reviewAction) + 1;
-        }
-    }
-    QVERIFY(followsReviewInMenu);
-    shell->resize(1100, 750);
-    shell->show();
-    QVERIFY(QTest::qWaitForWindowExposed(shell));
-    QToolBar *toolbar = shell->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
-    QVERIFY(toolbar);
-    QCOMPARE(toolbar->actions().indexOf(action), toolbar->actions().indexOf(reviewAction) + 1);
-    auto *abTestingButton = qobject_cast<QToolButton *>(toolbar->widgetForAction(action));
-    QVERIFY(abTestingButton);
-    QCOMPARE(abTestingButton->text(), QStringLiteral("A/B testing"));
-
-    BrowserUrlCatcher catcher;
-    QDesktopServices::setUrlHandler(QStringLiteral("https"), &catcher, "open");
-    const auto unsetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
-    QTest::mouseClick(abTestingButton, Qt::LeftButton);
-    QCOMPARE(catcher.urls, QList<QUrl>({QUrl(QStringLiteral("https://ab.example.org:8445/"))}));
-
-    // Without a page the entry stays in place but hidden, in the menu and on the toolbar.
-    qputenv("THOUGHTS_AB_TESTING_URL", "");
-    auto *plain = new Shell;
-    QAction *const hidden = plain->actionCollection()->action(QStringLiteral("ab_testing"));
-    QVERIFY(hidden);
-    QVERIFY(!hidden->isVisible());
-    plain->resize(1100, 750);
-    plain->show();
-    QVERIFY(QTest::qWaitForWindowExposed(plain));
-    QToolBar *plainToolbar = plain->findChild<QToolBar *>(QStringLiteral("mainToolBar"));
-    QVERIFY(plainToolbar);
-    QWidget *const hiddenButton = plainToolbar->widgetForAction(hidden);
-    QVERIFY(!hiddenButton || !hiddenButton->isVisible());
-    QCOMPARE(catcher.urls.size(), 1);
 }
 
 // File › Agent Notes and its toolbar button, both right after Review, open the window of the

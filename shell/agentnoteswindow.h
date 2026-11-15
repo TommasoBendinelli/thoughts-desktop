@@ -53,17 +53,26 @@ public:
     void fitWidth(int available);
     // A click on the picture emits clicked() (the sidebar's way to see it large).
     void setClickable(bool clickable);
+    // The note's sources on the picture: a click on one emits linkActivated(href) instead of
+    // clicked(), and the pointer and a tooltip show where it goes.
+    void setLinks(const QList<AgentNotes::NoteLink> &links);
+    QList<AgentNotes::NoteLink> links() const { return m_links; }
+    // The link under @p position (widget pixels), or -1.
+    int linkAt(const QPointF &position) const;
 
 Q_SIGNALS:
     void clicked();
+    void linkActivated(const QString &href);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
 
 private:
     void updateSize();
+    void updateCursor(int link);
 
     QString m_sha256;
     QSize m_expectedSize;
@@ -74,6 +83,8 @@ private:
     bool m_loading = false;
     bool m_clickable = false;
     QPixmap m_scaled;
+    QList<AgentNotes::NoteLink> m_links;
+    int m_hoveredLink = -1;
 };
 
 // The notes, newest first with unread ones marked, and the chosen note with its picture,
@@ -131,6 +142,11 @@ public:
     void setLargeOpener(NoteOpener openLarge) { m_openLarge = std::move(openLarge); }
     // "Send Page to Agent…": the page it sends (none: the button is hidden).
     void setPageProvider(PageProvider provider);
+    // Opens a link of a note's picture (a Library PDF page or a web page).
+    using LinkOpener = std::function<void(const QString &href)>;
+    void setLinkOpener(LinkOpener open) { m_openLink = std::move(open); }
+    // A link of a note's picture was clicked.
+    void openLink(const QString &href);
     void setLibraryProvider(LibraryProvider provider);
 
     // Only a project's or a document's notes (empty: all). Older notes of those documents are
@@ -196,6 +212,7 @@ private:
     QPointer<AgentNotes::Center> m_center;
     DocumentResolver m_resolveDocument;
     DocumentOpener m_openDocument;
+    LinkOpener m_openLink;
     CardOpener m_openCard;
     NoteOpener m_openLarge;
     PageProvider m_pageProvider;
@@ -248,6 +265,8 @@ private:
     QPushButton *m_drawButton = nullptr;
     QLabel *m_replyStatus = nullptr;
     QPushButton *m_sendReply = nullptr;
+    // What the agent may use when it answers (AgentNotes::ReplySources), sent with every reply.
+    QComboBox *m_sourcesBox = nullptr;
     QLabel *m_repliesHeader = nullptr;
     QWidget *m_replies = nullptr;
     QVBoxLayout *m_repliesLayout = nullptr;

@@ -9,6 +9,8 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
+#include <QSignalBlocker>
+#include <QToolTip>
 #include <QContextMenuEvent>
 #include <QDesktopServices>
 #include <QFileInfo>
@@ -232,14 +234,62 @@ void AgentNoteImageView::paintEvent(QPaintEvent *)
 void AgentNoteImageView::setClickable(bool clickable)
 {
     m_clickable = clickable;
-    setCursor(clickable ? Qt::PointingHandCursor : Qt::ArrowCursor);
+    updateCursor(m_hoveredLink);
+}
+
+void AgentNoteImageView::setLinks(const QList<AgentNotes::NoteLink> &links)
+{
+    m_links = links;
+    m_hoveredLink = -1;
+    setMouseTracking(!links.isEmpty());
+    updateCursor(-1);
+}
+
+int AgentNoteImageView::linkAt(const QPointF &position) const
+{
+    if (m_links.isEmpty() || width() <= 0 || height() <= 0) return -1;
+    // The picture fills the widget at its own aspect ratio (fitWidth), so widget fractions are picture fractions.
+    const QPointF at(position.x() / width(), position.y() / height());
+    for (int index = 0; index < m_links.size(); ++index) {
+        if (m_links.at(index).rect.contains(at)) return index;
+    }
+    return -1;
+}
+
+void AgentNoteImageView::updateCursor(int link)
+{
+    setCursor(link >= 0 || m_clickable ? Qt::PointingHandCursor : Qt::ArrowCursor);
+}
+
+void AgentNoteImageView::mouseMoveEvent(QMouseEvent *event)
+{
+    const int link = linkAt(event->position());
+    if (link != m_hoveredLink) {
+        m_hoveredLink = link;
+        updateCursor(link);
+        if (link >= 0) {
+            const AgentNotes::NoteLink &target = m_links.at(link);
+            const QString where = target.href.startsWith(QLatin1String("thoughts-pdf-link:"))
+                ? i18n("Open in Thoughts") : target.href;
+            QToolTip::showText(event->globalPosition().toPoint(), target.label.isEmpty() ? where : i18n("%1 — %2", target.label, where), this);
+        } else {
+            QToolTip::hideText();
+        }
+    }
+    QWidget::mouseMoveEvent(event);
 }
 
 void AgentNoteImageView::mouseReleaseEvent(QMouseEvent *event)
 {
-    if (m_clickable && event->button() == Qt::LeftButton && rect().contains(event->position().toPoint())) {
-        Q_EMIT clicked();
-        return;
+    if (event->button() == Qt::LeftButton && rect().contains(event->position().toPoint())) {
+        if (const int link = linkAt(event->position()); link >= 0) {
+            Q_EMIT linkActivated(m_links.at(link).href);
+            return;
+        }
+        if (m_clickable) {
+            Q_EMIT clicked();
+            return;
+        }
     }
     QWidget::mouseReleaseEvent(event);
 }
@@ -491,6 +541,16 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         m_center->setDraftMessage(m_shownNoteId, m_replyField->toPlainText());
     });
     connect(m_drawButton, &QPushButton::clicked, this, [this] { openComposer(m_shownNoteId); });
+    const auto showSources = [this] {
+        const QString value = m_center ? m_center->replySources() : AgentNotes::ReplySources::defaultValue();
+        const QSignalBlocker blocker(m_sourcesBox);
+        m_sourcesBox->setCurrentIndex(std::max(0, m_sourcesBox->findData(value)));
+        m_sourcesBox->setToolTip(i18n("What the agent may use to answer: %1", AgentNotes::ReplySources::description(value)));
+    };
+    showSources();
+    connect(m_sourcesBox, &QComboBox::activated, this, [this](int index) {
+        if (m_center) m_center->setReplySources(m_sourcesBox->itemData(index).toString());
+    });
     connect(m_sendReply, &QPushButton::clicked, this, [this] {
         if (m_center && !m_shownNoteId.isEmpty() && m_sendReply->isEnabled()) m_center->sendReply(m_shownNoteId);
     });
@@ -513,6 +573,8 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
             if (noteId == m_shownNoteId) updateAnswerLine();
         });
         connect(m_center, &AgentNotes::Center::answerOptionsChanged, this, &AgentNotesView::updateAnswerLine);
+        // The Agent Notes window and the reader sidebar show the same choice.
+        connect(m_center, &AgentNotes::Center::replySourcesChanged, this, showSources);
         m_listeningTimer = new QTimer(this);
         m_listeningTimer->setObjectName(QStringLiteral("agentNoteListeningTimer"));
         m_listeningTimer->setInterval(ListeningRefreshMs);
@@ -582,6 +644,7 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     }
     m_image = new AgentNoteImageView(m_detail);
     m_image->setObjectName(QStringLiteral("agentNoteImage"));
+    connect(m_image, &AgentNoteImageView::linkActivated, this, &AgentNotesView::openLink);
 
     // Reply, as on the phone: a comment, a drawing on the picture, or both.
     m_replyBox = new QWidget(m_detail);
@@ -607,7 +670,27 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     m_sendReply = new QPushButton(QIcon::fromTheme(QStringLiteral("document-send")), i18n("Send Reply"), m_replyBox);
     m_sendReply->setObjectName(QStringLiteral("agentNoteSend"));
     m_sendReply->setToolTip(i18n("Send the comment (and the drawing) to the agent (%1)", QKeySequence(Qt::CTRL | Qt::Key_Return).toString(QKeySequence::NativeText)));
+    // What the answering agent may use: kept for every reply until changed.
+    m_sourcesBox = new QComboBox(m_replyBox);
+    m_sourcesBox->setObjectName(QStringLiteral("agentNoteReplySources"));
+    // In the reader's narrow sidebar the box shrinks with it (its texts are cut, the list shows them whole).
+    m_sourcesBox->setSizeAdjustPolicy(sidebar ? QComboBox::AdjustToMinimumContentsLengthWithIcon : QComboBox::AdjustToContents);
     if (sidebar) {
+        m_sourcesBox->setMinimumContentsLength(4);
+        m_sourcesBox->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    }
+    for (const QString &value : AgentNotes::ReplySources::all()) {
+        m_sourcesBox->addItem(AgentNotes::ReplySources::label(value), value);
+        m_sourcesBox->setItemData(m_sourcesBox->count() - 1, AgentNotes::ReplySources::description(value), Qt::ToolTipRole);
+    }
+    m_sourcesBox->setAccessibleName(i18n("What the agent may use to answer"));
+    auto *sourcesLabel = new QLabel(i18nc("what the agent may use to answer a reply", "Sources:"), m_replyBox);
+    sourcesLabel->setBuddy(m_sourcesBox);
+    if (sidebar) {
+        auto *sourcesRow = new QHBoxLayout;
+        sourcesRow->addWidget(sourcesLabel);
+        sourcesRow->addWidget(m_sourcesBox, 1);
+        replyButtons->addLayout(sourcesRow);
         auto *row = new QHBoxLayout;
         row->addWidget(m_drawButton);
         row->addStretch(1);
@@ -617,6 +700,8 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     } else {
         replyButtons->addWidget(m_drawButton);
         replyButtons->addWidget(m_replyStatus, 1);
+        replyButtons->addWidget(sourcesLabel);
+        replyButtons->addWidget(m_sourcesBox);
         replyButtons->addWidget(m_sendReply);
     }
     replyLayout->addLayout(replyButtons);
@@ -927,6 +1012,17 @@ void AgentNotesView::openInPlace(const QString &noteId)
     markSeenSoon(*note);
 }
 
+void AgentNotesView::openLink(const QString &href)
+{
+    if (m_openLink) {
+        m_openLink(href);
+        return;
+    }
+    // Without the Shell (tests): a web page in the browser.
+    const QUrl url(href);
+    if (url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("http")) QDesktopServices::openUrl(url);
+}
+
 void AgentNotesView::markSeenSoon(const Note &note)
 {
     // Unread here, or not opened anywhere yet: the server hears "opened" (Center::noteShown).
@@ -977,6 +1073,7 @@ void AgentNotesView::showDetail(const Note &note, bool sameNote)
     m_message->setVisible(!note.message.isEmpty());
 
     // A picture that failed to load is asked for again when the note is shown again.
+    m_image->setLinks(note.links);
     if (!sameNote || m_image->sha256() != note.imageSha256 || m_image->failed()) {
         m_image->setSource(note.imageSha256, QSize(note.imageWidth, note.imageHeight));
         loadImage(m_image, note.imageUrl, note.imageSha256, note.mediaType);
@@ -1429,6 +1526,10 @@ void AgentNotesView::rebuildReplies(const Note &note)
         QStringList parts{AgentNotes::relativeTime(reply.createdAt, now), reply.deviceId.isEmpty() ? i18n("from the phone") : i18n("from %1", reply.deviceId)};
         if (reply.strokeCount > 0) parts.append(i18np("1 stroke drawn", "%1 strokes drawn", reply.strokeCount));
         if (reply.hasPhoto()) parts.append(i18n("with a photo from the glasses"));
+        // What the agent could use, when the reply narrowed it.
+        if (!reply.sources.isEmpty() && reply.sources != AgentNotes::ReplySources::defaultValue()
+            && !AgentNotes::ReplySources::label(reply.sources).isEmpty())
+            parts.append(AgentNotes::ReplySources::label(reply.sources));
         meta->setText(parts.join(QStringLiteral(" · ")));
         layout->addWidget(meta);
         auto *message = wrappingLabel(QStringLiteral("agentNoteReplyMessage"), box);
@@ -1443,6 +1544,11 @@ void AgentNotesView::rebuildReplies(const Note &note)
             auto *image = new AgentNoteImageView(box);
             image->setObjectName(QStringLiteral("agentNoteReplyImage"));
             image->setSource(reply.imageSha256, QSize(reply.imageWidth, reply.imageHeight));
+            // The note's picture drawn on: its links stay where they were.
+            if (reply.imageWidth == note.imageWidth && reply.imageHeight == note.imageHeight) {
+                image->setLinks(note.links);
+                connect(image, &AgentNoteImageView::linkActivated, this, &AgentNotesView::openLink);
+            }
             if (shown.contains(reply.imageSha256)) {
                 image->setImage(shown.value(reply.imageSha256));
                 if (m_center) image->setCachedPath(m_center->client()->cachedImagePath(reply.imageSha256, reply.mediaType));
