@@ -5145,9 +5145,10 @@ void CommentsOverview::showFedoraDetails()
     addressStatus->setWordWrap(true);
     addressStatus->setTextFormat(Qt::PlainText);
     layout->addWidget(addressStatus);
-    // The device token belongs to the server that issued it. When the address
-    // names another server, the stored token is not sent there and the
-    // owner is asked for that server's token.
+    // The device tokens belong to the server that issued them. A new
+    // installation, or an address that names another server, asks for that
+    // server's two tokens here: the app's and the source publisher's. A token
+    // stored for one server is not sent to another.
     auto *tokenStatus = new QLabel(dialog);
     tokenStatus->setObjectName(QStringLiteral("thoughtsOverviewServerTokenStatus"));
     tokenStatus->setWordWrap(true);
@@ -5155,54 +5156,106 @@ void CommentsOverview::showFedoraDetails()
     layout->addWidget(tokenStatus);
     auto *tokenRow = new QWidget(dialog);
     tokenRow->setObjectName(QStringLiteral("thoughtsOverviewServerTokenRow"));
-    auto *tokenLayout = new QHBoxLayout(tokenRow);
+    auto *tokenLayout = new QGridLayout(tokenRow);
     tokenLayout->setContentsMargins(0, 0, 0, 0);
-    auto *tokenLabel = new QLabel(i18n("Device token:"), tokenRow);
+    auto *tokenLabel = new QLabel(i18n("App token:"), tokenRow);
     auto *token = new QLineEdit(tokenRow);
     token->setObjectName(QStringLiteral("thoughtsOverviewServerToken"));
     token->setEchoMode(QLineEdit::Password);
     token->setAccessibleName(i18n("Device token of the server"));
     tokenLabel->setBuddy(token);
-    auto *storeToken = new QPushButton(i18n("Store Token"), tokenRow);
+    auto *sourceTokenLabel = new QLabel(i18n("Source publisher token:"), tokenRow);
+    auto *sourceToken = new QLineEdit(tokenRow);
+    sourceToken->setObjectName(QStringLiteral("thoughtsOverviewServerSourceToken"));
+    sourceToken->setEchoMode(QLineEdit::Password);
+    sourceToken->setAccessibleName(i18n("Source publisher token of the server"));
+    sourceTokenLabel->setBuddy(sourceToken);
+    auto *storeToken = new QPushButton(i18n("Store Tokens"), tokenRow);
     storeToken->setObjectName(QStringLiteral("thoughtsOverviewServerTokenStore"));
     storeToken->setAutoDefault(false);
     storeToken->setEnabled(false);
-    tokenLayout->addWidget(tokenLabel);
-    tokenLayout->addWidget(token, 1);
-    tokenLayout->addWidget(storeToken);
+    tokenLayout->addWidget(tokenLabel, 0, 0);
+    tokenLayout->addWidget(token, 0, 1);
+    tokenLayout->addWidget(sourceTokenLabel, 1, 0);
+    tokenLayout->addWidget(sourceToken, 1, 1);
+    tokenLayout->addWidget(storeToken, 1, 2);
+    tokenLayout->setColumnStretch(1, 1);
     layout->addWidget(tokenRow);
     const bool addressFromEnvironment = Thoughts::ServerAddress::overriddenByEnvironment();
-    const auto updateToken = [tokenStatus, tokenRow, addressFromEnvironment] {
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+    constexpr bool secretStore = true;
+#else
+    constexpr bool secretStore = false;
+#endif
+    const auto updateToken = [tokenStatus, tokenRow, addressFromEnvironment, secretStore] {
         const QString configured = Thoughts::ServerAddress::configured();
         const QString issuedFor = Thoughts::ServerAddress::tokenOrigin(Thoughts::Platform::desktopDeviceAccount());
         const QString target = Thoughts::ServerAddress::origin(configured);
-        const bool otherServer = !issuedFor.isEmpty() && !target.isEmpty() && issuedFor != target;
-        tokenStatus->setVisible(otherServer);
+        // No token recorded yet (a new installation) or one for another server.
+        const bool needsToken = !target.isEmpty() && issuedFor != target;
+        tokenStatus->setVisible(needsToken);
         // A token for a THOUGHTS_SERVER_URL address is given with THOUGHTS_TOKEN, not stored.
-        tokenRow->setVisible(otherServer && !addressFromEnvironment);
-        if (otherServer) {
-            tokenStatus->setText(addressFromEnvironment
-                    ? i18n("This computer's device token was issued for %1 and is not sent to %2. Give the token for this session in THOUGHTS_TOKEN.", issuedFor, target)
-                    : i18n("This computer's device token was issued for %1 and is not sent to %2. Enter the device token of %2:", issuedFor, target));
+        // Without a secret store (Linux) a new installation is given its tokens in the environment.
+        const bool environmentTokens = addressFromEnvironment || (!secretStore && issuedFor.isEmpty());
+        tokenRow->setVisible(needsToken && !environmentTokens);
+        if (!needsToken) {
+            return;
+        }
+        if (environmentTokens) {
+            tokenStatus->setText(issuedFor.isEmpty()
+                    ? i18n("Give this computer's tokens for %1 in THOUGHTS_TOKEN and THOUGHTS_SOURCE_TOKEN.", target)
+                    : i18n("This computer's device token was issued for %1 and is not sent to %2. Give the token for this session in THOUGHTS_TOKEN.", issuedFor, target));
+        } else {
+            tokenStatus->setText(issuedFor.isEmpty()
+                    ? i18n("Enter the two tokens the owner of %1 gave you for this computer:", target)
+                    : i18n("This computer's device token was issued for %1 and is not sent to %2. Enter the tokens of %2:", issuedFor, target));
         }
     };
     updateToken();
-    connect(token, &QLineEdit::textChanged, storeToken, [token, storeToken] { storeToken->setEnabled(!token->text().trimmed().isEmpty()); });
+    const auto updateStore = [token, sourceToken, storeToken] {
+        storeToken->setEnabled(!token->text().trimmed().isEmpty() || !sourceToken->text().trimmed().isEmpty());
+    };
+    connect(token, &QLineEdit::textChanged, storeToken, updateStore);
+    connect(sourceToken, &QLineEdit::textChanged, storeToken, updateStore);
     connect(token, &QLineEdit::returnPressed, storeToken, &QPushButton::click);
-    connect(storeToken, &QPushButton::clicked, dialog, [this, token, tokenStatus, tokenRow] {
-        const QByteArray secret = Thoughts::Platform::cleanSecret(token->text().toUtf8());
-        const QString saved = Thoughts::ServerAddress::saved();
-        const QString account = Thoughts::Platform::desktopDeviceAccount();
-        QString error;
-        const bool stored = m_serverTokenWriter ? m_serverTokenWriter(account, secret, &error)
-                                                : Thoughts::Platform::writeSecret(Thoughts::ServerAddress::tokenService(), account, secret, &error);
-        if (secret.isEmpty() || !stored || !Thoughts::ServerAddress::bindToken(account, secret, saved, &error)) {
-            tokenStatus->setText(error.isEmpty() ? i18n("The token could not be stored.") : i18n("The token could not be stored: %1", error));
-            return;
+    connect(sourceToken, &QLineEdit::returnPressed, storeToken, &QPushButton::click);
+    connect(storeToken, &QPushButton::clicked, dialog, [this, saveAddress, token, sourceToken, tokenStatus, updateToken] {
+        // The address comes first: each token is bound to the address saved
+        // when it is stored, so an address typed but not saved is saved now.
+        if (saveAddress->isEnabled()) {
+            saveAddress->click();
+            if (saveAddress->isEnabled()) {
+                return;
+            }
         }
-        token->clear();
-        tokenRow->setVisible(false);
-        tokenStatus->setText(i18n("Stored the device token of %1. Quit and reopen Thoughts to connect.", Thoughts::ServerAddress::origin(saved)));
+        const QString saved = Thoughts::ServerAddress::saved();
+        const bool firstConnection = Thoughts::ServerAddress::tokenOrigin(Thoughts::Platform::desktopDeviceAccount()).isEmpty();
+        const QList<std::pair<QLineEdit *, QString>> fields{{token, Thoughts::Platform::desktopDeviceAccount()},
+                                                            {sourceToken, QStringLiteral("thoughts-source-sync")}};
+        for (const auto &[field, account] : fields) {
+            const QByteArray secret = Thoughts::Platform::cleanSecret(field->text().toUtf8());
+            if (secret.isEmpty()) {
+                continue;
+            }
+            QString error;
+            const bool stored = m_serverTokenWriter ? m_serverTokenWriter(account, secret, &error)
+                                                    : Thoughts::Platform::writeSecret(Thoughts::ServerAddress::tokenService(), account, secret, &error);
+            if (!stored || !Thoughts::ServerAddress::bindToken(account, secret, saved, &error)) {
+                tokenStatus->setText(error.isEmpty() ? i18n("The token could not be stored.") : i18n("The token could not be stored: %1", error));
+                return;
+            }
+            field->clear();
+        }
+        updateToken();
+        tokenStatus->setVisible(true);
+        if (firstConnection) {
+            // Nothing has connected yet, so this Sync uses the new tokens.
+            tokenStatus->setText(i18n("Stored the tokens of %1. Connecting…", Thoughts::ServerAddress::origin(saved)));
+            Q_EMIT syncRequested();
+        } else {
+            // The running connection keeps the token it started with.
+            tokenStatus->setText(i18n("Stored the tokens of %1. Quit and reopen Thoughts to connect.", Thoughts::ServerAddress::origin(saved)));
+        }
     });
     if (addressFromEnvironment) {
         address->setReadOnly(true);
@@ -5224,8 +5277,11 @@ void CommentsOverview::showFedoraDetails()
             const QString saved = Thoughts::ServerAddress::saved();
             address->setText(saved);
             saveAddress->setEnabled(false);
-            addressStatus->setText(i18n("Saved. Quit and reopen Thoughts to connect to %1.", saved));
-            // Another server: ask for its token.
+            // A new installation connects once its tokens are stored; a
+            // running connection keeps its address until a restart.
+            const bool firstConnection = Thoughts::ServerAddress::tokenOrigin(Thoughts::Platform::desktopDeviceAccount()).isEmpty();
+            addressStatus->setText(firstConnection ? i18n("Saved.") : i18n("Saved. Quit and reopen Thoughts to connect to %1.", saved));
+            // Another server, or none yet: ask for its tokens.
             updateToken();
         });
     }

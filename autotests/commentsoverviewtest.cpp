@@ -686,6 +686,7 @@ private Q_SLOTS:
     void testFedoraDetailsDialog();
     void testServerDialogSavesAddress();
     void testServerDialogAsksForTheTokenOfAnotherServer();
+    void testServerDialogStoresBothTokensOnFirstRun();
     void testDocumentSyncPresentationAggregation();
     void testDocumentSyncActivityPresentation();
     void testSyncOutcomeSummary();
@@ -8693,7 +8694,8 @@ void CommentsOverviewTest::testServerDialogSavesAddress()
     QCOMPARE(Thoughts::ServerAddress::saved(), QStringLiteral("https://thoughts.example.org"));
     QCOMPARE(address->text(), QStringLiteral("https://thoughts.example.org"));
     QVERIFY(!save->isEnabled());
-    QCOMPARE(status->text(), QStringLiteral("Saved. Quit and reopen Thoughts to connect to https://thoughts.example.org."));
+    // No token recorded yet: the tokens are asked for next, and they connect without a restart.
+    QCOMPARE(status->text(), QStringLiteral("Saved."));
     dialog->close();
     delete dialog;
 
@@ -8778,7 +8780,7 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     QVERIFY(!tokenStatus->isHidden());
     QVERIFY(!tokenRow->isHidden());
     QCOMPARE(tokenStatus->text(), QStringLiteral("This computer's device token was issued for https://first.example.org and is not sent to https://second.example.org. "
-                                                 "Enter the device token of https://second.example.org:"));
+                                                 "Enter the tokens of https://second.example.org:"));
     QVERIFY(!Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-one", second));
     QVERIFY(!storeToken->isEnabled());
 
@@ -8795,7 +8797,7 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     QCOMPARE(storedAccount, account);
     QCOMPARE(storedToken, QByteArray("token-two"));
     QVERIFY(tokenRow->isHidden());
-    QCOMPARE(tokenStatus->text(), QStringLiteral("Stored the device token of https://second.example.org. Quit and reopen Thoughts to connect."));
+    QCOMPARE(tokenStatus->text(), QStringLiteral("Stored the tokens of https://second.example.org. Quit and reopen Thoughts to connect."));
     QVERIFY(token->text().isEmpty());
     QVERIFY(Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-two", second));
     QVERIFY(!Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-two", first));
@@ -8812,6 +8814,95 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     QCOMPARE(tokenStatus->text(), QStringLiteral("This computer's device token was issued for https://second.example.org and is not sent to https://third.example.org. "
                                                  "Give the token for this session in THOUGHTS_TOKEN."));
     QVERIFY(dialog->findChild<QWidget *>(QStringLiteral("thoughtsOverviewServerTokenRow"))->isHidden());
+    dialog->close();
+    delete dialog;
+}
+
+void CommentsOverviewTest::testServerDialogStoresBothTokensOnFirstRun()
+{
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    QSKIP("Without a secret store a new installation is given its tokens in THOUGHTS_TOKEN and THOUGHTS_SOURCE_TOKEN.");
+#endif
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString store = Thoughts::ServerAddress::storePath();
+    QFile::remove(store);
+    const bool hadServer = qEnvironmentVariableIsSet("THOUGHTS_SERVER_URL");
+    const QByteArray previousServer = qgetenv("THOUGHTS_SERVER_URL");
+    const auto restore = qScopeGuard([hadServer, previousServer, store] {
+        if (hadServer) {
+            qputenv("THOUGHTS_SERVER_URL", previousServer);
+        } else {
+            qunsetenv("THOUGHTS_SERVER_URL");
+        }
+        QFile::remove(store);
+    });
+    qunsetenv("THOUGHTS_SERVER_URL");
+    const QString first = QStringLiteral("https://first.example.org");
+    const QString ours = QStringLiteral("https://ours.example.org");
+    const QString account = Thoughts::Platform::desktopDeviceAccount();
+    const QString sourceAccount = QStringLiteral("thoughts-source-sync");
+    // A new installation: the build's address is saved, and no token was ever stored.
+    QVERIFY(Thoughts::ServerAddress::save(first));
+
+    Thoughts::CommentsOverview overview(temporary.path());
+    QMap<QString, QByteArray> stored;
+    bool storeSucceeds = false;
+    overview.setServerTokenWriter([&](const QString &tokenAccount, const QByteArray &token, QString *error) {
+        if (!storeSucceeds) {
+            *error = QStringLiteral("the secret store is locked");
+            return false;
+        }
+        stored.insert(tokenAccount, token);
+        return true;
+    });
+    QSignalSpy syncRequests(&overview, &Thoughts::CommentsOverview::syncRequested);
+    overview.showServerDetails();
+    auto *dialog = overview.findChild<QDialog *>(QStringLiteral("thoughtsOverviewFedoraDetailsDialog"));
+    QVERIFY(dialog);
+    auto *address = dialog->findChild<QLineEdit *>(QStringLiteral("thoughtsOverviewServerAddress"));
+    auto *tokenStatus = dialog->findChild<QLabel *>(QStringLiteral("thoughtsOverviewServerTokenStatus"));
+    auto *tokenRow = dialog->findChild<QWidget *>(QStringLiteral("thoughtsOverviewServerTokenRow"));
+    auto *token = dialog->findChild<QLineEdit *>(QStringLiteral("thoughtsOverviewServerToken"));
+    auto *sourceToken = dialog->findChild<QLineEdit *>(QStringLiteral("thoughtsOverviewServerSourceToken"));
+    auto *storeToken = dialog->findChild<QPushButton *>(QStringLiteral("thoughtsOverviewServerTokenStore"));
+    QVERIFY(address && tokenStatus && tokenRow && token && sourceToken && storeToken);
+    // Both tokens are asked for at once, hidden as they are typed.
+    QVERIFY(!tokenStatus->isHidden());
+    QVERIFY(!tokenRow->isHidden());
+    QCOMPARE(tokenStatus->text(), QStringLiteral("Enter the two tokens the owner of https://first.example.org gave you for this computer:"));
+    QCOMPARE(token->echoMode(), QLineEdit::Password);
+    QCOMPARE(sourceToken->echoMode(), QLineEdit::Password);
+    QVERIFY(!storeToken->isEnabled());
+
+    // The owner's address is typed but not saved: storing the tokens saves it first, so they are bound to it.
+    address->clear();
+    QTest::keyClicks(address, ours);
+    QTest::keyClicks(token, QStringLiteral(" app-1 "));
+    QTest::keyClicks(sourceToken, QStringLiteral("publisher-1"));
+    QVERIFY(storeToken->isEnabled());
+    QTest::mouseClick(storeToken, Qt::LeftButton);
+    QCOMPARE(tokenStatus->text(), QStringLiteral("The token could not be stored: the secret store is locked"));
+    QCOMPARE(Thoughts::ServerAddress::saved(), ours);
+    QVERIFY(Thoughts::ServerAddress::tokenOrigin(account).isEmpty());
+    QVERIFY(!tokenRow->isHidden());
+    QCOMPARE(syncRequests.count(), 0);
+
+    storeSucceeds = true;
+    QTest::mouseClick(storeToken, Qt::LeftButton);
+    QCOMPARE(stored.value(account), QByteArray("app-1"));
+    QCOMPARE(stored.value(sourceAccount), QByteArray("publisher-1"));
+    QCOMPARE(Thoughts::ServerAddress::tokenOrigin(account), ours);
+    QCOMPARE(Thoughts::ServerAddress::tokenOrigin(sourceAccount), ours);
+    QVERIFY(Thoughts::ServerAddress::tokenMayBeSentTo(account, "app-1", ours));
+    QVERIFY(Thoughts::ServerAddress::tokenMayBeSentTo(sourceAccount, "publisher-1", ours));
+    QVERIFY(!Thoughts::ServerAddress::tokenMayBeSentTo(account, "app-1", first));
+    QVERIFY(tokenRow->isHidden());
+    QVERIFY(token->text().isEmpty());
+    QVERIFY(sourceToken->text().isEmpty());
+    // Nothing had connected yet, so it connects now, without a restart.
+    QCOMPARE(tokenStatus->text(), QStringLiteral("Stored the tokens of https://ours.example.org. Connecting…"));
+    QCOMPARE(syncRequests.count(), 1);
     dialog->close();
     delete dialog;
 }
