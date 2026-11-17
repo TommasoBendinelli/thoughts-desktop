@@ -368,8 +368,12 @@ QString tokenWithheldMessage(const QString &account, const QString &issuedFor, c
     QString message = QStringLiteral("The token stored on this computer (%1) was issued for %2 and is not sent to %3. "
                                      "Store the token of %3 with: thoughtsctl store-secret --account %1 (it reads the token from standard input)")
                           .arg(account, issuedFor, target.isEmpty() ? address : target);
-    // Server… asks for this computer's device token only.
-    message += account == Thoughts::Platform::desktopDeviceAccount() ? QStringLiteral(", or enter it in Server… (Thoughts menu on macOS, File menu elsewhere).") : QStringLiteral(".");
+    // Server… asks for both of this computer's tokens where there is a secret store.
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    message += QStringLiteral(", or enter it in Server… (Thoughts menu on macOS, File menu elsewhere).");
+#else
+    message += QStringLiteral(".");
+#endif
     return message;
 }
 
