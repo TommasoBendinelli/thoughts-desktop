@@ -56,7 +56,7 @@ struct Library {
 };
 Library libraryFromSnapshot(const IndexSnapshot &snapshot, const QString &docsRoot);
 
-// Tag -> knowledge level ("solid", "shaky", "unknown" or "ignore").
+// Tag -> knowledge level ("solid", "shaky", "unknown", "own" (the user's own idea) or "ignore").
 struct Levels {
     QList<QPair<QString, QString>> tags; // In file order.
     QString source;                      // "default mapping" or the file read.

@@ -16,6 +16,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QHideEvent>
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGridLayout>
@@ -1390,6 +1391,8 @@ void Reviews::updateTypeFilter()
         | (m_proposalsFilter->isChecked() ? AnnotationModel::AgentProposal : 0)
         | (m_reviewCardsFilter->isChecked() ? AnnotationModel::ReviewCard : 0);
     m_filterProxy->setVisibleItemTypes(types);
+    // Cards hidden from the list: the selected card's answer is no longer highlighted on the page.
+    if (!m_reviewCardsFilter->isChecked()) hideActiveReviewCardHighlight();
     if (selectedSource.isValid()) {
         const QModelIndex viewIndex = m_authorProxy->mapFromSource(m_groupProxy->mapFromSource(m_filterProxy->mapFromSource(selectedSource)));
         if (viewIndex.isValid()) m_view->setCurrentIndex(viewIndex);
@@ -1981,6 +1984,21 @@ void Reviews::clearActiveReviewCard()
     const QString previous = std::exchange(m_activeReviewCardId, {});
     m_model->setReviewCardStatus(previous, {});
     Q_EMIT clearReviewCardPresentationRequested();
+}
+
+void Reviews::hideActiveReviewCardHighlight()
+{
+    if (m_activeReviewCardId.isEmpty()) return;
+    const QString previous = std::exchange(m_activeReviewCardId, {});
+    m_model->setReviewCardStatus(previous, {});
+    Q_EMIT reviewCardHighlightHidden();
+}
+
+void Reviews::hideEvent(QHideEvent *event)
+{
+    // The panel closed (not the window minimized): the selected card's highlight leaves the page.
+    if (!event->spontaneous()) hideActiveReviewCardHighlight();
+    QWidget::hideEvent(event);
 }
 
 void Reviews::editActiveReviewCard()

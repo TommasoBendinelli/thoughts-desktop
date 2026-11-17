@@ -239,6 +239,8 @@ public Q_SLOTS:
     void setReviewMaskInverted(bool inverted);
     bool reviewMaskInverted() const;
     void clearReviewMask();
+    // Clears the Cards list's highlight of a selected card, never a review's answer mask.
+    void clearSidebarReviewHighlight();
     // Turns a hidden answer into an outlined one: the same area, now readable inside a blue box.
     void revealReviewMask();
     // A review card's answer areas in reading order (page, then top, then left), for the

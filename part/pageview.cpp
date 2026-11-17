@@ -5880,6 +5880,11 @@ bool PageView::showReviewMasks(const QVariantList &regions, ReviewMaskStyle styl
     return true;
 }
 
+void PageView::clearSidebarReviewHighlight()
+{
+    if (d->m_reviewMaskStyle == ReviewMaskStyle::SidebarHighlight) clearReviewMask();
+}
+
 void PageView::clearReviewMask()
 {
     // No card is under review any more: its feedback is not shown elsewhere.

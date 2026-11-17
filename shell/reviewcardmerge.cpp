@@ -54,10 +54,14 @@ bool mergeReviewCards(QWidget *parent, ReviewStore &store, const QList<ReviewCar
     dialog.setObjectName(QStringLiteral("reviewMergeCardsDialog"));
     dialog.setWindowTitle(i18n("Merge Review Cards"));
     auto *layout = new QVBoxLayout(&dialog);
+    // Cards of an imported PDF have no source: their highlighted areas are combined, the PDF stays as it is.
     auto *intro = new QLabel(i18np("These cards become one card. ", "These %1 cards become one card. ", ordered.size())
-                                 + i18n("The card you keep keeps its schedule and review history and shows every card's passage as its own "
-                                        "answer area, in reading order; text between the passages stays out. The other cards are deleted "
-                                        "with their history."),
+                                 + (preview.pdf ? i18n("The card you keep keeps its schedule and review history and shows every card's highlighted "
+                                                       "areas as its own, in reading order. The other cards are deleted with their history. "
+                                                       "The PDF does not change.")
+                                                : i18n("The card you keep keeps its schedule and review history and shows every card's passage as its own "
+                                                       "answer area, in reading order; text between the passages stays out. The other cards are deleted "
+                                                       "with their history.")),
                              &dialog);
     intro->setWordWrap(true);
     layout->addWidget(intro);
@@ -74,7 +78,9 @@ bool mergeReviewCards(QWidget *parent, ReviewStore &store, const QList<ReviewCar
     question->setMinimumHeight(90);
     form->addRow(i18n("Question:"), question);
     layout->addLayout(form);
-    auto *passages = new QLabel(i18np("1 passage in %2", "%1 passages in %2", preview.passages, preview.sourceFile), &dialog);
+    auto *passages = new QLabel(preview.pdf ? i18np("1 area on the PDF", "%1 areas on the PDF", preview.passages)
+                                            : i18np("1 passage in %2", "%1 passages in %2", preview.passages, preview.sourceFile),
+                                &dialog);
     passages->setObjectName(QStringLiteral("reviewMergePassages"));
     passages->setWordWrap(true);
     layout->addWidget(passages);

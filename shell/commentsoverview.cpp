@@ -4002,6 +4002,8 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
     m_tabs->addTab(m_commentsPage, i18n("Annotations"));
     m_mentalModelView = new MentalModelView(m_reviewPage);
     connect(m_mentalModelView, &MentalModelView::cardRequested, this, &CommentsOverview::showReviewCardInfo);
+    // A rewritten Mental Model note goes to the server with a Sync, as a note edited here would.
+    connect(m_mentalModelView, &MentalModelView::libraryNoteWritten, this, &CommentsOverview::syncRequested);
     m_reviewPage->addTab(m_reviewCardsWidget, i18n("Browse cards"));
     m_reviewPage->addTab(m_mentalModelView, i18n("Mental Model"));
     connect(m_reviewPage, &QTabWidget::currentChanged, this, [this] {

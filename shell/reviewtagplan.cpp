@@ -14,7 +14,7 @@ namespace
 {
 const QStringList &levelNames()
 {
-    static const QStringList names{QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("ignore")};
+    static const QStringList names{QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("own"), QStringLiteral("ignore")};
     return names;
 }
 
@@ -204,7 +204,7 @@ bool parse(const QJsonObject &document, Plan *plan, QString *error)
     const QJsonValue levels = document.value(QStringLiteral("knowledge_levels"));
     if (!levels.isUndefined()) {
         if (!levels.isObject()) {
-            *error = QStringLiteral("\"knowledge_levels\" must map tags to solid, shaky, unknown or ignore.");
+            *error = QStringLiteral("\"knowledge_levels\" must map tags to solid, shaky, unknown, own or ignore.");
             return false;
         }
         const QJsonObject object = levels.toObject();

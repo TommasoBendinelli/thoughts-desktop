@@ -19,7 +19,8 @@ namespace Thoughts::Updates
 bool available();
 QString currentVersion();
 
-// The Help menu action: reports; asks for a token only when GitHub refuses the check.
+// Check for Updates… (Help menu; the Thoughts menu on the Mac): reports; asks for a token
+// only when GitHub refuses the check.
 void checkInteractively(QWidget *parent);
 // Shortly after startup, at most once a day; silent unless an update exists.
 void checkInBackground(QWidget *parent);

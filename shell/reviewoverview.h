@@ -290,6 +290,9 @@ public:
 Q_SIGNALS:
     // A cited card was clicked: show it in Browse cards.
     void cardRequested(const QString &cardId);
+    // Refresh rewrote the Library note mental-model.md, which every agent and service reads: Sync takes it to the
+    // server.
+    void libraryNoteWritten();
 
 private:
     QLabel *m_status = nullptr;
@@ -396,7 +399,7 @@ private Q_SLOTS:
     void setMaskFlipped(bool flipped);
     void showAnswerPages(const ReviewCard &card);
     void updateAnswerControls();
-    void toggleReveal();
+    void toggleMaskFlipped();
     void hideAnswer();
     void chooseTags();
     void closeTagsDialog();
@@ -423,7 +426,7 @@ private Q_SLOTS:
     void updateCardMenu();
 
 private:
-    // The line above Flip | Reveal | Set knowledge with the card's newest agent conversation.
+    // The line above Reveal with the card's newest agent conversation.
     // @p cardChanged: a new card or a re-shown bar, where the line may appear or go; otherwise
     // (the projections changed) it only follows while the knowledge is not being set.
     // @p projections: the new projections when the caller has them, else the provider's.
@@ -490,8 +493,8 @@ private:
     // Shows the panel editable until the answer is first shown, then as one locked line, with
     // the agent's prediction under it.
     void updateBeforePanel();
-    // The answer is shown for the first time (Reveal or Set knowledge): the before step locks,
-    // and each group asked before and after starts the after step at the step predicted.
+    // The answer is shown for the first time (Reveal): the before step locks, and each group
+    // asked before and after starts the after step at the step predicted.
     void lockBeforeStep();
     // Whether @p tag belongs to a group asked before the answer only (Feeling).
     bool beforeOnlyTag(const QString &tag) const;
@@ -586,7 +589,7 @@ private:
     QPointer<QFrame> m_sessionPage;
     QPointer<QWidget> m_sessionHost;
     QPointer<QObject> m_sessionHostGuard;
-    QWidget *m_ratingPanel = nullptr; // The Tag | Interval | Next bar, shown once the knowledge is being set.
+    QWidget *m_ratingPanel = nullptr; // The Tag | Interval | Next bar, shown with the answer (Reveal).
     QPushButton *m_doneButton = nullptr;
     QPushButton *m_browseCardsButton = nullptr;
 
@@ -603,9 +606,7 @@ private:
     QLabel *m_reviewQuestion = nullptr;
     QPushButton *m_startButton = nullptr;
     QPushButton *m_revealButton = nullptr;
-    QPushButton *m_flipButton = nullptr;
     bool m_maskFlipped = false;
-    bool m_answerPeeked = false; // Reveal frames the answer without recording anything.
     QStringList m_selectedTags;
     // The tag groups the bar's tag cell orders slider steps by; read when a card is shown.
     QList<ReviewTags::TagGroup> m_barTagGroups;
@@ -641,8 +642,27 @@ private:
         // Opened again with the pencil after the answer was shown (the phone's "Back to before
         // step"), until the answer is shown again; answerShownAt keeps the first time.
         bool reopened = false;
+        // The card's last answer when the step began (invalid: never answered): the answer the
+        // step kept on disk belongs to (keptBeforeStep).
+        QDateTime answeredAt = {};
         bool locked() const { return answerShownAt.isValid() && !reopened; }
     };
+    // The before step of each card is kept on this computer until that card's answer is recorded,
+    // also through a restart: a card that leaves the review before it is answered (unavailable for
+    // a while, skipped, the review ended or the app quit) comes back with what was picked and
+    // typed, in the same review or a later one. A step belongs to the card's last answer when it began; another
+    // last answer (recorded here or on another device) makes it obsolete. A step with no pick and
+    // no note keeps nothing, so clearing them clears it.
+    QString beforeStepsPath() const;
+    // The step kept for @p card, or an empty one; an obsolete kept step is dropped.
+    BeforeStep keptBeforeStep(const ReviewCard &card) const;
+    // Keeps m_before as it is now (after a pick, the note, Reveal, the pencil).
+    void keepBeforeStep();
+    // The cards' answers were recorded (or the cards deleted or merged away): their steps go.
+    void forgetBeforeSteps(const QStringList &cardIds);
+    // Each group asked before and after starts the after step at the step picked before (Reveal).
+    void startAfterStepAtPrediction();
+    QTimer *m_beforeNoteSaveTimer = nullptr; // Typing in the before note is kept a moment later.
     // showCurrentCard(), keeping @p kept when it is the before step of the card shown: the same
     // card shown again (after Edit), or the step carried into the card a merge made of it.
     void showCurrentCard(const BeforeStep &kept);
@@ -680,7 +700,6 @@ private:
     std::optional<QHash<QString, int>> m_tagUsage; // Cards per current tag: loaded once per session, then counted locally.
     QToolButton *m_noteButton = nullptr;
     QWidget *m_answerRow = nullptr;
-    QPushButton *m_setKnowledgeButton = nullptr;
     QLabel *m_currentState = nullptr;
     QPushButton *m_tagField = nullptr;
     QPushButton *m_intervalField = nullptr;

@@ -126,6 +126,8 @@ public:
     qulonglong getFreeMemory(qulonglong *freeSwap = nullptr);
     bool loadDocumentInfo(LoadDocumentInfoFlags loadWhat);
     bool loadDocumentInfo(QFile &infoFile, LoadDocumentInfoFlags loadWhat);
+    // Thoughts: the replies restored from m_localAnnotationsFileName get their comments back.
+    void relinkLocalAnnotationReplies();
     void loadViewsInfo(View *view, const QDomElement &e);
 
     /**
@@ -244,6 +246,8 @@ public:
     // cached stuff
     QString m_docFileName;
     QString m_xmlFileName;
+    // Thoughts: annotations of a PDF outside the Library, restored at open (setLocalAnnotationsFile).
+    QString m_localAnnotationsFileName;
     QTemporaryFile *m_tempFile;
     qint64 m_docSize;
 

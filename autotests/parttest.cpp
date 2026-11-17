@@ -29,6 +29,7 @@
 #include "../part/annotationmodel.h"
 #include "../part/pdfversions.h"
 #include "../part/feedbackversion.h"
+#include "../part/outsidepdfcomments.h"
 #include "../part/annotwindow.h"
 #include "../part/annotationpopup.h"
 #include "../part/annotationpropertiesdialog.h"
@@ -820,6 +821,7 @@ private Q_SLOTS:
     void testCommentOnlyActionsAndShortcuts();
     void testCommentAutosaveAndEmptyNoteDiscard();
     void testDocsCommentMutationsDoNotWriteReadOnlyPdf();
+    void testOutsidePdfCommentsAreKeptOnThisComputer();
     void testDocsCommentReplyCreation();
     void testDocsExplicitExportEmbedsSidecarComments();
     void testCommentsOverviewBatchDeletePersistsAtomically();
@@ -883,6 +885,11 @@ void PartTest::init()
 {
     // Default settings for every test
     Okular::Settings::self()->setDefaults();
+
+    // Comments kept for PDFs outside the Library: the test PDFs are opened in place by many
+    // tests, and each test starts without the comments of the ones before (under this test
+    // run's own HOME).
+    QVERIFY(QDir(Thoughts::OutsidePdfComments::directory()).removeRecursively());
 
     // Clean docdatas
     const QList<QUrl> urls = {QUrl::fromUserInput(QStringLiteral("file://" KDESRCDIR "data/file1.pdf")),
@@ -21138,6 +21145,12 @@ void PartTest::testSaveAsUndoStackAnnotations()
     part.m_document->redo();
     QVERIFY(!part.m_document->canRedo());
 
+    if (extension == QLatin1String("pdf")) {
+        // A PDF outside the Library keeps its comments on this computer: closing asks nothing.
+        closeDialogHelper.reset();
+        QVERIFY(part.closeUrl());
+        return;
+    }
     closeDialogHelper.reset(new TestingUtils::CloseDialogHelper(&part, QDialogButtonBox::No)); // this is the "do you want to save or discard" dialog
     part.closeUrl();
 }
@@ -22824,6 +22837,26 @@ void PartTest::testAnnotationSidebarReviewCardPdfHighlight()
     QTest::qWait(150);
     QVERIFY(screenshot(QStringLiteral("sidebar-answer-initial")));
     QTRY_VERIFY(highlightedTextPixels() > 20);
+    // Leaving Cards (another filter shown instead, or the panel closed) takes the selected card's
+    // highlight off the page; selecting the card again brings it back.
+    {
+        QSignalSpy hidden(reviews, &Reviews::reviewCardHighlightHidden);
+        reviews->m_reviewCardsFilter->setChecked(false);
+        QCOMPARE(hidden.size(), 1);
+        QVERIFY(reviews->m_activeReviewCardId.isEmpty());
+        reviews->m_reviewCardsFilter->setChecked(true);
+        QTRY_VERIFY(!view->visualRect(view->model()->index(0, 0)).isEmpty());
+        clickCard(0, false);
+        QCOMPARE(status(), QStringLiteral("Answer highlighted in PDF"));
+        reviews->hide();
+        QCOMPARE(hidden.size(), 2);
+        QVERIFY(reviews->m_activeReviewCardId.isEmpty());
+        reviews->show();
+        QTRY_VERIFY(!view->visualRect(view->model()->index(0, 0)).isEmpty());
+        clickCard(0, false);
+        QCOMPARE(status(), QStringLiteral("Answer highlighted in PDF"));
+        QTRY_VERIFY(highlightedTextPixels() > 20);
+    }
     QSignalSpy editRequested(&part, &Okular::Part::requestEditReviewCard);
     const auto chooseEdit = [&](const QString &name) {
         QTimer::singleShot(0, &part, [name] {
@@ -26006,6 +26039,96 @@ void PartTest::testCommentsOverviewMutationsPersist()
     QCOMPARE(unrelated->contents(), QStringLiteral("Unrelated PDF edit"));
 }
 
+void PartTest::testOutsidePdfCommentsAreKeptOnThisComputer()
+{
+    // A PDF outside the Library (a paper in Downloads) takes comments. They are kept on this
+    // computer, never in the PDF; closing asks nothing; they come back when the PDF is opened
+    // again, also renamed or in a newer version at the same place, and a deleted one stays deleted.
+    const QTemporaryDir downloads;
+    QVERIFY(downloads.isValid());
+    const QString pdf = QDir(downloads.path()).filePath(QStringLiteral("paper.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file1.pdf"), pdf));
+    QVERIFY(QFile::setPermissions(pdf, QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    const auto bytesOf = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+    const QByteArray original = bytesOf(pdf);
+    const auto contents = [](Okular::Part &part) {
+        QStringList found;
+        for (uint page = 0; page < part.m_document->pages(); ++page)
+            for (const Okular::Annotation *annotation : part.m_document->page(page)->annotations()) found.append(annotation->contents());
+        return found;
+    };
+
+    // Both parts stay alive: the settings singleton goes with the last part.
+    Okular::Part first(nullptr, {});
+    QVERIFY(openDocument(&first, pdf));
+    QVERIFY(first.isOutsidePdf(QUrl::fromLocalFile(pdf)));
+    QVERIFY(first.m_document->isAllowed(Okular::AllowNotes));
+    auto *note = new Okular::TextAnnotation();
+    note->setTextType(Okular::TextAnnotation::Linked);
+    note->setUniqueName(QStringLiteral("outside-note"));
+    note->setBoundingRectangle(Okular::NormalizedRect(0.2, 0.2, 0.25, 0.25));
+    note->setContents(QStringLiteral("Kept on this computer"));
+    first.m_document->addPageAnnotation(0, note);
+    QTRY_VERIFY_WITH_TIMEOUT(!first.isModified(), 3000);
+    QVERIFY(first.closeUrl());
+    QCOMPARE(bytesOf(pdf), original);
+    const QString sha = Thoughts::FeedbackVersion::cachedFileSha256(pdf);
+    QVERIFY(QFileInfo::exists(Thoughts::OutsidePdfComments::fileFor(sha)));
+
+    Okular::Part second(nullptr, {});
+    QVERIFY(openDocument(&second, pdf));
+    QVERIFY(contents(second).contains(QStringLiteral("Kept on this computer")));
+    QVERIFY(!second.isModified());
+    QVERIFY(!second.m_document->canUndo());
+    // A reply from the sidebar is kept the same way, still a reply; the PDF is never written.
+    const QVariantMap replied = second.addReviewAnnotationReply(QStringLiteral("outside-note"), 1, QStringLiteral("A reply"));
+    QVERIFY2(replied.value(QStringLiteral("success")).toBool(), qPrintable(replied.value(QStringLiteral("error")).toString()));
+    QTRY_VERIFY_WITH_TIMEOUT(!second.isModified(), 3000);
+    QCOMPARE(bytesOf(pdf), original);
+    QVERIFY(second.closeUrl());
+    const auto replyParent = [](Okular::Part &part) {
+        for (Okular::Annotation *annotation : part.m_document->page(0)->annotations())
+            if (annotation->contents() == QLatin1String("A reply"))
+                return annotation->previousAnnotation() ? annotation->previousAnnotation()->uniqueName() : QStringLiteral("no comment");
+        return QString();
+    };
+
+    // Renamed: found by its bytes.
+    const QString renamed = QDir(downloads.path()).filePath(QStringLiteral("renamed.pdf"));
+    QVERIFY(QFile::rename(pdf, renamed));
+    QVERIFY(openDocument(&second, renamed));
+    QVERIFY(contents(second).contains(QStringLiteral("Kept on this computer")));
+    QCOMPARE(replyParent(second), QStringLiteral("outside-note"));
+    QVERIFY(second.closeUrl());
+
+    // A newer version at the same place: found by its path.
+    {
+        QFile file(renamed);
+        QVERIFY(file.open(QIODevice::Append));
+        QVERIFY(file.write("\n% a newer version\n") > 0);
+    }
+    QVERIFY(Thoughts::FeedbackVersion::cachedFileSha256(renamed) != sha);
+    QVERIFY(openDocument(&second, renamed));
+    QVERIFY(contents(second).contains(QStringLiteral("Kept on this computer")));
+    QVERIFY(QFileInfo::exists(Thoughts::OutsidePdfComments::fileFor(Thoughts::FeedbackVersion::cachedFileSha256(renamed))));
+
+    // Your own comment is editable and deletable; the deletion is kept.
+    Okular::Annotation *kept = nullptr;
+    for (Okular::Annotation *annotation : second.m_document->page(0)->annotations())
+        if (annotation->contents() == QLatin1String("Kept on this computer")) kept = annotation;
+    QVERIFY(kept);
+    QVERIFY(second.m_document->canRemovePageAnnotation(kept));
+    second.m_document->removePageAnnotation(0, kept);
+    QTRY_VERIFY_WITH_TIMEOUT(!second.isModified(), 3000);
+    QVERIFY(second.closeUrl());
+    QVERIFY(openDocument(&second, renamed));
+    QVERIFY(!contents(second).contains(QStringLiteral("Kept on this computer")));
+    QVERIFY(second.closeUrl());
+}
+
 void PartTest::testDocsCommentMutationsDoNotWriteReadOnlyPdf()
 {
     const QTemporaryDir docsRoot;
@@ -26198,7 +26321,9 @@ void PartTest::testCommentOnlyActionsAndShortcuts()
     const QString unmanagedPdf = QDir(unmanaged.path()).filePath(QStringLiteral("unmanaged.pdf"));
     QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file1.pdf"), unmanagedPdf));
     QVERIFY(openDocument(&part, unmanagedPdf));
-    QVERIFY(!part.m_document->isAllowed(Okular::AllowNotes));
+    // A PDF outside the Library takes comments too, kept on this computer
+    // (testOutsidePdfCommentsAreKeptOnThisComputer).
+    QVERIFY(part.m_document->isAllowed(Okular::AllowNotes));
     QVERIFY(pdfExport->isEnabled());
 }
 

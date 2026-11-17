@@ -648,6 +648,11 @@ private:
     bool tryOpeningUrlWithFragmentAsName();
     bool shouldSyncDocsComments(const QUrl &documentUrl) const;
     bool isWorkspaceThirdPartyPdf(const QUrl &documentUrl) const;
+    // A PDF outside the Library (and not an earlier version from History): its comments are kept
+    // on this computer (outsidepdfcomments.h), not synchronized.
+    bool isOutsidePdf(const QUrl &documentUrl) const;
+    // Writes the open outside PDF's comments to this computer now, when they changed or @p force.
+    void saveOutsidePdfComments(bool force = false);
     QUrl normalizedDocsLibraryUrl(const QUrl &documentUrl) const;
     int normalizeLegacyCrossPageComments();
     bool writeDocsCommentSnapshot(const QUrl &documentUrl, QJsonObject *snapshot, QString *failureReason, const QString &onlyLogicalId = QString()) const;
@@ -891,6 +896,11 @@ private:
     bool m_docsCompanionActive = false;
     QPointer<Thoughts::DocsChangeMonitor> m_docsChangeMonitor;
     QTimer *m_docsCommentMutationCaptureTimer = nullptr;
+    // The open outside PDF whose comments are kept on this computer (empty for any other), the
+    // hash of its bytes, and the timer that saves them shortly after a change.
+    QString m_outsideCommentsPdfPath;
+    QString m_outsideCommentsSha256;
+    QTimer *m_outsideCommentsSaveTimer = nullptr;
     QTimer *m_docsCommentMutationFlushTimer = nullptr;
     QFutureWatcher<QJsonObject> *m_docsCommentLoadWatcher = nullptr;
     QFutureWatcher<QJsonObject> *m_docsPdfIdentityWatcher = nullptr;
@@ -1000,6 +1010,9 @@ private:
     QHash<int, int> m_commentHistoryDocumentIndex;
     bool m_applyingCommentStorage = false;
     QHash<QString, Thoughts::CommentRecord> m_legacyCommentStates;
+    // Set while the comment history is undone or redone: only then does deleting a restored comment
+    // redo its earlier deletion. A new deletion of it is a deletion of its own.
+    bool m_commentHistoryStep = false;
     QList<Thoughts::CommentRecord> commentRecords();
     bool commitCommentChanges(const QList<Thoughts::CommentChange> &changes, QString *error);
     QVariantMap deleteLegacyReviewAnnotations(const QVariantList &targets);

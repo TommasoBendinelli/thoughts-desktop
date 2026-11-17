@@ -48,6 +48,7 @@
 #include <cmath>
 #include <memory>
 #include <limits>
+#include <tuple>
 
 namespace Thoughts
 {
@@ -3746,11 +3747,15 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
             validIds = validIds && value.isString() && !QUuid(cardId).isNull() && QUuid(cardId).toString(QUuid::WithoutBraces) == cardId && !ids.contains(cardId);
             ids.append(cardId);
         }
-        if (m_readOnly || !validIds || ids.size() < 2 || ids.size() > 20 || !DocumentIdentityStore::validId(requestId) || !validSha256(expected)
+        // Cards of an imported PDF have no source: their request leaves out source and its SHA-256.
+        const bool pdfRequest = !request.contains(QStringLiteral("source")) && !request.contains(QStringLiteral("expected_source_sha256"));
+        if (m_readOnly || !validIds || ids.size() < 2 || ids.size() > 20 || !DocumentIdentityStore::validId(requestId)
+            || (!pdfRequest && (!validSha256(expected) || !request.value(QStringLiteral("source")).isString()))
             || (request.contains(QStringLiteral("keep_card_id")) && !ids.contains(keep))
             || (request.contains(QStringLiteral("question")) && !request.value(QStringLiteral("question")).isString()))
             return failure(QStringLiteral("invalid_request"), QStringLiteral("Provide 2 to 20 different card UUIDs, a keep_card_id among them if any, "
-                                                                            "the current source SHA-256 and a request UUID."));
+                                                                            "a request UUID and, for cards marked in a note, its source and current "
+                                                                            "SHA-256 (leave both out for cards of a PDF)."));
         if (!QDir().mkpath(QDir(rootPath()).filePath(QStringLiteral("card-commands")))) return failure(QStringLiteral("write_failed"), QStringLiteral("Cannot prepare local reviews."));
         QLockFile lock(QDir(rootPath()).filePath(QStringLiteral("card-commands.lock")));
         if (!lock.tryLock(2000)) return failure(QStringLiteral("busy"), QStringLiteral("Another card action is in progress."));
@@ -3768,25 +3773,32 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
             if (ids.contains(card.id()) && !card.schedule.deleted) chosen.append(card);
         if (chosen.size() != ids.size())
             return failure(QStringLiteral("card_unavailable"), QStringLiteral("A card is unavailable or already deleted."));
-        const QString root = QFileInfo(m_docsRoot).canonicalFilePath();
-        const QString path = QFileInfo(QDir(root).absoluteFilePath(request.value(QStringLiteral("source")).toString())).canonicalFilePath();
-        const QString relative = QDir(root).relativeFilePath(path);
-        QFile source(path);
-        if (path.isEmpty() || !path.startsWith(root + QLatin1Char('/')) || SourceOwner::of(relative).isEmpty() || !source.open(QIODevice::ReadOnly))
-            return failure(QStringLiteral("invalid_source"), QStringLiteral("Choose the saved Thoughts source that holds the cards' markers."));
-        if (sha256(source.readAll()) != expected)
-            return failure(QStringLiteral("source_conflict"), QStringLiteral("The source changed; read it again and retry with its current SHA-256."));
-        source.close();
-        for (const ReviewCard &card : std::as_const(chosen)) {
-            for (const auto &value : primaryObject(card.record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray()) {
-                if (value.toObject().value(QStringLiteral("source_file")).toString() != relative)
-                    return failure(QStringLiteral("invalid_source"), QStringLiteral("Card %1 has a passage in %2, not in this source.")
-                                                                         .arg(card.id(), value.toObject().value(QStringLiteral("source_file")).toString()));
+        QString path;
+        if (!pdfRequest) {
+            const QString root = QFileInfo(m_docsRoot).canonicalFilePath();
+            path = QFileInfo(QDir(root).absoluteFilePath(request.value(QStringLiteral("source")).toString())).canonicalFilePath();
+            const QString relative = QDir(root).relativeFilePath(path);
+            QFile source(path);
+            if (path.isEmpty() || !path.startsWith(root + QLatin1Char('/')) || SourceOwner::of(relative).isEmpty() || !source.open(QIODevice::ReadOnly))
+                return failure(QStringLiteral("invalid_source"), QStringLiteral("Choose the saved Thoughts source that holds the cards' markers."));
+            if (sha256(source.readAll()) != expected)
+                return failure(QStringLiteral("source_conflict"), QStringLiteral("The source changed; read it again and retry with its current SHA-256."));
+            source.close();
+            for (const ReviewCard &card : std::as_const(chosen)) {
+                for (const auto &value : primaryObject(card.record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray()) {
+                    if (value.toObject().value(QStringLiteral("source_file")).toString() != relative)
+                        return failure(QStringLiteral("invalid_source"), QStringLiteral("Card %1 has a passage in %2, not in this source.")
+                                                                             .arg(card.id(), value.toObject().value(QStringLiteral("source_file")).toString()));
+                }
             }
         }
         CardMerge preview;
         if (const QString problem = cardMergeProblem(chosen, bundleRoot, &preview); !problem.isEmpty())
             return failure(QStringLiteral("merge_refused"), problem);
+        if (pdfRequest && !preview.pdf)
+            return failure(QStringLiteral("invalid_request"), QStringLiteral("These cards are marked in a note: give its source and expected_source_sha256."));
+        if (!pdfRequest && preview.pdf)
+            return failure(QStringLiteral("invalid_request"), QStringLiteral("These cards are only on the PDF: leave out source and expected_source_sha256."));
         QList<ReviewCard> ordered;
         for (const QString &cardId : std::as_const(preview.order))
             for (const ReviewCard &card : std::as_const(chosen))
@@ -3802,9 +3814,12 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
             {QStringLiteral("kept_card_id"), merged.keptId}, {QStringLiteral("deleted_card_ids"), QJsonArray::fromStringList(merged.deletedIds)},
             {QStringLiteral("delete_event_ids"), QJsonArray::fromStringList(merged.deleteEventIds)},
             {QStringLiteral("card_order"), QJsonArray::fromStringList(merged.order)}, {QStringLiteral("question"), question},
-            {QStringLiteral("source"), path}, {QStringLiteral("source_sha256"), merged.sourceSha256}, {QStringLiteral("passages"), merged.passages},
-            {QStringLiteral("replayed"), false},
-            {QStringLiteral("message"), QStringLiteral("Merged on this computer; the next Sync carries the whole merge. PDF placement follows the next build.")}};
+            {QStringLiteral("kind"), merged.pdf ? QStringLiteral("pdf") : QStringLiteral("source")},
+            {QStringLiteral("source"), merged.pdf ? QJsonValue(QJsonValue::Null) : QJsonValue(path)},
+            {QStringLiteral("source_sha256"), merged.pdf ? QJsonValue(QJsonValue::Null) : QJsonValue(merged.sourceSha256)},
+            {QStringLiteral("passages"), merged.passages}, {QStringLiteral("replayed"), false},
+            {QStringLiteral("message"), merged.pdf ? QStringLiteral("Merged on this computer; the next Sync carries the whole merge.")
+                                                   : QStringLiteral("Merged on this computer; the next Sync carries the whole merge. PDF placement follows the next build.")}};
         if (!writeJson(journalPath, {{QStringLiteral("sha256"), hash}, {QStringLiteral("result"), result}, {QStringLiteral("complete"), true}}, &error))
             qWarning() << "The merge is done, but its request receipt could not be saved:" << error;
         return result;
@@ -4814,6 +4829,7 @@ struct ReviewStore::CardMergePlan {
     QString relative, path;
     QByteArray source;
     ReviewCardMergeSource merge;
+    bool pdf = false;        // Cards of an imported PDF: nothing in a source changes.
 };
 
 // A card as merge messages name it: its question, shortened.
@@ -4861,6 +4877,20 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
     QHash<QString, ReviewCard> current;
     for (const ReviewCard &card : cards())
         if (ids.contains(card.id())) current.insert(card.id(), card);
+    // Cards marked in a note merge in its source; cards with no source (an imported PDF) merge on the
+    // PDF alone. The two kinds are not merged together.
+    QString markedExample, pdfExample;
+    for (const ReviewCard &card : requested) {
+        const auto found = current.constFind(card.id());
+        if (found == current.cend()) continue;
+        const bool marked = !primaryObject(found->record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray().isEmpty();
+        if (marked && markedExample.isEmpty()) markedExample = mergeCardLabel(*found);
+        if (!marked && !found->isWholeDocument() && !isBasicReviewCard(found->record) && pdfExample.isEmpty()) pdfExample = mergeCardLabel(*found);
+    }
+    if (!markedExample.isEmpty() && !pdfExample.isEmpty())
+        return QStringLiteral("Card “%1” is marked in its note and card “%2” is only on the PDF. Merge cards of a note with each other, "
+                              "and cards of a PDF with each other.").arg(markedExample, pdfExample);
+    const bool pdfMerge = markedExample.isEmpty();
     QStringList files, pdfs;
     QHash<QString, QSet<QString>> segmentIds;
     QSet<QString> placedOn; // The source versions the cards' passages were marked or found in.
@@ -4874,6 +4904,15 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
         const QJsonObject record = cardRecord(card.id());
         if (record.isEmpty() || found->record != card.record) return QStringLiteral("Card “%1” changed. Refresh and try again.").arg(mergeCardLabel(card));
         if (!found->isApproved()) return QStringLiteral("Card “%1” is not an approved card.").arg(mergeCardLabel(card));
+        if (pdfMerge) {
+            if (found->isWholeDocument() || isBasicReviewCard(record))
+                return QStringLiteral("Card “%1” has no answer areas of its own on the PDF, so it cannot be merged.").arg(mergeCardLabel(card));
+            if (found->regions().isEmpty()) return QStringLiteral("Card “%1” has no answer areas on the PDF.").arg(mergeCardLabel(card));
+            if (!pdfs.contains(found->pdfSha256())) pdfs.append(found->pdfSha256());
+            plan->cards.append(*found);
+            plan->records.insert(card.id(), record);
+            continue;
+        }
         const auto segments = primaryObject(record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray();
         if (found->isWholeDocument() || isBasicReviewCard(record) || segments.isEmpty())
             return QStringLiteral("Card “%1” is not linked to a source passage. Only cards whose answers are marked in the source can be merged.").arg(mergeCardLabel(card));
@@ -4899,6 +4938,27 @@ QString ReviewStore::prepareCardMerge(const QList<ReviewCard> &requested, QStrin
             return QStringLiteral("Card “%1” has no answer areas on the PDF yet. Sync and wait for the PDF to be rebuilt, then merge the cards.").arg(mergeCardLabel(card));
         plan->cards.append(*found);
         plan->records.insert(card.id(), record);
+    }
+    if (pdfMerge) {
+        if (pdfs.size() > 1 || !validSha256(pdfs.value(0)))
+            return QStringLiteral("The cards are placed on different versions of the PDF, so their areas cannot be combined.");
+        // Reading order: each card by its first area (page, then top, then left).
+        const auto firstArea = [](const ReviewCard &card) {
+            std::tuple<int, double, double> first{std::numeric_limits<int>::max(), 0, 0};
+            for (const QVariant &value : card.regions()) {
+                const QVariantMap region = value.toMap();
+                const QVariantList rect = region.value(QStringLiteral("rect")).toList();
+                first = std::min(first, std::tuple<int, double, double>{region.value(QStringLiteral("page")).toInt(), rect.value(1).toDouble(), rect.value(0).toDouble()});
+            }
+            return first;
+        };
+        std::stable_sort(plan->cards.begin(), plan->cards.end(), [&firstArea](const ReviewCard &a, const ReviewCard &b) { return firstArea(a) < firstArea(b); });
+        if (keptId.isEmpty()) keptId = defaultMergeKeptCard(plan->cards);
+        plan->keptId = keptId;
+        for (const ReviewCard &card : std::as_const(plan->cards))
+            if (card.id() != keptId) plan->others.append(card.id());
+        plan->pdf = true;
+        return {};
     }
     if (files.size() > 1)
         return QStringLiteral("The cards' passages are in different source files (%1). A card's passages must be in one file.").arg(files.join(QStringLiteral(", ")));
@@ -4967,9 +5027,14 @@ QString ReviewStore::cardMergeProblem(const QList<ReviewCard> &cards, const QStr
         preview->keptId = plan.keptId;
         preview->deletedIds = plan.others;
         for (const ReviewCard &card : std::as_const(plan.cards)) preview->order.append(card.id());
-        preview->sourceFile = plan.relative;
-        preview->sourceSha256 = sha256(plan.merge.replacement);
-        preview->passages = plan.merge.anchor.value(QStringLiteral("segments")).toArray().size();
+        preview->pdf = plan.pdf;
+        if (plan.pdf) {
+            for (const ReviewCard &card : std::as_const(plan.cards)) preview->passages += card.regions().size();
+        } else {
+            preview->sourceFile = plan.relative;
+            preview->sourceSha256 = sha256(plan.merge.replacement);
+            preview->passages = plan.merge.anchor.value(QStringLiteral("segments")).toArray().size();
+        }
     }
     return problem;
 }
@@ -5004,6 +5069,7 @@ bool ReviewStore::mergeCards(const QList<ReviewCard> &cards, const QString &kept
     const auto firstRegion = regions.first().toObject();
     if (!first || firstRegion.value(QStringLiteral("page")).toInt() != first->page() || !validSha256(first->pageVisualSha256()))
         return fail(QStringLiteral("Card “%1” has no verified page on the PDF. Sync and wait for the PDF to be rebuilt, then merge the cards.").arg(first ? mergeCardLabel(*first) : QString()));
+    if (plan.pdf) return mergePdfCards(plan, regions, answers, question, error, result);
     const QString base = sha256(plan.source);
     const auto &versions = plan.merge.versions;
     const QDateTime now = QDateTime::currentDateTimeUtc();
@@ -5094,6 +5160,72 @@ bool ReviewStore::mergeCards(const QList<ReviewCard> &cards, const QString &kept
         result->sourceFile = plan.relative;
         result->sourceSha256 = sha256(plan.merge.replacement);
         result->passages = plan.merge.anchor.value(QStringLiteral("segments")).toArray().size();
+    }
+    return true;
+}
+
+// Cards of an imported PDF: nothing in a source changes. The kept card takes every card's areas
+// (@p regions, in reading order) and the merged question; the others are deleted as Delete card
+// deletes them, naming the kept card. One batch, so the server applies all of it or none.
+bool ReviewStore::mergePdfCards(const CardMergePlan &plan, const QJsonArray &regions, const QStringList &answers, const QString &question,
+                                QString *error, CardMerge *result)
+{
+    const ReviewCard &first = plan.cards.constFirst();
+    const auto firstRegion = regions.first().toObject();
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    QJsonArray records;
+    QStringList eventIds;
+    for (const QString &id : plan.others) {
+        const ReviewCard &card = *std::find_if(plan.cards.cbegin(), plan.cards.cend(), [&id](const ReviewCard &c) { return c.id() == id; });
+        // After the card's own events, whatever this clock says.
+        QDateTime at = now;
+        for (const auto &prior : card.history) {
+            const QDateTime earlier = parseUtc(objectString(prior, QStringLiteral("reviewed_at")));
+            if (earlier.isValid() && earlier >= at) at = earlier.addMSecs(1);
+        }
+        const QString eventId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        eventIds.append(eventId);
+        const QJsonObject event{{QStringLiteral("schema_version"), schemaVersion}, {QStringLiteral("event_id"), eventId},
+            {QStringLiteral("card_id"), card.id()}, {QStringLiteral("reviewed_at"), utcString(at)}, {QStringLiteral("updated_at"), utcString(at)},
+            {QStringLiteral("origin_id"), Thoughts::Platform::reviewOriginId()}, {QStringLiteral("revision"), 1},
+            {QStringLiteral("rating"), QStringLiteral("delete")}, {QStringLiteral("scheduler_version"), currentSchedulerVersion},
+            {QStringLiteral("source_anchor"), primaryObject(plan.records.value(card.id())).value(QStringLiteral("source_anchor")).toObject()},
+            {QStringLiteral("merged_into"), plan.keptId}};
+        records.append(QJsonObject{{QStringLiteral("relative_path"), QStringLiteral("events/mac-okular/%1.json").arg(eventId)}, {QStringLiteral("record"), event}});
+    }
+    auto card = plan.records.value(plan.keptId);
+    auto primary = primaryObject(card);
+    primary.remove(QStringLiteral("answer_region_override"));
+    primary.remove(QStringLiteral("source_kind"));
+    primary.remove(QStringLiteral("component_origin"));
+    primary.insert(QStringLiteral("question"), question.trimmed());
+    primary.insert(QStringLiteral("pdf_sha256"), first.pdfSha256());
+    primary.insert(QStringLiteral("page"), firstRegion.value(QStringLiteral("page")).toInt());
+    primary.insert(QStringLiteral("rect"), firstRegion.value(QStringLiteral("rect")).toArray());
+    primary.insert(QStringLiteral("regions"), regions);
+    primary.insert(QStringLiteral("page_visual_sha256"), first.pageVisualSha256());
+    primary.insert(QStringLiteral("page_visual_fingerprint_method"), QString::fromLatin1(reviewFingerprintMethod));
+    if (answers.isEmpty()) primary.remove(QStringLiteral("answer_anchor"));
+    else {
+        const QString text = answers.join(QLatin1Char(' '));
+        primary.insert(QStringLiteral("answer_anchor"), QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("normalized_text"), text},
+            {QStringLiteral("text_sha256"), sha256(text.toUtf8())}});
+    }
+    card.insert(QStringLiteral("primary"), primary);
+    card.insert(QStringLiteral("schema_version"), 4);
+    card.remove(QStringLiteral("reanchor"));
+    if (objectString(card, QStringLiteral("status")) == QLatin1String("needs_reanchor")) card.insert(QStringLiteral("status"), QStringLiteral("approved"));
+    card = prepareCardUpdate(FeedbackVersion::stamped(card, reviewVersion(card)));
+    records.append(QJsonObject{{QStringLiteral("relative_path"), QStringLiteral("cards/%1.json").arg(plan.keptId)}, {QStringLiteral("record"), card}});
+    if (!writeServerRecords(records, error)) return false;
+    if (result) {
+        *result = {};
+        result->keptId = plan.keptId;
+        result->deletedIds = plan.others;
+        result->deleteEventIds = eventIds;
+        for (const ReviewCard &merged : std::as_const(plan.cards)) result->order.append(merged.id());
+        result->passages = regions.size();
+        result->pdf = true;
     }
     return true;
 }

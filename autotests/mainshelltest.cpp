@@ -529,6 +529,8 @@ private Q_SLOTS:
     void testLibraryDocumentPageActivation();
     void testOpenDocumentCommand();
     void testOpenPageLink();
+    void testHistoryOfAnImportedLibraryPdf();
+    void testMergeDialogsBelongToTheWindowInUse();
     void testDeleteCommentCommand();
     void testTodoCommands();
     void testDecideProposalCommand();
@@ -625,6 +627,7 @@ private Q_SLOTS:
     void testReviewMergeOfTheCardUnderReviewKeepsItsBeforeStep();
     void testReviewReloadKeepsTheCardUnderReview();
     void testReviewBeforeLineAndPencil();
+    void testReviewBeforeStepSurvivesTheCardLeavingTheReview();
     void testReviewWithoutGroupsAskedBefore();
     void testReviewTakeBackAnswerFromHistory();
     void testReviewRefreshCostWithManyCards();
@@ -3223,6 +3226,73 @@ void MainShellTest::testOpenDocumentCommand()
         request.insert(QStringLiteral("document"), invalid);
         QVERIFY(!shell->handleSyncCommandRequest(request).value(QStringLiteral("accepted")).toBool());
     }
+}
+
+// "Show merge" in the Library window: the merge dialogs belong to the window the user is in, never to
+// a hidden reader window that would come up empty just to carry them.
+void MainShellTest::testMergeDialogsBelongToTheWindowInUse()
+{
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto closeShell = qScopeGuard([shell] { shell->close(); delete shell; });
+    QVERIFY(!shell->isVisible());
+    QWidget library;
+    library.setWindowTitle(QStringLiteral("Library"));
+    library.show();
+    QApplication::setActiveWindow(&library);
+    QVERIFY(QTest::qWaitForWindowActive(&library));
+    QCOMPARE(shell->mergeDialogOwner(), &library);
+    // A reader window on screen carries its own dialogs.
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QCOMPARE(shell->mergeDialogOwner(), static_cast<QWidget *>(shell));
+}
+
+// A PDF imported into the Library is listed in the Library index, often without an identity
+// record on this Mac: it has a History all the same.
+void MainShellTest::testHistoryOfAnImportedLibraryPdf()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(QFileInfo(library.path()).canonicalFilePath());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")));
+    const QString pdf = root.filePath(QStringLiteral("current_pdfs/document_0123456789abcdef0123.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), pdf));
+    const QString elsewhere = root.filePath(QStringLiteral("loose.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), elsewhere));
+    QFile index(root.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+    QVERIFY(index.open(QIODevice::WriteOnly));
+    index.write(QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1},
+                                           {QStringLiteral("pdfs"), QJsonArray {QJsonObject {{QStringLiteral("filename"), QStringLiteral("document_0123456789abcdef0123.pdf")},
+                                                                                             {QStringLiteral("document_id"), QStringLiteral("0190a000-0000-7000-8000-0000000000d2")}}}}})
+                    .toJson());
+    index.close();
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral(".thoughts/document-identities.json"))));
+
+    auto *shell = new Shell;
+    QVERIFY(shell->isValid());
+    const auto closeShell = qScopeGuard([shell] { shell->close(); delete shell; });
+    shell->openUrl(QUrl::fromLocalFile(pdf));
+    shell->openUrl(QUrl::fromLocalFile(elsewhere));
+    QVERIFY(QTest::qWaitFor([&] { return shell->findTabIndex(QUrl::fromLocalFile(pdf)) >= 0 && shell->findTabIndex(QUrl::fromLocalFile(elsewhere)) >= 0; }));
+    const auto partOf = [shell](const QString &path) { return shell->m_tabs.at(shell->findTabIndex(QUrl::fromLocalFile(path))).part; };
+    shell->attachDocumentHistory(partOf(pdf));
+    shell->attachDocumentHistory(partOf(elsewhere));
+    // History opens, as the Cards menu's History asks it ("not a Library PDF" before).
+    const auto historyShown = [](KParts::ReadOnlyPart *part) {
+        bool shown = false;
+        QMetaObject::invokeMethod(part, "showHistorySidebar", Qt::DirectConnection, Q_RETURN_ARG(bool, shown));
+        return shown;
+    };
+    QVERIFY(historyShown(partOf(pdf)));
+    // A PDF from outside the Library still has none.
+    QVERIFY(!historyShown(partOf(elsewhere)));
 }
 
 // A page link from a chat (thoughts://open/document/<id>?page=N&first=F&version=<sha256>)
@@ -9168,6 +9238,7 @@ void MainShellTest::testReviewBrowseMergesCards()
     const QString first = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString second = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString elsewhere = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString elsewhereNext = QUuid::createUuid().toString(QUuid::WithoutBraces);
     auto marked = Thoughts::markReviewSourceRanges(relative, note, {{7, 7}}, second);
     QVERIFY2(marked.error.isEmpty(), qPrintable(marked.error));
     marked = Thoughts::markReviewSourceRanges(relative, marked.replacement, {{3, 3}}, first);
@@ -9196,6 +9267,7 @@ void MainShellTest::testReviewBrowseMergesCards()
     writeCard(first, QStringLiteral("paper"), QStringLiteral("First?"), 0.1, true);
     writeCard(second, QStringLiteral("paper"), QStringLiteral("Second?"), 0.5, true);
     writeCard(elsewhere, QStringLiteral("other"), QStringLiteral("Elsewhere?"), 0.2, false);
+    writeCard(elsewhereNext, QStringLiteral("other"), QStringLiteral("Further down?"), 0.6, false);
     {
         // The second card was reviewed: it keeps its schedule unless the user chooses otherwise.
         Thoughts::ReviewStore store(temporary.path());
@@ -9205,7 +9277,7 @@ void MainShellTest::testReviewBrowseMergesCards()
 
     Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
     QTRY_VERIFY(cards.m_loadedAt.isValid());
-    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 3);
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 4);
     auto *actions = cards.findChild<QToolButton *>(QStringLiteral("reviewBrowseActionsButton"));
     QVERIFY(actions);
     auto *mergeAction = actions->menu()->findChild<QAction *>(QStringLiteral("reviewBrowseMergeAction"));
@@ -9281,7 +9353,7 @@ void MainShellTest::testReviewBrowseMergesCards()
     QVERIFY(merged.open(QIODevice::ReadOnly));
     QCOMPARE(merged.readAll(), Thoughts::markReviewSourceRanges(relative, note, {{3, 3}, {7, 7}}, second).replacement);
     // The browser lists the kept card with its new question; the other card is gone.
-    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 2);
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 3);
     QStringList listed;
     for (int row = 0; row < cards.m_browseTable->topLevelItemCount(); ++row)
         listed.append(cards.m_browseTable->topLevelItem(row)->data(0, Qt::UserRole).toString());
@@ -9294,6 +9366,32 @@ void MainShellTest::testReviewBrowseMergesCards()
             QCOMPARE(card.schedule.reviewCount, 1);
         }
         if (card.id() == first) QVERIFY(card.schedule.deleted);
+    }
+
+    // Two cards of an imported PDF (no source): their areas are combined, no source is touched.
+    const QByteArray mergedSource = Thoughts::markReviewSourceRanges(relative, note, {{3, 3}, {7, 7}}, second).replacement;
+    select({elsewhere, elsewhereNext});
+    QString pdfIntro, areas;
+    whenModal([&](QWidget *modal) {
+        QCOMPARE(modal->objectName(), QStringLiteral("reviewMergeCardsDialog"));
+        pdfIntro = labelsOf(modal);
+        areas = modal->findChild<QLabel *>(QStringLiteral("reviewMergePassages"))->text();
+        modal->findChild<QPushButton *>(QStringLiteral("reviewMergeButton"))->click();
+    });
+    mergeButton->click();
+    QCOMPARE(areas, QStringLiteral("2 areas on the PDF"));
+    QVERIFY2(pdfIntro.contains(QStringLiteral("The PDF does not change")), qPrintable(pdfIntro));
+    QTRY_COMPARE(cards.m_browseTable->topLevelItemCount(), 2);
+    QFile untouched(sourcePath);
+    QVERIFY(untouched.open(QIODevice::ReadOnly));
+    QCOMPARE(untouched.readAll(), mergedSource);
+    Thoughts::ReviewStore after(temporary.path());
+    for (const auto &card : after.cards()) {
+        if (card.id() == elsewhere) {
+            QCOMPARE(card.question(), QStringLiteral("Elsewhere? Further down?"));
+            QCOMPARE(card.regions().size(), 2);
+        }
+        if (card.id() == elsewhereNext) QVERIFY(card.schedule.deleted);
     }
 }
 
@@ -11551,7 +11649,7 @@ void MainShellTest::testReviewInTwoSteps()
     QCOMPARE(overview.m_before.note, QStringLiteral("not sure"));
 
     // Reveal locks it: one line, the agent's prediction (pending) under it; Recall starts at the prediction.
-    overview.toggleReveal();
+    overview.revealAnswer();
     QVERIFY(overview.m_before.answerShownAt.isValid());
     QVERIFY(!overview.m_beforeGroups->isVisible());
     QVERIFY(!overview.m_beforeNote->isVisible());
@@ -11571,8 +11669,8 @@ void MainShellTest::testReviewInTwoSteps()
                                               {QStringLiteral("reason"), QStringLiteral("Recalled it last time.")}, {QStringLiteral("model"), QStringLiteral("m")},
                                               {QStringLiteral("made_at"), shownAt.addSecs(5).toString(Qt::ISODateWithMs)}});
     QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent predicted: Recalled — Recalled it last time."));
-    overview.toggleReveal();
-    QVERIFY(!overview.m_answerPeeked);
+    overview.hideAnswer();
+    QVERIFY(overview.m_ratingPanel->isHidden());
     QVERIFY(overview.m_beforeSummary->isVisible());
     QCOMPARE(overview.m_before.answerShownAt, shownAt);
 
@@ -11776,7 +11874,7 @@ void MainShellTest::testReviewMergeOfTheCardUnderReviewKeepsItsBeforeStep()
     QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Introduction"));
     // Shown masked, with both cards' areas.
     QCOMPARE(presented, (QList<QPair<QString, int>>{{queue.at(1), 2}}));
-    QVERIFY(overview.m_ratingPanel->isHidden() && !overview.m_answerPeeked);
+    QVERIFY(overview.m_ratingPanel->isHidden());
     // Its before step, with what was picked and typed for the card it was made of.
     QCOMPARE(overview.m_before.cardId, queue.at(1));
     QVERIFY(panel->isVisible());
@@ -11884,7 +11982,8 @@ void MainShellTest::testReviewReloadKeepsTheCardUnderReview()
     QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Recalled")});
     QCOMPARE(overview.m_beforeNote->toPlainText(), QStringLiteral("sure"));
 
-    // Skip: the next card with its own, empty before step; Undo: the skipped one, afresh.
+    // Skip: the next card with its own, empty before step; Undo: the skipped one, with the before
+    // step it had (a skip records no answer, so the step is kept until the card is answered).
     overview.skipWithDefaults();
     QCOMPARE(shown(), queue.at(2));
     QCOMPARE(overview.m_before.cardId, queue.at(2));
@@ -11892,7 +11991,9 @@ void MainShellTest::testReviewReloadKeepsTheCardUnderReview()
     overview.undoPrevious();
     QCOMPARE(shown(), queue.at(1));
     QCOMPARE(overview.m_before.cardId, queue.at(1));
-    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible() && overview.m_before.tags.isEmpty());
+    QVERIFY(panel->isVisible() && overview.m_beforeGroups->isVisible());
+    QCOMPARE(overview.m_before.tags, QStringList{QStringLiteral("Recalled")});
+    QCOMPARE(overview.m_beforeNote->toPlainText(), QStringLiteral("sure"));
 
     // Review now of a card that is not due: Sync's refresh keeps it, and only it.
     overview.revealAnswer();
@@ -11962,7 +12063,7 @@ void MainShellTest::testReviewBeforeLineAndPencil()
     QVERIFY(overview.m_reviewStatus->isHidden());
 
     // Nothing picked: "Before: not rated".
-    overview.toggleReveal();
+    overview.revealAnswer();
     QVERIFY(overview.m_beforeSummaryRow->isVisible() && pencil->isVisible());
     QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Before: not rated"));
     QCOMPARE(pencil->toolTip(), QStringLiteral("Change what you picked before seeing the answer"));
@@ -11974,13 +12075,12 @@ void MainShellTest::testReviewBeforeLineAndPencil()
     const int maskedBefore = masked;
     QTest::mouseClick(pencil, Qt::LeftButton);
     QCOMPARE(masked, maskedBefore + 1);
-    QVERIFY(!overview.m_answerPeeked);
-    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
+    QVERIFY(overview.m_ratingPanel->isHidden() && overview.m_revealButton->isVisible());
     QVERIFY(overview.m_before.reopened && !overview.m_before.locked());
     QVERIFY(overview.m_beforeGroups->isVisible() && overview.m_beforeNote->isVisible());
     QVERIFY(overview.m_beforeSummaryRow->isHidden());
     QCOMPARE(beforeValue(panel, QStringLiteral("g-r")), -1);
-    // Picked now, then the answer shown again with Set knowledge: back to the line.
+    // Picked now, then the answer shown again with Reveal: back to the line.
     QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Home);
     QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Right);
     QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Home);
@@ -12007,8 +12107,8 @@ void MainShellTest::testReviewBeforeLineAndPencil()
     reviewHost.resize(1000, 700);
     QTRY_COMPARE(overview.m_beforeSummary->text(), overview.m_beforeSummaryText);
 
-    // The after step chosen; the pencil from Set knowledge hides the rating row until the answer
-    // is shown again, and keeps the after step.
+    // The after step chosen; the pencil hides the rating row until the answer is shown again,
+    // and keeps the after step.
     overview.m_selectedTags = {QStringLiteral("I get it")};
     overview.m_groupNotes = {{Thoughts::ReviewTags::answerNoteKey(), QStringLiteral("clear now")}};
     QTest::mouseClick(pencil, Qt::LeftButton);
@@ -12050,7 +12150,7 @@ void MainShellTest::testReviewBeforeLineAndPencil()
     // Undo, then Edit: the same card shown again keeps what was picked (and when the answer was shown).
     overview.undoPrevious();
     QTest::keyClick(beforeScale(panel, QStringLiteral("g-s")), Qt::Key_End);
-    overview.toggleReveal();
+    overview.revealAnswer();
     const QDateTime again = overview.m_before.answerShownAt;
     QTimer::singleShot(0, &overview, [&overview] {
         auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewCardRegionDialog"));
@@ -12065,6 +12165,146 @@ void MainShellTest::testReviewBeforeLineAndPencil()
     QCOMPARE(overview.m_before.answerShownAt, again);
     QVERIFY(overview.m_beforeSummaryRow->isVisible());
     QCOMPARE(overview.m_beforeSummary->text(), QStringLiteral("Setup: Glasses"));
+}
+
+// The before step of a card (picks and a before note) was once lost when a pending
+// agent proposal made the card unavailable for a while and the review went on. The before step is
+// kept per card until its answer is recorded: through the card leaving the review, another card
+// answered meanwhile, a restart, and Reveal (it comes back locked, with when the answer was first
+// shown). Another last answer (here: as if from the phone) makes it obsolete; clearing the picks
+// and the note clears it.
+void MainShellTest::testReviewBeforeStepSurvivesTheCardLeavingTheReview()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QString pdfSha256;
+    const QStringList ids = twoStepCards(temporary.path(), 3, &pdfSha256);
+    QCOMPARE(ids.size(), 3);
+    const QString rl = ids.at(0), other = ids.at(1), third = ids.at(2);
+    Thoughts::ReviewStore store(temporary.path());
+    QString error;
+    QVERIFY2(store.saveTagGroups(twoStepGroups(), &error), qPrintable(error));
+    const QVariantMap document{{QStringLiteral("pdf_path"), QStringLiteral(KDESRCDIR "data/file1.pdf")}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")},
+                               {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    const auto makeOverview = [&] {
+        return std::make_unique<Thoughts::ReviewOverview>(
+            temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr,
+            Thoughts::ReviewStore::ProjectionProvider{}, Thoughts::ReviewOverview::CardBrowserOpener{}, [&reviewHost] { return &reviewHost; });
+    };
+    // A pending proposal in the card's passage: the card is not offered for review meanwhile.
+    const auto setAvailable = [&temporary](const QString &cardId, bool available) {
+        QFile file(QDir(temporary.path()).filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)));
+        if (!file.open(QIODevice::ReadOnly)) return false;
+        QJsonObject card = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        card.insert(QStringLiteral("status"), available ? QStringLiteral("approved") : QStringLiteral("pending"));
+        card.insert(QStringLiteral("revision"), card.value(QStringLiteral("revision")).toInt(1) + 1);
+        return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(QJsonDocument(card).toJson(QJsonDocument::Compact)) > 0;
+    };
+    const auto cardOf = [&store](const QString &id) {
+        for (const auto &card : store.cards())
+            if (card.id() == id) return card;
+        return Thoughts::ReviewCard{};
+    };
+    const QString note = QStringLiteral("Worth knowing; only the outline comes back.");
+
+    auto overview = makeOverview();
+    auto *panel = overview->m_beforePanel;
+    overview->reviewCard(rl);
+    QCOMPARE(overview->m_before.cardId, rl);
+    // The before step filled in: Good, Partly recalled, and the note (typed: kept a moment later).
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Home);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-r")), Qt::Key_Right);
+    overview->m_beforeNote->setPlainText(note);
+    QVERIFY(overview->m_beforeNoteSaveTimer->isActive());
+
+    // The card becomes unavailable for a while: Sync's refresh ends the review of it.
+    QVERIFY(setAvailable(rl, false));
+    overview->reloadFromProjections();
+    QCOMPARE(overview->m_currentReview, -1);
+    QVERIFY(QFile::exists(overview->beforeStepsPath()));
+    // The review goes on: another card, with its own empty before step, answered.
+    overview->reviewCard(other);
+    QCOMPARE(overview->m_before.cardId, other);
+    QVERIFY(overview->m_before.tags.isEmpty() && overview->m_beforeNote->toPlainText().isEmpty());
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Home);
+    overview->revealAnswer();
+    overview->m_nextButton->click();
+    QVERIFY(overview->m_sessionComplete);
+
+    // The app restarts; the card is available again and comes back, in a new review, as it was left.
+    overview.reset();
+    QVERIFY(setAvailable(rl, true));
+    overview = makeOverview();
+    panel = overview->m_beforePanel;
+    overview->reviewCard(rl);
+    QCOMPARE(overview->m_before.cardId, rl);
+    QVERIFY(panel->isVisible() && overview->m_beforeGroups->isVisible() && overview->m_beforeNote->isVisible());
+    QVERIFY(!overview->m_before.locked());
+    QCOMPARE(overview->m_before.tags, (QStringList{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-f")), 1);
+    QCOMPARE(beforeValue(panel, QStringLiteral("g-r")), 1);
+    QCOMPARE(overview->m_beforeNote->toPlainText(), note);
+
+    // Reveal locks it; the card leaves the review again, and comes back locked, the time the answer
+    // was first shown kept, and the after step's Recall starting at the step picked before.
+    overview->revealAnswer();
+    const QDateTime shownAt = overview->m_before.answerShownAt;
+    QVERIFY(shownAt.isValid());
+    QVERIFY(setAvailable(rl, false));
+    overview->reloadFromProjections();
+    QCOMPARE(overview->m_currentReview, -1);
+    QVERIFY(setAvailable(rl, true));
+    overview->reviewCard(rl);
+    QVERIFY(overview->m_ratingPanel->isHidden());
+    QVERIFY(overview->m_before.locked());
+    QCOMPARE(overview->m_before.answerShownAt, shownAt);
+    QVERIFY(!overview->m_beforeGroups->isVisible() && !overview->m_beforeNote->isVisible());
+    QVERIFY(overview->m_beforeSummaryRow->isVisible());
+    QCOMPARE(overview->m_beforeSummaryText, QStringLiteral("Feeling: Good · Recall: Partly recalled — ") + note);
+    QVERIFY(overview->m_selectedTags.contains(QStringLiteral("Partly recalled")));
+
+    // The answer records the before step kept, then it is gone.
+    overview->revealAnswer();
+    QCOMPARE(overview->m_before.answerShownAt, shownAt);
+    overview->m_selectedTags = {QStringLiteral("Recalled"), QStringLiteral("I get it")};
+    overview->m_nextButton->click();
+    QVERIFY(overview->m_sessionComplete);
+    const QJsonObject answer = cardOf(rl).history.constLast();
+    QCOMPARE(answer.value(QStringLiteral("review_group_notes")).toObject().value(QStringLiteral("before_note")).toString(), note);
+    const QJsonObject before = answer.value(QStringLiteral("review_phases")).toObject().value(QStringLiteral("before")).toObject();
+    QCOMPARE(before.value(QStringLiteral("tags")).toArray(), (QJsonArray{QStringLiteral("Good"), QStringLiteral("Partly recalled")}));
+    QCOMPARE(before.value(QStringLiteral("answer_shown_at")).toString(), shownAt.toString(Qt::ISODateWithMs));
+    QVERIFY(!QFile::exists(overview->beforeStepsPath()));
+    overview->reviewCard(rl);
+    QVERIFY(overview->m_before.tags.isEmpty() && overview->m_beforeNote->toPlainText().isEmpty() && !overview->m_before.answerShownAt.isValid());
+
+    // A step kept for a card answered since elsewhere (the phone's answer, brought by Sync) is obsolete.
+    overview->reviewCard(third);
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    overview->skipWithDefaults();
+    QVERIFY(QFile::exists(overview->beforeStepsPath()));
+    const QDateTime elsewhere = QDateTime::currentDateTimeUtc();
+    QVERIFY2(store.recordRating(third, QStringLiteral("custom_interval"), elsewhere, &error, elsewhere.addDays(3), nullptr, {}, {QStringLiteral("I get it")}),
+             qPrintable(error));
+    overview->reviewCard(third);
+    QCOMPARE(overview->m_before.cardId, third);
+    QVERIFY(overview->m_before.tags.isEmpty());
+    QVERIFY(!QFile::exists(overview->beforeStepsPath()));
+
+    // Clearing the picks and the note clears the step.
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_End);
+    overview->m_beforeNote->setPlainText(QStringLiteral("x"));
+    overview->keepBeforeStep();
+    QVERIFY(QFile::exists(overview->beforeStepsPath()));
+    QTest::keyClick(beforeScale(panel, QStringLiteral("g-f")), Qt::Key_Delete);
+    overview->m_beforeNote->setPlainText(QString());
+    overview->keepBeforeStep();
+    QVERIFY(!QFile::exists(overview->beforeStepsPath()));
 }
 
 // Without a group asked before the answer there is no before step: no rows before the answer, no
@@ -12519,11 +12759,10 @@ void MainShellTest::testReviewAsksForARecallPrediction()
     QVERIFY(overview.m_predictionLine->isHidden());
     // Shown again in the session, the card is not asked about again.
     overview.showCurrentCard();
-    overview.toggleReveal();
+    overview.revealAnswer();
     QCOMPARE(overview.m_predictionLine->text(), QStringLiteral("Agent predicted: Partly recalled — Forgot it last time."));
     QTest::qWait(200);
     QCOMPARE(requests.size(), 1);
-    overview.revealAnswer();
     overview.m_nextButton->click();
     QJsonObject recorded;
     for (const auto &card : store.cards())
@@ -12610,14 +12849,15 @@ void MainShellTest::testReviewCopyForAgentNamesSharedFeedback()
     // The reader gets the cards that exist, whose feedback may be shared: B, not the deleted C.
     const QJsonObject homeCards = overview.feedbackHomeCards(overview.m_dueCards.at(overview.m_currentReview));
     QCOMPARE(homeCards.keys(), QStringList{cardB});
-    overview.toggleReveal();
+    overview.revealAnswer();
 
-    // Copy for agent: the shared line names its card.
+    // Copy for agent: the shared line names its card (then, the answer shown, the review being given).
     overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewCopyForAgentAction"))->trigger();
     const QString copied = QApplication::clipboard()->text();
-    QVERIFY2(copied.endsWith(QStringLiteral("Answer feedback:\n"
+    QVERIFY2(copied.contains(QStringLiteral("Answer feedback:\n"
                                             "- Liked: \"some random text\"\n"
-                                            "- Disliked: \"a bit silly\" — From B. (from another card: \"What does card B ask?\")\n")),
+                                            "- Disliked: \"a bit silly\" — From B. (from another card: \"What does card B ask?\")\n"
+                                            "Current review (being given now, not saved yet):\n")),
              qPrintable(copied));
 }
 
@@ -12725,13 +12965,13 @@ void MainShellTest::testCardHistoryInSidebar()
     QCOMPARE(history->text(), QStringLiteral("Show history"));
     // Masked, its pictures wait; revealed, they show; hidden again, they wait again.
     QCOMPARE(overview.maskedHistoryCard(), cardId);
-    overview.toggleReveal();
+    overview.revealAnswer();
     QVERIFY(overview.maskedHistoryCard().isEmpty());
     QVERIFY(!maskChanged.isEmpty() && maskChanged.last().at(0).toString().isEmpty());
-    overview.toggleReveal();
+    overview.hideAnswer();
     QCOMPARE(overview.maskedHistoryCard(), cardId);
     QCOMPARE(maskChanged.last().at(0).toString(), cardId);
-    overview.revealAnswer(); // Set knowledge reveals it too
+    overview.revealAnswer();
     QVERIFY(overview.maskedHistoryCard().isEmpty());
 
     // Copy for agent: the §6.5 section after the card lines, in created_at order, then (knowledge
@@ -13059,9 +13299,9 @@ void MainShellTest::testReviewAnswerSurvivesPdfReload()
     const QStringList offered{QStringLiteral("ReviewFeedbackLike"), QStringLiteral("ReviewFeedbackDislike"), QStringLiteral("ReviewFeedbackComment"), QStringLiteral("|")};
     QVERIFY(feedbackActions().isEmpty());
 
-    // Reveal (the bar reads Flip | Hide | Set knowledge): the selection menu offers feedback.
-    overview->toggleReveal();
-    QVERIFY(overview->m_answerPeeked);
+    // Reveal: the selection menu offers feedback.
+    overview->revealAnswer();
+    QVERIFY(!overview->m_ratingPanel->isHidden());
     QVERIFY(pageView->reviewFeedbackVisible());
     QCOMPARE(feedbackActions(), offered);
 
@@ -13070,14 +13310,14 @@ void MainShellTest::testReviewAnswerSurvivesPdfReload()
     QTRY_VERIFY(document->pages() == 1);
     document->requestTextPage(0);
     QTRY_VERIFY(!document->page(0)->text().isEmpty());
-    QVERIFY(overview->m_answerPeeked);
+    QVERIFY(!overview->m_ratingPanel->isHidden());
     QTRY_VERIFY(pageView->reviewFeedbackVisible());
     QCOMPARE(pageView->reviewFeedback()->cardId(), cardId);
     QCOMPARE(feedbackActions(), offered);
 
-    // Hide covers the answer again; a reload while it is covered keeps it covered.
-    overview->toggleReveal();
-    QVERIFY(!overview->m_answerPeeked);
+    // Hide again covers the answer again; a reload while it is covered keeps it covered.
+    overview->hideAnswer();
+    QVERIFY(overview->m_ratingPanel->isHidden());
     const int blocks = part->reviewMaskBlockCount();
     QVERIFY(blocks > 0);
     QVERIFY(internals.reload(part));
@@ -13085,7 +13325,7 @@ void MainShellTest::testReviewAnswerSurvivesPdfReload()
     QVERIFY(!pageView->reviewFeedbackVisible());
     QVERIFY(feedbackActions().isEmpty());
     // And Reveal shows it with its feedback again.
-    overview->toggleReveal();
+    overview->revealAnswer();
     QCOMPARE(feedbackActions(), offered);
 }
 
@@ -13141,7 +13381,7 @@ void MainShellTest::testReviewPresentationWaitsForTheRebuiltPdfsPlaces()
     QSignalSpy revealed(&overview, &Thoughts::ReviewOverview::answerRevealed);
     overview.startReview();
     QCOMPARE(presented, 1);
-    overview.toggleReveal();
+    overview.revealAnswer();
     QCOMPARE(revealed.count(), 1);
 
     // Sync rebuilt the PDF and the tab reloaded it, before the card's places on it arrived.
@@ -13162,14 +13402,14 @@ void MainShellTest::testReviewPresentationWaitsForTheRebuiltPdfsPlaces()
     QCOMPARE(restored.size(), 1);
     QCOMPARE(restored.constFirst().constFirst().toMap().value(QStringLiteral("rect")).toList().at(1).toDouble(), 0.16);
     QCOMPARE(revealed.count(), 2);
-    QVERIFY(overview.m_answerPeeked);
+    QVERIFY(!overview.m_ratingPanel->isHidden());
     QVERIFY(overview.m_lostPresentationCardId.isEmpty());
     QCOMPARE(presented, 1); // the card presenter (which raises the window) is not used
     overview.reloadFromProjections();
     QCOMPARE(restored.size(), 1);
 
     // Masked when lost: masked again, nothing revealed.
-    overview.toggleReveal();
+    overview.hideAnswer();
     QCOMPARE(presented, 2);
     overview.restoreReviewPresentation(cardId);
     QCOMPARE(restored.size(), 2);
@@ -14502,47 +14742,41 @@ void MainShellTest::testReviewQuestionRemainsVisibleAfterReveal()
     QCOMPARE(maskPresentations, 1);
     QVERIFY(overview.m_revealButton->isEnabled());
     QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
-    QCOMPARE(overview.m_setKnowledgeButton->text(), QStringLiteral("Set knowledge"));
-    QVERIFY(overview.m_setKnowledgeButton->isVisible());
     QVERIFY(overview.m_currentState->isHidden());
-
-    // Flip, as on the phone: offered before the answer is revealed, it hides
-    // the context instead of the answer and survives Hide review / Focus.
+    // One button under the question: Reveal. Flip moved to the card menu; Set knowledge is gone.
     // The session panel floats over the PDF, so it is not the dialog's child.
-    auto *flip = overview.m_sessionPage->findChild<QPushButton *>(QStringLiteral("reviewFlipButton"));
-    QVERIFY(flip);
+    QCOMPARE(overview.m_answerRow->findChildren<QPushButton *>(), QList<QPushButton *>{overview.m_revealButton});
+    QVERIFY(!overview.m_sessionPage->findChild<QPushButton *>(QStringLiteral("reviewFlipButton")));
+    QVERIFY(!overview.m_sessionPage->findChild<QPushButton *>(QStringLiteral("reviewSetKnowledgeButton")));
+
+    // Flip, as on the phone: in the card menu before the answer is revealed, it hides
+    // the context instead of the answer and survives Hide review / Focus.
+    auto *menu = overview.m_cardMenuButton->menu();
+    auto *flip = menu->findChild<QAction *>(QStringLiteral("reviewFlipAction"));
+    auto *hideAgain = menu->findChild<QAction *>(QStringLiteral("reviewHideAgainAction"));
+    QVERIFY(flip && hideAgain);
+    // The menu updates as it opens.
+    overview.updateCardMenu();
     QCOMPARE(flip->text(), QStringLiteral("Flip"));
-    QVERIFY(flip->isCheckable());
-    QVERIFY(!flip->isHidden());
-    QVERIFY(flip->isEnabled());
-    QVERIFY(!flip->isChecked());
+    QVERIFY(!flip->isCheckable());
+    QVERIFY(flip->isVisible() && flip->isEnabled());
+    QVERIFY(!hideAgain->isVisible());
     QSignalSpy inverted(&overview, &Thoughts::ReviewOverview::reviewMaskInvertedChanged);
     QSignalSpy revealed(&overview, &Thoughts::ReviewOverview::answerRevealed);
-    flip->click();
+    flip->trigger();
     QCOMPARE(inverted.count(), 1);
     QCOMPARE(inverted.last().constFirst().toBool(), true);
     overview.toggleReviewVisibility();
     overview.toggleReviewVisibility();
     QCOMPARE(inverted.last().constFirst().toBool(), true);
-    QVERIFY(flip->isChecked());
+    overview.updateCardMenu();
     QCOMPARE(flip->text(), QStringLiteral("Unflip"));
+    QVERIFY(overview.m_ratingPanel->isHidden());
 
-    // Reveal is a peek: it outlines the answer and records nothing; it reads Hide and Flip waits.
+    // Reveal (what Set knowledge was): the row gives way to the current state and the
+    // Tag | Interval | Next bar; Flip leaves the menu and Hide again takes its place.
     overview.m_revealButton->click();
     QCOMPARE(revealed.count(), 1);
-    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Hide"));
-    QVERIFY(!flip->isEnabled());
-    QVERIFY(overview.m_ratingPanel->isHidden());
-    QVERIFY(overview.m_setKnowledgeButton->isVisible());
-    // Hide covers it again and keeps Flip.
-    overview.m_revealButton->click();
-    QCOMPARE(overview.m_revealButton->text(), QStringLiteral("Reveal"));
-    QVERIFY(flip->isEnabled() && flip->isChecked());
-    QCOMPARE(inverted.last().constFirst().toBool(), true);
-
-    // Set knowledge: the row gives way to the current state and the Tag | Interval | Next bar.
-    overview.m_setKnowledgeButton->click();
-    QVERIFY(!flip->isVisible());
     QVERIFY(!overview.m_revealButton->isVisible());
     QVERIFY(overview.m_answerRow->isHidden());
     QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
@@ -14551,8 +14785,32 @@ void MainShellTest::testReviewQuestionRemainsVisibleAfterReveal()
     QCOMPARE(overview.m_currentState->text(), QStringLiteral("Current: new card"));
     QVERIFY(maskClears >= 2);
     QVERIFY(overview.m_tagField->isEnabled() && overview.m_intervalField->isEnabled() && overview.m_nextButton->isEnabled());
+    overview.updateCardMenu();
+    QVERIFY(!flip->isVisible());
+    QVERIFY(hideAgain->isVisible());
+    // Flip does nothing while the answer is shown.
+    const int invertedBefore = inverted.count();
+    flip->trigger();
+    QCOMPARE(inverted.count(), invertedBefore);
+    QVERIFY(overview.m_ratingPanel->isVisible());
+
+    // Hide again covers it again and keeps Flip: Reveal and the menu's Unflip come back.
+    hideAgain->trigger();
+    QVERIFY(overview.m_ratingPanel->isHidden());
+    QVERIFY(overview.m_revealButton->isVisible());
+    QCOMPARE(inverted.last().constFirst().toBool(), true);
+    overview.updateCardMenu();
+    QVERIFY(flip->isVisible() && !hideAgain->isVisible());
+    QCOMPARE(flip->text(), QStringLiteral("Unflip"));
+    flip->trigger();
+    QCOMPARE(inverted.last().constFirst().toBool(), false);
+    overview.updateCardMenu();
+    QCOMPARE(flip->text(), QStringLiteral("Flip"));
+
     // Reveal outlines the answer instead of clearing it; hiding the review and coming back outlines it again.
+    overview.m_revealButton->click();
     QCOMPARE(revealed.count(), 2);
+    QVERIFY(overview.m_ratingPanel->isVisible());
     overview.toggleReviewVisibility();
     overview.toggleReviewVisibility();
     QCOMPARE(revealed.count(), 3);
@@ -14562,7 +14820,7 @@ void MainShellTest::testReviewQuestionRemainsVisibleAfterReveal()
     overview.startReview();
     QCoreApplication::processEvents();
     QCOMPARE(overview.m_reviewQuestion->text(), QStringLiteral("Which updated fact should be recalled?"));
-    QCOMPARE(maskPresentations, 5); // start, Focus after Hide review, Hide after Reveal, Focus after Set knowledge (outlined again), restart
+    QCOMPARE(maskPresentations, 5); // start, Focus after Hide review, Hide again, Focus after Reveal (outlined again), restart
     QVERIFY(overview.m_revealButton->isEnabled());
 
     const int maskClearsBeforeClose = maskClears;

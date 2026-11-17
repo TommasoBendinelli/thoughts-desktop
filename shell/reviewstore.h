@@ -625,10 +625,12 @@ public:
         QStringList order;           // Every card, by its first passage in the source.
         QString sourceFile;          // Library path of the source.
         QString sourceSha256;        // The source after the merge.
-        int passages = 0;            // The kept card's passages afterwards.
+        int passages = 0;            // The kept card's passages afterwards (its answer areas, for cards of a PDF).
+        bool pdf = false;            // Cards of an imported PDF: no source; their areas become the kept card's.
     };
     // The checks mergeCards makes before writing anything: empty when @p cards can be merged,
-    // else why not. @p preview gets the cards' reading order and their source.
+    // else why not. @p preview gets the cards' reading order and their source. Cards marked in a
+    // note's source merge there; cards with no source (an imported PDF) merge on the PDF alone.
     // @p syncFirst: set when the only obstacle is that the server lacks this Mac's latest source
     // (unsent edits, or the source check after a Sync): a Sync, then the merge again.
     QString cardMergeProblem(const QList<ReviewCard> &cards, const QString &bundleRoot, CardMerge *preview = nullptr, bool *syncFirst = nullptr) const;
@@ -708,6 +710,7 @@ private:
     bool writeServerRecords(const QJsonArray &records, QString *error) const;
     struct CardMergePlan;
     QString prepareCardMerge(const QList<ReviewCard> &cards, QString keptId, const QString &bundleRoot, CardMergePlan *plan, bool *syncFirst = nullptr) const;
+    bool mergePdfCards(const CardMergePlan &plan, const QJsonArray &regions, const QStringList &answers, const QString &question, QString *error, CardMerge *result);
     // @p projectionSnapshot, when given, is read instead of calling the projection provider again.
     QList<QJsonObject> records(const QString &entityType, const QString &collection, const QString &idField, QStringList *errors = nullptr, const QString &pdfStem = {},
                                const QJsonObject *projectionSnapshot = nullptr) const;

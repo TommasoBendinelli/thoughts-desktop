@@ -279,6 +279,10 @@ private Q_SLOTS:
     void beginSourceConflictResolutionForPath(const QString &path);
     // Lists the source files that need a merge, why, and offers to resolve each.
     void showSourceFilesNeedingMerge();
+    // The window a merge dialog belongs to: this reader window while it is on screen, else the one the
+    // user is working in (the Library window that asked). A hidden reader window must not come up empty
+    // just to carry the dialog.
+    QWidget *mergeDialogOwner();
     void sourceConflictResolutionBundleReady(const QVariantMap &bundle, const QString &error);
     void sourceConflictResolutionStatusChanged(const QString &operationId, const QString &status, const QString &message);
     void triggerFedoraSync();

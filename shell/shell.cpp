@@ -4104,6 +4104,10 @@ void Shell::setupActions()
         auto *updatesAction = actionCollection()->addAction(QStringLiteral("thoughts_check_updates"));
         updatesAction->setText(i18n("Check for Updates…"));
         updatesAction->setIcon(QIcon::fromTheme(QStringLiteral("system-software-update")));
+#ifdef Q_OS_MACOS
+        // On the Mac it is in the Thoughts menu, where Mac apps keep it, not in Help.
+        updatesAction->setMenuRole(QAction::ApplicationSpecificRole);
+#endif
         connect(updatesAction, &QAction::triggered, this, [this] { Thoughts::Updates::checkInteractively(this); });
         static bool backgroundCheckStarted = false;
         if (!backgroundCheckStarted) {
@@ -5824,6 +5828,14 @@ void Shell::beginSourceConflictResolution()
     beginSourceConflictResolutionForPath(QString());
 }
 
+QWidget *Shell::mergeDialogOwner()
+{
+    if (isVisible() && !isMinimized()) return this;
+    if (QWidget *active = QApplication::activeWindow(); active && active->isVisible()) return active;
+    if (s_commentsOverview && s_commentsOverview->window()->isVisible()) return s_commentsOverview->window();
+    return this;
+}
+
 void Shell::showSourceFilesNeedingMerge()
 {
     const QStringList paths = Thoughts::recordedSourceConflictPaths();
@@ -5832,7 +5844,7 @@ void Shell::showSourceFilesNeedingMerge()
         beginSourceConflictResolution();
         return;
     }
-    auto *dialog = new QDialog(this);
+    auto *dialog = new QDialog(mergeDialogOwner());
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setObjectName(QStringLiteral("sourceMergeFilesDialog"));
     dialog->setWindowTitle(Thoughts::SyncStatusLabels::sourceFilesNeedMerge(paths.size()));
@@ -5883,11 +5895,12 @@ void Shell::beginSourceConflictResolutionForPath(const QString &path)
     if (m_sourceConflictProgress) {
         m_sourceConflictProgress->close();
     }
-    m_sourceConflictProgress = new QProgressDialog(i18n("Loading this computer's, the server's, and the common-base versions…"), QString(), 0, 0, this);
+    QWidget *owner = mergeDialogOwner();
+    m_sourceConflictProgress = new QProgressDialog(i18n("Loading this computer's, the server's, and the common-base versions…"), QString(), 0, 0, owner);
     m_sourceConflictProgress->setObjectName(QStringLiteral("sourceConflictProgress"));
     m_sourceConflictProgress->setWindowTitle(i18n("Resolve Source Conflict"));
     m_sourceConflictProgress->setCancelButton(nullptr);
-    m_sourceConflictProgress->setWindowModality(modalityOver(this));
+    m_sourceConflictProgress->setWindowModality(modalityOver(owner));
     m_sourceConflictProgress->setMinimumDuration(0);
     m_sourceConflictProgress->show();
     if (!QMetaObject::invokeMethod(part, "requestSourceConflictResolutionBundle", Qt::QueuedConnection, Q_ARG(QString, path))) {
@@ -6046,8 +6059,9 @@ void Shell::sourceConflictResolutionBundleReady(const QVariantMap &bundle, const
         m_sourceConflictProgress->deleteLater();
         m_sourceConflictProgress.clear();
     }
+    QWidget *owner = mergeDialogOwner();
     if (!error.isEmpty() || bundle.isEmpty()) {
-        KMessageBox::error(this, error.isEmpty() ? i18n("No unresolved source conflict is available.") : error, i18n("Resolve Source Conflict"));
+        KMessageBox::error(owner, error.isEmpty() ? i18n("No unresolved source conflict is available.") : error, i18n("Resolve Source Conflict"));
         return;
     }
 
@@ -6056,11 +6070,11 @@ void Shell::sourceConflictResolutionBundleReady(const QVariantMap &bundle, const
     const QByteArray macContents = QByteArray::fromBase64(bundle.value(QStringLiteral("mac_content_base64")).toString().toLatin1());
     const QByteArray mergedContents = QByteArray::fromBase64(bundle.value(QStringLiteral("merged_content_base64")).toString().toLatin1());
     if (baseContents.isNull() || fedoraContents.isNull() || macContents.isNull()) {
-        KMessageBox::error(this, i18n("The downloaded source-conflict versions are incomplete."), i18n("Resolve Source Conflict"));
+        KMessageBox::error(owner, i18n("The downloaded source-conflict versions are incomplete."), i18n("Resolve Source Conflict"));
         return;
     }
 
-    QDialog dialog(this);
+    QDialog dialog(owner);
     dialog.setObjectName(QStringLiteral("sourceConflictResolver"));
     dialog.setWindowTitle(i18n("Resolve Source Conflict"));
     dialog.resize(620, 250);
@@ -7704,6 +7718,19 @@ void Shell::refreshSidebarReviewCards(KParts::ReadOnlyPart *part, const QJsonObj
     attachDocumentHistory(part);
 }
 
+// The document ID the Library index gives a Library PDF (current_pdfs), for one this Mac has no
+// identity record of (a PDF imported into the Library, say); empty when it is not in the Library.
+static QString libraryIndexDocumentId(const QString &filename)
+{
+    QFile file(QDir(ShellUtils::docsRoot()).filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+    if (filename.isEmpty() || !file.open(QIODevice::ReadOnly)) return {};
+    for (const QJsonValue &value : QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("pdfs")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        if (entry.value(QStringLiteral("filename")).toString() == filename) return entry.value(QStringLiteral("document_id")).toString();
+    }
+    return {};
+}
+
 void Shell::attachDocumentHistory(KParts::ReadOnlyPart *part)
 {
     if (!part || !part->widget() || !part->url().isLocalFile()) return;
@@ -7721,7 +7748,11 @@ void Shell::attachDocumentHistory(KParts::ReadOnlyPart *part)
                                                       QFileInfo(pdfPath).completeBaseName());
         libraryPdf = stem.isEmpty() ? QString() : QDir(ShellUtils::docsRoot()).filePath(QStringLiteral("current_pdfs/%1.pdf").arg(stem));
     }
-    if (libraryPdf.isEmpty() || Thoughts::DocumentIdentityStore(ShellUtils::docsRoot()).byFilename(QFileInfo(libraryPdf).fileName()).isEmpty()) return;
+    // A Library PDF: one this Mac knows by its identity, or one the Library index lists.
+    if (libraryPdf.isEmpty()
+        || (Thoughts::DocumentIdentityStore(ShellUtils::docsRoot()).byFilename(QFileInfo(libraryPdf).fileName()).isEmpty()
+            && libraryIndexDocumentId(QFileInfo(libraryPdf).fileName()).isEmpty()))
+        return;
     auto *panel = new Thoughts::ReviewFeedbackPanel;
     panel->setObjectName(QStringLiteral("documentHistoryPanel"));
     panel->setFrameShape(QFrame::NoFrame);
@@ -7771,7 +7802,8 @@ void Shell::updateDocumentHistory(KParts::ReadOnlyPart *part, Thoughts::ReviewFe
     Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this] { return effectiveFedoraProjections(); });
     QList<Thoughts::ReviewFeedbackPanel::Version> versions = Thoughts::documentHistoryVersions(store, QFileInfo(libraryPdf).completeBaseName(), libraryPdf);
     // Every version, also one without cards: the current one, those still here and those with comments.
-    const QString documentId = Thoughts::DocumentIdentityStore(ShellUtils::docsRoot()).forFile(libraryPdf).value(QStringLiteral("document_id")).toString();
+    QString documentId = Thoughts::DocumentIdentityStore(ShellUtils::docsRoot()).forFile(libraryPdf).value(QStringLiteral("document_id")).toString();
+    if (documentId.isEmpty()) documentId = libraryIndexDocumentId(QFileInfo(libraryPdf).fileName());
     Thoughts::addDocumentVersions(versions,
                                   documentId.isEmpty() ? QList<QJsonObject>() : Thoughts::DocumentFeedback::recordsOfDocument(effectiveFedoraProjections(), documentId),
                                   Thoughts::keptDocumentVersions(ShellUtils::docsRoot(), QFileInfo(libraryPdf).fileName()),

@@ -119,6 +119,9 @@ Q_SIGNALS:
     void reviewCardHighlightsChanged(const QVariantList &cards);
     void reviewCardPresentationRequested(const QVariantList &regions, bool navigate);
     void clearReviewCardPresentationRequested();
+    // The Cards list was left (Cards filter off, or the panel hidden): only the selected card's
+    // highlight goes; a review's answer mask stays.
+    void reviewCardHighlightHidden();
     void reviewCardEditRequested(const QString &id);
     void reviewCardOpenRequested(const QString &id);
     // Review now: this card alone in the Review window.
@@ -149,6 +152,11 @@ private Q_SLOTS:
 private:
     friend class Okular::PartTest;
 
+protected:
+    void hideEvent(QHideEvent *event) override;
+
+private:
+
     QModelIndex annotationModelIndex(const QModelIndex &index) const;
     QModelIndex adjacentAnnotationIndex(const QModelIndex &index, bool forward) const;
     QModelIndexList retrieveAnnotations(const QModelIndex &idx) const;
@@ -158,6 +166,7 @@ private:
     void openCommentWindow(const QModelIndex &index);
     bool activateReviewCard(const QModelIndex &index, bool navigate = false);
     void clearActiveReviewCard();
+    void hideActiveReviewCardHighlight();
     void updateTypeFilter();
     void revealRow(const QModelIndex &viewIndex);
     // The Cards list and highlights from m_reviewCardRecords.

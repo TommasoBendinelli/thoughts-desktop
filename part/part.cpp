@@ -12,6 +12,7 @@
 #include "reviewcardfeedback.h"
 #include "feedbackversion.h"
 #include "pdfversions.h"
+#include "outsidepdfcomments.h"
 #include "reviewfeedbackoverlay.h"
 #include "documentfeedback.h"
 #include "documentfeedbackoverlay.h"
@@ -591,6 +592,8 @@ Part::Part(QObject *parent, const QVariantList &args)
         }
     });
     connect(m_document, &Document::undoHistoryCleanChanged, this, [this](bool clean) {
+        // A comment on a PDF outside the Library: saved on this computer a moment later.
+        if (!clean && !m_outsideCommentsPdfPath.isEmpty()) m_outsideCommentsSaveTimer->start();
         const bool commentMutationPending = shouldSyncDocsComments(url()) && (!m_pendingDocsCommentMutationIds.isEmpty() || !m_transientEmptyDocsCommentIds.isEmpty());
         if (clean || !commentMutationPending) {
             setModified(!clean);
@@ -886,6 +889,7 @@ Part::Part(QObject *parent, const QVariantList &args)
         m_pageView->showReviewMasks(regions, PageView::ReviewMaskStyle::SidebarHighlight, navigate);
     });
     connect(m_reviewsWidget.data(), &Reviews::clearReviewCardPresentationRequested, m_pageView.data(), &PageView::clearReviewMask);
+    connect(m_reviewsWidget.data(), &Reviews::reviewCardHighlightHidden, m_pageView.data(), &PageView::clearSidebarReviewHighlight);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardEditRequested, this, &Part::requestEditReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardOpenRequested, this, &Part::requestOpenReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardReviewRequested, this, &Part::requestReviewReviewCard);
@@ -967,6 +971,10 @@ Part::Part(QObject *parent, const QVariantList &args)
     followDocsChanges();
     m_docsCommentMutationCaptureTimer = new QTimer(this);
     m_docsCommentMutationCaptureTimer->setSingleShot(true);
+    m_outsideCommentsSaveTimer = new QTimer(this);
+    m_outsideCommentsSaveTimer->setSingleShot(true);
+    m_outsideCommentsSaveTimer->setInterval(300);
+    connect(m_outsideCommentsSaveTimer, &QTimer::timeout, this, [this] { saveOutsidePdfComments(); });
     m_docsCommentMutationFlushTimer = new QTimer(this);
     m_docsCommentMutationFlushTimer->setSingleShot(true);
     m_docsCommentMutationFlushTimer->setInterval(100);
@@ -1734,7 +1742,8 @@ void Part::makeExistingAnnotationsReadOnly()
             continue;
         }
         for (Okular::Annotation *annotation : page->annotations()) {
-            if (annotation) {
+            // The PDF's own annotations; comments kept on this computer stay editable.
+            if (annotation && (annotation->flags() & Okular::Annotation::External)) {
                 annotation->setFlags(annotation->flags() | Okular::Annotation::DenyWrite | Okular::Annotation::DenyDelete);
             }
         }
@@ -2318,7 +2327,13 @@ bool Part::openFile()
     const QUrl logicalDocumentUrl = QUrl::fromLocalFile(fileNameToOpen);
     const bool useSidecarReviewAnnotations = shouldSyncDocsComments(logicalDocumentUrl);
     m_document->setUseSidecarReviewAnnotations(useSidecarReviewAnnotations);
-    m_document->setAnnotationEditingEnabled(useSidecarReviewAnnotations || isWorkspaceThirdPartyPdf(logicalDocumentUrl));
+    // A PDF outside the Library takes comments too; they are kept on this computer.
+    const bool outsidePdf = isOutsidePdf(logicalDocumentUrl);
+    m_document->setAnnotationEditingEnabled(useSidecarReviewAnnotations || isWorkspaceThirdPartyPdf(logicalDocumentUrl) || outsidePdf);
+    const QString outsideSha256 = outsidePdf ? Thoughts::FeedbackVersion::cachedFileSha256(fileNameToOpen) : QString();
+    const QString outsideComments = outsideSha256.isEmpty() ? QString() : Thoughts::OutsidePdfComments::find(fileNameToOpen, outsideSha256);
+    // Save As swaps the file under the comments already open: none to restore.
+    m_document->setLocalAnnotationsFile(swappingBackingFile ? QString() : outsideComments);
     if (useSidecarReviewAnnotations) {
         openedDocsPdfPath = QFileInfo(fileNameToOpen).canonicalFilePath();
         if (!openedDocsPdfPath.isEmpty()) {
@@ -2381,6 +2396,17 @@ bool Part::openFile()
 
     // update one-time actions
     const bool ok = openResult == Document::OpenSuccess;
+    m_outsideCommentsPdfPath = ok && !outsideSha256.isEmpty() ? QFileInfo(fileNameToOpen).absoluteFilePath() : QString();
+    m_outsideCommentsSha256 = m_outsideCommentsPdfPath.isEmpty() ? QString() : outsideSha256;
+    // Comments found for other bytes at this path, or for these bytes at another path (moved, a new
+    // version of the paper): kept for this file from now on.
+    if (!m_outsideCommentsPdfPath.isEmpty() && !outsideComments.isEmpty()
+        && (outsideComments != Thoughts::OutsidePdfComments::fileFor(outsideSha256)
+            || Thoughts::OutsidePdfComments::recordedPath(outsideComments) != QFileInfo(fileNameToOpen).canonicalFilePath())) {
+        saveOutsidePdfComments(true);
+    } else if (swappingBackingFile && !m_outsideCommentsPdfPath.isEmpty()) {
+        saveOutsidePdfComments(true);
+    }
     // Annotations embedded in an opened PDF are read-only. After Save As the same
     // annotations are still being edited and are on the undo stack: locking them made
     // undo fail silently (the annotation came back) and freed it twice on close.
@@ -2673,6 +2699,7 @@ bool Part::tryOpeningUrlWithFragmentAsName()
 
 bool Part::queryClose()
 {
+    saveOutsidePdfComments();
     if (!isModified()) {
         return true;
     }
@@ -2718,9 +2745,12 @@ bool Part::queryClose()
 
 bool Part::closeUrl(bool promptToSave)
 {
+    saveOutsidePdfComments();
     if (promptToSave && !queryClose()) {
         return false;
     }
+    m_outsideCommentsPdfPath.clear();
+    m_outsideCommentsSha256.clear();
 
     if (m_swapInsteadOfOpening) {
         // If we're swapping the backing file, we don't want to close the
@@ -3725,6 +3755,10 @@ bool Part::saveFile()
     }
     if (!isModified()) {
         return true;
+    } else if (!m_outsideCommentsPdfPath.isEmpty()) {
+        // A PDF outside the Library is never written: its comments are kept on this computer.
+        saveOutsidePdfComments();
+        return !isModified();
     } else if (shouldSyncDocsComments(url())) {
         // Library generations are immutable.  Native-only changes such as
         // forms or signatures must be written to a user-selected copy.
@@ -6332,6 +6366,27 @@ bool Part::shouldSyncDocsComments(const QUrl &documentUrl) const
     }
 
     return !Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(documentInfo.absoluteFilePath()).isEmpty();
+}
+
+bool Part::isOutsidePdf(const QUrl &documentUrl) const
+{
+    if (!documentUrl.isLocalFile()) return false;
+    const QFileInfo info(documentUrl.toLocalFile());
+    return info.isFile() && info.suffix().compare(QLatin1String("pdf"), Qt::CaseInsensitive) == 0 && !Thoughts::PdfVersions::isCachedVersion(info.absoluteFilePath())
+        && !shouldSyncDocsComments(documentUrl);
+}
+
+void Part::saveOutsidePdfComments(bool force)
+{
+    if (m_outsideCommentsSaveTimer) m_outsideCommentsSaveTimer->stop();
+    if (m_outsideCommentsPdfPath.isEmpty() || !m_document->isOpened() || (!force && m_document->isHistoryClean())) return;
+    QString error;
+    if (!Thoughts::OutsidePdfComments::save(m_outsideCommentsPdfPath, m_outsideCommentsSha256, m_document->localAnnotationsXml(), &error)) {
+        errorMessage(i18n("The comments could not be saved on this computer: %1", error), 15000);
+        return;
+    }
+    // Saved: nothing to ask about when the PDF closes.
+    m_document->setHistoryClean(true);
 }
 
 bool Part::isWorkspaceThirdPartyPdf(const QUrl &documentUrl) const

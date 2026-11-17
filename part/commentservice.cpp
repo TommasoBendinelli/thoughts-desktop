@@ -77,7 +77,9 @@ bool Part::commitCommentChanges(const QList<Thoughts::CommentChange> &changes, Q
     for (const auto &change : changes) {
         if (change.before.payload.value(QStringLiteral("_legacy")).toBool()) {
             restore = !change.after.payload.value(QStringLiteral("deleted")).toBool();
-            redo = change.before.payload.contains(QStringLiteral("_legacyHistory"));
+            // Redo the earlier deletion only when the history is redone: a new deletion of a
+            // restored comment would otherwise redo whichever deletion was undone last.
+            redo = m_commentHistoryStep && change.before.payload.contains(QStringLiteral("_legacyHistory"));
             legacy.append(QVariantMap{{QStringLiteral("annotationId"), change.before.id}, {QStringLiteral("page"), change.before.payload.value(QStringLiteral("page")).toInt()}});
         } else logical.append(change.after.payload);
     }
@@ -118,6 +120,7 @@ QVariantMap Part::deleteComments(const QStringList &ids) {
     return mapped;
 }
 QVariantMap Part::undoCommentDeletion(int token) {
+    QScopedValueRollback<bool> historyStep(m_commentHistoryStep, true);
     const auto result = commentService().undo(token);
     if (result.success) { m_commentUndoTokens.removeAll(token); m_commentRedoTokens.append(token); m_commentHistoryDocumentIndex[token] = m_document->undoHistoryIndex(); }
     updateUndoAction(); auto mapped = resultMap(result);
@@ -126,6 +129,7 @@ QVariantMap Part::undoCommentDeletion(int token) {
     return mapped;
 }
 QVariantMap Part::redoCommentDeletion(int token) {
+    QScopedValueRollback<bool> historyStep(m_commentHistoryStep, true);
     const auto result = commentService().redo(token);
     if (result.success) { m_commentRedoTokens.removeAll(token); m_commentUndoTokens.append(token); m_commentHistoryDocumentIndex[token] = m_document->undoHistoryIndex(); }
     updateUndoAction(); auto mapped = resultMap(result);

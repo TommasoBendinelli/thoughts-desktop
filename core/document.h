@@ -1187,6 +1187,20 @@ public:
     void docdataMigrationDone();
 
     /**
+     * Thoughts: the comments of a PDF outside the Library are kept in a file on this computer.
+     * When @p fileName is set, openDocument() restores the annotations and form values that file
+     * holds (written from localAnnotationsXml()) before observers are set up, so they are no change
+     * to undo. Empty turns it off; closeDocument() clears it.
+     */
+    void setLocalAnnotationsFile(const QString &fileName);
+
+    /**
+     * Thoughts: the annotations added to this document (not the ones its file came with) and its
+     * changed form values, as the XML setLocalAnnotationsFile() reads. Empty when there are none.
+     */
+    QByteArray localAnnotationsXml() const;
+
+    /**
      * Returns the model for rendering layers (NULL if the document has no layers)
      *
      * @since 0.24

@@ -894,25 +894,25 @@ Library libraryFromSnapshot(const IndexSnapshot &snapshot, const QString &docsRo
 
 QStringList levelNames()
 {
-    return {QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("ignore")};
+    // "own": the user came up with it (an idea of their own), so they know it best whatever the schedule says.
+    return {QStringLiteral("solid"), QStringLiteral("shaky"), QStringLiteral("unknown"), QStringLiteral("own"), QStringLiteral("ignore")};
 }
 
 Levels defaultLevels()
 {
-    // The user's slider groups (2026-10-15): Understanding and Recall say how well the answer is
-    // known; Interest, Study, Material and Source say nothing about it. Tags merged into these
-    // (e.g. the built-in Correct into Recalled) count under them.
+    // The user's slider groups: Understanding, answered after seeing the answer, says how well it is
+    // known. Confidence (once called Recall, asked before the answer) is what calibration
+    // compares with that, so it is no level; Interest, Study effort, Feeling and Setup say nothing
+    // about it. "I came up with it" marks the user's own idea. Tags merged into these count under them.
     Levels levels;
     levels.source = QStringLiteral("default mapping");
     levels.tags = {
         {QStringLiteral("I get it"), QStringLiteral("solid")},
         {QStringLiteral("Deeply"), QStringLiteral("solid")},
-        {QStringLiteral("Recalled"), QStringLiteral("solid")},
-        {QStringLiteral("Know by heart"), QStringLiteral("solid")},
         {QStringLiteral("Partly"), QStringLiteral("shaky")},
-        {QStringLiteral("Partly recalled"), QStringLiteral("shaky")},
         {QStringLiteral("Don't get it"), QStringLiteral("unknown")},
-        {QStringLiteral("Forgot"), QStringLiteral("unknown")},
+        {QStringLiteral("Doubtful"), QStringLiteral("shaky")},
+        {QStringLiteral("I came up with it"), QStringLiteral("own")},
     };
     return levels;
 }
@@ -928,8 +928,8 @@ QJsonObject levelsDocument(const Levels &levels)
     for (const auto &[tag, level] : levels.tags) tags.insert(tagLabel(tag), level);
     return QJsonObject{{QStringLiteral("schema_version"), 1},
                        {QStringLiteral("about"), QStringLiteral("How well each review tag says the user knows a card's answer, for thoughtsctl knowledge-profile: "
-                                                                "solid, shaky, unknown or ignore. Tags not listed are ignored. An answer with several "
-                                                                "listed tags counts at its lowest level.")},
+                                                                "solid, shaky, unknown, own (the user's own idea: always solid) or ignore. Tags not listed are "
+                                                                "ignored. An answer with several listed tags counts at its lowest level.")},
                        {QStringLiteral("levels"), tags}};
 }
 
@@ -949,7 +949,7 @@ bool loadLevels(const QString &path, Levels *levels, QString *message)
     const QJsonObject root = document.object();
     if (parse.error != QJsonParseError::NoError || !document.isObject() || root.value(QStringLiteral("schema_version")).toInt() != 1
         || !root.value(QStringLiteral("levels")).isObject()) {
-        *message = QStringLiteral("%1 is not a knowledge level mapping: expected {\"schema_version\": 1, \"levels\": {\"<tag>\": \"solid\"|\"shaky\"|\"unknown\"|\"ignore\"}}.").arg(path);
+        *message = QStringLiteral("%1 is not a knowledge level mapping: expected {\"schema_version\": 1, \"levels\": {\"<tag>\": \"solid\"|\"shaky\"|\"unknown\"|\"own\"|\"ignore\"}}.").arg(path);
         return false;
     }
     Levels result;
@@ -1045,12 +1045,24 @@ namespace
 struct Assessment {
     QString level;
     QStringList reason;
+    bool ownIdea = false; // The user came up with it: solid, whatever the schedule says.
 };
 
 Assessment assess(const ReviewCard &card, const QHash<QString, QString> &levelOf, const QDateTime &now)
 {
     const Schedule schedule = scheduleOf(card, now);
     Assessment result;
+    for (const auto &answer : card.answers()) {
+        for (const QString &tag : card.tagsOfEvent(answer)) {
+            if (levelOf.value(tag.toCaseFolded()) != QLatin1String("own")) continue;
+            // An idea of the user's own: they know it best, however long ago it was reviewed.
+            result.level = QStringLiteral("solid");
+            result.ownIdea = true;
+            result.reason.append(QStringLiteral("own idea (%1)").arg(tagLabel(tag)));
+            if (schedule.retired) result.reason.append(QStringLiteral("retired"));
+            return result;
+        }
+    }
     if (!card.wasAnswered()) {
         result.level = QStringLiteral("unreviewed");
         result.reason.append(QStringLiteral("never answered"));
@@ -1123,6 +1135,10 @@ SignalGroups signalGroups(const Library &library, const QHash<QString, QString> 
         // Groups that say how well the answer is known (Understanding, Recall) are the knowledge
         // levels' job, including their tags without a level.
         if (std::any_of(group.tags.cbegin(), group.tags.cend(), knowledgeTag) || std::any_of(group.scale.cbegin(), group.scale.cend(), knowledgeTag)) continue;
+        // Groups asked only before the answer say how the review went (Feeling, Setup: tired,
+        // on the phone), not what the user thinks of the card. Confidence is the one about the
+        // card, and calibration compares it with the answer.
+        if (group.phase == ReviewTags::beforePhase() && group.name.compare(QLatin1String("Confidence"), Qt::CaseInsensitive) != 0) continue;
         bool added = false;
         for (const QString &tag : group.scale + group.tags) {
             const QString key = tag.toCaseFolded();
@@ -1450,7 +1466,9 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
     }
     QStringList unmapped;
     for (const auto &group : library.groups) {
-        // The Understanding group, and the steps of every slider: each step should have a level.
+        // The Understanding group, and the steps of every slider: each step should have a level. Groups
+        // asked only before the answer (Confidence, Feeling, Setup) say nothing about how well it is known.
+        if (group.phase == ReviewTags::beforePhase()) continue;
         const bool understanding = group.name.compare(QLatin1String("Understanding"), Qt::CaseInsensitive) == 0;
         for (const QString &tag : understanding ? group.tags : group.scale)
             if (!levelOf.contains(tag.toCaseFolded()) && !unmapped.contains(tagLabel(tag))) unmapped.append(tagLabel(tag));
@@ -1464,11 +1482,16 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
     QHash<QString, QStringList> questions;
     SignalTally topicSignals;
     CalibrationTally topicCalibration;
+    QStringList ownIdeas;
     for (const auto &entry : std::as_const(entries)) {
         const ReviewCard &card = *entry.card;
         const Assessment assessment = assess(card, levelOf, now);
         QJsonObject item{{QStringLiteral("card_id"), card.id()}, {QStringLiteral("question"), card.question()},
                          {QStringLiteral("document"), entry.documentName}, {QStringLiteral("reason"), assessment.reason.join(QStringLiteral("; "))}};
+        if (assessment.ownIdea) {
+            item.insert(QStringLiteral("own_idea"), true);
+            ownIdeas.append(shortQuestion(card.question()));
+        }
         if (!entry.project.isEmpty()) item.insert(QStringLiteral("project"), entry.project);
         const auto cardSignals = signalsOf(card, groups);
         topicCalibration.add(cardSignals, assessment.level, shortQuestion(card.question()), groups);
@@ -1505,6 +1528,12 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
             if (shown.isEmpty()) continue;
             QString line = label + QStringLiteral(": ") + shown.mid(0, summaryListLimit).join(QStringLiteral("; "));
             if (shown.size() > summaryListLimit) line += QStringLiteral(" (+%1 more)").arg(shown.size() - summaryListLimit);
+            summary.append(line);
+        }
+        if (!ownIdeas.isEmpty()) {
+            QString line = QStringLiteral("The user's own ideas (they came up with them; build on them, don't explain them back): ")
+                + ownIdeas.mid(0, summaryListLimit).join(QStringLiteral("; "));
+            if (ownIdeas.size() > summaryListLimit) line += QStringLiteral(" (+%1 more)").arg(ownIdeas.size() - summaryListLimit);
             summary.append(line);
         }
         for (const QString &line : topicSignals.lines(groups)) summary.append(line);

@@ -2515,6 +2515,12 @@ Document::OpenResult Document::openDocument(const QString &docFile, const QUrl &
             d->m_docdataMigrationNeeded = true;
         }
         d->loadDocumentInfo(LoadGeneralInfo);
+        if (!d->m_localAnnotationsFileName.isEmpty()) {
+            QFile localAnnotations(d->m_localAnnotationsFileName);
+            if (d->loadDocumentInfo(localAnnotations, LoadPageInfo)) {
+                d->relinkLocalAnnotationReplies();
+            }
+        }
     }
 
     d->m_bookmarkManager->setUrl(d->m_url);
@@ -2709,6 +2715,7 @@ void Document::closeDocument()
     d->m_walletGenerator = nullptr;
     d->m_docFileName = QString();
     d->m_xmlFileName = QString();
+    d->m_localAnnotationsFileName = QString();
     delete d->m_tempFile;
     d->m_tempFile = nullptr;
     delete d->m_archiveData;
@@ -5662,6 +5669,87 @@ void Document::walletDataForFile(const QString &fileName, QString *walletName, Q
     } else if (d->m_walletGenerator) {
         d->m_walletGenerator->walletDataForFile(fileName, walletName, walletFolder, walletKey);
     }
+}
+
+void DocumentPrivate::relinkLocalAnnotationReplies()
+{
+    QFile file(m_localAnnotationsFileName);
+    QDomDocument doc;
+    if (!file.open(QIODevice::ReadOnly) || !doc.setContent(&file)) {
+        return;
+    }
+    QHash<QString, QString> parentOf;
+    const QDomNodeList elements = doc.elementsByTagName(QStringLiteral("annotation"));
+    for (int i = 0; i < elements.count(); ++i) {
+        const QDomElement element = elements.at(i).toElement();
+        const QString parent = element.attribute(QStringLiteral("thoughtsInReplyTo"));
+        const QString name = element.firstChildElement(QStringLiteral("base")).attribute(QStringLiteral("uniqueName"));
+        if (!parent.isEmpty() && !name.isEmpty()) {
+            parentOf.insert(name, parent);
+        }
+    }
+    if (parentOf.isEmpty()) {
+        return;
+    }
+    QHash<QString, Annotation *> byName;
+    for (const Page *page : std::as_const(m_pagesVector)) {
+        for (Annotation *annotation : page->annotations()) {
+            byName.insert(annotation->uniqueName(), annotation);
+        }
+    }
+    for (auto it = parentOf.cbegin(); it != parentOf.cend(); ++it) {
+        Annotation *reply = byName.value(it.key());
+        Annotation *parent = byName.value(it.value());
+        if (reply && parent && reply != parent) {
+            reply->setPreviousAnnotation(parent);
+        }
+    }
+}
+
+void Document::setLocalAnnotationsFile(const QString &fileName)
+{
+    d->m_localAnnotationsFileName = fileName;
+}
+
+QByteArray Document::localAnnotationsXml() const
+{
+    QDomDocument doc(QStringLiteral("documentInfo"));
+    doc.appendChild(doc.createProcessingInstruction(QStringLiteral("xml"), QStringLiteral("version=\"1.0\" encoding=\"utf-8\"")));
+    QDomElement root = doc.createElement(QStringLiteral("documentInfo"));
+    doc.appendChild(root);
+    QDomElement pageList = doc.createElement(QStringLiteral("pageList"));
+    root.appendChild(pageList);
+    for (const Page *page : std::as_const(d->m_pagesVector)) {
+        // Changed form values, as the docdata folder kept them.
+        QDomElement formsParent = doc.createElement(QStringLiteral("forms-of-page"));
+        page->d->saveLocalContents(formsParent, doc, FormFieldPageItems);
+        QDomElement pageElement = formsParent.firstChildElement(QStringLiteral("page"));
+        if (pageElement.isNull()) {
+            pageElement = doc.createElement(QStringLiteral("page"));
+            pageElement.setAttribute(QStringLiteral("number"), page->number());
+        }
+        QDomElement annotationList = doc.createElement(QStringLiteral("annotationList"));
+        for (const Annotation *annotation : page->annotations()) {
+            // The file's own annotations stay in the file.
+            if (annotation->flags() & Annotation::External) {
+                continue;
+            }
+            QDomElement element = doc.createElement(QStringLiteral("annotation"));
+            AnnotationUtils::storeAnnotation(annotation, element, doc);
+            // A reply's comment, which the annotation itself does not store.
+            if (const Annotation *previous = const_cast<Annotation *>(annotation)->previousAnnotation()) {
+                element.setAttribute(QStringLiteral("thoughtsInReplyTo"), previous->uniqueName());
+            }
+            annotationList.appendChild(element);
+        }
+        if (annotationList.hasChildNodes()) {
+            pageElement.insertBefore(annotationList, pageElement.firstChild());
+        }
+        if (pageElement.hasChildNodes()) {
+            pageList.appendChild(pageElement);
+        }
+    }
+    return pageList.hasChildNodes() ? doc.toByteArray() : QByteArray();
 }
 
 bool Document::isDocdataMigrationNeeded() const

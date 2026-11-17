@@ -5769,6 +5769,10 @@ ReviewOverview::ReviewOverview(const QString &docsRoot,
     setWindowTitle(i18n("PDF Review"));
     setModal(false);
     resize(760, 430);
+    m_beforeNoteSaveTimer = new QTimer(this);
+    m_beforeNoteSaveTimer->setSingleShot(true);
+    m_beforeNoteSaveTimer->setInterval(300);
+    connect(m_beforeNoteSaveTimer, &QTimer::timeout, this, &ReviewOverview::keepBeforeStep);
     buildUi();
     m_queueRefreshTimer = new QTimer(this);
     m_queueRefreshTimer->setSingleShot(true);
@@ -5781,6 +5785,8 @@ ReviewOverview::ReviewOverview(const QString &docsRoot,
 
 ReviewOverview::~ReviewOverview()
 {
+    // A note typed a moment ago is kept too.
+    if (m_beforeNoteSaveTimer->isActive()) keepBeforeStep();
     delete m_tagsDialog.data();
     delete m_sessionHostGuard.data();
     if (m_sessionHost) {
@@ -5805,7 +5811,6 @@ void ReviewOverview::closeEvent(QCloseEvent *event)
     m_lastActionWasSkip = false;
     m_reviewQuestion->clear();
     m_reviewStatus->clear();
-    m_answerPeeked = false;
     m_ratingPanel->hide();
     updateAnswerControls();
     setSessionControlsVisible(false);
@@ -5979,7 +5984,7 @@ void ReviewOverview::buildUi()
     m_cardMenuButton->setMinimumSize(30, 30);
     auto *cardMenu = new QMenu(m_cardMenuButton);
     m_cardMenuButton->setMenu(cardMenu);
-    // The phone's order. Hide again appears once the answer is visible.
+    // The phone's order. Flip is offered until the answer is shown, Hide again once it is.
     cardMenu->addAction(i18n("Focus"), this, &ReviewOverview::focusReview)->setObjectName(QStringLiteral("reviewFocusAction"));
     cardMenu->addAction(i18n("More info"), this, &ReviewOverview::showCardInfo)->setObjectName(QStringLiteral("reviewMoreInfoAction"));
     cardMenu->addAction(i18n("Copy for agent"), this, &ReviewOverview::copyCardForAgent)->setObjectName(QStringLiteral("reviewCopyForAgentAction"));
@@ -5987,6 +5992,8 @@ void ReviewOverview::buildUi()
     cardMenu->addAction(i18n("Add note"), this, &ReviewOverview::editNote)->setObjectName(QStringLiteral("reviewNoteAction"));
     cardMenu->addAction(i18n("Skip"), this, &ReviewOverview::chooseSkip)->setObjectName(QStringLiteral("reviewSkipAction"));
     cardMenu->addAction(i18n("Undo"), this, &ReviewOverview::undoPrevious)->setObjectName(QStringLiteral("reviewUndoAction"));
+    // Flip hides the answer's context instead, so the passage itself prompts recall; it reads Unflip then.
+    cardMenu->addAction(i18n("Flip"), this, &ReviewOverview::toggleMaskFlipped)->setObjectName(QStringLiteral("reviewFlipAction"));
     cardMenu->addAction(i18n("Hide again"), this, &ReviewOverview::hideAnswer)->setObjectName(QStringLiteral("reviewHideAgainAction"));
     // The card's History (review answers and answer feedback by PDF version): its document's
     // History in the sidebar of the tab under review, at the card.
@@ -6061,7 +6068,10 @@ void ReviewOverview::buildUi()
                 m_beforeNote->moveCursor(QTextCursor::End);
             }
             // Typing after the answer was shown is not "before": the box is hidden by then.
-            if (!m_before.locked()) m_before.note = text;
+            if (!m_before.locked()) {
+                m_before.note = text;
+                m_beforeNoteSaveTimer->start();
+            }
         });
         before->addWidget(m_beforeNote);
         // Locked: one line with the picks, as high as its text, and the pencil that opens them again.
@@ -6109,8 +6119,8 @@ void ReviewOverview::buildUi()
     m_beforePanel->hide();
     sessionLayout->addWidget(m_beforePanel);
 
-    // The card's newest agent conversation, one flat line above Flip | Reveal | Set knowledge;
-    // no space is kept for it when the card has none.
+    // The card's newest agent conversation, one flat line above Reveal; no space is kept for it
+    // when the card has none.
     m_conversationLine = new QPushButton(m_sessionPage);
     m_conversationLine->setObjectName(QStringLiteral("reviewAgentConversationLine"));
     m_conversationLine->setFlat(true);
@@ -6154,41 +6164,22 @@ void ReviewOverview::buildUi()
     m_conversationStatusTimer->setInterval(5000);
     connect(m_conversationStatusTimer, &QTimer::timeout, this, &ReviewOverview::updateConversationStatus);
 
-    // As on the phone: Flip | Reveal | Set knowledge. Reveal only frames the answer
-    // (and then reads Hide); Set knowledge shows the current state and the bar.
+    // As on the phone: one Reveal, which shows the answer with the current state and the bar.
+    // Flip is in the card menu until then; Hide again there covers the answer again.
     m_answerRow = new QWidget(m_sessionPage);
     m_answerRow->setObjectName(QStringLiteral("reviewAnswerRow"));
     auto *answerRow = new QHBoxLayout(m_answerRow);
     answerRow->setContentsMargins(0, 0, 0, 0);
     answerRow->setSpacing(6);
-    // Before the answer is visible, Flip hides its context instead, so the passage itself prompts recall.
-    m_flipButton = new QPushButton(i18n("Flip"), m_answerRow);
-    m_flipButton->setObjectName(QStringLiteral("reviewFlipButton"));
-    m_flipButton->setCheckable(true);
-    m_flipButton->setToolTip(i18n("Show only the answer and hide everything around it"));
-    connect(m_flipButton, &QPushButton::toggled, this, [this](bool checked) {
-        m_maskFlipped = checked;
-        Q_EMIT reviewMaskInvertedChanged(checked);
-        updateAnswerControls();
-    });
     m_revealButton = new QPushButton(i18n("Reveal"), m_answerRow);
     m_revealButton->setObjectName(QStringLiteral("reviewRevealButton"));
-    m_revealButton->setToolTip(i18n("Show the answer without recording anything"));
-    m_setKnowledgeButton = new QPushButton(i18n("Set knowledge"), m_answerRow);
-    m_setKnowledgeButton->setObjectName(QStringLiteral("reviewSetKnowledgeButton"));
-    m_setKnowledgeButton->setToolTip(i18n("Show the answer and choose its tags and when to review it again"));
-    const QColor accent = palette().color(QPalette::Highlight);
-    const QString accentRgb = QStringLiteral("%1, %2, %3").arg(accent.red()).arg(accent.green()).arg(accent.blue());
-    for (QPushButton *button : {m_flipButton, m_revealButton, m_setKnowledgeButton}) {
-        button->setAutoDefault(false);
-        button->setMinimumWidth(0);
-        button->setMinimumHeight(36);
-        button->setStyleSheet(button == m_setKnowledgeButton
-            ? QStringLiteral("QPushButton { background: palette(highlight); color: palette(highlighted-text); border: none; border-radius: 10px; padding: 6px 10px; }"
-                             "QPushButton:disabled { background: palette(mid); }")
-            : reviewCellStyle({}) + QStringLiteral("QPushButton:checked { background: rgba(%1, 40); border-color: rgba(%1, 160); }").arg(accentRgb));
-        answerRow->addWidget(button, 1);
-    }
+    m_revealButton->setToolTip(i18n("Show the answer and choose its tags and when to review it again"));
+    m_revealButton->setAutoDefault(false);
+    m_revealButton->setMinimumWidth(0);
+    m_revealButton->setMinimumHeight(36);
+    m_revealButton->setStyleSheet(QStringLiteral("QPushButton { background: palette(highlight); color: palette(highlighted-text); border: none; border-radius: 10px; padding: 6px 10px; }"
+                                                 "QPushButton:disabled { background: palette(mid); }"));
+    answerRow->addWidget(m_revealButton, 1);
     sessionLayout->addWidget(m_answerRow);
 
     m_currentState = new QLabel(m_sessionPage);
@@ -6239,6 +6230,8 @@ void ReviewOverview::buildUi()
     m_intervalField = field(QStringLiteral("reviewIntervalField"), i18n("Interval"));
     connect(m_tagField, &QPushButton::clicked, this, &ReviewOverview::chooseTags);
     connect(m_intervalField, &QPushButton::clicked, this, &ReviewOverview::chooseInterval);
+    const QColor accent = palette().color(QPalette::Highlight);
+    const QString accentRgb = QStringLiteral("%1, %2, %3").arg(accent.red()).arg(accent.green()).arg(accent.blue());
     m_nextButton = new QPushButton(i18n("Next"), m_ratingPanel);
     m_nextButton->setObjectName(QStringLiteral("reviewNextButton"));
     m_nextButton->setAutoDefault(false);
@@ -6265,8 +6258,7 @@ void ReviewOverview::buildUi()
     connect(m_doneButton, &QPushButton::clicked, this, &ReviewOverview::showReviewLanding);
     connect(m_documentFilter, &QComboBox::currentIndexChanged, this, &ReviewOverview::refreshDueQueue);
     connect(m_startButton, &QPushButton::clicked, this, &ReviewOverview::startReview);
-    connect(m_revealButton, &QPushButton::clicked, this, &ReviewOverview::toggleReveal);
-    connect(m_setKnowledgeButton, &QPushButton::clicked, this, &ReviewOverview::revealAnswer);
+    connect(m_revealButton, &QPushButton::clicked, this, &ReviewOverview::revealAnswer);
     setSessionControlsVisible(false);
 }
 
@@ -6388,6 +6380,112 @@ void ReviewOverview::saveBarDrafts() const
     QSaveFile file(path);
     const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("drafts"), drafts}}).toJson(QJsonDocument::Compact);
     if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) file.commit();
+}
+
+namespace
+{
+// The kept before steps by card ID, as beforeStepsPath() holds them; read and written whole each
+// time, so that two review windows never write back each other's older copy.
+QJsonObject readBeforeSteps(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    const auto saved = QJsonDocument::fromJson(file.readAll()).object();
+    if (saved.value(QStringLiteral("schema_version")).toInt() != 1) return {};
+    return saved.value(QStringLiteral("steps")).toObject();
+}
+
+void writeBeforeSteps(const QString &path, const QJsonObject &steps)
+{
+    if (steps.isEmpty()) {
+        QFile::remove(path);
+        return;
+    }
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) return;
+    QSaveFile file(path);
+    const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("steps"), steps}}).toJson(QJsonDocument::Compact);
+    if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) file.commit();
+}
+
+QString beforeStepTime(const QDateTime &time)
+{
+    return time.isValid() ? time.toUTC().toString(Qt::ISODateWithMs) : QString();
+}
+}
+
+QString ReviewOverview::beforeStepsPath() const
+{
+    const auto root = QDir(m_docsRoot).absolutePath().toUtf8();
+    const auto key = QString::fromLatin1(QCryptographicHash::hash(root, QCryptographicHash::Sha256).toHex());
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("review-before-steps/%1.json").arg(key));
+}
+
+ReviewOverview::BeforeStep ReviewOverview::keptBeforeStep(const ReviewCard &card) const
+{
+    BeforeStep step{card.id(), {}, {}, {}, false};
+    step.answeredAt = card.schedule.lastReviewedAt;
+    const QString path = beforeStepsPath();
+    QJsonObject steps = readBeforeSteps(path);
+    const auto found = steps.constFind(card.id());
+    if (found == steps.constEnd()) return step;
+    const QJsonObject kept = found->toObject();
+    QStringList tags;
+    for (const auto &tag : kept.value(QStringLiteral("tags")).toArray()) {
+        if (!tag.toString().isEmpty()) tags.append(tag.toString());
+    }
+    const QString note = kept.value(QStringLiteral("note")).toString();
+    // Started after another answer than the card's last: it was answered since, here or elsewhere.
+    if (kept.value(QStringLiteral("answered_at")).toString() != beforeStepTime(card.schedule.lastReviewedAt) || (tags.isEmpty() && note.trimmed().isEmpty())) {
+        steps.remove(card.id());
+        writeBeforeSteps(path, steps);
+        DeveloperLog::record(QStringLiteral("review.before_step.obsolete"), {{QStringLiteral("card_id"), card.id()}});
+        return step;
+    }
+    step.tags = tags;
+    step.note = note;
+    step.answerShownAt = QDateTime::fromString(kept.value(QStringLiteral("answer_shown_at")).toString(), Qt::ISODateWithMs);
+    step.reopened = step.answerShownAt.isValid() && kept.value(QStringLiteral("reopened")).toBool();
+    step.shown = true;
+    DeveloperLog::record(QStringLiteral("review.before_step.restored"),
+                         {{QStringLiteral("card_id"), card.id()}, {QStringLiteral("locked"), step.locked()}, {QStringLiteral("tags"), int(tags.size())},
+                          {QStringLiteral("note"), !note.trimmed().isEmpty()}});
+    return step;
+}
+
+void ReviewOverview::keepBeforeStep()
+{
+    m_beforeNoteSaveTimer->stop();
+    if (m_before.cardId.isEmpty() || !m_before.shown) return;
+    const QString path = beforeStepsPath();
+    QJsonObject steps = readBeforeSteps(path);
+    if (m_before.tags.isEmpty() && m_before.note.trimmed().isEmpty()) {
+        if (!steps.contains(m_before.cardId)) return;
+        steps.remove(m_before.cardId);
+    } else {
+        QJsonObject step{{QStringLiteral("tags"), QJsonArray::fromStringList(m_before.tags)},
+                         {QStringLiteral("note"), m_before.note},
+                         {QStringLiteral("answered_at"), beforeStepTime(m_before.answeredAt)},
+                         {QStringLiteral("saved_at"), beforeStepTime(QDateTime::currentDateTimeUtc())}};
+        if (m_before.answerShownAt.isValid()) step.insert(QStringLiteral("answer_shown_at"), beforeStepTime(m_before.answerShownAt));
+        if (m_before.reopened) step.insert(QStringLiteral("reopened"), true);
+        steps.insert(m_before.cardId, step);
+    }
+    writeBeforeSteps(path, steps);
+}
+
+void ReviewOverview::forgetBeforeSteps(const QStringList &cardIds)
+{
+    // A note typed a moment ago must not bring the step of an answered card back.
+    if (cardIds.contains(m_before.cardId)) m_beforeNoteSaveTimer->stop();
+    const QString path = beforeStepsPath();
+    QJsonObject steps = readBeforeSteps(path);
+    bool changed = false;
+    for (const QString &cardId : cardIds) {
+        if (!steps.contains(cardId)) continue;
+        steps.remove(cardId);
+        changed = true;
+    }
+    if (changed) writeBeforeSteps(path, steps);
 }
 
 void ReviewOverview::saveVerifiedCounts(int newCards, int learningCards, int reviewCards, int unavailable) const
@@ -6685,7 +6783,7 @@ void ReviewOverview::focusReview()
         return;
     }
     m_lostPresentationCardId.clear();
-    const bool answerVisible = m_answerPeeked || !m_ratingPanel->isHidden();
+    const bool answerVisible = !m_ratingPanel->isHidden();
     if (answerVisible) Q_EMIT answerRevealed();
     m_reviewHidden = false;
     // Hiding the review cleared the mask; restore Flip with it.
@@ -6765,7 +6863,6 @@ void ReviewOverview::updateSessionMessage(const QString &message)
     m_reviewQuestion->setText(message);
     m_reviewQuestion->setToolTip({});
     m_reviewStatus->hide();
-    m_answerPeeked = false;
     m_ratingPanel->hide();
     m_doneButton->show();
     refreshCardConversations(true);
@@ -6890,10 +6987,15 @@ void ReviewOverview::reloadFromProjections()
                 queue.removeIf([&](const ReviewCard &card) { return card.id() == keptId || card.id() == currentCardId; });
                 queue.prepend(*kept);
                 BeforeStep carried;
-                if (m_before.cardId == currentCardId && !m_before.answerShownAt.isValid())
+                if (m_before.cardId == currentCardId && !m_before.answerShownAt.isValid()) {
                     carried = {keptId, m_before.tags, m_before.note, {}, false};
+                    // Kept from now on for the answer the card it became has.
+                    carried.answeredAt = kept->schedule.lastReviewedAt;
+                }
                 m_dueCards = std::move(queue);
                 m_currentReview = 0;
+                // The merged card is gone: what it kept is carried, or dropped.
+                forgetBeforeSteps({currentCardId});
                 DeveloperLog::record(QStringLiteral("review.current_card.merged"),
                                      {{QStringLiteral("card_id"), currentCardId}, {QStringLiteral("kept_card_id"), keptId},
                                       {QStringLiteral("before_carried"), !carried.cardId.isEmpty()}});
@@ -6902,6 +7004,11 @@ void ReviewOverview::reloadFromProjections()
                 return;
             }
         }
+        // Unavailable or no longer due, unanswered: its before step stays kept for when it comes back.
+        if (m_beforeNoteSaveTimer->isActive()) keepBeforeStep();
+        DeveloperLog::record(QStringLiteral("review.current_card.left"),
+                             {{QStringLiteral("card_id"), currentCardId}, {QStringLiteral("before_kept"), m_before.cardId == currentCardId && m_before.shown
+                                                                                                    && (!m_before.tags.isEmpty() || !m_before.note.trimmed().isEmpty())}});
         m_maskClearer();
         m_dueCards.removeIf([&currentCardId](const ReviewCard &card) { return card.id() == currentCardId; });
         m_currentReview = -1;
@@ -6968,7 +7075,6 @@ void ReviewOverview::refreshDueQueue()
     updateDueSummary();
     if (m_currentReview < 0 && !m_sessionComplete) {
         m_reviewQuestion->clear();
-        m_answerPeeked = false;
         m_ratingPanel->hide();
         updateAnswerControls();
         setSessionControlsVisible(false);
@@ -7188,6 +7294,8 @@ void ReviewOverview::showCurrentCard()
 
 void ReviewOverview::showCurrentCard(const BeforeStep &kept)
 {
+    // The before step on screen is kept before another one (or the same card's, read back) replaces it.
+    if (m_beforeNoteSaveTimer->isActive()) keepBeforeStep();
     closeTagsDialog();
     m_lostPresentationCardId.clear();
     m_answerNotFoundCardId.clear();
@@ -7207,21 +7315,23 @@ void ReviewOverview::showCurrentCard(const BeforeStep &kept)
         m_doneButton->hide();
         // Every card starts with only the answer covered, and its own tag and interval.
         setMaskFlipped(false);
-        m_answerPeeked = false;
         m_ratingPanel->hide();
         if (m_reviewHidden) m_maskClearer();
         m_barCardId.clear();
         m_answerArea = 0;
         updateRatingLabels(card);
         // The before step starts empty for every card shown: nothing carries over into a prediction,
-        // except the step kept for this very card (shown again after Edit, or made of the card
-        // under review by a merge).
-        m_before = kept.cardId == card.id() ? kept : BeforeStep{card.id(), {}, {}, {}, false};
+        // except the step of this very card: @p kept (shown again after Edit, or made of the card
+        // under review by a merge), else the one kept on disk since its last answer (the card left
+        // the review before it was answered: unavailable for a while, skipped, the review ended).
+        m_before = kept.cardId == card.id() ? kept : keptBeforeStep(card);
         {
             const QSignalBlocker blocker(m_beforeNote);
             m_beforeNote->setPlainText(m_before.note);
         }
         rebuildBeforePanel();
+        // Kept locked (its answer had been shown): the after step starts where Reveal started it.
+        if (m_before.locked()) startAfterStepAtPrediction();
         requestRecallPrediction(card);
         // A new card: its conversation line may appear or go once the bar shows (below).
         m_conversationCardId.clear();
@@ -7252,30 +7362,26 @@ void ReviewOverview::showAnswerPages(const ReviewCard &card)
 void ReviewOverview::setMaskFlipped(bool flipped)
 {
     m_maskFlipped = flipped;
-    if (m_flipButton) {
-        const QSignalBlocker blocker(m_flipButton);
-        m_flipButton->setChecked(flipped);
-    }
     Q_EMIT reviewMaskInvertedChanged(flipped);
 }
 
-// The phone's states: the question (Flip | Reveal | Set knowledge); Reveal's peek, where
-// Reveal reads Hide and Flip is off; and Set knowledge, where the row gives way to the
-// current tags and interval and the Tag | Interval | Next bar.
+// The card menu's Flip (Unflip once flipped): offered only while the answer is covered.
+void ReviewOverview::toggleMaskFlipped()
+{
+    if (m_sessionComplete || m_currentReview < 0 || m_currentReview >= m_dueCards.size() || !m_ratingPanel->isHidden()) return;
+    setMaskFlipped(!m_maskFlipped);
+    updateAnswerControls();
+    updateCardMenu();
+}
+
+// The phone's states: the question (Reveal, with Flip in the card menu); and the answer shown,
+// where the row gives way to the current tags and interval and the Tag | Interval | Next bar.
 void ReviewOverview::updateAnswerControls()
 {
     const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
     const bool knowledge = current && !m_ratingPanel->isHidden();
     m_answerRow->setVisible(current && !knowledge);
-    m_revealButton->setText(m_answerPeeked ? i18n("Hide") : i18n("Reveal"));
     m_revealButton->setEnabled(current);
-    m_setKnowledgeButton->setEnabled(current);
-    {
-        const QSignalBlocker blocker(m_flipButton);
-        m_flipButton->setChecked(m_maskFlipped);
-    }
-    m_flipButton->setText(m_maskFlipped ? i18n("Unflip") : i18n("Flip"));
-    m_flipButton->setEnabled(current && !m_answerPeeked);
     m_currentState->setVisible(knowledge);
     m_tagField->setEnabled(knowledge);
     m_intervalField->setEnabled(knowledge);
@@ -7289,8 +7395,7 @@ void ReviewOverview::updateAnswerControls()
         const QJsonObject primary = primaryObject(m_dueCards.at(m_currentReview));
         QString answer = primary.value(QStringLiteral("selected_text")).toString();
         if (answer.isEmpty()) answer = primary.value(QStringLiteral("text_quote")).toObject().value(QStringLiteral("exact")).toString();
-        const bool answerShown = m_answerPeeked || knowledge;
-        m_reviewStatus->setText(answerShown ? i18n("Answer not found in the current page. Stored answer:\n%1", answer) : i18n("Answer not found in the current page."));
+        m_reviewStatus->setText(knowledge ? i18n("Answer not found in the current page. Stored answer:\n%1", answer) : i18n("Answer not found in the current page."));
         m_reviewStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
         m_reviewStatus->show();
     }
@@ -7342,8 +7447,8 @@ void ReviewOverview::restoreReviewPresentation(const QString &lostCardId)
         m_lostPresentationCardId = cardId;
         return;
     }
-    // As the bar shows it: revealed (Reveal's peek or Set knowledge), else masked, flipped or not.
-    if (m_answerPeeked || !m_ratingPanel->isHidden()) Q_EMIT answerRevealed();
+    // As the bar shows it: revealed, else masked, flipped or not.
+    if (!m_ratingPanel->isHidden()) Q_EMIT answerRevealed();
     else if (m_maskFlipped) Q_EMIT reviewMaskInvertedChanged(true);
     updateAnswerControls();
 }
@@ -7437,7 +7542,7 @@ void ReviewOverview::refreshAnswerFeedback()
     if (!m_feedbackHistoryAction) return;
     const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
     m_feedbackHistoryAction->setVisible(current);
-    const bool answerVisible = current && (m_answerPeeked || !m_ratingPanel->isHidden());
+    const bool answerVisible = current && !m_ratingPanel->isHidden();
     const QString masked = current && !answerVisible ? m_dueCards.at(m_currentReview).id() : QString();
     if (std::exchange(m_maskedHistoryCard, masked) != masked) Q_EMIT maskedHistoryCardChanged(masked);
 }
@@ -7457,22 +7562,7 @@ void ReviewOverview::stepAnswerArea(int step)
     m_focusAnswerArea(m_answerArea);
 }
 
-// Reveal is a peek: the answer is framed and nothing is recorded. It then reads Hide.
-void ReviewOverview::toggleReveal()
-{
-    if (m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
-    if (m_answerPeeked) {
-        hideAnswer();
-        return;
-    }
-    m_answerPeeked = true;
-    lockBeforeStep();
-    Q_EMIT answerRevealed();
-    updateAnswerControls();
-    updateCardMenu();
-}
-
-// Hide (and Hide again) covers the answer again, keeping Flip, the tag and the interval.
+// Hide again covers the answer again, keeping Flip, the tag and the interval.
 void ReviewOverview::hideAnswer()
 {
     if (m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
@@ -7482,7 +7572,6 @@ void ReviewOverview::hideAnswer()
         return;
     }
     m_lostPresentationCardId.clear();
-    m_answerPeeked = false;
     m_ratingPanel->hide();
     if (m_maskFlipped) Q_EMIT reviewMaskInvertedChanged(true);
     updateAnswerControls();
@@ -7490,7 +7579,7 @@ void ReviewOverview::hideAnswer()
     updateSessionExtras();
 }
 
-// Set knowledge: frame the answer and choose its tags and when to review it again.
+// Reveal: frame the answer and choose its tags and when to review it again.
 void ReviewOverview::revealAnswer()
 {
     if (m_currentReview < 0 || m_currentReview >= m_dueCards.size()) {
@@ -7588,6 +7677,7 @@ void ReviewOverview::rebuildBeforePanel()
                 }
             }
             m_before.tags = ordered;
+            keepBeforeStep();
         };
         column->addWidget(scale);
     }
@@ -7597,6 +7687,7 @@ void ReviewOverview::rebuildBeforePanel()
     // Without a group asked before, there is no before step: no panel, an answer as before.
     if (asked > 0 && !m_before.locked()) m_before.shown = true;
     updateBeforePanel();
+    keepBeforeStep();
 }
 
 void ReviewOverview::updateBeforePanel()
@@ -7673,6 +7764,12 @@ void ReviewOverview::lockBeforeStep()
     // the picks may have changed since, the moment the answer was seen did not.
     if (!m_before.answerShownAt.isValid()) m_before.answerShownAt = QDateTime::currentDateTimeUtc();
     m_before.reopened = false;
+    keepBeforeStep();
+    startAfterStepAtPrediction();
+}
+
+void ReviewOverview::startAfterStepAtPrediction()
+{
     // The after step asks each group asked before and after again, from the step predicted;
     // without a prediction it starts as the bar has it.
     for (const ReviewTags::TagGroup &group : std::as_const(m_barTagGroups)) {
@@ -7686,17 +7783,17 @@ void ReviewOverview::lockBeforeStep()
 }
 
 // The phone's "Before: … · Tap to change" (its card menu's "Back to before step"), with the same
-// data: the answer is covered again, the rows open on the picks and the note, and showing the
-// answer again (Reveal or Set knowledge) locks the changed picks; the answer records them with
-// the time it was first shown, and nothing marks the change.
+// data: the answer is covered again, the rows open on the picks and the note, and Reveal locks
+// the changed picks; the answer records them with the time it was first shown, and nothing marks
+// the change.
 void ReviewOverview::reopenBeforeStep()
 {
     if (m_sessionComplete || m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
     if (m_before.cardId != m_dueCards.at(m_currentReview).id() || !m_before.shown || !m_before.locked()) return;
-    if (m_answerPeeked || !m_ratingPanel->isHidden()) {
+    if (!m_ratingPanel->isHidden()) {
         hideAnswer();
         // The reader could not cover it again: the picks stay as they were.
-        if (m_answerPeeked || !m_ratingPanel->isHidden()) return;
+        if (!m_ratingPanel->isHidden()) return;
     }
     m_before.reopened = true;
     {
@@ -7876,6 +7973,8 @@ void ReviewOverview::rateCurrent(const QString &rating, const QDateTime &schedul
         KMessageBox::error(this, error, i18n("Could Not Record Review"));
         return;
     }
+    // Answered (or deleted): the before step kept for the card is done with.
+    forgetBeforeSteps({cardId});
     if (rating == QLatin1String("delete")) {
         m_reviewHistory.removeIf([&cardId](const auto &entry) { return entry.first == cardId; });
         moveTagUsage(previousTags, {});
@@ -8150,6 +8249,7 @@ void ReviewOverview::rateScoped(const QString &rating, const QDateTime &schedule
         m_barDrafts.remove(id);
     }
     saveBarDrafts();
+    forgetBeforeSteps(targets);
     // Every card it was given to now has these tags, as ReviewStore::reviewTagUsage() counts them.
     const QStringList answered = countedReviewTags(recordedTags, m_tagMerges);
     for (const QStringList &previous : std::as_const(previousTags)) moveTagUsage(previous, answered);
@@ -8270,9 +8370,12 @@ void ReviewOverview::updateCardMenu()
     }
     menu->findChild<QAction *>(QStringLiteral("reviewNoteAction"))->setText(current && !m_dueCards.at(m_currentReview).record.value(QStringLiteral("note")).toString().isEmpty() ? i18n("Edit note") : i18n("Add note"));
     menu->findChild<QAction *>(QStringLiteral("reviewUndoAction"))->setEnabled(!m_reviewHistory.isEmpty() || !m_pendingSkip.id.isEmpty());
-    const bool answerVisible = current && (m_answerPeeked || !m_ratingPanel->isHidden());
+    const bool answerVisible = current && !m_ratingPanel->isHidden();
     // Like the phone, Skip is offered before the answer is revealed too.
     menu->findChild<QAction *>(QStringLiteral("reviewSkipAction"))->setVisible(current);
+    auto *flip = menu->findChild<QAction *>(QStringLiteral("reviewFlipAction"));
+    flip->setText(m_maskFlipped ? i18n("Unflip") : i18n("Flip"));
+    flip->setVisible(current && !answerVisible);
     menu->findChild<QAction *>(QStringLiteral("reviewHideAgainAction"))->setVisible(answerVisible);
     m_cardMenuButton->setVisible(current || !m_reviewHistory.isEmpty() || !m_pendingSkip.id.isEmpty());
 }
@@ -8719,11 +8822,15 @@ void MentalModelView::rewrite()
     m_status->setText(i18n("Writing from your review cards… (a minute or two)"));
     connect(m_writer, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
         const QString error = QString::fromUtf8(m_writer->readAllStandardError());
+        const QString output = QString::fromUtf8(m_writer->readAllStandardOutput());
         m_writer->deleteLater();
         m_writer = nullptr;
         m_refresh->setEnabled(true);
         if (status == QProcess::NormalExit && exitCode == 0) {
             reload();
+            // build.py rewrote the Library note (it says so on a line of its own).
+            if (output.contains(QLatin1String("\nlibrary note written: ")) || output.startsWith(QLatin1String("library note written: ")))
+                Q_EMIT libraryNoteWritten();
             return;
         }
         // build.py ends with the reason; poppler warnings from thoughtsctl come before it.

@@ -709,6 +709,7 @@ if(BUILD_DESKTOP)
     part/pageviewannotator.cpp
     part/pageviewmouseannotation.cpp
     part/pageview.cpp
+    part/outsidepdfcomments.cpp
     part/readaloudbar.cpp
     part/reviewfeedbackeditor.cpp
     part/reviewfeedbackoverlay.cpp

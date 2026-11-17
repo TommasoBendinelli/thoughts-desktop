@@ -285,6 +285,7 @@ private Q_SLOTS:
     void mergeOfARealSourceCopy();
     void mergeCardsWhosePassageStartsTheFile();
     void mergeCardsWhoseHeadingsAreInTheContents();
+    void mergeCardsOfAnImportedPdf();
     void mergingCardsKeepsPendingProposalsInsideTheirPassages();
     void mergingCardsRefusesAProposalThatHoldsACardMarker();
     void mergingCardsWhosePassageHoldsADefinition();
@@ -5560,7 +5561,7 @@ void ReviewStoreTest::mergingCardsRefusesWhatItCannotMergeSafely()
     QVERIFY2(refusal({card(first), card(otherDocument)}).contains(QStringLiteral("one document")), qPrintable(refusal({card(first), card(otherDocument)})));
     QVERIFY(refusal({card(first), card(otherDocument)}).contains(QStringLiteral("other.pdf")));
     QVERIFY(refusal({card(first), card(otherFile)}).contains(QStringLiteral("different source files")));
-    QVERIFY(refusal({card(first), card(pdfOnly)}).contains(QStringLiteral("not linked to a source passage")));
+    QVERIFY(refusal({card(first), card(pdfOnly)}).contains(QStringLiteral("Merge cards of a note with each other, and cards of a PDF with each other")));
     QVERIFY(refusal({card(first), card(otherVersion)}).contains(QStringLiteral("different versions of the PDF")));
     QVERIFY(refusal({card(first), card(second)}).isEmpty());
     QString error;
@@ -5642,6 +5643,124 @@ void ReviewStoreTest::interruptedMergeIsRecovered()
     QCOMPARE(queued.first().value(QStringLiteral("payload")).toObject().value(QStringLiteral("card_id")).toString(), second);
     QCOMPARE(queued.last().value(QStringLiteral("entity_id")).toString(), first);
     QVERIFY(cardWithId(store->cards(), second).schedule.deleted);
+}
+
+// Cards of an imported PDF have no source: the kept card takes every card's areas, the others are
+// deleted naming it, and nothing else changes. Through Merge cards… and thoughtsctl alike.
+void ReviewStoreTest::mergeCardsOfAnImportedPdf()
+{
+    QTemporaryDir dir;
+    MergeFixture doc;
+    doc.root = dir.path();
+    const auto id = [] { return QUuid::createUuid().toString(QUuid::WithoutBraces); };
+    const QString later = id(), middle = id(), top = id(), otherPdf = id(), whole = id();
+    const auto add = [&](const QString &cardId, const QString &question, const QJsonArray &regions, const QString &pageVisual, const QString &answer = {},
+                         const QString &pdfSha = QString(64, QLatin1Char('a'))) {
+        auto record = reviewCard(cardId, QStringLiteral("imported_paper"), pdfSha);
+        record.insert(QStringLiteral("schema_version"), 4);
+        auto primary = record.value(QStringLiteral("primary")).toObject();
+        primary.insert(QStringLiteral("question"), question);
+        primary.insert(QStringLiteral("regions"), regions);
+        primary.insert(QStringLiteral("page"), regions.first().toObject().value(QStringLiteral("page")));
+        primary.insert(QStringLiteral("rect"), regions.first().toObject().value(QStringLiteral("rect")));
+        primary.insert(QStringLiteral("page_visual_sha256"), pageVisual);
+        if (!answer.isEmpty())
+            primary.insert(QStringLiteral("answer_anchor"), QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("normalized_text"), answer},
+                {QStringLiteral("text_sha256"), sha256Hex(answer.toUtf8())}});
+        record.insert(QStringLiteral("primary"), primary);
+        doc.projection.insert(QStringLiteral("review_card\ncards\n") + cardId, record);
+        return record;
+    };
+    const auto area = [](int page, double y) { return QJsonObject{{QStringLiteral("page"), page}, {QStringLiteral("rect"), QJsonArray{0.1, y, 0.9, y + 0.05}}}; };
+    // Listed out of order: the card on pages 3 and 2 starts on page 2; two cards share page 1.
+    add(later, QStringLiteral("Why is it sample efficient?"), QJsonArray{area(3, 0.1), area(2, 0.4)}, QString(64, QLatin1Char('3')), QStringLiteral("Later"));
+    add(middle, QStringLiteral("What is the main experiment?"), QJsonArray{area(1, 0.6)}, QString(64, QLatin1Char('2')));
+    add(top, QStringLiteral("How does it work?"), QJsonArray{area(1, 0.2)}, QString(64, QLatin1Char('1')), QStringLiteral("Top"));
+    add(otherPdf, QStringLiteral("Older copy?"), QJsonArray{area(1, 0.8)}, QString(64, QLatin1Char('4')), {}, QString(64, QLatin1Char('f')));
+    auto wholeRecord = add(whole, QStringLiteral("The whole paper?"), QJsonArray{area(1, 0.9)}, QString(64, QLatin1Char('5')));
+    auto wholePrimary = wholeRecord.value(QStringLiteral("primary")).toObject();
+    wholePrimary.insert(QStringLiteral("scope"), QStringLiteral("document"));
+    wholeRecord.insert(QStringLiteral("primary"), wholePrimary);
+    doc.projection.insert(QStringLiteral("review_card\ncards\n") + whole, wholeRecord);
+    const QString askedFirst = id(), askedSecond = id();
+    add(askedFirst, QStringLiteral("Asked by an agent?"), QJsonArray{area(5, 0.5)}, QString(64, QLatin1Char('6')));
+    add(askedSecond, QStringLiteral("And this?"), QJsonArray{area(5, 0.1)}, QString(64, QLatin1Char('7')));
+    auto store = doc.store();
+    const auto cards = store->cards();
+    const auto card = [&cards](const QString &cardId) { return cardWithId(cards, cardId); };
+    QVERIFY(store->cardMergeProblem({card(top), card(otherPdf)}, {}).contains(QStringLiteral("different versions of the PDF")));
+    QVERIFY(store->cardMergeProblem({card(top), card(whole)}, {}).contains(QStringLiteral("no answer areas of its own")));
+
+    ReviewStore::CardMerge preview;
+    QCOMPARE(store->cardMergeProblem({card(later), card(middle), card(top)}, {}, &preview), QString());
+    QVERIFY(preview.pdf);
+    QCOMPARE(preview.order, (QStringList{top, middle, later}));
+    QCOMPARE(preview.keptId, top); // None was reviewed: the first in reading order.
+    QCOMPARE(preview.passages, 4);
+    QVERIFY(preview.sourceFile.isEmpty());
+
+    QString error;
+    ReviewStore::CardMerge merged;
+    QVERIFY2(store->mergeCards({card(top), card(middle), card(later)}, middle, QStringLiteral("How does it work, and what shows it?"), {}, &error, &merged),
+             qPrintable(error));
+    QVERIFY(merged.pdf);
+    QCOMPARE(merged.keptId, middle);
+    QCOMPARE(merged.deletedIds, (QStringList{top, later}));
+    QCOMPARE(merged.passages, 4);
+    const auto queued = doc.queued();
+    QCOMPARE(queued.size(), 3);
+    QJsonObject kept;
+    QStringList deleted;
+    for (const auto &operation : queued) {
+        const auto payload = operation.value(QStringLiteral("payload")).toObject();
+        if (operation.value(QStringLiteral("entity_type")).toString() == QLatin1String("review_card")) {
+            kept = payload;
+            continue;
+        }
+        QCOMPARE(payload.value(QStringLiteral("rating")).toString(), QStringLiteral("delete"));
+        QCOMPARE(payload.value(QStringLiteral("merged_into")).toString(), middle);
+        // A plain deletion: no source to change.
+        for (const QString &key : {QStringLiteral("source_authority"), QStringLiteral("source_change"), QStringLiteral("marker_removal")})
+            QVERIFY2(!payload.contains(key), qPrintable(key));
+        QVERIFY(payload.value(QStringLiteral("source_anchor")).toObject().isEmpty());
+        deleted.append(payload.value(QStringLiteral("card_id")).toString());
+    }
+    QCOMPARE(deleted, (QStringList{top, later}));
+    QCOMPARE(kept.value(QStringLiteral("card_id")).toString(), middle);
+    QCOMPARE(kept.value(QStringLiteral("revision")).toInteger(), 2);
+    QCOMPARE(kept.value(QStringLiteral("schema_version")).toInt(), 4);
+    QVERIFY(!kept.contains(QStringLiteral("source_change")));
+    QVERIFY(!kept.contains(QStringLiteral("source_authority")));
+    const auto primary = kept.value(QStringLiteral("primary")).toObject();
+    QCOMPARE(primary.value(QStringLiteral("question")).toString(), QStringLiteral("How does it work, and what shows it?"));
+    // Every card's areas, cards in reading order; the page is the first card's.
+    QCOMPARE(primary.value(QStringLiteral("regions")).toArray(), (QJsonArray{area(1, 0.2), area(1, 0.6), area(3, 0.1), area(2, 0.4)}));
+    QCOMPARE(primary.value(QStringLiteral("page")).toInt(), 1);
+    QCOMPARE(primary.value(QStringLiteral("rect")).toArray(), area(1, 0.2).value(QStringLiteral("rect")).toArray());
+    QCOMPARE(primary.value(QStringLiteral("page_visual_sha256")).toString(), QString(64, QLatin1Char('1')));
+    QCOMPARE(primary.value(QStringLiteral("answer_anchor")).toObject().value(QStringLiteral("normalized_text")).toString(), QStringLiteral("Top Later"));
+    QVERIFY(primary.value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray().isEmpty());
+
+    // thoughtsctl merge-review-cards: cards of a PDF leave out both source fields.
+    const QJsonObject request{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("merge-review-cards")},
+        {QStringLiteral("card_ids"), QJsonArray{askedFirst, askedSecond}}, {QStringLiteral("request_id"), id()}};
+    const auto with = [&](const QString &key, const QJsonValue &value) { auto changed = request; changed.insert(key, value); return changed; };
+    QCOMPARE(store->sourceCardCommand(with(QStringLiteral("source"), QStringLiteral("docs-test/tex/source/main.tex")), {}).value(QStringLiteral("error_code")).toString(),
+             QStringLiteral("invalid_request"));
+    QCOMPARE(store->sourceCardCommand(with(QStringLiteral("expected_source_sha256"), QString(64, QLatin1Char('0'))), {}).value(QStringLiteral("error_code")).toString(),
+             QStringLiteral("invalid_request"));
+    const auto result = store->sourceCardCommand(request, {});
+    QVERIFY2(result.value(QStringLiteral("accepted")).toBool(), QJsonDocument(result).toJson().constData());
+    QCOMPARE(result.value(QStringLiteral("kind")).toString(), QStringLiteral("pdf"));
+    QVERIFY(result.value(QStringLiteral("source")).isNull());
+    QVERIFY(result.value(QStringLiteral("source_sha256")).isNull());
+    QCOMPARE(result.value(QStringLiteral("kept_card_id")).toString(), askedSecond); // First in reading order: higher on page 5.
+    QCOMPARE(result.value(QStringLiteral("card_order")).toArray(), (QJsonArray{askedSecond, askedFirst}));
+    QCOMPARE(result.value(QStringLiteral("question")).toString(), QStringLiteral("And this? Asked by an agent?"));
+    QCOMPARE(result.value(QStringLiteral("passages")).toInt(), 2);
+    QCOMPARE(doc.queued().size(), 5);
+    QVERIFY(store->sourceCardCommand(request, {}).value(QStringLiteral("replayed")).toBool());
+    QCOMPARE(doc.queued().size(), 5);
 }
 
 void ReviewStoreTest::mergeCommandIsOneRequestWithAReceipt()

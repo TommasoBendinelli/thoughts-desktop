@@ -222,6 +222,7 @@ private Q_SLOTS:
     void cardsCarryTheirAnswerFeedback();
     void cardsShareTheAnswerFeedbackOfTheirDocument();
     void retiredCardsAreReportedButNeverDue();
+    void ownIdeasAreSolidWhateverTheScheduleSays();
     void historyCarriesTheBeforeStep();
     void fullAnswerIsTheWholePassage();
     void documentFeedbackComesWithItsPage();
@@ -434,11 +435,14 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
                 {QStringLiteral("scale"), QJsonArray{QStringLiteral("Not interesting"), QStringLiteral("Somewhat"), QStringLiteral("Interesting"), QStringLiteral("Very interesting")}}},
             QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-effort")}, {QStringLiteral("name"), QStringLiteral("Effort")},
                 {QStringLiteral("tags"), QJsonArray{QStringLiteral("Skimmed"), QStringLiteral("Studied")}}},
-            QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-confidence")}, {QStringLiteral("name"), QStringLiteral("Confidence")},
-                {QStringLiteral("scale"), QJsonArray{QStringLiteral("Guessing"), QStringLiteral("Not sure"), QStringLiteral("Fairly sure"), QStringLiteral("Sure")}}}}}});
+            QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-confidence")}, {QStringLiteral("name"), QStringLiteral("Confidence")}, {QStringLiteral("phase"), QStringLiteral("before")},
+                {QStringLiteral("scale"), QJsonArray{QStringLiteral("Guessing"), QStringLiteral("Not sure"), QStringLiteral("Fairly sure"), QStringLiteral("Sure")}}},
+            // Asked before the answer, about the review itself: not a signal about the card.
+            QJsonObject{{QStringLiteral("group_id"), QStringLiteral("g-feeling")}, {QStringLiteral("name"), QStringLiteral("Feeling")}, {QStringLiteral("phase"), QStringLiteral("before")},
+                {QStringLiteral("scale"), QJsonArray{QStringLiteral("Tired"), QStringLiteral("OK"), QStringLiteral("Fresh")}}}}}});
     // KL: very interesting and studied; tensor parallelism: not interesting, skimmed.
     projections.insert(QStringLiteral("review_event\nevents\ne6"), answer(QStringLiteral("e6"), kl, 4, 7,
-        QJsonArray{QStringLiteral("I kind of get it"), QStringLiteral("very interesting"), QStringLiteral("Studied"), QStringLiteral("Sure")}));
+        QJsonArray{QStringLiteral("I kind of get it"), QStringLiteral("very interesting"), QStringLiteral("Studied"), QStringLiteral("Sure"), QStringLiteral("Tired")}));
     projections.insert(QStringLiteral("review_event\nevents\ne4"), answer(QStringLiteral("e4"), tensor, 1, 0.9,
         QJsonArray{QStringLiteral("wrong"), QStringLiteral("Not interesting"), QStringLiteral("Skimmed"), QStringLiteral("Guessing")}));
     const Library library = libraryFromSnapshot({projections, {}, true}, docs);
@@ -456,6 +460,7 @@ void ReviewKnowledgeTest::profileDescribesTheLearnerForNewTopics()
                           {QStringLiteral("Confidence"), QStringLiteral("Sure")}}));
     QVERIFY2(topic.value(QStringLiteral("summary")).toString().contains(QStringLiteral("Interest: typically Very interesting (Interesting 1, Very interesting 1)")),
              qPrintable(topic.value(QStringLiteral("summary")).toString()));
+    QVERIFY2(!topic.value(QStringLiteral("summary")).toString().contains(QStringLiteral("Feeling")), qPrintable(topic.value(QStringLiteral("summary")).toString()));
     // Sure of a shaky answer is overconfident; guessing at one not understood is about right.
     QCOMPARE(topic.value(QStringLiteral("calibration")).toObject().value(QStringLiteral("overconfident")).toArray(),
              QJsonArray{QStringLiteral("Why add a KL penalty to the reward?")});
@@ -518,7 +523,7 @@ void ReviewKnowledgeTest::levelsFileIsOnlyWrittenOnRequest()
     QCOMPARE(levels.tags.size(), defaultLevels().tags.size());
     QVERIFY(write(path, R"({"schema_version": 1, "levels": {"Correct": "great"}})"));
     QVERIFY(!loadLevels(path, &levels, &error));
-    QVERIFY(error.contains(QStringLiteral("solid, shaky, unknown, ignore")));
+    QVERIFY(error.contains(QStringLiteral("solid, shaky, unknown, own, ignore")));
     QVERIFY(write(path, "not json"));
     QVERIFY(!loadLevels(path, &levels, &error));
 }
@@ -545,14 +550,16 @@ void ReviewKnowledgeTest::defaultLevelsReadTheSliderSteps()
     QCOMPARE(result.value(QStringLiteral("counts")).toObject(), (QJsonObject{{QStringLiteral("solid"), 2}, {QStringLiteral("shaky"), 1},
                                                                             {QStringLiteral("unknown"), 0}, {QStringLiteral("unreviewed"), 1}}));
     const QJsonObject levels = result.value(QStringLiteral("mapping")).toObject().value(QStringLiteral("levels")).toObject();
-    QCOMPARE(levels.value(QStringLiteral("Know by heart")).toString(), QStringLiteral("solid"));
-    QCOMPARE(levels.value(QStringLiteral("Forgot")).toString(), QStringLiteral("unknown"));
+    QCOMPARE(levels.value(QStringLiteral("Partly")).toString(), QStringLiteral("shaky"));
+    // The Recall steps (now Confidence's, asked before the answer) are no levels: calibration compares them with the answer.
+    QVERIFY(!levels.contains(QStringLiteral("Know by heart")));
+    QVERIFY(!levels.contains(QStringLiteral("Forgot")));
     QVERIFY(!levels.contains(QStringLiteral("Correct")));
-    // Forgot after Recalled long ago: not understood; the old answers read under the new names.
+    // Forgot after Recalled long ago, and no Understanding answer: only its interval tells how well it is known.
     const auto tensorResult = profile(library, {{QStringLiteral("topic"), QStringLiteral("tensor parallelism")}}, defaultLevels(), now);
-    QCOMPARE(tensorResult.value(QStringLiteral("counts")).toObject().value(QStringLiteral("unknown")).toInt(), 1);
-    QVERIFY(tensorResult.value(QStringLiteral("cards")).toObject().value(QStringLiteral("unknown")).toArray().at(0).toObject()
-                .value(QStringLiteral("reason")).toString().startsWith(QStringLiteral("last 2 answers: Forgot, Recalled")));
+    QCOMPARE(tensorResult.value(QStringLiteral("counts")).toObject().value(QStringLiteral("shaky")).toInt(), 1);
+    QVERIFY(tensorResult.value(QStringLiteral("cards")).toObject().value(QStringLiteral("shaky")).toArray().at(0).toObject()
+                .value(QStringLiteral("reason")).toString().startsWith(QStringLiteral("2 answers, none with an understanding tag")));
     // An answer tagged with the old built-in still counts as a wrong answer.
     const auto found = search(library, {{QStringLiteral("query"), QStringLiteral("allreduce")}}, now);
     int wrongCount = -1;
@@ -936,6 +943,33 @@ void ReviewKnowledgeTest::retiredCardsAreReportedButNeverDue()
                               temporary.filePath(QStringLiteral("levels.json")), now);
     QCOMPARE(ids(viaIndex), QStringList{baseline});
     QCOMPARE(viaIndex.value(QStringLiteral("cards")).toArray().at(0).toObject().value(QStringLiteral("retired_at")).toString(), iso(now.addDays(-1)));
+}
+
+void ReviewKnowledgeTest::ownIdeasAreSolidWhateverTheScheduleSays()
+{
+    QTemporaryDir temporary;
+    const QString docs = temporary.filePath(QStringLiteral("docs"));
+    QJsonObject projections = fixture(docs);
+    // KL: the user came up with it long ago; the later answer said only "I kind of get it".
+    projections.insert(QStringLiteral("review_event\nevents\ne8"),
+                       answer(QStringLiteral("e8"), kl, 60, 3, QJsonArray{QStringLiteral("I came up with it")}));
+    const Library library = libraryFromSnapshot({projections, {}, true}, docs);
+    const auto result = profile(library, {{QStringLiteral("topic"), QStringLiteral("KL penalty")}}, defaultLevels(), now);
+    QCOMPARE(result.value(QStringLiteral("mapping")).toObject().value(QStringLiteral("levels")).toObject().value(QStringLiteral("I came up with it")).toString(),
+             QStringLiteral("own"));
+    const QJsonObject entry = result.value(QStringLiteral("cards")).toObject().value(QStringLiteral("solid")).toArray().at(0).toObject();
+    QCOMPARE(entry.value(QStringLiteral("card_id")).toString(), kl);
+    QCOMPARE(entry.value(QStringLiteral("reason")).toString(), QStringLiteral("own idea (I came up with it)"));
+    QVERIFY(entry.value(QStringLiteral("own_idea")).toBool());
+    QVERIFY(result.value(QStringLiteral("summary")).toString().contains(
+        QStringLiteral("The user's own ideas (they came up with them; build on them, don't explain them back): Why add a KL penalty to the reward?")));
+    // Ignored, the tag says nothing: the card is judged by its schedule again.
+    Levels ignored = defaultLevels();
+    for (auto &[tag, level] : ignored.tags)
+        if (tag == QLatin1String("I came up with it")) level = QStringLiteral("ignore");
+    const auto plain = profile(library, {{QStringLiteral("topic"), QStringLiteral("KL penalty")}}, ignored, now);
+    QVERIFY(plain.value(QStringLiteral("cards")).toObject().value(QStringLiteral("solid")).toArray().isEmpty());
+    QVERIFY(!plain.value(QStringLiteral("summary")).toString().contains(QStringLiteral("own ideas")));
 }
 
 // review-phases spec: an answer given in two steps exports what was picked and noted before the
