@@ -301,7 +301,7 @@ void AgentNoteImageView::contextMenuEvent(QContextMenuEvent *event)
     QAction *copy = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy Picture"));
     connect(copy, &QAction::triggered, this, [this] { QApplication::clipboard()->setImage(m_image); });
     if (!m_cachedPath.isEmpty() && QFileInfo::exists(m_cachedPath)) {
-        QAction *open = menu.addAction(QIcon::fromTheme(QStringLiteral("document-open")), i18n("Open in Preview"));
+        QAction *open = menu.addAction(QIcon::fromTheme(QStringLiteral("document-open")), i18n("Open Picture"));
         connect(open, &QAction::triggered, this, [path = m_cachedPath] { QDesktopServices::openUrl(QUrl::fromLocalFile(path)); });
     }
     menu.exec(event->globalPos());
@@ -1059,7 +1059,7 @@ void AgentNotesView::showDetail(const Note &note, bool sameNote)
         if (title.size() > limit) title = title.left(limit - 1) + QChar(0x2026);
         m_openDocumentButton->setText(title.isEmpty() ? i18n("Open Document") : i18n("Open “%1”", title));
         m_openDocumentButton->setEnabled(!link.path.isEmpty());
-        m_openDocumentButton->setToolTip(link.path.isEmpty() ? i18n("The document of this note is not in this Mac's Library.") : link.path);
+        m_openDocumentButton->setToolTip(link.path.isEmpty() ? i18n("The document of this note is not in this computer's Library.") : link.path);
     }
     m_shownCardId = note.reviewCardId;
     m_openCardButton->setVisible(!note.reviewCardId.isEmpty());

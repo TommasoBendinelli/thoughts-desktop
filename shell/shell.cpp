@@ -8450,7 +8450,7 @@ QJsonObject Shell::todoCommand(const QString &command, const QJsonObject &reques
     if (command == QLatin1String("list-todos")) {
         // Nothing at all is no synced state, which must not read as an empty To-dos list.
         if (projections.isEmpty()) {
-            return Thoughts::syncCommandError(QStringLiteral("not_configured"), QStringLiteral("Thoughts has no synced data on this Mac yet. Sync, then try again."));
+            return Thoughts::syncCommandError(QStringLiteral("not_configured"), QStringLiteral("Thoughts has no synced data on this computer yet. Sync, then try again."));
         }
         return Thoughts::TodoCommands::list(projections, request, now.date());
     }
@@ -9257,7 +9257,7 @@ void Shell::openAgentNoteLink(const QString &href)
         const QString path = agentNoteDocumentPath(QString(), filename, nullptr);
         Shell *shell = path.isEmpty() ? nullptr : shellForCommentsOverview(path);
         if (!shell) {
-            KMessageBox::information(parent, i18n("“%1” is not in this Mac's Library yet. Sync, then click the link again.", filename), i18n("Open Link"));
+            KMessageBox::information(parent, i18n("“%1” is not in this computer's Library yet. Sync, then click the link again.", filename), i18n("Open Link"));
             return;
         }
         QString error;
