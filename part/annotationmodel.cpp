@@ -606,6 +606,7 @@ QVariant AnnotationModel::data(const QModelIndex &index, int role) const
     if (item->type == AnnItem::Type::ReviewCard) {
         if (role == Qt::DisplayRole) return item->card.question;
         if (role == Qt::DecorationRole) return QIcon::fromTheme(QStringLiteral("view-card"), QIcon::fromTheme(QStringLiteral("view-list-details")));
+        if (role == ReviewCardKindRole) return item->card.schedule.toVariantMap();
         // Worded against the clock when asked, so "Due in 2 hours" turns into "Due now" by itself.
         if (role == ReviewCardScheduleRole || role == ReviewCardScheduleTagsRole || role == ReviewCardSchedulePartsRole || role == ReviewCardDueRole
             || role == ReviewCardDueOrderRole || role == Qt::ToolTipRole) {
@@ -1101,6 +1102,17 @@ ReviewCardScheduleText AnnotationModel::reviewCardSchedule(const QJsonObject &sc
         details.append(i18n("Last tags: %1", tags.join(QStringLiteral(", "))));
     } else if (schedule.value(QStringLiteral("answered")).toBool()) {
         details.append(i18n("Last tags: none"));
+    }
+    // A project card (review-card-kinds.md §5) says so after when it is due, and first that its
+    // passage changed since it was last answered (it is due at once then).
+    if (schedule.value(QStringLiteral("review_kind")).toString() == QLatin1String("project")) {
+        const bool changed = schedule.value(QStringLiteral("passage_changed")).toBool();
+        line.insert(std::min<qsizetype>(1, line.size()), i18nc("a project card", "Project"));
+        details.prepend(i18n("Project card: it comes back at least once a week, and at once when its passage changes."));
+        if (changed) {
+            line.prepend(i18n("Changed since you last saw it"));
+            details.prepend(i18n("Changed since you last saw it"));
+        }
     }
     text.parts = line;
     text.line = line.join(QStringLiteral(" · "));

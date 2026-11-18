@@ -1800,8 +1800,11 @@ void Shell::migrateLegacyPdfLibraryActionConfig()
 }
 
 // With @p moreAreas, the dialog also offers Add More Areas…, which accepts it and sets *moreAreas.
+// With @p onlySelection (a section card made from a selected heading), it also offers Hide Only the
+// Selection, which closes it, sets *onlySelection and returns the question typed so far.
 static QString promptManualReviewQuestion(QWidget *parent, bool *accepted, int *firstDueDays, QDateTime *customFirstDueAt,
-                                          const QString &initialQuestion = {}, const QString &instructionText = {}, bool *moreAreas = nullptr)
+                                          const QString &initialQuestion = {}, const QString &instructionText = {}, bool *moreAreas = nullptr,
+                                          bool *onlySelection = nullptr)
 {
     QDialog dialog(parent);
     dialog.setWindowTitle(i18n("Add Review Card"));
@@ -1862,6 +1865,16 @@ static QString promptManualReviewQuestion(QWidget *parent, bool *accepted, int *
             dialog.accept();
         });
     }
+    if (onlySelection) {
+        *onlySelection = false;
+        QPushButton *selectionButton = buttons->addButton(i18n("Hide Only the Selection…"), QDialogButtonBox::ActionRole);
+        selectionButton->setObjectName(QStringLiteral("ManualReviewOnlySelection"));
+        selectionButton->setToolTip(i18n("Make a card that hides only the selected text, not the whole section."));
+        QObject::connect(selectionButton, &QPushButton::clicked, &dialog, [&dialog, onlySelection] {
+            *onlySelection = true;
+            dialog.reject();
+        });
+    }
     layout->addWidget(buttons);
 
     const auto update = [editor, characterCount, addButton, moreButton, dueChoice, customDue]() {
@@ -1889,7 +1902,7 @@ static QString promptManualReviewQuestion(QWidget *parent, bool *accepted, int *
     }
     if (wasAccepted && firstDueDays) *firstDueDays = dueChoice->currentData().toInt();
     if (wasAccepted && customFirstDueAt && dueChoice->currentData().toInt() == -1) *customFirstDueAt = customDue->dateTime().toUTC();
-    return wasAccepted ? editor->toPlainText().trimmed() : QString();
+    return wasAccepted || (onlySelection && *onlySelection) ? editor->toPlainText().trimmed() : QString();
 }
 
 #ifdef Q_OS_WIN
@@ -6636,6 +6649,63 @@ void Shell::editSidebarReviewCard(const QString &cardId)
     KMessageBox::error(this, i18n("This review card is no longer available."), i18n("Cannot Edit Review Card"));
 }
 
+void Shell::setSidebarReviewCardKind(const QString &cardId, const QString &kind)
+{
+    Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this] { return effectiveFedoraProjections(); });
+    QString error;
+    if (!store.setCardKind(cardId, kind, &error)) {
+        KMessageBox::error(this, error, i18n("Cannot Change the Card's Kind"));
+        return;
+    }
+    refreshReviewCardsEverywhere();
+}
+
+// Retire card in the Cards list: out of review, history kept; Library › Restore to review brings a card back.
+void Shell::retireSidebarReviewCards(const QStringList &cardIds)
+{
+    if (cardIds.isEmpty()) return;
+    Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this] { return effectiveFedoraProjections(); });
+    QStringList errors;
+    for (const QString &cardId : cardIds) {
+        QString error;
+        if (!store.retireCard(cardId, &error)) errors.append(error);
+    }
+    refreshReviewCardsEverywhere();
+    if (!errors.isEmpty()) KMessageBox::error(this, errors.join(QLatin1Char('\n')), i18n("Cannot Retire Review Card"));
+}
+
+// Delete card… in the Cards list: asks first, as the Library and Review do, then deletes for good.
+void Shell::deleteSidebarReviewCards(const QStringList &cardIds)
+{
+    if (cardIds.isEmpty()) return;
+    const QString question = cardIds.size() == 1
+        ? i18n("Permanently delete this review card? It and its history cannot be restored.\n\n"
+               "Retire card instead stops reviewing it and keeps its history; it can be restored to review later.")
+        : i18n("Permanently delete %1 selected review cards? They and their history cannot be restored.\n\n"
+               "Retire card instead stops reviewing a card and keeps its history; it can be restored to review later.", cardIds.size());
+    if (KMessageBox::questionTwoActions(this, question, i18n("Delete Review Card"), KGuiItem(i18n("Delete"), QStringLiteral("edit-delete")),
+                                        KStandardGuiItem::cancel())
+        != KMessageBox::PrimaryAction)
+        return;
+    Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this] { return effectiveFedoraProjections(); });
+    QString error;
+    const bool deleted = store.setCardsDeleted(cardIds, true, QDateTime::currentDateTimeUtc(), &error);
+    refreshReviewCardsEverywhere();
+    if (!deleted) KMessageBox::error(this, error, i18n("Cannot Delete Review Cards"));
+}
+
+void Shell::refreshReviewCardsEverywhere()
+{
+    for (KMainWindow *window : KMainWindow::memberList()) {
+        auto *shell = qobject_cast<Shell *>(window);
+        if (!shell) continue;
+        const auto projections = shell->effectiveFedoraProjections();
+        for (const auto &tab : std::as_const(shell->m_tabs)) shell->refreshSidebarReviewCards(tab.part, projections);
+        if (shell->m_reviewOverview) QTimer::singleShot(0, shell->m_reviewOverview, &Thoughts::ReviewOverview::reloadFromProjections);
+    }
+    if (s_commentsOverview) s_commentsOverview->reloadReviewCards();
+}
+
 void Shell::mergeSidebarReviewCards(const QStringList &cardIds)
 {
     mergeReviewCardsIn(qobject_cast<KParts::ReadWritePart *>(sender()), cardIds, false);
@@ -6785,11 +6855,24 @@ void Shell::createManualReviewCardAreas(const QString &pdfPath, const QVariantLi
     document.insert(QStringLiteral("document_id"), identity.value(QStringLiteral("document_id")).toString());
     Q_UNUSED(pdfPath)
 
+    // A selected section heading: the card hides the whole section.
+    QString initialQuestion;
+    const bool sectionRequested = std::exchange(m_sectionCardRequested, false);
+    if (textSelection && areas.size() == 1) {
+        switch (offerSectionReviewCard(sourcePart, document, areas.constFirst().page, areas.constFirst().rect, sectionRequested, &initialQuestion)) {
+        case SectionCardOutcome::Handled:
+            return;
+        case SectionCardOutcome::NotHeading:
+        case SectionCardOutcome::OnlySelection:
+            break;
+        }
+    }
+
     bool accepted = false;
     bool moreAreas = false;
     int firstDueDays = 2;
     QDateTime customFirstDueAt;
-    const QString question = promptManualReviewQuestion(this, &accepted, &firstDueDays, &customFirstDueAt, {}, {}, &moreAreas);
+    const QString question = promptManualReviewQuestion(this, &accepted, &firstDueDays, &customFirstDueAt, initialQuestion, {}, &moreAreas);
     if (!accepted) {
         return;
     }
@@ -6905,6 +6988,84 @@ void Shell::createManualReviewCardAreas(const QString &pdfPath, const QVariantLi
         return prepared;
     }));
     progress->show();
+}
+
+void Shell::createSectionReviewCard(const QString &pdfPath, int page, const QVariantList &rect)
+{
+    m_sectionCardRequested = true;
+    createManualReviewCardAreas(pdfPath, {QVariantMap{{QStringLiteral("page"), page}, {QStringLiteral("rect"), rect}}}, true);
+    m_sectionCardRequested = false;
+}
+
+Shell::SectionCardOutcome Shell::offerSectionReviewCard(QObject *sourcePart, const QVariantMap &document, int page, const QRectF &rect, bool requested,
+                                                        QString *question)
+{
+    const QString title = i18n("Add Review Card");
+    const QString path = document.value(QStringLiteral("pdf_path")).toString();
+    const QString hash = document.value(QStringLiteral("pdf_sha256")).toString();
+    const QString bundleRoot = document.value(QStringLiteral("source_bundle_root"), Thoughts::defaultReviewSourceBundleRoot()).toString();
+    const QString cardId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const auto section = Thoughts::planReviewSectionCard(ShellUtils::docsRoot(), bundleRoot, path, hash, {page, rect, true}, cardId);
+    QApplication::restoreOverrideCursor();
+    if (!section.isHeading) {
+        if (!requested) return SectionCardOutcome::NotHeading;
+        KMessageBox::error(this, section.error.isEmpty() ? i18n("This line is not a section heading.") : section.error, title);
+        return SectionCardOutcome::Handled;
+    }
+    if (!section.error.isEmpty()) {
+        KMessageBox::error(this, i18n("No card can hide the %1: %2", section.name(), section.error), title);
+        return SectionCardOutcome::Handled;
+    }
+    // How much is hidden, checked before the card is added; the page shows it highlighted meanwhile.
+    const QString pages = section.firstPage == section.lastPage ? i18n("page %1", section.firstPage) : i18n("pages %1–%2", section.firstPage, section.lastPage);
+    QString extent = section.fromSource
+        ? i18n("Hides %1 (%2; lines %3–%4 of %5).", section.name(), pages, section.firstLine, section.lastLine, QFileInfo(section.sourceId).fileName())
+        : i18n("Hides %1 (%2).", section.name(), pages);
+    if (section.wrappedCards > 0)
+        extent += QLatin1Char(' ') + i18np("The card already inside it stays as it is.", "The %1 cards already inside it stay as they are.", section.wrappedCards);
+    bool previewed = false;
+    if (sourcePart)
+        QMetaObject::invokeMethod(sourcePart, "previewReviewCardAreas", Qt::DirectConnection, Q_RETURN_ARG(bool, previewed),
+                                  Q_ARG(QVariantList, section.plan.regions.toVariantList()));
+    bool accepted = false, onlySelection = false;
+    int firstDueDays = 2;
+    QDateTime customFirstDueAt;
+    const QString typed = promptManualReviewQuestion(this, &accepted, &firstDueDays, &customFirstDueAt, i18n("Explain “%1”.", section.title),
+                                                     extent + QStringLiteral("\n\n") + i18n("Enter the question to show while the section is hidden. Its heading stays visible."),
+                                                     nullptr, requested ? nullptr : &onlySelection);
+    if (previewed && sourcePart) QMetaObject::invokeMethod(sourcePart, "clearReviewCardAreasPreview", Qt::DirectConnection);
+    if (onlySelection) {
+        if (question) *question = typed;
+        return SectionCardOutcome::OnlySelection;
+    }
+    if (!accepted) return SectionCardOutcome::Handled;
+    {
+        QFile pdf(path);
+        if (!pdf.open(QIODevice::ReadOnly) || QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex()) != hash) {
+            KMessageBox::error(this, i18n("The PDF changed while the card was being made. Select the heading again."), title);
+            return SectionCardOutcome::Handled;
+        }
+    }
+    const QJsonObject first = section.plan.regions.first().toObject();
+    Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this]() { return effectiveFedoraProjections(); });
+    Thoughts::ReviewCard card;
+    QString error;
+    if (!store.createManualCard(document, first.value(QStringLiteral("page")).toInt(), first.value(QStringLiteral("rect")).toArray().toVariantList(), typed,
+                                section.plan.pageVisualSha256, &card, &error, firstDueDays, customFirstDueAt, &section.plan, cardId)) {
+        KMessageBox::error(this, error, title);
+        return SectionCardOutcome::Handled;
+    }
+    if (m_reviewOverview) m_reviewOverview->reload();
+    if (s_commentsOverview) s_commentsOverview->reloadReviewCards();
+    QString message = firstDueDays == -1 ? i18n("The review card was added and is due %1.", QLocale().toString(customFirstDueAt.toLocalTime(), QLocale::ShortFormat))
+        : firstDueDays == 0 ? i18n("The review card was added and is due now.")
+        : i18n("The review card was added and is due in %1 days.", firstDueDays);
+    message += QStringLiteral("\n\n") + i18n("It hides %1; its heading stays visible.", section.name());
+    if (card.linkingState() == QLatin1String("linking_failed"))
+        message += QStringLiteral("\n\n") + i18n("Linking failed: %1", card.linkingReason());
+    KMessageBox::information(this, message, i18n("Review Card Added"));
+    return SectionCardOutcome::Handled;
 }
 
 bool Shell::presentReviewCard(const Thoughts::ReviewCard &card, bool masked, QString *error)
@@ -7606,6 +7767,7 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
             shell->scheduleCommentsOverviewDocumentSyncPresentationUpdate();
         }
     });
+    connect(overview, &Thoughts::CommentsOverview::reviewCardsChangedLocally, overview, [] { refreshReviewCardsEverywhere(); });
     connect(overview, &Thoughts::CommentsOverview::trackPdfRequested, overview, []() {
         if (Shell *shell = shellForCommentsOverview()) {
             shell->choosePdfForLibrary();
@@ -11932,11 +12094,15 @@ void Shell::connectPart(const KParts::ReadWritePart *part)
     connect(part, &KParts::ReadOnlyPart::canceled, this, [this, part](const QString &) { schedulePdfLibraryPartRefresh(part); });
     connect(part, SIGNAL(requestManualReviewCard(QString, int, QVariantList, bool)), this, SLOT(createManualReviewCard(QString, int, QVariantList, bool))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestManualReviewCardAreas(QString, QVariantList, bool)), this, SLOT(createManualReviewCardAreas(QString, QVariantList, bool))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestSectionReviewCard(QString, int, QVariantList)), this, SLOT(createSectionReviewCard(QString, int, QVariantList))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestHtmlReviewCard(QString, QVariantMap)), this, SLOT(createHtmlReviewCard(QString, QVariantMap))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestEditReviewCard(QString)), this, SLOT(editSidebarReviewCard(QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestOpenReviewCard(QString)), this, SLOT(openSidebarReviewCard(QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestReviewReviewCard(QString)), this, SLOT(reviewSidebarReviewCard(QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestMergeReviewCards(QStringList)), this, SLOT(mergeSidebarReviewCards(QStringList))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestReviewCardKind(QString,QString)), this, SLOT(setSidebarReviewCardKind(QString,QString))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestRetireReviewCards(QStringList)), this, SLOT(retireSidebarReviewCards(QStringList))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestDeleteReviewCards(QStringList)), this, SLOT(deleteSidebarReviewCards(QStringList))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestOutlineDocumentActions(QMenu*, QString, int, QString)), this, SLOT(addOutlineDocumentActions(QMenu*, QString, int, QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestCommentsOverviewForComment(QString, QString, int)), this, SLOT(showCommentInOverview(QString, QString, int)));  // clazy:exclude=old-style-connect
     connect(part, SIGNAL(unplacedCommentOpened(QString, int)), this, SLOT(recordUnplacedCommentOpened(QString, int)));  // clazy:exclude=old-style-connect

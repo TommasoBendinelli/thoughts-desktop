@@ -4,6 +4,7 @@
 #include <QToolButton>
 #include <functional>
 #include "projectreadingcontext.h"
+#include "projectfeedback.h"
 #include "thoughtsplatform.h"
 #include "thoughtshome.h"
 #include "sourceowner.h"
@@ -762,7 +763,8 @@ Part::Part(QObject *parent, const QVariantList &args)
             if (error) *error = i18n("The local sync queue is not available.");
             return false;
         }
-        return m_fedoraRepository->enqueueDocumentFeedback(record, error);
+        const auto own = projectFeedbackToDocument(record, error);
+        return own && m_fedoraRepository->enqueueDocumentFeedback(*own, error);
     });
     m_pageView->reviewFeedback()->setBatchWriter([this](const QList<QJsonObject> &records, QString *error) {
         if (!m_fedoraRepository) {
@@ -776,7 +778,13 @@ Part::Part(QObject *parent, const QVariantList &args)
             if (error) *error = i18n("The local sync queue is not available.");
             return false;
         }
-        return m_fedoraRepository->enqueueDocumentFeedbackBatch(records, error);
+        QList<QJsonObject> own;
+        for (const QJsonObject &record : records) {
+            const auto translated = projectFeedbackToDocument(record, error);
+            if (!translated) return false;
+            own.append(*translated);
+        }
+        return m_fedoraRepository->enqueueDocumentFeedbackBatch(own, error);
     });
     connect(m_reviewsWidget, &Reviews::replyToAnnotation, m_pageView, &PageView::promptReplyToAnnotation);
     rightContainer->setFocusProxy(m_pageView);
@@ -832,6 +840,7 @@ Part::Part(QObject *parent, const QVariantList &args)
     connect(m_pageView.data(), &PageView::openTexSourceRequested, this, &Part::openTexSource);
     connect(m_pageView.data(), &PageView::manualReviewCardRequested, this, &Part::requestManualReviewCard);
     connect(m_pageView.data(), &PageView::manualReviewCardAreasRequested, this, &Part::requestManualReviewCardAreas);
+    connect(m_pageView.data(), &PageView::sectionReviewCardRequested, this, &Part::requestSectionReviewCard);
     connect(m_pageView.data(), &PageView::readAloudDeveloperEvent, this, &Part::developerEvent);
     connect(m_pageView.data(), &PageView::commentRelatedOpenOverviewRequested, this, &Part::requestCommentsOverviewForComment);
     connect(m_pageView, &PageView::triggerSearch, this, [this](const QString &searchText) {
@@ -894,6 +903,9 @@ Part::Part(QObject *parent, const QVariantList &args)
     connect(m_reviewsWidget.data(), &Reviews::reviewCardOpenRequested, this, &Part::requestOpenReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardReviewRequested, this, &Part::requestReviewReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardsMergeRequested, this, &Part::requestMergeReviewCards);
+    connect(m_reviewsWidget.data(), &Reviews::reviewCardKindRequested, this, &Part::requestReviewCardKind);
+    connect(m_reviewsWidget.data(), &Reviews::reviewCardsRetireRequested, this, &Part::requestRetireReviewCards);
+    connect(m_reviewsWidget.data(), &Reviews::reviewCardsDeleteRequested, this, &Part::requestDeleteReviewCards);
     // Showing or hiding a kind in the Annotations list also shows or hides its
     // markup on the page. Go through the Visible markup toggle so the setting is
     // saved and every open document follows, exactly as from the toolbar menu.
@@ -995,8 +1007,10 @@ Part::Part(QObject *parent, const QVariantList &args)
             m_pageView->reviewFeedback()->setRecords(Thoughts::ReviewCardFeedback::recordsForCard(projections, m_pageView->reviewFeedback()->cardId(),
                                                                                                   m_pageView->reviewFeedback()->document(),
                                                                                                   m_pageView->reviewFeedback()->homeCards(), true));
-        if (m_pageView && m_pageView->documentFeedback()->hasDocument())
-            m_pageView->documentFeedback()->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(projections, m_pageView->documentFeedback()->documentId(), true));
+        if (m_pageView && m_pageView->documentFeedback()->hasDocument()) {
+            if (m_projectFeedback.reading) refreshDocumentFeedback();
+            else m_pageView->documentFeedback()->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(projections, m_pageView->documentFeedback()->documentId(), true));
+        }
         if (m_htmlReader && m_htmlReader->isActive()) {
             refreshHtmlComments();
             refreshHtmlFeedback();
@@ -9541,6 +9555,17 @@ void Part::revealReviewMask()
     }
 }
 
+bool Part::previewReviewCardAreas(const QVariantList &regions)
+{
+    if (!m_pageView || m_attachmentReviewShown || m_htmlReviewShown || reviewMaskBlockCount() > 0) return false;
+    return m_pageView->showReviewMasks(regions, PageView::ReviewMaskStyle::SidebarHighlight, true);
+}
+
+void Part::clearReviewCardAreasPreview()
+{
+    if (m_pageView) m_pageView->clearSidebarReviewHighlight();
+}
+
 QVariantList Part::reviewDocumentOutline() const
 {
     if (!m_document || !m_document->isOpened() || Thoughts::ProjectReadingContext::load(m_docsOpenedPdfPath)) return {};
@@ -9614,10 +9639,18 @@ void Part::refreshDocumentFeedback()
     m_attachmentVersions.clear();
     auto *feedback = m_pageView->documentFeedback();
     const QString path = url().isLocalFile() ? localFilePath() : QString();
-    // A project read as one PDF numbers its pages across documents; v1 anchors one document's PDF.
-    if (path.isEmpty() || !m_document->isOpened() || Thoughts::ProjectReadingContext::load(path)
-        || (!m_docsOpenedPdfPath.isEmpty() && Thoughts::ProjectReadingContext::load(m_docsOpenedPdfPath))) {
+    m_projectFeedback = {};
+    if (path.isEmpty() || !m_document->isOpened()) {
         feedback->clear();
+        return;
+    }
+    // A Project read as one PDF numbers its pages across its documents: each document's feedback
+    // shows at its pages there, and what is given there goes to its own document.
+    if (Thoughts::ProjectReadingContext::load(path) || (!m_docsOpenedPdfPath.isEmpty() && Thoughts::ProjectReadingContext::load(m_docsOpenedPdfPath))) {
+        if (!refreshProjectDocumentFeedback(Thoughts::ProjectReadingContext::load(path) ? path : m_docsOpenedPdfPath)) {
+            m_projectFeedback = {};
+            feedback->clear();
+        }
         return;
     }
     // The Library identity of these bytes: the entry is returned only when the file is its PDF.
@@ -9633,6 +9666,64 @@ void Part::refreshDocumentFeedback()
     // Feedback written now records this PDF version.
     feedback->setReviewVersion(Thoughts::FeedbackVersion::forPdf(m_docsRenderRoot, path, false, sha256));
     feedback->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(m_fedoraProjections, documentId, true));
+}
+
+bool Part::refreshProjectDocumentFeedback(const QString &path)
+{
+    const auto reading = Thoughts::ProjectReadingContext::load(path);
+    if (!reading || reading->revision.size() != 64) return false;
+    ProjectFeedbackState state;
+    state.virtualId = Thoughts::ProjectFeedback::virtualDocumentId(reading->revision);
+    state.virtualSha = reading->revision.toLower();
+    state.reading = reading->reading;
+    QList<QJsonObject> records;
+    for (const auto &document : reading->documents) {
+        state.filenames.append({document.document.id, document.filename});
+        for (const QJsonObject &record : Thoughts::DocumentFeedback::recordsOfDocument(m_fedoraProjections, document.document.id, true)) {
+            state.owners.insert(record.value(QStringLiteral("feedback_id")).toString(), document.document.id);
+            records.append(Thoughts::ProjectFeedback::toProject(record, document.document, state.virtualId, state.virtualSha));
+        }
+    }
+    m_projectFeedback = state;
+    auto *feedback = m_pageView->documentFeedback();
+    feedback->setDocument(state.virtualId, state.virtualSha);
+    // Stamped with the reading's hash here; projectFeedbackToDocument puts each document's own back.
+    feedback->setReviewVersion(Thoughts::FeedbackVersion::make(state.virtualSha, false));
+    feedback->setRecords(records);
+    return true;
+}
+
+std::optional<QJsonObject> Part::projectFeedbackToDocument(const QJsonObject &record, QString *error)
+{
+    if (!m_projectFeedback.reading || Thoughts::DocumentFeedback::documentIdOf(record).compare(m_projectFeedback.virtualId, Qt::CaseInsensitive) != 0)
+        return record;
+    const Thoughts::ProjectReading &reading = *m_projectFeedback.reading;
+    const QString feedbackId = record.value(QStringLiteral("feedback_id")).toString();
+    const Thoughts::ReadingDocument *document = nullptr;
+    // Feedback already there stays with its document; new feedback goes to the one its passage is in.
+    if (const QString owner = m_projectFeedback.owners.value(feedbackId); !owner.isEmpty()) {
+        for (const auto &candidate : reading.documents)
+            if (candidate.id == owner) document = &candidate;
+    } else {
+        document = Thoughts::ProjectFeedback::documentOf(record, reading);
+    }
+    if (!document) {
+        if (error) *error = i18n("Select a passage within one document of the Project.");
+        return std::nullopt;
+    }
+    QJsonObject own = Thoughts::ProjectFeedback::fromProject(record, *document, m_projectFeedback.virtualSha);
+    // Stamped here (with the reading's hash, now the document's): the document's own PDF version,
+    // as if the feedback had been given in it. A stamp of an earlier version stays as it was.
+    if (own.value(Thoughts::FeedbackVersion::field()).toObject().value(QStringLiteral("pdf_sha256")).toString().compare(document->pdfSha256, Qt::CaseInsensitive) == 0) {
+        QString filename;
+        for (const auto &[id, name] : std::as_const(m_projectFeedback.filenames))
+            if (id == document->id) filename = name;
+        const QJsonObject version = Thoughts::FeedbackVersion::make(document->pdfSha256.toLower(),
+                                                                    Thoughts::FeedbackVersion::librarySourceBuilt(m_docsRenderRoot, filename));
+        own = Thoughts::FeedbackVersion::stamped(own, version);
+    }
+    m_projectFeedback.owners.insert(feedbackId, document->id);
+    return own;
 }
 
 void Part::showDocumentFeedbackList()

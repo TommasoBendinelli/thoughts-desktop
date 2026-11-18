@@ -611,6 +611,7 @@ private Q_SLOTS:
     void testUnlinkedDocumentMenu();
     void testDocumentSettingsTransaction();
     void testProjectMenuCopiesProjectName();
+    void testProjectMenuChoosesReviewCardKind();
     void testLibrarySummarySaysLoadingUntilFirstLoad();
     void testLibraryMenuSurvivesRefresh_data();
     void testLibraryMenuSurvivesRefresh();
@@ -3438,6 +3439,117 @@ void CommentsOverviewTest::testProjectMenuCopiesProjectName()
     overview.showLibraryItemContextMenu(tree->topLevelItem(0), tree, {}, true);
     QVERIFY2(labels.indexOf(QStringLiteral("Copy project name")) == labels.indexOf(QStringLiteral("Rename…")) + 1, qPrintable(labels.join(QLatin1Char('|'))));
     QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("Benchmark-Conf"));
+}
+
+// A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow, as a
+// queued set_review_kind action, only when the catalogue has review_kind; Retire project cards…
+// names the count and retires only them.
+void CommentsOverviewTest::testProjectMenuChoosesReviewCardKind()
+{
+    QTemporaryDir temporary;
+    Thoughts::LibraryProjectStore store(temporary.path());
+    const QJsonObject doc{{QStringLiteral("id"), QStringLiteral("paper.pdf")}, {QStringLiteral("filename"), QStringLiteral("paper.pdf")},
+                          {QStringLiteral("document_id"), QStringLiteral("aaaaaaaa-0000-4000-8000-00000000000a")}, {QStringLiteral("name"), QStringLiteral("Paper")}};
+    QJsonObject project{{QStringLiteral("id"), QStringLiteral("new:reading")}, {QStringLiteral("name"), QStringLiteral("Reading")},
+                        {QStringLiteral("documents"), QJsonArray{doc}}, {QStringLiteral("revision"), 4}, {QStringLiteral("review_kind"), QStringLiteral("knowledge")}};
+    QVERIFY(store.receive({{QStringLiteral("projects"), QJsonArray{project}}}).isEmpty());
+    QVERIFY(registerCatalogueProject(temporary.path(), project));
+    // Two cards on the Project's document, one of them made as a knowledge card.
+    for (const QString &cardId : {QStringLiteral("00000000-0000-4000-8000-0000000000e1"), QStringLiteral("00000000-0000-4000-8000-0000000000e2")}) {
+        QJsonObject card{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("card_id"), cardId},
+                         {QStringLiteral("status"), QStringLiteral("approved")},
+                         {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("paper")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+                                                                 {QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+                                                                 {QStringLiteral("question"), QStringLiteral("Question?")}, {QStringLiteral("document_id"), QStringLiteral("aaaaaaaa-0000-4000-8000-00000000000a")}}}};
+        if (cardId.endsWith(QLatin1Char('2'))) card.insert(QStringLiteral("review_kind"), QStringLiteral("knowledge"));
+        QVERIFY(writeFile(temporary.filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)), QJsonDocument(card).toJson()));
+    }
+    Thoughts::CommentsOverview overview(temporary.path());
+    overview.show();
+    overview.showSummary();
+    auto *tree = overview.findChild<QTreeWidget *>(QStringLiteral("thoughtsOverviewLibraryTree"));
+    QVERIFY(tree);
+    QTRY_COMPARE(tree->topLevelItemCount(), 1);
+    // The menu's Review cards entries: which kind is chosen, and whether there is a card to retire.
+    struct Shown {
+        bool present = false;
+        bool knowledge = false, project = false, retireEnabled = false;
+    };
+    const auto openMenu = [&](const char *trigger = nullptr) {
+        Shown shown;
+        QTimer::singleShot(0, &overview, [&] {
+            auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+            if (!menu) return;
+            if (auto *cards = menu->findChild<QMenu *>(QStringLiteral("libraryProjectReviewCardsMenu"))) {
+                shown.present = true;
+                shown.knowledge = cards->findChild<QAction *>(QStringLiteral("libraryProjectKnowledgeCardsAction"))->isChecked();
+                shown.project = cards->findChild<QAction *>(QStringLiteral("libraryProjectProjectCardsAction"))->isChecked();
+                shown.retireEnabled = cards->findChild<QAction *>(QStringLiteral("libraryRetireProjectCardsAction"))->isEnabled();
+                menu->close();
+                if (trigger) cards->findChild<QAction *>(QString::fromLatin1(trigger))->trigger();
+                return;
+            }
+            menu->close();
+        });
+        overview.showLibraryItemContextMenu(tree->topLevelItem(0), tree, {}, true);
+        return shown;
+    };
+    Shown shown = openMenu();
+    QVERIFY(shown.present);
+    QVERIFY(shown.knowledge);
+    QVERIFY(!shown.project);
+    // Project cards: one set_review_kind action with the Project's revision; the manifest is not touched.
+    const QByteArray manifest = [&] {
+        QFile file(Thoughts::ProjectConfiguration::path(temporary.path(), QStringLiteral("new:reading")));
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    }();
+    QSignalSpy changed(&overview, &Thoughts::CommentsOverview::reviewCardsChangedLocally);
+    openMenu("libraryProjectProjectCardsAction");
+    QTRY_COMPARE(changed.count(), 1);
+    const QJsonArray pending = store.pending();
+    QCOMPARE(pending.size(), 1);
+    const QJsonObject action = pending.first().toObject();
+    QCOMPARE(action.value(QStringLiteral("action")).toString(), QStringLiteral("set_review_kind"));
+    QCOMPARE(action.value(QStringLiteral("review_kind")).toString(), QStringLiteral("project"));
+    QCOMPARE(action.value(QStringLiteral("project_id")).toString(), QStringLiteral("new:reading"));
+    QCOMPARE(action.value(QStringLiteral("base_revision")).toInt(), 4);
+    QVERIFY(QUuid(action.value(QStringLiteral("operation_id")).toString()).version() == QUuid::Random);
+    QFile after(Thoughts::ProjectConfiguration::path(temporary.path(), QStringLiteral("new:reading")));
+    QVERIFY(after.open(QIODevice::ReadOnly));
+    QCOMPARE(after.readAll(), manifest);
+    // Shown at once; the card without a kind of its own is a project card now.
+    QTRY_VERIFY(openMenu().project);
+    const auto cards = Thoughts::ReviewStore(temporary.path()).cards();
+    QCOMPARE(std::count_if(cards.cbegin(), cards.cend(), [](const Thoughts::ReviewCard &card) { return card.isProjectCard(); }), 1);
+    overview.m_reviewCardsWidget->reload();
+    QTRY_COMPARE(overview.m_reviewCardsWidget->activeProjectCardCount(QStringLiteral("new:reading")), 1);
+    QVERIFY(openMenu().retireEnabled);
+
+    // Retire project cards…: the confirmation names the count; the knowledge card stays.
+    QString confirmation;
+    auto *poll = new QTimer(&overview);
+    poll->setInterval(10);
+    connect(poll, &QTimer::timeout, &overview, [&confirmation, poll] {
+        QWidget *modal = QApplication::activeModalWidget();
+        if (!modal || !modal->isVisible()) return;
+        poll->stop();
+        for (auto *label : modal->findChildren<QLabel *>()) confirmation += label->text();
+        for (auto *button : modal->findChildren<QPushButton *>())
+            if (button->text().remove(QLatin1Char('&')) == QLatin1String("Retire 1 card")) button->click();
+    });
+    poll->start();
+    openMenu("libraryRetireProjectCardsAction");
+    QTRY_COMPARE(changed.count(), 2);
+    QVERIFY2(confirmation.contains(QStringLiteral("Retire the project card of “Reading”?")), qPrintable(confirmation));
+    QVERIFY2(confirmation.contains(QStringLiteral("Knowledge cards are not touched.")), qPrintable(confirmation));
+    for (const auto &card : Thoughts::ReviewStore(temporary.path()).cards())
+        QCOMPARE(card.schedule.retired, card.id().endsWith(QLatin1Char('1')));
+
+    // An older server lists no review_kind: no choice at all.
+    project.remove(QStringLiteral("review_kind"));
+    QVERIFY(store.receive({{QStringLiteral("projects"), QJsonArray{project}}}, action.value(QStringLiteral("operation_id")).toString()).isEmpty());
+    overview.updateLibraryTree();
+    QTRY_VERIFY(!openMenu().present);
 }
 
 void CommentsOverviewTest::testLibrarySearchDocumentHitsOpenTheirSearch()

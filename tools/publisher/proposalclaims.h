@@ -21,4 +21,11 @@ std::optional<Py::Json> prepareProposalClaims(SourcePublisher &publisher, const 
 // After the server answered the publication (`result`): forgets its claims.
 void expireProposalClaims(SourcePublisher &publisher, const Py::Json &result);
 
+// `text`, a Fedora revision of `path`, with the stored claims made on its own
+// wrappers decided as they say (accepted, or rejected or withdrawn): the
+// source Thoughts wrote when the user decided those proposals on that
+// revision. nullopt when no stored claim names a wrapper of `text`, or the
+// claims cannot be read or applied.
+std::optional<QByteArray> withClaimedDecisions(const SourcePublisher &publisher, const QString &path, const QByteArray &text);
+
 }

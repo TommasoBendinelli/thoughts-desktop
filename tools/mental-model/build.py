@@ -8,7 +8,9 @@ writes it from prompt.md and four inputs of the last --months months:
   - the review cards (a card is in the window when it was reviewed in it, or has never been reviewed): its question,
     its note, its whole answer, its state now (status, due date, interval, counts, current tags), every review with its
     tags, its note and group notes, the before step (mood, setup and predicted recall, before the answer was shown)
-    and the agent's prediction, and the passages of the answer the user liked or disliked;
+    and the agent's prediction, and the passages of the answer the user liked or disliked; project cards (about work
+    the user is writing or building) are listed apart, under a heading that says they describe work in progress, not
+    what the user knows;
   - the feedback on documents (`thoughtsctl list-document-feedback`): the likes, dislikes, questions, drawings and
     text boxes the user gave while reading, with their comments, each inside the text of its page on the PDF version
     it was given on; the pictures of drawings and text boxes go with them (comments are left out: they never go to
@@ -166,6 +168,18 @@ def card_block(card, group_of):
     return "\n".join(lines)
 
 
+# The heading of the project cards in the model's input: they are about work in progress (review-card-kinds.md §8).
+PROJECT_HEADING = "# Project cards: work in progress, not what the user knows"
+PROJECT_NOTE = ("Project cards are about work the user is writing or building, so their content keeps changing. They describe "
+                "work in progress, not what the user knows: do not read them as knowledge.")
+
+
+def by_kind(cards):
+    """The knowledge cards and the project cards; a card from a thoughtsctl without kinds is a knowledge card."""
+    project = [c for c in cards if c.get("review_kind") == "project"]
+    return [c for c in cards if c.get("review_kind") != "project"], project
+
+
 def card_data(cards, tag_groups, since):
     """The cards of the window (reviewed in it, or never reviewed) as text for the model."""
     group_of = {tag: group["name"] for group in tag_groups for tag in group["tags"]}
@@ -319,13 +333,17 @@ def image(path):
 def write_page(cards, tag_groups, since, months):
     """The model's Mental Model page, from the saved prompt, the cards, the feedback on documents, the drawings and the
     pilot's results; with --request, what the model would read is written there instead, and nothing is returned."""
-    count, data = card_data(cards, tag_groups, since)
+    knowledge, projects = by_kind(cards)
+    count, data = card_data(knowledge, tag_groups, since)
+    project_count, project_data = card_data(projects, tag_groups, since)
     drawings, notes, pictures = note_data(since)
     pilot = args.out.parent / "explanation-pilot.md"
     with tempfile.TemporaryDirectory() as images:
         marks, feedback, page_pictures = feedback_data(since, Path(images), len(pictures) + 1)
+        project_section = (f"\n\n{PROJECT_HEADING}\n\n{PROJECT_NOTE} The {project_count} project cards of the last {months} "
+                           f"months.\n\n{project_data}" if project_count else "")
         request = (f"Today is {datetime.now():%d %B %Y}.\n\n# Review cards\n\nThe {count} review cards of the last {months} "
-                   f"months.\n\n{data}\n\n# Feedback on documents\n\nThe {marks} pieces of feedback of the last {months} "
+                   f"months.\n\n{data}{project_section}\n\n# Feedback on documents\n\nThe {marks} pieces of feedback of the last {months} "
                    f"months, by document and PDF version, newest first; {len(page_pictures)} of their pictures follow the "
                    f"input.\n\n{feedback or 'None.'}\n\n# Drawings sent to the phone\n\nThe {drawings} drawings of the last "
                    f"{months} months, newest first; {len(pictures)} of their pictures follow the input.\n\n{notes or 'None.'}\n\n"

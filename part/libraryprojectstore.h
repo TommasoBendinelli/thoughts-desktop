@@ -541,6 +541,8 @@ public:
                 if (project.value(QStringLiteral("id")) != id) continue;
                 if (action == QLatin1String("remove")) { projects.removeAt(i); break; }
                 if (action == QLatin1String("rename")) project.insert(QStringLiteral("name"), op.value(QStringLiteral("name")));
+                // Knowledge cards or Project cards (review-card-kinds.md §2.3), shown at once.
+                if (action == QLatin1String("set_review_kind")) project.insert(QStringLiteral("review_kind"), op.value(QStringLiteral("review_kind")));
                 auto documents = project.value(QStringLiteral("documents")).toArray();
                 if (action == QLatin1String("rename_source")) {
                     const QString owner = op.value(QStringLiteral("source_project")).toString();

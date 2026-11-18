@@ -7808,8 +7808,11 @@ bool FedoraRepository::manualReaderArtifactsRecorded(const QJsonObject &serverSt
     if (objects.isEmpty()) {
         return true;
     }
-    // One query for every receipt instead of one per object.
-    const QHash<QString, Thoughts::DesktopVerifiedObject> known = store->verifiedObjects(&error);
+    // Only the receipts of these objects, in a few queries: this runs in the window every 20 s, and
+    // reading every receipt (tens of thousands) froze it for seconds.
+    QStringList wanted;
+    for (const QJsonValue &value : objects) wanted.append(value.toString());
+    const QHash<QString, Thoughts::DesktopVerifiedObject> known = store->verifiedObjects(wanted, &error);
     if (!error.isEmpty()) {
         return false;
     }
@@ -10963,7 +10966,7 @@ void FedoraRepository::markGlobalReaderCacheCurrent()
     QStringList ordered = identities.values();
     std::sort(ordered.begin(), ordered.end());
     QStringList retained;
-    const QHash<QString, Thoughts::DesktopVerifiedObject> receipts = store->verifiedObjects(&error);
+    const QHash<QString, Thoughts::DesktopVerifiedObject> receipts = store->verifiedObjects(ordered, &error);
     if (!error.isEmpty()) {
         return;
     }

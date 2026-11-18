@@ -186,6 +186,9 @@ public:
     std::optional<DesktopVerifiedObject> verifiedObject(const QString &sha256, QString *error = nullptr) const;
     // All receipts in one query; per-object lookups cost ~0.2 ms each for thousands of objects.
     QHash<QString, DesktopVerifiedObject> verifiedObjects(QString *error = nullptr) const;
+    // Only the receipts of @p sha256s (a few queries of up to 500 each), for checks that need some
+    // of them: the whole table holds tens of thousands, and reading it all took seconds in the window.
+    QHash<QString, DesktopVerifiedObject> verifiedObjects(const QStringList &sha256s, QString *error = nullptr) const;
     bool upsertVerifiedObject(const DesktopVerifiedObject &object, QString *error = nullptr);
 
     QList<DesktopLogicalOperation> logicalOperations(bool includeAcknowledged = false, QString *error = nullptr) const;

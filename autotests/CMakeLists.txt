@@ -437,6 +437,10 @@ if(BUILD_DESKTOP)
         TEST_NAME "reviewdocumenttoolstest"
         LINK_LIBRARIES Qt6::Widgets Qt6::Test Qt6::PrintSupport Poppler::Qt6 okulardocscommentsync KF6::ConfigCore thoughtsdesktopsync
     )
+    ecm_add_test(reviewsectiontest.cpp ../shell/reviewdocumenttools.cpp
+        TEST_NAME "reviewsectiontest"
+        LINK_LIBRARIES Qt6::Widgets Qt6::Test Poppler::Qt6 okulardocscommentsync KF6::ConfigCore KF6::Archive thoughtsdesktopsync
+    )
 endif()
 
 if(BUILD_DESKTOP)

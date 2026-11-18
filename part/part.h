@@ -38,6 +38,7 @@
 
 #include <memory>
 #include <thoughts/commentservice.h>
+#include "projectreading.h"
 
 #include <KCompressionDevice>
 #include <KIO/Job>
@@ -286,6 +287,10 @@ public:
     // As showReviewMasks(@p regions), scrolling to the answer only when @p navigate.
     Q_INVOKABLE bool showReviewMasks(const QVariantList &regions, bool navigate);
     Q_INVOKABLE void clearReviewMask();
+    // A new card's answer areas ({page, rect}), highlighted as the Cards list highlights a card,
+    // while the card is being made; never over a card under review.
+    Q_INVOKABLE bool previewReviewCardAreas(const QVariantList &regions);
+    Q_INVOKABLE void clearReviewCardAreasPreview();
     Q_INVOKABLE void revealReviewMask();
     Q_INVOKABLE int reviewMaskBlockCount() const;
     // The PDF outline (bookmarks) for context notes: maps {title, page (1-based, 0 without a
@@ -422,6 +427,8 @@ Q_SIGNALS:
     void requestManualReviewCard(const QString &pdfPath, int page, const QVariantList &rect, bool textSelection);
     // Several areas ({page, rect: [x0, y0, x1, y1]}, one-based pages) for one card.
     void requestManualReviewCardAreas(const QString &pdfPath, const QVariantList &areas, bool textSelection);
+    // A card that hides the section whose heading line (@p rect, normalized) is on one-based @p page.
+    void requestSectionReviewCard(const QString &pdfPath, int page, const QVariantList &rect);
     // A card from a selection in the HTML view: @p fields are the card's HTML placement
     // (created_in, html_edition_sha256, text_quote, source_range?) plus pdf_path, pdf_stem,
     // pdf_sha256, document_id and selected_text. The server places its markers at the next Sync.
@@ -440,6 +447,11 @@ Q_SIGNALS:
     void requestReviewReviewCard(const QString &cardId);
     // Merge cards… in the Cards list: the cards of this document to merge into one (Shell::mergeSidebarReviewCards).
     void requestMergeReviewCards(const QStringList &cardIds);
+    // The Cards list's Make project card, Make knowledge card or Follow the Project (Shell::setSidebarReviewCardKind).
+    void requestReviewCardKind(const QString &cardId, const QString &kind);
+    // The Cards list's Retire card and Delete card… (Shell::retireSidebarReviewCards, Shell::deleteSidebarReviewCards).
+    void requestRetireReviewCards(const QStringList &cardIds);
+    void requestDeleteReviewCards(const QStringList &cardIds);
     void requestOutlineDocumentActions(QMenu *menu, const QString &pdfPath, int page, const QString &title);
     void requestCommentsOverviewForComment(const QString &pdfPath, const QString &annotationId, int page);
     void unplacedCommentOpened(const QString &annotationId, int page);
@@ -958,6 +970,18 @@ private:
     QString m_docsOpenedPdfPath;
     QString m_docsOpenedPdfSha256;
     bool m_docsOpenedPdfIdentityVerified = false;
+    // A Project read as one PDF: its document feedback under one virtual document
+    // (Thoughts::ProjectFeedback); empty documents when another PDF is open.
+    struct ProjectFeedbackState {
+        QString virtualId;
+        QString virtualSha;
+        QList<QPair<QString, QString>> filenames; // document_id -> Library filename
+        QHash<QString, QString> owners; // feedback_id -> document_id
+        std::optional<Thoughts::ProjectReading> reading;
+    } m_projectFeedback;
+    // A record written in the combined PDF, back on its own document; @p record as it is otherwise.
+    std::optional<QJsonObject> projectFeedbackToDocument(const QJsonObject &record, QString *error);
+    bool refreshProjectDocumentFeedback(const QString &path);
     QPointer<QWidget> m_unplacedCommentPanel;
     bool openUnplacedComment(const QString &annotationId, int expectedPage);
     QList<QJsonObject> unplacedCommentThread(const QString &annotationId) const;

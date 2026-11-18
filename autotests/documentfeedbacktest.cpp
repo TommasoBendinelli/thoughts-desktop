@@ -3,6 +3,7 @@
 // (thoughts-server protocol/document-feedback.md, extending review-card-feedback.md).
 #include "../part/documentfeedback.h"
 #include "../part/desktopsyncstore.h"
+#include "../part/projectfeedback.h"
 
 #include <QDir>
 #include <QTemporaryDir>
@@ -33,6 +34,7 @@ private Q_SLOTS:
     void testImmutableFieldsComeFromTheFirstWrite();
     void testCreateEditDeleteUndo();
     void testRecordsOfDocument();
+    void testProjectReadingMovesFeedbackToItsDocument();
     void testSearchPages();
     void testPlacement();
     void testSelectionContext();
@@ -689,6 +691,70 @@ void DocumentFeedbackTest::testTextBox()
     QVERIFY(!DocumentFeedback::validationError(resolved).isEmpty());
     // Deleted, it is still valid, so the tombstone syncs.
     QCOMPARE(DocumentFeedback::validationError(DocumentFeedback::remove(record, QStringLiteral("mac"))), QString());
+}
+
+void DocumentFeedbackTest::testProjectReadingMovesFeedbackToItsDocument()
+{
+    // A Project read as one PDF: two documents of 3 and 4 pages, the second starting at page 4.
+    ProjectReading reading;
+    ReadingDocument first;
+    first.id = QStringLiteral("0190a000-0000-4000-8000-00000000000a");
+    first.pdfSha256 = QString(64, QLatin1Char('a'));
+    first.pages = 3;
+    first.firstPage = 0;
+    ReadingDocument second;
+    second.id = QStringLiteral("0190a000-0000-4000-8000-00000000000b");
+    second.pdfSha256 = QString(64, QLatin1Char('b'));
+    second.pages = 4;
+    second.firstPage = 3;
+    reading.documents = {first, second};
+    reading.pages = 7;
+    const QString virtualSha = QString(64, QLatin1Char('c'));
+    const QString virtualId = ProjectFeedback::virtualDocumentId(virtualSha);
+    QVERIFY(QUuid(virtualId).version() == QUuid::Random);
+    QCOMPARE(ProjectFeedback::virtualDocumentId(virtualSha), virtualId);
+
+    const auto record = [](const QString &documentId, const QString &sha, QList<int> pages, const QString &versionSha) {
+        QJsonArray regions;
+        for (int page : pages) regions.append(QJsonObject{{QStringLiteral("page"), page}, {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.9, 0.25}}});
+        return QJsonObject{{QStringLiteral("feedback_id"), QStringLiteral("0190a000-0000-4000-8000-0000000000f1")},
+                           {QStringLiteral("anchor"), QJsonObject{{QStringLiteral("pdf"), QJsonObject{{QStringLiteral("document_id"), documentId},
+                                                                                                     {QStringLiteral("pdf_sha256"), sha},
+                                                                                                     {QStringLiteral("regions"), regions}}}}},
+                           {FeedbackVersion::field(), QJsonObject{{QStringLiteral("pdf_sha256"), versionSha}, {QStringLiteral("source_built"), true}}}};
+    };
+    const auto pages = [](const QJsonObject &value) {
+        QList<int> result;
+        for (const QJsonValue &region : value.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject().value(QStringLiteral("regions")).toArray())
+            result.append(region.toObject().value(QStringLiteral("page")).toInt());
+        return result;
+    };
+    const auto pdf = [](const QJsonObject &value) { return value.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject(); };
+
+    // The second document's page 2 shows on the combined PDF's page 5, under the virtual document.
+    const QJsonObject own = record(second.id, second.pdfSha256, {2}, second.pdfSha256);
+    const QJsonObject shown = ProjectFeedback::toProject(own, second, virtualId, virtualSha);
+    QCOMPARE(pages(shown), QList<int>{5});
+    QCOMPARE(pdf(shown).value(QStringLiteral("document_id")).toString(), virtualId);
+    QCOMPARE(pdf(shown).value(QStringLiteral("pdf_sha256")).toString(), virtualSha);
+    QCOMPARE(DocumentFeedback::recordsOfDocument(QList<QJsonObject>{shown}, virtualId, true).size(), 1);
+    // And back, exactly as it was.
+    QCOMPARE(ProjectFeedback::fromProject(shown, second, virtualSha), own);
+    // Feedback made on an earlier PDF of the document keeps its hash (it is placed by its text).
+    const QJsonObject earlier = record(second.id, QString(64, QLatin1Char('e')), {1}, QString(64, QLatin1Char('e')));
+    QCOMPARE(pdf(ProjectFeedback::toProject(earlier, second, virtualId, virtualSha)).value(QStringLiteral("pdf_sha256")).toString(), QString(64, QLatin1Char('e')));
+
+    // New feedback given in the combined PDF goes to the document its passage is in.
+    QCOMPARE(ProjectFeedback::documentOf(record(virtualId, virtualSha, {4, 5}, virtualSha), reading), &reading.documents[1]);
+    QCOMPARE(ProjectFeedback::documentOf(record(virtualId, virtualSha, {3}, virtualSha), reading), &reading.documents[0]);
+    // Across two documents, or outside the reading: none.
+    QVERIFY(!ProjectFeedback::documentOf(record(virtualId, virtualSha, {3, 4}, virtualSha), reading));
+    QVERIFY(!ProjectFeedback::documentOf(record(virtualId, virtualSha, {8}, virtualSha), reading));
+    const QJsonObject given = ProjectFeedback::fromProject(record(virtualId, virtualSha, {4, 5}, virtualSha), second, virtualSha);
+    QCOMPARE(pages(given), (QList<int>{1, 2}));
+    QCOMPARE(pdf(given).value(QStringLiteral("document_id")).toString(), second.id);
+    QCOMPARE(pdf(given).value(QStringLiteral("pdf_sha256")).toString(), second.pdfSha256);
+    QCOMPARE(given.value(FeedbackVersion::field()).toObject().value(QStringLiteral("pdf_sha256")).toString(), second.pdfSha256);
 }
 
 QTEST_GUILESS_MAIN(DocumentFeedbackTest)

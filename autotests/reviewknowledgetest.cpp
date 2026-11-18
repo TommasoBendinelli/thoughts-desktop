@@ -226,6 +226,7 @@ private Q_SLOTS:
     void historyCarriesTheBeforeStep();
     void fullAnswerIsTheWholePassage();
     void documentFeedbackComesWithItsPage();
+    void projectCardsAreListedApartFromWhatTheUserKnows();
 };
 
 void ReviewKnowledgeTest::searchRanksMatchesAndExcludesDeletedCards()
@@ -866,6 +867,87 @@ void ReviewKnowledgeTest::readingTheIndexUsesAnExistingLog()
         writer.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("writer"));
+}
+
+// Project cards (review-card-kinds.md §8): search and listing report the kind, its source, the
+// mark and the capped due time; the profile classifies knowledge cards only and lists the
+// project cards apart; without matching project cards it is exactly as before.
+void ReviewKnowledgeTest::projectCardsAreListedApartFromWhatTheUserKnows()
+{
+    QTemporaryDir temporary;
+    const QString docs = temporary.filePath(QStringLiteral("docs"));
+    QJsonObject projections = fixture(docs);
+    const Library before = libraryFromSnapshot({projections, {}, true}, docs);
+    const Levels levels = defaultLevels();
+    // The Systems Project holds project cards; the PPO card was made a project card by hand.
+    {
+        QFile file(QDir(docs).filePath(QStringLiteral(".thoughts/library-projects.json")));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QJsonObject state = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        QJsonArray projects = state.value(QStringLiteral("projects")).toArray();
+        for (int index = 0; index < projects.size(); ++index) {
+            QJsonObject project = projects.at(index).toObject();
+            project.insert(QStringLiteral("review_kind"), project.value(QStringLiteral("name")).toString() == QLatin1String("Systems") ? QStringLiteral("project")
+                                                                                                                                       : QStringLiteral("knowledge"));
+            projects.replace(index, project);
+        }
+        state.insert(QStringLiteral("projects"), projects);
+        QVERIFY(write(file.fileName(), QJsonDocument(state).toJson()));
+    }
+    projections.insert(QStringLiteral("review_event\nevents\n00000000-0000-4000-8000-0000000000f1"),
+                       QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), QStringLiteral("00000000-0000-4000-8000-0000000000f1")},
+                                   {QStringLiteral("card_id"), ppo}, {QStringLiteral("queue_action"), QStringLiteral("set_review_kind")},
+                                   {QStringLiteral("review_kind"), QStringLiteral("project")}, {QStringLiteral("reviewed_at"), iso(now.addDays(-1))},
+                                   {QStringLiteral("origin_id"), QStringLiteral("test")}});
+    const Library library = libraryFromSnapshot({projections, {}, true}, docs);
+
+    const auto all = search(library, {{QStringLiteral("limit"), 50}}, now);
+    QVERIFY2(all.value(QStringLiteral("accepted")).toBool(), QJsonDocument(all).toJson().constData());
+    QHash<QString, QJsonObject> byId;
+    for (const auto &value : all.value(QStringLiteral("cards")).toArray()) byId.insert(value.toObject().value(QStringLiteral("card_id")).toString(), value.toObject());
+    QCOMPARE(byId.value(grpo).value(QStringLiteral("review_kind")).toString(), QStringLiteral("knowledge"));
+    QCOMPARE(byId.value(grpo).value(QStringLiteral("review_kind_source")).toString(), QStringLiteral("project"));
+    QVERIFY(!byId.value(grpo).contains(QStringLiteral("passage_changed")));
+    QCOMPARE(byId.value(tensor).value(QStringLiteral("review_kind")).toString(), QStringLiteral("project"));
+    QCOMPARE(byId.value(tensor).value(QStringLiteral("review_kind_source")).toString(), QStringLiteral("project"));
+    QCOMPARE(byId.value(tensor).value(QStringLiteral("passage_changed")), QJsonValue(false));
+    QCOMPARE(byId.value(ppo).value(QStringLiteral("review_kind")).toString(), QStringLiteral("project"));
+    QCOMPARE(byId.value(ppo).value(QStringLiteral("review_kind_source")).toString(), QStringLiteral("card"));
+    // Answered 5 days ago with a 40-day interval: a project card is due 7 days after its answer.
+    QCOMPARE(byId.value(ppo).value(QStringLiteral("due_at")).toString(), iso(now.addDays(2)));
+    // Filtered by kind.
+    const auto projectsOnly = search(library, {{QStringLiteral("kind"), QStringLiteral("project")}}, now);
+    QStringList projectIds = ids(projectsOnly);
+    projectIds.sort();
+    QCOMPARE(projectIds, (QStringList{tensor, ppo}));
+    QCOMPARE(search(library, {{QStringLiteral("kind"), QStringLiteral("draft")}}, now).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
+
+    // A topic only project cards match: no knowledge, the project cards apart.
+    const auto ppoProfile = profile(library, {{QStringLiteral("topic"), QStringLiteral("PPO clipping")}, {QStringLiteral("learner"), false}}, levels, now);
+    QVERIFY2(ppoProfile.value(QStringLiteral("accepted")).toBool(), QJsonDocument(ppoProfile).toJson().constData());
+    QCOMPARE(ppoProfile.value(QStringLiteral("matched")).toInt(), 0);
+    const QJsonObject projectCards = ppoProfile.value(QStringLiteral("project_cards")).toObject();
+    QCOMPARE(projectCards.value(QStringLiteral("count")).toInt(), 1);
+    const QJsonObject listed = projectCards.value(QStringLiteral("cards")).toArray().at(0).toObject();
+    QCOMPARE(listed.value(QStringLiteral("card_id")).toString(), ppo);
+    QCOMPARE(listed.value(QStringLiteral("question")).toString(), QStringLiteral("What does the PPO clipping ratio bound?"));
+    QCOMPARE(listed.value(QStringLiteral("project")).toString(), QStringLiteral("RL"));
+    QVERIFY(listed.contains(QStringLiteral("document")));
+    const QStringList lines = ppoProfile.value(QStringLiteral("summary")).toString().split(QLatin1Char('\n'));
+    QCOMPARE(lines.first(), QStringLiteral("No knowledge cards match \"PPO clipping\": there is no record of what the user knows about it."));
+    QCOMPARE(lines.last(), QStringLiteral("Project cards on this topic (work in progress, not what the user knows): What does the PPO clipping ratio bound?"));
+
+    // A topic of knowledge cards only: exactly as before.
+    for (const QString &topic : {QStringLiteral("GRPO advantage"), QStringLiteral("baseline")}) {
+        const QJsonObject request{{QStringLiteral("topic"), topic}, {QStringLiteral("learner"), false}};
+        QCOMPARE(profile(library, request, levels, now), profile(before, request, levels, now));
+    }
+    // The learner overview leaves project cards out.
+    const auto learner = profile(library, {{QStringLiteral("topic"), QStringLiteral("quantum chromodynamics")}, {QStringLiteral("learner"), true}}, levels, now);
+    QCOMPARE(learner.value(QStringLiteral("learner")).toObject().value(QStringLiteral("cards")).toInt(), 3);
+    QVERIFY(!learner.contains(QStringLiteral("project_cards")));
+    QVERIFY(learner.value(QStringLiteral("summary")).toString().startsWith(QStringLiteral("No review cards match")));
 }
 
 QTEST_GUILESS_MAIN(ReviewKnowledgeTest)

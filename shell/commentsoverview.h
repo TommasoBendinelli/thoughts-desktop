@@ -345,6 +345,9 @@ Q_SIGNALS:
     void libraryDisplayNameRequested(const QString &filename, const QString &sha256, const QString &displayName);
     void libraryRemovalRequested(const QString &pdfPath, const QString &filename, const QString &sha256, const QString &displayName);
     void projectAttachmentChangedLocally(const QString &target);
+    // Review cards changed kind or were retired here (a Project's Review cards menu): reviews and
+    // the readers' Cards lists read them again.
+    void reviewCardsChangedLocally();
     void projectExportRequested(const QJsonObject &project, const QString &destination);
     void trackPdfRequested();
     void syncRequested();
@@ -420,6 +423,10 @@ private Q_SLOTS:
     void setSourceMovePlanner(SourceMovePlanner planner) { m_sourceMovePlanner = std::move(planner); }
     void setServerTokenWriter(ServerTokenWriter writer) { m_serverTokenWriter = std::move(writer); }
     void editLibraryProject(const QJsonObject &project, const QString &action, const QJsonObject &document = {});
+    // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow,
+    // queued as a set_review_kind Library-project action, and Retire project cards….
+    void setLibraryProjectReviewKind(const QJsonObject &project, const QString &kind);
+    void retireLibraryProjectCards(const QJsonObject &project);
     void showDocumentInformation(const QString &pdfPath);
     void undoOverviewChange();
     void redoOverviewChange();

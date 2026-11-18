@@ -389,6 +389,8 @@ private Q_SLOTS:
     void testEditDuringFedoraMergeKeepsItsBase();
     void testFrozenCopyOnDesktopsEarlierBase_data();
     void testFrozenCopyOnDesktopsEarlierBase();
+    void testDecisionOnFedorasMergeBeforeDesktopRecordedIt_data();
+    void testDecisionOnFedorasMergeBeforeDesktopRecordedIt();
     void testClaimsAgainstServer();
     void testDecideProposalCommand();
     void testRestoreRemovedProposal();
@@ -1230,6 +1232,88 @@ void ProposalDecisionsTest::testFrozenCopyOnDesktopsEarlierBase()
     QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
     QCOMPARE(server.publications.size(), 2);
     QVERIFY(!workspace.state().value(QStringLiteral("superseded_bases")).toObject().contains(Relative));
+}
+
+void ProposalDecisionsTest::testDecisionOnFedorasMergeBeforeDesktopRecordedIt_data()
+{
+    QTest::addColumn<QString>("action");
+    QTest::addColumn<QByteArray>("savedAfter");
+    QTest::addColumn<QByteArray>("expected");
+    QTest::addColumn<bool>("onMergedBase");
+    QTest::newRow("accepted on the merge") << QStringLiteral("accept") << QByteArray() << QByteArray("Intro.\nNew line.\nEnd.\n") << true;
+    QTest::newRow("rejected on the merge") << QStringLiteral("disregard") << QByteArray() << QByteArray("Intro.\nNew line.\nOutro.\n") << true;
+    // The decision was made on the merge, but an editor then saved its copy
+    // from before the merge over it: agent-2's offer is missing from the file
+    // and no decision explains it, so Fedora keeps the offer.
+    QTest::newRow("accepted, then an older copy saved over it") << QStringLiteral("accept") << QByteArray("Intro.\nNew line.\nOutro.\n")
+                                                                << QByteArray("Intro.\nNew line.\nOutro.\n") << false;
+}
+
+// A conflict seen in use: the user accepted agent-1 here
+// while an agent proposed agent-2 on Fedora. Fedora merged the two and the
+// publisher installed the merge, but Desktop kept its base from before the
+// accept (it records the merge only once a later check finds the file
+// unchanged), and the user accepted agent-2 on the installed merge before
+// that. The next Sync named the old base; the file, with agent-2 decided
+// where Fedora's revision holds its wrapper, clashed with that revision, so
+// it went to Fedora against the old base and Fedora reported a conflict.
+// The claim of the decision, made on the wrapper of the merged revision, shows
+// the file was written on it: it is published against that revision.
+void ProposalDecisionsTest::testDecisionOnFedorasMergeBeforeDesktopRecordedIt()
+{
+    QFETCH(QString, action);
+    QFETCH(QByteArray, savedAfter);
+    QFETCH(QByteArray, expected);
+    QFETCH(bool, onMergedBase);
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray accepted = "Intro.\nNew line.\nOutro.\n";
+    const QByteArray merged = (QStringLiteral("Intro.\nNew line.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (Base + SecondWrapper).toUtf8());
+    QVERIFY(write(workspace.source(), accepted));
+    server.applyResult = merged;
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(read(workspace.source()), merged);
+    QCOMPARE(server.applies.size(), 1);
+
+    // The user decides Fedora's new proposal in Thoughts.
+    workspace.proposalId = QStringLiteral("agent-2");
+    QVERIFY(workspace.decide(action));
+    QCOMPARE(ProposalDecisions::storedClaims(workspace.database()).size(), 1);
+    if (!savedAfter.isEmpty()) QVERIFY(write(workspace.source(), savedAfter));
+    QCOMPARE(read(workspace.source()), expected);
+
+    // Desktop's own record still names the base from before the first accept.
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages, sha(Base.toUtf8())), qPrintable(failure));
+    const QString log = messages.join(QLatin1Char('\n'));
+    if (!onMergedBase) {
+        // Sent against the old base, alone or not, so Fedora merges its offer back in.
+        const QJsonObject sent = server.applies.size() == 2 ? server.applies.last()
+                                                            : server.publications.last().value(QStringLiteral("mutations")).toArray().first().toObject();
+        QCOMPARE(sent.value(QStringLiteral("content_sha256")).toString(), sha(expected));
+        QCOMPARE(sent.value(QStringLiteral("base_sha256")).toString(), sha(Base.toUtf8()));
+        QVERIFY2(log.contains(QStringLiteral("merged against that earlier base")), qPrintable(log));
+        return;
+    }
+    QCOMPARE(server.applies.size(), 1);
+    QCOMPARE(server.publications.size(), 2);
+    const QJsonObject sent = server.publications.last().value(QStringLiteral("mutations")).toArray().first().toObject();
+    QCOMPARE(sent.value(QStringLiteral("content_sha256")).toString(), sha(expected));
+    QCOMPARE(sent.value(QStringLiteral("base_sha256")).toString(), sha(merged));
+    QVERIFY2(log.contains(QStringLiteral("with proposals decided here, so it is published against revision 3")), qPrintable(log));
+    // The decision travels with the publication and expires with its answer.
+    const QJsonArray decisions = server.publications.last().value(QStringLiteral("proposal_decisions")).toArray();
+    QCOMPARE(decisions.size(), 1);
+    QCOMPARE(decisions.first().toObject().value(QStringLiteral("proposal_id")).toString(), QStringLiteral("agent-2"));
+    QVERIFY(ProposalDecisions::storedClaims(workspace.database()).isEmpty());
+    // Nothing more to send.
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
+    QCOMPARE(server.applies.size(), 1);
 }
 
 void ProposalDecisionsTest::testDecideProposalCommand()

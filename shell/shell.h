@@ -252,6 +252,8 @@ private Q_SLOTS:
     void createManualReviewCard(const QString &pdfPath, int page, const QVariantList &rect, bool textSelection = false);
     // One card with several answer areas ({page, rect}), e.g. a text selection over a page break.
     void createManualReviewCardAreas(const QString &pdfPath, const QVariantList &areas, bool textSelection = false);
+    // Add Review Card for This Section… on a heading line (@p rect, normalized, on one-based @p page).
+    void createSectionReviewCard(const QString &pdfPath, int page, const QVariantList &rect);
     void createHtmlReviewCard(const QString &pdfPath, const QVariantMap &fields);
     void editSidebarReviewCard(const QString &cardId);
     void openSidebarReviewCard(const QString &cardId);
@@ -259,6 +261,11 @@ private Q_SLOTS:
     void reviewSidebarReviewCard(const QString &cardId);
     // Merge cards… in a reader's Cards list: those cards of its document become one.
     void mergeSidebarReviewCards(const QStringList &cardIds);
+    // Make project card, Make knowledge card or Follow the Project in a reader's Cards list
+    // (review-card-kinds.md §5): @p kind is knowledge, project or follow_project.
+    void setSidebarReviewCardKind(const QString &cardId, const QString &kind);
+    void retireSidebarReviewCards(const QStringList &cardIds);
+    void deleteSidebarReviewCards(const QStringList &cardIds);
     void addOutlineDocumentActions(QMenu *menu, const QString &pdfPath, int page, const QString &title);
     void refreshSidebarReviewCards(KParts::ReadOnlyPart *part, const QJsonObject &projections);
     // Sidebar › History of a Library PDF: its versions with their cards and answer feedback.
@@ -473,6 +480,8 @@ private:
     QVariantMap activeFedoraRenderStatus();
     void updatePdfLibraryWidget(bool sourceLinked, const QString &status = {}, const QString &reason = {}, Thoughts::DocumentSyncStatus syncState = Thoughts::DocumentSyncStatus::SyncNeeded);
     static Thoughts::CommentsOverview *commentsOverview();
+    // Cards changed kind or were retired here: every window's review, Cards lists and the Library's cards read them again.
+    static void refreshReviewCardsEverywhere();
     static Thoughts::AgentNotesWindow *agentNotesWindow();
     // The Agent Notes views (window, sidebars): a note's document is its Library PDF on this Mac
     // (else no path), titled as the reader titles it.
@@ -696,6 +705,12 @@ private:
     QPointer<Thoughts::ReviewOverview> m_reviewOverview;
     QPointer<Thoughts::PdfVersions::Fetcher> m_historyVersionFetcher;
     bool m_manualReviewFingerprintRunning = false;
+    // A card for a whole section (Add Review Card on a section heading): NotHeading when the area
+    // names no section heading (an ordinary card is made of it), OnlySelection when the person
+    // chose to hide only the selected text (*question: what they typed).
+    enum class SectionCardOutcome { NotHeading, Handled, OnlySelection };
+    SectionCardOutcome offerSectionReviewCard(QObject *sourcePart, const QVariantMap &document, int page, const QRectF &rect, bool requested, QString *question);
+    bool m_sectionCardRequested = false;
     QPointer<QProgressDialog> m_sourceConflictProgress;
     // Set while resolve-source-conflict waits: the bundle goes here instead of to the resolver dialog.
     std::function<void(const QVariantMap &, const QString &)> m_sourceConflictCommandBundleHandler;

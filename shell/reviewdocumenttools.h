@@ -67,6 +67,65 @@ ReviewAnchorPlan planReviewSourceAnchor(const QString &docsRoot, const QString &
 ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
                                          const QString &pdfSha256, const QList<ReviewArea> &areas, const QString &cardId,
                                          bool replaceCardMarkers = false);
+// A review card for a whole section: the user names a section or subsection by its heading (a
+// selection of it, or a click on it) and the card hides its body, from just below the heading to
+// just before the next heading of the same or a higher level, across pages; the heading stays
+// visible as the cue.
+//
+// The section of a TeX or Markdown source whose heading is on one of @p headingLines (the lines
+// its PDF text maps to; a title may run over several lines). TeX headings are \part, \chapter,
+// \section, \subsection and \subsubsection, starred or not; the body starts after the labels and
+// anchors on the lines below the heading and ends before the next heading of the same or a higher
+// level, the appendix, the bibliography or the end of the document. Markdown headings are # to
+// ###### outside code blocks. Blank and comment lines at either end, and another card's markers
+// whose passage lies outside, stay out of the body.
+struct ReviewSourceSection {
+    QString error;
+    bool isHeading = false; // the lines hold a section heading (even when the section is refused)
+    QString title;          // the heading's text without markup
+    QString kind;           // "section", "subsection", "subsubsection", "chapter", "part"
+    int level = 0;          // smaller is higher: \part -1, \chapter 0, \section 1, ...; Markdown: # 1, ## 2, ...
+    int headingLine = 0;    // the heading's first line
+    int firstLine = 0, lastLine = 0; // the body, inclusive
+    int nextHeadingLine = 0;         // where the next section (or the bibliography, ...) starts; 0 at the end
+};
+ReviewSourceSection reviewSourceSection(const QString &path, const QByteArray &source, const QList<int> &headingLines);
+// The section of a PDF without source (an imported paper) whose heading @p heading shows: its
+// outline (bookmarks) entry on that page, then the next entry of the same or a higher level; or,
+// without one, the heading's number (2.1 ends at 2.2, 3, References, ...) or, unnumbered, its
+// type size (the next line set at least as large). Areas are the column blocks the body covers,
+// page by page, in reading order (two-column pages too). With @p identifyOnly only the heading.
+struct ReviewPdfSection {
+    QString error;
+    bool isHeading = false;
+    bool fromOutline = false;
+    QString title, number;
+    int level = 0;
+    QList<ReviewArea> areas;
+};
+ReviewPdfSection reviewPdfSection(const QString &pdfPath, const ReviewArea &heading, bool identifyOnly = false);
+// Everything a section card needs. For a PDF built from source its passage is the source section
+// (reviewSourceSection), marked as one segment that may hold other cards' passages whole, and its
+// areas are where the body's lines are rendered; for a PDF without source, the areas of
+// reviewPdfSection, saved as a PDF card (planReviewSourceAnchors). isHeading is false when the
+// area names no section heading: then make an ordinary card of it.
+struct ReviewSectionPlan {
+    QString error;
+    bool isHeading = false;
+    bool fromSource = false;
+    QString title, number, kind;
+    int level = 0;
+    QString sourceId;                // Library path of the source, when from source
+    int firstLine = 0, lastLine = 0; // the body's source lines (before marking)
+    int wrappedCards = 0;            // other cards whose passages the body holds
+    int firstPage = 0, lastPage = 0;
+    ReviewAnchorPlan plan;           // ready for ReviewStore::createManualCard (regions in reading order)
+    // "subsection 2.1 “Method”" or "subsection “Method”".
+    QString name() const;
+};
+ReviewSectionPlan planReviewSectionCard(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
+                                        const QString &pdfSha256, const ReviewArea &heading, const QString &cardId,
+                                        bool identifyOnly = false);
 // Where the words of an answer area (its PDF text in reading order) occur in a TeX or Markdown
 // source, for when the PDF's build lines cannot place it: a build older than the source (a
 // proposal accepted since), or SyncTeX lines that do not name the selected words (all the text
@@ -134,8 +193,11 @@ QString reviewCardMarkerProblem(const QString &path, const QByteArray &source, c
 // \DeclareRobustCommand), other card's marker or pending proposal. @p existingPassages: the
 // ranges already are a card's passages (a merge moves their markers), so definitions in them and
 // pending agent proposals they hold whole are no obstacle; a proposal held only in part still is.
+// Existing passages, and new ones with @p wrapOtherCards (a section card), may hold other cards'
+// passages whole (both markers inside), never part of one.
 ReviewAnchorPlan markReviewSourceRanges(const QString &path, const QByteArray &source, const QList<QPair<int, int>> &ranges,
-                                        const QString &cardId, int *failedRange = nullptr, bool existingPassages = false);
+                                        const QString &cardId, int *failedRange = nullptr, bool existingPassages = false,
+                                        bool wrapOtherCards = false);
 QJsonObject reviewPdfComponentOrigin(const QString &bundleRoot, const QString &pdfPath,
                                      const QString &pdfSha256, int page);
 ReviewAnchorPlan markReviewSourceLines(const QString &path, const QByteArray &source, const QList<int> &lines, const QString &cardId);

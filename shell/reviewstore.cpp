@@ -13,6 +13,7 @@
 #include "reviewstore.h"
 #include "reviewdocumenttools.h"
 #include <QLockFile>
+#include <QMutex>
 #include "../part/reviewcardregions.h"
 #include "../part/reviewcardfeedback.h"
 #include "../part/documentfeedback.h"
@@ -524,6 +525,285 @@ QHash<QString, State> fold(const QList<QJsonObject> &events)
         state.retireEventId = action.eventId;
     }
     return states;
+}
+}
+
+namespace ReviewKinds
+{
+QString capability() { return QStringLiteral("review_card_kinds_v1"); }
+QString action() { return QStringLiteral("set_review_kind"); }
+QString field() { return QStringLiteral("review_kind"); }
+QString knowledge() { return QStringLiteral("knowledge"); }
+QString project() { return QStringLiteral("project"); }
+QString followProject() { return QStringLiteral("follow_project"); }
+QString sourceCard() { return QStringLiteral("card"); }
+QString sourceProject() { return QStringLiteral("project"); }
+QString sourceDefault() { return QStringLiteral("default"); }
+QString passageField() { return QStringLiteral("passage"); }
+int projectIntervalDays() { return 7; }
+
+namespace
+{
+bool validKind(const QJsonValue &value) { return value.isString() && (value.toString() == knowledge() || value.toString() == project()); }
+bool validEventKind(const QJsonValue &value) { return validKind(value) || (value.isString() && value.toString() == followProject()); }
+
+// The first copy of each event ID, in the given order; events without one are left out.
+QList<QJsonObject> uniqueEvents(const QList<QJsonObject> &events)
+{
+    QSet<QString> seen;
+    QList<QJsonObject> unique;
+    for (const QJsonObject &event : events) {
+        const QJsonValue id = event.value(QStringLiteral("event_id"));
+        if (!id.isString() || id.toString().isEmpty() || seen.contains(id.toString())) continue;
+        seen.insert(id.toString());
+        unique.append(event);
+    }
+    return unique;
+}
+
+// Ordered by reviewed_at as an instant, then by event_id.
+bool later(const QJsonObject &a, const QJsonObject &b)
+{
+    const QDateTime at = parseTime(a.value(QStringLiteral("reviewed_at")).toString());
+    const QDateTime bt = parseTime(b.value(QStringLiteral("reviewed_at")).toString());
+    return at == bt ? a.value(QStringLiteral("event_id")).toString() > b.value(QStringLiteral("event_id")).toString() : at > bt;
+}
+
+QJsonObject primaryOf(const QJsonObject &card)
+{
+    const QJsonValue primary = card.value(QStringLiteral("primary"));
+    return primary.isObject() ? primary.toObject() : QJsonObject();
+}
+
+QString text(const QJsonValue &value) { return value.isString() ? value.toString() : QString(); }
+
+// segment_id -> content_sha256 of a stamp; nullopt when it has no complete segments.
+std::optional<QHash<QString, QString>> segmentMap(const QJsonValue &stamp)
+{
+    const QJsonValue segments = stamp.isObject() ? stamp.toObject().value(QStringLiteral("segments")) : QJsonValue();
+    if (!segments.isArray() || segments.toArray().isEmpty()) return std::nullopt;
+    QHash<QString, QString> result;
+    for (const QJsonValue &value : segments.toArray()) {
+        const QJsonObject segment = value.toObject();
+        if (!value.isObject() || !segment.value(QStringLiteral("segment_id")).isString() || !segment.value(QStringLiteral("content_sha256")).isString())
+            return std::nullopt;
+        result.insert(segment.value(QStringLiteral("segment_id")).toString(), segment.value(QStringLiteral("content_sha256")).toString());
+    }
+    return result;
+}
+}
+
+QDateTime parseTime(const QString &value)
+{
+    static const QRegularExpression zone(QStringLiteral("(Z|z|[+-]\\d\\d(:?\\d\\d)?)$"));
+    if (value.isEmpty() || !value.contains(QLatin1Char('T')) || !zone.match(value).hasMatch()) return {};
+    QDateTime parsed = QDateTime::fromString(value, Qt::ISODateWithMs);
+    if (!parsed.isValid()) parsed = QDateTime::fromString(value, Qt::ISODate);
+    return parsed.isValid() ? parsed.toUTC() : QDateTime();
+}
+
+bool isEvent(const QJsonObject &event)
+{
+    return event.value(QStringLiteral("queue_action")).toString() == action();
+}
+
+QString projectKind(const QJsonObject &project)
+{
+    return validKind(project.value(field())) ? project.value(field()).toString() : knowledge();
+}
+
+QList<QJsonObject> cardProjects(const QJsonObject &cardRecord, const QJsonArray &projects)
+{
+    const QJsonObject primary = primaryOf(cardRecord);
+    QString documentId = text(primary.value(QStringLiteral("pdf_document_id")));
+    if (documentId.isEmpty()) documentId = text(primary.value(QStringLiteral("document_id")));
+    QString stem = text(primary.value(QStringLiteral("pdf_stem")));
+    if (stem.isEmpty()) stem = text(cardRecord.value(QStringLiteral("pdf_stem")));
+    const QString filename = stem.isEmpty() ? QString() : stem + QStringLiteral(".pdf");
+    QList<QJsonObject> held;
+    for (const QJsonValue &value : projects) {
+        if (!value.isObject()) continue;
+        const QJsonObject project = value.toObject();
+        bool holds = !filename.isEmpty() && text(project.value(QStringLiteral("target"))) == filename;
+        for (const QString &list : {QStringLiteral("documents"), QStringLiteral("unpublished_documents")}) {
+            for (const QJsonValue &entry : project.value(list).toArray()) {
+                if (holds) break;
+                const QJsonObject document = entry.toObject();
+                holds = (!documentId.isEmpty() && text(document.value(QStringLiteral("document_id"))) == documentId)
+                    || (!filename.isEmpty() && text(document.value(QStringLiteral("filename"))) == filename);
+            }
+        }
+        if (holds) held.append(project);
+    }
+    return held;
+}
+
+QJsonObject latestEvent(const QString &cardId, const QList<QJsonObject> &events)
+{
+    QJsonObject latest;
+    if (cardId.isEmpty()) return latest;
+    for (const QJsonObject &event : uniqueEvents(events)) {
+        if (!isEvent(event) || text(event.value(QStringLiteral("card_id"))) != cardId
+            || !parseTime(text(event.value(QStringLiteral("reviewed_at")))).isValid() || !validEventKind(event.value(field())))
+            continue;
+        if (latest.isEmpty() || later(event, latest)) latest = event;
+    }
+    return latest;
+}
+
+Kind fold(const QJsonObject &cardRecord, const QList<QJsonObject> &events, const QJsonArray &projects)
+{
+    Kind result;
+    const QList<QJsonObject> held = cardProjects(cardRecord, projects);
+    for (const QJsonObject &project : held) result.projectIds.append(text(project.value(QStringLiteral("id"))));
+    result.projectsKind = std::any_of(held.cbegin(), held.cend(), [](const QJsonObject &project) { return projectKind(project) == ReviewKinds::project(); })
+        ? project() : knowledge();
+    const QJsonObject event = latestEvent(text(cardRecord.value(QStringLiteral("card_id"))), events);
+    if (!event.isEmpty() && validKind(event.value(field()))) {
+        result.kind = event.value(field()).toString();
+        result.source = sourceCard();
+    } else if (event.isEmpty() && validKind(cardRecord.value(field()))) {
+        result.kind = cardRecord.value(field()).toString();
+        result.source = sourceCard();
+    } else {
+        result.kind = result.projectsKind;
+        result.source = held.isEmpty() ? sourceDefault() : sourceProject();
+    }
+    return result;
+}
+
+QJsonObject latestAnswer(const QString &cardId, const QList<QJsonObject> &events)
+{
+    QList<QJsonObject> own;
+    for (const QJsonObject &event : uniqueEvents(events))
+        if (!cardId.isEmpty() && text(event.value(QStringLiteral("card_id"))) == cardId) own.append(event);
+    QSet<QString> retracted;
+    for (const QJsonObject &event : std::as_const(own))
+        if (event.value(QStringLiteral("retracted_event_id")).isString()) retracted.insert(event.value(QStringLiteral("retracted_event_id")).toString());
+    QJsonObject latest;
+    for (const QJsonObject &event : std::as_const(own)) {
+        const QString rating = text(event.value(QStringLiteral("rating")));
+        if (rating.isEmpty() || rating == QLatin1String("delete") || event.contains(QStringLiteral("queue_action"))
+            || retracted.contains(text(event.value(QStringLiteral("event_id")))) || !parseTime(text(event.value(QStringLiteral("reviewed_at")))).isValid())
+            continue;
+        if (latest.isEmpty() || later(event, latest)) latest = event;
+    }
+    return latest;
+}
+
+QJsonObject passageStamp(const QJsonObject &cardRecord)
+{
+    const QJsonValue anchorValue = primaryOf(cardRecord).value(QStringLiteral("source_anchor"));
+    const QJsonObject anchor = anchorValue.toObject();
+    if (!anchorValue.isObject() || !anchor.value(QStringLiteral("version")).isDouble() || anchor.value(QStringLiteral("version")).toDouble() != 2) return {};
+    const QJsonValue segments = anchor.value(QStringLiteral("segments"));
+    if (!segments.isArray() || segments.toArray().isEmpty()) return {};
+    QJsonArray stamp;
+    for (const QJsonValue &value : segments.toArray()) {
+        const QJsonObject segment = value.toObject();
+        if (!value.isObject() || !segment.value(QStringLiteral("segment_id")).isString() || !segment.value(QStringLiteral("content_sha256")).isString())
+            return {};
+        stamp.append(QJsonObject{{QStringLiteral("segment_id"), segment.value(QStringLiteral("segment_id"))},
+                                 {QStringLiteral("content_sha256"), segment.value(QStringLiteral("content_sha256"))}});
+    }
+    return {{QStringLiteral("segments"), stamp}};
+}
+
+bool passageChanged(const QJsonObject &cardRecord, const QList<QJsonObject> &events)
+{
+    const QJsonObject answer = latestAnswer(text(cardRecord.value(QStringLiteral("card_id"))), events);
+    if (answer.isEmpty()) return false;
+    const auto seen = segmentMap(answer.value(passageField()));
+    const auto current = segmentMap(passageStamp(cardRecord));
+    return seen && current && *seen != *current;
+}
+
+QDateTime projectDueAt(const QJsonObject &cardRecord, const QList<QJsonObject> &events, const QDateTime &scheduledDueAt)
+{
+    const QJsonObject answer = latestAnswer(text(cardRecord.value(QStringLiteral("card_id"))), events);
+    if (answer.isEmpty()) return scheduledDueAt;
+    const QDateTime answeredAt = parseTime(text(answer.value(QStringLiteral("reviewed_at"))));
+    QDateTime due = answeredAt.addDays(projectIntervalDays());
+    if (scheduledDueAt.isValid() && scheduledDueAt.toUTC() < due) due = scheduledDueAt.toUTC();
+    if (passageChanged(cardRecord, events)) {
+        const QDateTime updatedAt = parseTime(text(cardRecord.value(QStringLiteral("updated_at"))));
+        const QDateTime changedAt = updatedAt.isValid() && updatedAt > answeredAt ? updatedAt : answeredAt;
+        if (changedAt < due) due = changedAt;
+    }
+    return due;
+}
+
+QJsonArray catalogue(const QString &docsRoot)
+{
+    if (docsRoot.isEmpty()) return {};
+    const QString path = QDir(docsRoot).filePath(QStringLiteral(".thoughts/library-projects.json"));
+    const QFileInfo info(path);
+    if (!info.isFile()) return {};
+    struct Cached {
+        qint64 size = -1;
+        QDateTime modified;
+        QJsonArray projects;
+    };
+    static QMutex mutex;
+    static QHash<QString, Cached> cache;
+    {
+        const QMutexLocker locker(&mutex);
+        const auto found = cache.constFind(path);
+        if (found != cache.cend() && found->size == info.size() && found->modified == info.lastModified()) return found->projects;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    const QJsonObject state = QJsonDocument::fromJson(file.readAll()).object();
+    // Only what the fold and the Projects' names need is kept.
+    QJsonArray projects;
+    for (const QJsonValue &value : state.value(QStringLiteral("projects")).toArray()) {
+        if (!value.isObject()) continue;
+        const QJsonObject project = value.toObject();
+        QJsonObject kept;
+        for (const QString &key : {QStringLiteral("id"), QStringLiteral("name"), QStringLiteral("revision"), QStringLiteral("target"), field()})
+            if (project.contains(key)) kept.insert(key, project.value(key));
+        for (const QString &list : {QStringLiteral("documents"), QStringLiteral("unpublished_documents")}) {
+            if (!project.contains(list)) continue;
+            QJsonArray documents;
+            for (const QJsonValue &entry : project.value(list).toArray()) {
+                const QJsonObject document = entry.toObject();
+                QJsonObject reduced;
+                for (const QString &key : {QStringLiteral("id"), QStringLiteral("document_id"), QStringLiteral("filename"), QStringLiteral("name")})
+                    if (document.contains(key)) reduced.insert(key, document.value(key));
+                documents.append(reduced);
+            }
+            kept.insert(list, documents);
+        }
+        projects.append(kept);
+    }
+    // This computer's queued changes count at once, as the Library shows them.
+    for (const QJsonValue &value : state.value(QStringLiteral("pending")).toArray()) {
+        const QJsonObject operation = value.toObject();
+        const QString actionName = operation.value(QStringLiteral("action")).toString();
+        for (int index = 0; index < projects.size(); ++index) {
+            QJsonObject project = projects.at(index).toObject();
+            if (project.value(QStringLiteral("id")) != operation.value(QStringLiteral("project_id"))) continue;
+            if (actionName == QLatin1String("remove")) {
+                projects.removeAt(index);
+                break;
+            }
+            if (actionName == action() && validKind(operation.value(field()))) {
+                project.insert(field(), operation.value(field()));
+                projects.replace(index, project);
+            }
+        }
+    }
+    const QMutexLocker locker(&mutex);
+    cache.insert(path, {info.size(), info.lastModified(), projects});
+    return projects;
+}
+
+QJsonObject catalogueProject(const QJsonArray &projects, const QString &projectId)
+{
+    if (projectId.isEmpty()) return {};
+    for (const QJsonValue &value : projects)
+        if (value.toObject().value(QStringLiteral("id")).toString() == projectId) return value.toObject();
+    return {};
 }
 }
 
@@ -1879,6 +2159,19 @@ bool ReviewStore::refreshQueryDatabase(const QString &databasePath, QString *err
     auto documentFeedbackRecords = records(DocumentFeedback::entityType(), DocumentFeedback::collection(), QStringLiteral("feedback_id"));
     std::sort(documentFeedbackRecords.begin(), documentFeedbackRecords.end(), [&](const auto &a, const auto &b) { return byId(a, b, QStringLiteral("feedback_id")); });
     for (const auto &feedback : std::as_const(documentFeedbackRecords)) source.append(feedback);
+    // The Projects' kinds change project cards' due times (review-card-kinds.md §6.2) without a
+    // record or event changing.
+    {
+        QJsonArray kinds;
+        for (const QJsonValue &value : ReviewKinds::catalogue(m_docsRoot)) {
+            const QJsonObject project = value.toObject();
+            if (ReviewKinds::projectKind(project) != ReviewKinds::project()) continue;
+            kinds.append(QJsonObject{{QStringLiteral("id"), project.value(QStringLiteral("id"))}, {QStringLiteral("target"), project.value(QStringLiteral("target"))},
+                                     {QStringLiteral("documents"), project.value(QStringLiteral("documents"))},
+                                     {QStringLiteral("unpublished_documents"), project.value(QStringLiteral("unpublished_documents"))}});
+        }
+        if (!kinds.isEmpty()) source.append(QJsonObject{{QStringLiteral("project_review_kinds"), kinds}});
+    }
     // Include the schedule folding version so a corrected rule rebuilds old query indexes
     // (3: adds review_tag_records; 4: adds review_feedback; 5: adds review_card_retirements;
     // 6: adds document_feedback).
@@ -2565,6 +2858,8 @@ QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdf
         records(ReviewTags::mergeEntityType(), ReviewTags::mergeCollection(), QStringLiteral("merge_id"), nullptr, {}, shared));
     // One view of where the sources hold each card's passage, for every card.
     const QJsonObject locationIndex = sourceLocationIndex(m_docsRoot);
+    // The Library Projects that give cards their kind (ReviewKinds::fold).
+    const QJsonArray kindCatalogue = ReviewKinds::catalogue(m_docsRoot);
     QList<ReviewCard> output;
     for (const QJsonObject &savedRecord : cardRecords) {
         QJsonObject record = savedRecord;
@@ -2615,6 +2910,7 @@ QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdf
             // merely opening the card browser must never create an outgoing operation.
         }
         ReviewCard card{record, schedules.value(id), skippedUntil.value(id), histories.value(id)};
+        card.savedRecord = savedRecord;
         card.tagMerges = merges;
         if (!card.schedule.reviewed && !card.schedule.dueAt.isValid())
             card.schedule.dueAt = parseUtc(objectString(record, QStringLiteral("initial_due_at")));
@@ -2622,6 +2918,23 @@ QList<ReviewCard> ReviewStore::loadCards(QStringList *errors, const QString &pdf
             card.schedule.retired = true;
             card.schedule.retiredAt = retirement->retiredAt;
             card.schedule.retireEventId = retirement->retireEventId;
+        }
+        // Its kind (review-card-kinds.md §3): a project card is due at most a week after its latest
+        // answer, and at once when its passage changed since (§6). Knowledge cards keep their schedule.
+        {
+            const QList<QJsonObject> history = histories.value(id);
+            const ReviewKinds::Kind kind = ReviewKinds::fold(card.record, history, kindCatalogue);
+            card.reviewKind = kind.kind;
+            card.reviewKindSource = kind.source;
+            card.kindProjectIds = kind.projectIds;
+            card.projectsKind = kind.projectsKind;
+            card.scheduledDueAt = card.schedule.retained ? QDateTime() : card.schedule.dueAt;
+            if (kind.isProject() && !card.schedule.deleted && !ReviewKinds::latestAnswer(id, history).isEmpty()) {
+                card.passageChanged = ReviewKinds::passageChanged(card.record, history);
+                card.schedule.dueAt = ReviewKinds::projectDueAt(card.record, history, card.scheduledDueAt);
+                // "Never" is the knowledge schedule's: a project card still comes back within a week.
+                card.schedule.retained = false;
+            }
         }
         for (const auto &event : histories.value(id)) {
             if (event.value(QStringLiteral("rating")).toString() == QLatin1String("delete"))
@@ -2745,7 +3058,7 @@ bool ReviewStore::checkManualSourceLink(const ReviewCard &expected, const QStrin
 {
     auto card = cardRecord(expected.id(), error);
     if (card.isEmpty()) return false;
-    if (card != expected.record || expected.linkingState() != QLatin1String("linking_failed")) {
+    if (card != expected.stored() || expected.linkingState() != QLatin1String("linking_failed")) {
         if (error) *error = QStringLiteral("The card changed. Reload it before checking the connection.");
         return false;
     }
@@ -2920,6 +3233,17 @@ QString agentVersionFeedback(const QList<ReviewCard> &cards, const QList<QJsonOb
         if (DocumentFeedback::canResolve(record) && DocumentFeedback::isResolved(record)) line += QStringLiteral(" (resolved)");
         lines.append(line);
     }
+    // What each kind asks of the agent: a question wants an answer, not an edit; likes and
+    // dislikes are what to keep and what to change.
+    const bool openQuestion = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) {
+        return DocumentFeedback::kindOf(record) == DocumentFeedback::question() && !DocumentFeedback::isResolved(record);
+    });
+    const bool likes = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) { return DocumentFeedback::kindOf(record).isEmpty(); });
+    if (openQuestion) {
+        lines.append(QStringLiteral("Answer each Question in your reply. A question asks you something; it is not a request to change the text, so "
+                                    "make no proposal for it unless I ask for one."));
+    }
+    if (likes) lines.append(QStringLiteral("Liked and Disliked passages say what to keep and what to change; a change goes in a proposal."));
     return lines.isEmpty() ? QString() : lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
 }
 
@@ -3701,9 +4025,13 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
                     event.insert(QStringLiteral("interval_amount"), interval.amount);
                     event.insert(QStringLiteral("scheduled_due_at"), utcString(due));
                 }
-                result.insert(QStringLiteral("due_at"), utcString(due));
+                // A project card comes back within a week of its latest answer (review-card-kinds.md §6.2).
+                const QDateTime shownDue = card->isProjectCard() ? ReviewKinds::projectDueAt(card->record, card->history, due) : due;
+                result.insert(QStringLiteral("due_at"), utcString(shownDue));
                 result.insert(QStringLiteral("interval_unit"), unit);
+                result.insert(QStringLiteral("review_kind"), card->reviewKind);
                 if (const QJsonObject version = reviewVersion(card->record); !version.isEmpty()) event.insert(reviewVersionField(), version);
+                if (const QJsonObject passage = ReviewKinds::passageStamp(card->record); !passage.isEmpty()) event.insert(ReviewKinds::passageField(), passage);
             }
             // Persist exact event bytes before changing either the source or history.
             // An interrupted command replays this event rather than inventing another.
@@ -3936,10 +4264,17 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
         return failure(QStringLiteral("invalid_request"), QStringLiteral("Unknown review command."));
     const QSet<QString> allowed = create
         ? QSet<QString>{QStringLiteral("schema_version"), QStringLiteral("command"), QStringLiteral("source"), QStringLiteral("expected_source_sha256"),
-            QStringLiteral("start_line"), QStringLiteral("end_line"), QStringLiteral("question"), QStringLiteral("due_at"), QStringLiteral("request_id")}
-        : QSet<QString>{QStringLiteral("schema_version"), QStringLiteral("command"), QStringLiteral("source"), QStringLiteral("start_line"), QStringLiteral("end_line"), QStringLiteral("document")};
+            QStringLiteral("start_line"), QStringLiteral("end_line"), QStringLiteral("question"), QStringLiteral("due_at"), QStringLiteral("request_id"),
+            QStringLiteral("kind")}
+        : QSet<QString>{QStringLiteral("schema_version"), QStringLiteral("command"), QStringLiteral("source"), QStringLiteral("start_line"), QStringLiteral("end_line"), QStringLiteral("document"),
+            QStringLiteral("kind")};
     for (auto it = request.begin(); it != request.end(); ++it)
         if (!allowed.contains(it.key())) return failure(QStringLiteral("invalid_request"), QStringLiteral("Unexpected field: %1").arg(it.key()));
+    // A card's kind (review-card-kinds.md §8): knowledge or project; left out, the card follows its Project.
+    const QString requestedKind = request.value(QStringLiteral("kind")).toString();
+    if (request.contains(QStringLiteral("kind"))
+        && (!request.value(QStringLiteral("kind")).isString() || (requestedKind != ReviewKinds::knowledge() && requestedKind != ReviewKinds::project())))
+        return failure(QStringLiteral("invalid_request"), QStringLiteral("kind is \"knowledge\" or \"project\"."));
     const auto integer = [](const QJsonValue &v) { return v.isDouble() && v.toDouble() >= 1 && v.toDouble() <= 2147483647 && std::floor(v.toDouble()) == v.toDouble(); };
     const bool hasRange = request.contains(QStringLiteral("start_line")) || request.contains(QStringLiteral("end_line"));
     if ((create || hasRange) && (!integer(request.value(QStringLiteral("start_line"))) || !integer(request.value(QStringLiteral("end_line")))
@@ -3967,6 +4302,7 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
         }
         for (const auto &card : allCards) {
             if (card.schedule.deleted || (!document.isEmpty() && card.pdfStem() + QStringLiteral(".pdf") != document)) continue;
+            if (!requestedKind.isEmpty() && card.reviewKind != requestedKind) continue;
             // Every passage of the card in the requested file; source_range is the first.
             QJsonArray segments;
             for (const auto &v : primaryObject(card.record).value(QStringLiteral("source_anchor")).toObject().value(QStringLiteral("segments")).toArray()) {
@@ -3996,13 +4332,17 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
                 {QStringLiteral("source_range"), segment}, {QStringLiteral("source_ranges"), segments},
                 {QStringLiteral("feedback"), reviewCardAgentFeedback(m_docsRoot, card.record, agentFeedbackAnswer(m_docsRoot, card), allFeedback, homeCards, false,
                                                                      [this, &card] { return agentFeedbackAnswerText(m_docsRoot, card); })}});
+            QJsonObject listed = result.last().toObject();
+            // Its kind; due_at above is a project card's capped due time (review-card-kinds.md §8).
+            listed.insert(QStringLiteral("review_kind"), card.reviewKind);
+            listed.insert(QStringLiteral("review_kind_source"), card.reviewKindSource);
+            if (card.isProjectCard()) listed.insert(QStringLiteral("passage_changed"), card.passageChanged);
             // Retired: never reviewed, its schedule kept for a Restore to review.
             if (card.schedule.retired) {
-                QJsonObject listed = result.last().toObject();
                 listed.insert(QStringLiteral("retired"), true);
                 listed.insert(QStringLiteral("retired_at"), card.schedule.retiredAt.toUTC().toString(Qt::ISODateWithMs));
-                result.replace(result.size() - 1, listed);
             }
+            result.replace(result.size() - 1, listed);
         }
         return {{QStringLiteral("schema_version"), 1}, {QStringLiteral("accepted"), true}, {QStringLiteral("terminal"), true},
             {QStringLiteral("state"), QStringLiteral("listed")}, {QStringLiteral("cards"), result},
@@ -4058,6 +4398,16 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
         {QStringLiteral("pdf_document_id"), owner.value(QStringLiteral("document_id"))},
         {QStringLiteral("pdf_stem"), QFileInfo(owner.value(QStringLiteral("filename")).toString()).completeBaseName()},
         {QStringLiteral("question"), question}, {QStringLiteral("regions"), QJsonArray{}}, {QStringLiteral("source_anchor"), plan.anchor}};
+    {
+        // The kind it is made with (§2.2), else the kind of its Projects; the answer says which.
+        QJsonObject probe{{QStringLiteral("card_id"), id}, {QStringLiteral("primary"), primary}};
+        if (!requestedKind.isEmpty()) probe.insert(ReviewKinds::field(), requestedKind);
+        const ReviewKinds::Kind kind = ReviewKinds::fold(probe, {}, ReviewKinds::catalogue(m_docsRoot));
+        result.insert(QStringLiteral("review_kind"), kind.kind);
+        result.insert(QStringLiteral("review_kind_source"), kind.source);
+        result.insert(QStringLiteral("message"), kind.isProject() ? QStringLiteral("Project card saved locally. Linked: PDF placement pending.")
+                                                                  : QStringLiteral("Card saved locally. Linked: PDF placement pending."));
+    }
     QJsonObject card{{QStringLiteral("schema_version"), 4}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
         {QStringLiteral("card_id"), id}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("revision"), 1},
         {QStringLiteral("created_at"), timestamp}, {QStringLiteral("updated_at"), timestamp}, {QStringLiteral("approved_at"), timestamp},
@@ -4066,6 +4416,7 @@ QJsonObject ReviewStore::sourceCardCommand(const QJsonObject &request, const QSt
         {QStringLiteral("source_link"), QJsonObject{{QStringLiteral("state"), QStringLiteral("linked")}}},
         {QStringLiteral("reanchor"), QJsonObject{{QStringLiteral("state"), QStringLiteral("updating")}, {QStringLiteral("reason"), QStringLiteral("pdf_placement_pending")}}},
         {QStringLiteral("creation_request"), QJsonObject{{QStringLiteral("sha256"), requestHash}, {QStringLiteral("result"), result}}}};
+    if (!requestedKind.isEmpty()) card.insert(ReviewKinds::field(), requestedKind);
     QString error;
     if (!commitSourceChange(path, before, plan.replacement, QStringLiteral("cards/%1.json").arg(id), card, &error, base))
         return failure(QStringLiteral("creation_incomplete"), error);
@@ -4578,8 +4929,12 @@ bool ReviewStore::recordRating(const QString &cardId, const QString &rating, con
     // Whether the answer came from the due cards or from Review now (ReviewEntry).
     if (!reviewEntry.isEmpty() && rating != QLatin1String("delete")) event.insert(ReviewEntry::field(), reviewEntry);
     if (rating != QLatin1String("delete")) {
-        if (const QJsonObject version = reviewVersion(cardRecord ? *cardRecord : this->cardRecord(cardId)); !version.isEmpty())
+        const QJsonObject record = cardRecord ? *cardRecord : this->cardRecord(cardId);
+        if (const QJsonObject version = reviewVersion(record); !version.isEmpty())
             event.insert(reviewVersionField(), version);
+        // The passage the answer is given on, on a card of either kind (review-card-kinds.md §6.3).
+        if (const QJsonObject passage = ReviewKinds::passageStamp(record); !passage.isEmpty())
+            event.insert(ReviewKinds::passageField(), passage);
     }
     if (rating == QLatin1String("custom_interval")) {
         event.insert(QStringLiteral("scheduled_due_at"), scheduledDueAt.toUTC().toString(Qt::ISODateWithMs));
@@ -4644,6 +4999,8 @@ bool ReviewStore::setInterval(const QString &cardId, const ReviewInterval &inter
         else event.insert(QStringLiteral("interval_amount"), interval.amount);
     }
     if (const QJsonObject version = reviewVersion(card->record); !version.isEmpty()) event.insert(reviewVersionField(), version);
+    // As an answer does, it records the passage it was chosen on (not an answer: the fold ignores it).
+    if (const QJsonObject passage = ReviewKinds::passageStamp(card->record); !passage.isEmpty()) event.insert(ReviewKinds::passageField(), passage);
     return writeServerJson(QStringLiteral("events/mac-okular/%1.json").arg(eventId), event, error);
 }
 
@@ -4706,7 +5063,7 @@ bool ReviewStore::updateCardContent(const ReviewCard &expected, const QVariantLi
         return false;
     }
     QJsonObject primary = primaryObject(card);
-    if (primary != primaryObject(expected.record) || objectString(card, QStringLiteral("status")) != expected.status()) {
+    if (primary != primaryObject(expected.stored()) || objectString(card, QStringLiteral("status")) != expected.status()) {
         if (error) {
             *error = QStringLiteral("This card changed during editing. Reopen the editor and try again.");
         }
@@ -4746,7 +5103,7 @@ bool ReviewStore::updateCardAnswer(const ReviewCard &expected, const QVariantLis
     auto card = cardRecord(expected.id(), error);
     if (card.isEmpty()) return false;
     auto primary = primaryObject(card);
-    if (primary != primaryObject(expected.record) || objectString(card, QStringLiteral("status")) != expected.status()) {
+    if (primary != primaryObject(expected.stored()) || objectString(card, QStringLiteral("status")) != expected.status()) {
         if (error) *error = QStringLiteral("This card changed during editing. Reopen the editor and try again.");
         return false;
     }
@@ -4783,7 +5140,9 @@ bool ReviewStore::replaceCardAreas(const ReviewCard &expected, const QString &pd
     }
     auto card = cardRecord(expected.id(), error);
     if (card.isEmpty()) return false;
-    if (card != expected.record) return fail(QStringLiteral("This card changed during editing. Reopen the editor and try again."));
+    // Compared with the card as stored: the view of a card whose source changed since it was placed
+    // differs from it on purpose, and is no change made during editing.
+    if (card != expected.stored()) return fail(QStringLiteral("This card changed during editing. Reopen the editor and try again."));
     if (expected.isWholeDocument() || isBasicReviewCard(card)) return fail(QStringLiteral("This card's answer is not placed by areas."));
     const QString root = QFileInfo(m_docsRoot).canonicalFilePath();
     const QString relative = QDir(root).relativeFilePath(QFileInfo(plan.path).canonicalFilePath());
@@ -5286,7 +5645,7 @@ bool ReviewStore::updateNote(const ReviewCard &expected, const QString &note, QS
 {
     QJsonObject card = cardRecord(expected.id(), error);
     if (card.isEmpty()) return false;
-    if (note.trimmed().size() > 5000 || card.value(QStringLiteral("note")) != expected.record.value(QStringLiteral("note"))) {
+    if (note.trimmed().size() > 5000 || card.value(QStringLiteral("note")) != expected.stored().value(QStringLiteral("note"))) {
         if (error) *error = QStringLiteral("The note changed during editing, or exceeds 5000 characters. Reopen the editor and try again.");
         return false;
     }
@@ -5467,6 +5826,87 @@ bool ReviewStore::undoRetire(const QString &eventId, QString *error, const QDate
         return false;
     }
     return recordRetireAction(cardId, ReviewRetire::undoAction(), eventId, now, error, nullptr);
+}
+
+bool ReviewStore::setCardKind(const QString &cardId, const QString &kind, QString *error, const QDateTime &now, QString *recordedEventId)
+{
+    if (m_readOnly || QUuid(cardId).isNull() || !now.isValid()
+        || (kind != ReviewKinds::knowledge() && kind != ReviewKinds::project() && kind != ReviewKinds::followProject())) {
+        if (error) *error = QStringLiteral("Invalid review card operation.");
+        return false;
+    }
+    const auto snapshot = cardsWithIds({cardId});
+    const auto card = std::find_if(snapshot.cbegin(), snapshot.cend(), [&cardId](const ReviewCard &item) { return item.id() == cardId; });
+    if (card == snapshot.cend() || card->schedule.deleted) {
+        if (error) *error = QStringLiteral("The review card is unavailable.");
+        return false;
+    }
+    // The latest kind event counts (ReviewKinds::latestEvent): come after the card's earlier ones,
+    // even when this clock is behind the device that recorded them.
+    QDateTime at = now.toUTC();
+    for (const auto &event : card->history) {
+        if (!ReviewKinds::isEvent(event)) continue;
+        const QDateTime earlier = ReviewKinds::parseTime(objectString(event, QStringLiteral("reviewed_at")));
+        if (earlier.isValid() && earlier >= at) at = earlier.addMSecs(1);
+    }
+    const QString eventId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject event{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), eventId}, {QStringLiteral("card_id"), cardId},
+                      {QStringLiteral("queue_action"), ReviewKinds::action()}, {ReviewKinds::field(), kind},
+                      {QStringLiteral("reviewed_at"), at.toString(Qt::ISODateWithMs)}, {QStringLiteral("updated_at"), at.toString(Qt::ISODateWithMs)},
+                      {QStringLiteral("origin_id"), Thoughts::Platform::reviewOriginId()}, {QStringLiteral("revision"), 1}};
+    if (const QJsonObject version = reviewVersion(card->record); !version.isEmpty()) event.insert(reviewVersionField(), version);
+    if (!saveQueueActions({event}, error)) return false;
+    if (recordedEventId) *recordedEventId = eventId;
+    return true;
+}
+
+QList<ReviewCard> ReviewStore::activeProjectCards(const QList<ReviewCard> &cards, const QString &projectId)
+{
+    QList<ReviewCard> result;
+    if (projectId.isEmpty()) return result;
+    for (const ReviewCard &card : cards) {
+        const QString status = card.status();
+        if (card.isProjectCard() && !card.schedule.deleted && !card.schedule.retired && !card.record.value(QStringLiteral("deleted")).toBool()
+            && status != QLatin1String("candidate") && status != QLatin1String("rejected") && card.kindProjectIds.contains(projectId))
+            result.append(card);
+    }
+    return result;
+}
+
+bool ReviewStore::retireProjectCards(const QString &projectId, QString *error, const QDateTime &now, QStringList *retiredIds)
+{
+    if (m_readOnly || projectId.isEmpty() || !now.isValid()) {
+        if (error) *error = QStringLiteral("Invalid review card operation.");
+        return false;
+    }
+    const QList<ReviewCard> targets = activeProjectCards(cards(), projectId);
+    if (targets.isEmpty()) {
+        if (error) *error = QStringLiteral("This Project has no project cards in review.");
+        return false;
+    }
+    // One time for all of them (review-card-kinds.md §6.4), after every card's earlier retire actions.
+    QDateTime at = now.toUTC();
+    for (const ReviewCard &card : targets) {
+        for (const auto &event : card.history) {
+            if (!ReviewRetire::isEvent(event)) continue;
+            const QDateTime earlier = parseUtc(objectString(event, QStringLiteral("reviewed_at")));
+            if (earlier.isValid() && earlier >= at) at = earlier.addMSecs(1);
+        }
+    }
+    QList<QJsonObject> actions;
+    QStringList ids;
+    for (const ReviewCard &card : targets) {
+        QJsonObject event{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                          {QStringLiteral("card_id"), card.id()}, {QStringLiteral("queue_action"), ReviewRetire::retireAction()},
+                          {QStringLiteral("reviewed_at"), at.toString(Qt::ISODateWithMs)}, {QStringLiteral("updated_at"), at.toString(Qt::ISODateWithMs)},
+                          {QStringLiteral("origin_id"), Thoughts::Platform::reviewOriginId()}, {QStringLiteral("revision"), 1}};
+        if (const QJsonObject version = reviewVersion(card.record); !version.isEmpty()) event.insert(reviewVersionField(), version);
+        actions.append(event);
+        ids.append(card.id());
+    }
+    if (!saveQueueActions(actions, error)) return false;
+    if (retiredIds) *retiredIds = ids;
+    return true;
 }
 
 bool ReviewStore::setCardsDeleted(const QStringList &cardIds, bool deleted, const QDateTime &now, QString *error)

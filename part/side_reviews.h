@@ -128,6 +128,13 @@ Q_SIGNALS:
     void reviewCardReviewRequested(const QString &id);
     // Merge cards…: the review cards selected in the list (two or more), in list order.
     void reviewCardsMergeRequested(const QStringList &ids);
+    // Make project card, Make knowledge card or Follow the Project: @p kind is knowledge, project
+    // or follow_project (Shell::setSidebarReviewCardKind).
+    void reviewCardKindRequested(const QString &id, const QString &kind);
+    // Retire card / Delete card…: the right-clicked card, or every selected card when it is one of them
+    // (Shell::retireSidebarReviewCards, Shell::deleteSidebarReviewCards).
+    void reviewCardsRetireRequested(const QStringList &ids);
+    void reviewCardsDeleteRequested(const QStringList &ids);
     // The user switched an Annotations type filter (AnnotationModel::ItemType) on
     // or off, so the matching page markup should be shown or hidden too.
     void typeFilterClicked(int itemType, bool shown);
@@ -154,6 +161,8 @@ private:
 
 protected:
     void hideEvent(QHideEvent *event) override;
+    // Notes which card was highlighted when a click on the list began (see m_activeCardAtPress).
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
 
@@ -189,6 +198,9 @@ private:
     QJsonArray m_reviewCardRecords;
     QString m_reviewPdfSha256;
     QString m_activeReviewCardId;
+    // The card highlighted when the last click on the list began: a click on that same card takes
+    // its highlight off again (selecting it happens on the press, before the click arrives).
+    QString m_activeCardAtPress;
     QStringList m_expansionKeys;
     QString m_docsRoot;
     DocsSourceLinkState m_docsSourceLinkState = DocsSourceLinkState::NoDocument;

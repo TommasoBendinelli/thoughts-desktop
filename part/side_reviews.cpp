@@ -935,8 +935,19 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
 
     connect(m_view, &TreeView::doubleClicked, this, &Reviews::openReview);
     m_view->setExpandsOnDoubleClick(false);
+    m_view->viewport()->installEventFilter(this);
     connect(m_view, &TreeView::clicked, this, [this](const QModelIndex &index) {
         if (index.data(AnnotationModel::ReplyCountRole).toInt() > 0) m_view->setExpanded(index, !m_view->isExpanded(index));
+        // A click on the card whose answer is highlighted takes the highlight off and deselects it.
+        const QModelIndex clickedSource = annotationModelIndex(index);
+        if (clickedSource.data(AnnotationModel::ItemTypeRole).toInt() == AnnotationModel::ReviewCard && !m_activeCardAtPress.isEmpty()
+            && clickedSource.data(AnnotationModel::ItemIdRole).toString() == m_activeCardAtPress && m_activeCardAtPress == m_activeReviewCardId) {
+            m_activeCardAtPress.clear();
+            clearActiveReviewCard();
+            m_view->selectionModel()->clear();
+            m_view->doItemsLayout();
+            return;
+        }
         if (activateReviewCard(index)) return;
         const QModelIndex source = annotationModelIndex(index);
         if (source.data(AnnotationModel::DocumentFeedbackRole).toBool()) {
@@ -1351,6 +1362,9 @@ void Reviews::currentChanged(const QModelIndex &index)
 
 void Reviews::openReview(const QModelIndex &index)
 {
+    // The first click of a double-click on the highlighted card deselected it: the double-click
+    // selects it again, so the list and the page agree.
+    if (index.isValid() && m_view->currentIndex() != index) m_view->setCurrentIndex(index);
     if (activateReviewCard(index, true)) return;
     const QModelIndex annotIndex = annotationModelIndex(index);
     if (m_model->isAgentProposal(annotIndex)) {
@@ -1619,11 +1633,42 @@ void Reviews::contextMenuRequested(const QPoint pos)
         auto *merge = menu.addAction(i18n("Merge cards…"));
         merge->setObjectName(QStringLiteral("mergeSidebarReviewCards"));
         merge->setEnabled(selectedCards.size() >= 2);
+        // Knowledge card or project card (review-card-kinds.md §5), as the shell's schedule says.
+        const QVariantMap kind = annotationModelIndex(currentIndex).data(AnnotationModel::ReviewCardKindRole).toMap();
+        QAction *makeKind = nullptr;
+        QAction *follow = nullptr;
+        QAction *retire = nullptr;
+        QAction *remove = nullptr;
+        // Retire and Delete act on the selection when the right-clicked card is part of it, else on that card.
+        const QStringList affected = selectedCards.contains(id) && selectedCards.size() > 1 ? selectedCards : QStringList{id};
+        if (!annotationModelIndex(currentIndex).data(AnnotationModel::CandidateRole).toBool()) {
+            menu.addSeparator();
+            const bool project = kind.value(QStringLiteral("review_kind")).toString() == QLatin1String("project");
+            makeKind = menu.addAction(project ? i18n("Make knowledge card") : i18n("Make project card"));
+            makeKind->setObjectName(QStringLiteral("kindSidebarReviewCard"));
+            makeKind->setData(project ? QStringLiteral("knowledge") : QStringLiteral("project"));
+            if (kind.value(QStringLiteral("review_kind_source")).toString() == QLatin1String("card") && kind.contains(QStringLiteral("projects_kind"))) {
+                follow = menu.addAction(kind.value(QStringLiteral("projects_kind")).toString() == QLatin1String("project") ? i18n("Follow the Project (Project)")
+                                                                                                                         : i18n("Follow the Project (Knowledge)"));
+                follow->setObjectName(QStringLiteral("followProjectSidebarReviewCard"));
+            }
+            // Retire card takes it out of review and keeps its history (Library › Restore to review brings it
+            // back); Delete card… asks first, then removes it and its history for good.
+            menu.addSeparator();
+            retire = menu.addAction(affected.size() > 1 ? i18n("Retire %1 cards", affected.size()) : i18n("Retire card"));
+            retire->setObjectName(QStringLiteral("retireSidebarReviewCards"));
+            remove = menu.addAction(affected.size() > 1 ? i18n("Delete %1 cards…", affected.size()) : i18n("Delete card…"));
+            remove->setObjectName(QStringLiteral("deleteSidebarReviewCards"));
+        }
         QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
         if (chosen == reviewNow) Q_EMIT reviewCardReviewRequested(id);
         else if (chosen == open) Q_EMIT reviewCardOpenRequested(id);
         else if (chosen == edit) Q_EMIT reviewCardEditRequested(id);
         else if (chosen == merge) Q_EMIT reviewCardsMergeRequested(selectedCards);
+        else if (chosen && chosen == makeKind) Q_EMIT reviewCardKindRequested(id, makeKind->data().toString());
+        else if (chosen && chosen == follow) Q_EMIT reviewCardKindRequested(id, QStringLiteral("follow_project"));
+        else if (chosen && chosen == retire) Q_EMIT reviewCardsRetireRequested(affected);
+        else if (chosen && chosen == remove) Q_EMIT reviewCardsDeleteRequested(affected);
         return;
     }
     if (annotationModelIndex(currentIndex).data(AnnotationModel::DocumentFeedbackRole).toBool()) {
@@ -1992,6 +2037,12 @@ void Reviews::hideActiveReviewCardHighlight()
     const QString previous = std::exchange(m_activeReviewCardId, {});
     m_model->setReviewCardStatus(previous, {});
     Q_EMIT reviewCardHighlightHidden();
+}
+
+bool Reviews::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_view->viewport() && event->type() == QEvent::MouseButtonPress) m_activeCardAtPress = m_activeReviewCardId;
+    return QWidget::eventFilter(watched, event);
 }
 
 void Reviews::hideEvent(QHideEvent *event)

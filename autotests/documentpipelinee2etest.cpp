@@ -247,6 +247,8 @@ private Q_SLOTS:
     void testDefaultFolderDocumentCheckedAfterItsFileSynced();
     void testDefaultFolderDocuments();
     void testRestoreRemovedDocument();
+    // Knowledge cards and project cards: a Project's kind and a card's kind through a real Sync.
+    void testReviewCardKinds();
     // Review cards on a source document are always linked (2026-10-13).
     void testLinkedReviewCards();
     // A failed PDF build does not block proposals (2026-10-14).
@@ -2259,6 +2261,123 @@ void DocumentPipelineE2ETest::testSyncSpeedRealisticLibrary()
         QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Succeeded, qPrintable(outcome.message));
         report(QStringLiteral("after figure deleted #%1").arg(repeat), outcome);
     }
+}
+
+void DocumentPipelineE2ETest::testReviewCardKinds()
+{
+    // review-card-kinds.md: a Project's kind is a Library-project action (set_review_kind with
+    // base_revision), a card's kind a review event; both reach the server through a real Sync,
+    // and every answer carries the passage it was given on.
+    const QString source = QStringLiteral("docs-kinds/tex/source/kinds.tex");
+    const QByteArray text =
+        "\\documentclass{article}\n"
+        "\\providecommand{\\ReviewCardMaskStart}[2]{}\n\\providecommand{\\ReviewCardMaskEnd}[2]{}\n"
+        "\\begin{document}\n"
+        "A draft sentence about the method.\n\n"
+        "Another sentence that stays.\n"
+        "\\end{document}\n";
+    const QHash<QString, QString> before = library();
+    const QString created = createLatexProject(QStringLiteral("Kinds"), QStringLiteral("docs-kinds"), {{QStringLiteral("tex/source/kinds.tex"), text}},
+                                               {QStringLiteral("tex/source/kinds.tex")});
+    QVERIFY(!created.isEmpty());
+    Outcome outcome = sync(QStringLiteral("kinds setup"));
+    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Succeeded, qPrintable(outcome.message));
+    QString target;
+    const QHash<QString, QString> built = library();
+    for (auto it = built.cbegin(); it != built.cend(); ++it)
+        if (!before.contains(it.key())) target = it.key();
+    QVERIFY2(!target.isEmpty(), qPrintable(QStringList(library().keys()).join(QLatin1Char(','))));
+    const auto project = [&] {
+        for (const QJsonValue &value : Thoughts::LibraryProjectStore(m_docs).projects(false))
+            if (value.toObject().value(QStringLiteral("name")).toString() == QLatin1String("Kinds")) return value.toObject();
+        return QJsonObject();
+    };
+    // A server with review_card_kinds_v1 lists every Project's kind, knowledge until it is changed.
+    QVERIFY2(!project().isEmpty(), "the Kinds Project is not in the catalogue");
+    QCOMPARE(project().value(QStringLiteral("review_kind")).toString(), QStringLiteral("knowledge"));
+
+    // A card from the agent tools, following its Project.
+    const QString bundle = QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("thoughts-server/source-bundle"));
+    Thoughts::ReviewStore store(m_docs, [this] { return m_repository->effectiveProjections(); }, m_repository->m_stateRoot);
+    const QString path = QDir(m_docs).filePath(source);
+    const QByteArray current = readFile(path);
+    const int line = int(current.left(current.indexOf("A draft sentence")).count('\n')) + 1;
+    const QString cardId = uuid();
+    const QJsonObject request{{QStringLiteral("command"), QStringLiteral("create-review-card")}, {QStringLiteral("source"), path},
+                              {QStringLiteral("expected_source_sha256"), sha256(current)}, {QStringLiteral("start_line"), line}, {QStringLiteral("end_line"), line + 1},
+                              {QStringLiteral("question"), QStringLiteral("What does the draft say about the method?")},
+                              {QStringLiteral("due_at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}, {QStringLiteral("request_id"), cardId}};
+    const QJsonObject card = store.sourceCardCommand(request, bundle);
+    QVERIFY2(card.value(QStringLiteral("accepted")).toBool(), QJsonDocument(card).toJson().constData());
+    QCOMPARE(card.value(QStringLiteral("review_kind")).toString(), QStringLiteral("knowledge"));
+    QCOMPARE(card.value(QStringLiteral("review_kind_source")).toString(), QStringLiteral("project"));
+    const auto storedCard = [&]() -> Thoughts::ReviewCard {
+        for (const auto &candidate : store.cards())
+            if (candidate.id() == cardId) return candidate;
+        return {};
+    };
+    QVERIFY2(syncUntil(QStringLiteral("kinds card"), [&] { return !cardProjection(cardId).isEmpty() && nothingPending(); }), qPrintable(pendingSummary()));
+
+    // Project cards: one set_review_kind action, accepted with the Project's revision.
+    const QJsonObject knowledgeProject = project();
+    QString error = Thoughts::LibraryProjectStore(m_docs).enqueue(QStringLiteral("set_review_kind"), knowledgeProject, {{QStringLiteral("review_kind"), QStringLiteral("project")}});
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QVERIFY(storedCard().isProjectCard()); // at once, before Sync
+    outcome = sync(QStringLiteral("project kind"));
+    QVERIFY2(outcome.state == FedoraRepository::ManualSyncState::Succeeded, qPrintable(outcome.message));
+    QVERIFY2(Thoughts::LibraryProjectStore(m_docs).pending().isEmpty(), QJsonDocument(Thoughts::LibraryProjectStore(m_docs).pending()).toJson().constData());
+    // The server's catalogue as this computer received it, as the phone reads it.
+    QFile catalogueFile(QDir(m_docs).filePath(QStringLiteral(".thoughts/library-projects.json")));
+    QVERIFY(catalogueFile.open(QIODevice::ReadOnly));
+    bool serverKind = false;
+    for (const QJsonValue &value : QJsonDocument::fromJson(catalogueFile.readAll()).object().value(QStringLiteral("projects")).toArray())
+        if (value.toObject().value(QStringLiteral("name")).toString() == QLatin1String("Kinds"))
+            serverKind = value.toObject().value(QStringLiteral("review_kind")).toString() == QLatin1String("project");
+    QVERIFY2(serverKind, "the server's catalogue does not say Project cards");
+    QVERIFY(project().value(QStringLiteral("revision")).toInt() > knowledgeProject.value(QStringLiteral("revision")).toInt());
+    QVERIFY(storedCard().isProjectCard());
+    QCOMPARE(storedCard().reviewKindSource, QStringLiteral("project"));
+    // The manifest is not touched: nothing to publish.
+    VERIFY_SETTLED(QStringLiteral("project kind"));
+
+    // Make knowledge card: a kind event, stored by the server and read back from its projections.
+    QString eventId;
+    QVERIFY2(store.setCardKind(cardId, QStringLiteral("knowledge"), &error, QDateTime::currentDateTimeUtc(), &eventId), qPrintable(error));
+    QVERIFY(!storedCard().isProjectCard());
+    QVERIFY2(syncUntil(QStringLiteral("card kind"), [&] {
+        return m_repository->effectiveProjections().value(QStringLiteral("review_event\nevents\n") + eventId).toObject().value(QStringLiteral("review_kind")).toString()
+            == QLatin1String("knowledge") && nothingPending();
+    }), qPrintable(pendingSummary()));
+    const QJsonObject kindEvent = m_repository->effectiveProjections().value(QStringLiteral("review_event\nevents\n") + eventId).toObject();
+    QCOMPARE(kindEvent.value(QStringLiteral("queue_action")).toString(), QStringLiteral("set_review_kind"));
+    QCOMPARE(kindEvent.value(QStringLiteral("card_id")).toString(), cardId);
+    QVERIFY(!kindEvent.contains(QStringLiteral("rating")));
+    QCOMPARE(storedCard().reviewKind, QStringLiteral("knowledge"));
+    QCOMPARE(storedCard().reviewKindSource, QStringLiteral("card"));
+    // Follow the Project: a project card again, as its Project.
+    QVERIFY2(store.setCardKind(cardId, QStringLiteral("follow_project"), &error, QDateTime::currentDateTimeUtc(), &eventId), qPrintable(error));
+    QVERIFY2(syncUntil(QStringLiteral("follow project"), [&] {
+        return m_repository->effectiveProjections().contains(QStringLiteral("review_event\nevents\n") + eventId) && nothingPending();
+    }), qPrintable(pendingSummary()));
+    QVERIFY(storedCard().isProjectCard());
+    QCOMPARE(storedCard().reviewKindSource, QStringLiteral("project"));
+
+    // An answer carries its passage; the server keeps the stamp unchanged.
+    const Thoughts::ReviewCard answered = storedCard();
+    const QJsonObject stamp = Thoughts::ReviewKinds::passageStamp(answered.record);
+    QVERIFY2(!stamp.isEmpty(), QJsonDocument(answered.record).toJson().constData());
+    const QDateTime at = QDateTime::currentDateTimeUtc();
+    QString answerId;
+    QVERIFY2(store.recordRating(cardId, QStringLiteral("custom_interval"), at, &error, at.addDays(60), &answerId, {}, {QStringLiteral("Correct")}, {}, {},
+                                &answered.record), qPrintable(error));
+    QVERIFY2(syncUntil(QStringLiteral("answer passage"), [&] {
+        return m_repository->effectiveProjections().contains(QStringLiteral("review_event\nevents\n") + answerId) && nothingPending();
+    }), qPrintable(pendingSummary()));
+    QCOMPARE(m_repository->effectiveProjections().value(QStringLiteral("review_event\nevents\n") + answerId).toObject().value(QStringLiteral("passage")).toObject(), stamp);
+    // A project card: due a week after the answer, whatever the interval.
+    QCOMPARE(storedCard().schedule.dueAt, Thoughts::ReviewKinds::parseTime(at.toString(Qt::ISODateWithMs)).addDays(7));
+    QVERIFY(!storedCard().passageChanged);
+    VERIFY_SETTLED(QStringLiteral("card kinds"));
 }
 
 void DocumentPipelineE2ETest::testLinkedReviewCards()

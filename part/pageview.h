@@ -206,6 +206,9 @@ public:
     Q_INVOKABLE QRect agentProposalMarkerRect(const QString &proposalId) const;
     void hideAgentProposalHoverBar();
     bool isPdfLinkAnchorDocument(QString *paperKey = nullptr) const;
+    // The line under @p eventPos when it looks like a section heading (short, and set larger than
+    // the page's text, numbered, or named by the PDF outline), normalized; empty otherwise.
+    QRectF sectionHeadingLineAt(const PageViewItem *item, const QPointF &eventPos) const;
     bool createPdfLinkAnchor(const QString &anchorName, QString *latexLink = nullptr, QString *error = nullptr);
 
     void startSigning(Okular::SignatureAnnotation *signatureAnnotation);
@@ -373,6 +376,8 @@ Q_SIGNALS:
     void manualReviewCardRequested(const QString &pdfPath, int page, const QVariantList &rect, bool textSelection);
     // A text selection running over several pages: one area ({page, rect}) per page, in page order.
     void manualReviewCardAreasRequested(const QString &pdfPath, const QVariantList &areas, bool textSelection);
+    // Add Review Card for This Section… on a section heading (@p rect: its line, normalized, on one-based @p page).
+    void sectionReviewCardRequested(const QString &pdfPath, int page, const QVariantList &rect);
     void reviewCardEditRequested();
     /**
      * Requests opening of a newly signed file

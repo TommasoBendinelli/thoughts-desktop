@@ -817,6 +817,21 @@ Json SourcePublisher::laggingFrozenBase(const QString &path, const QByteArray &c
                    .arg(path, Py::pythonStr(recordedBase.value(QStringLiteral("revision")))));
         return recordedBase;
     }
+    // The user accepted or rejected, here, proposals the recorded revision
+    // brought (proposals of an agent that Fedora's merge installed, decided
+    // before Desktop recorded the merge). The file holds the decisions
+    // where the recorded base holds the wrappers, so the merge above clashes,
+    // but its decision claims, made on those very wrappers, say the file was
+    // written on the recorded base: it holds every change since, with them decided.
+    if (const std::optional<QByteArray> decided = withClaimedDecisions(*this, path, recorded)) {
+        const auto [again, againConflicts] = mergeSources(earlier, *decided, content, path);
+        if (!againConflicts && again == content) {
+            report(QStringLiteral("Desktop still names an earlier base of %1; the file holds every change since, with proposals decided here, so it is published "
+                                  "against revision %2.")
+                       .arg(path, Py::pythonStr(recordedBase.value(QStringLiteral("revision")))));
+            return recordedBase;
+        }
+    }
     // The file may lack changes Fedora made since the earlier base (an editor
     // that saved its older copy over the installed one): merged against that
     // base, Fedora keeps them; published against the recorded one, it would

@@ -129,6 +129,12 @@ public:
     const QList<ReviewBrowserCard> &libraryCards() const { return m_browseCards; }
     void setStateFilter(const QString &stateFilter);
     void selectCard(const QString &cardId);
+    // The active project cards of the Project @p projectId (ReviewStore::activeProjectCards): as the
+    // cards were last read (-1 before they are), or read now.
+    int activeProjectCardCount(const QString &projectId) const;
+    QList<ReviewCard> activeProjectCards(const QString &projectId);
+    // Retire project cards… of a Project (ReviewStore::retireProjectCards), then reads the cards again.
+    bool retireProjectCards(const QString &projectId, QString *error = nullptr);
 
 Q_SIGNALS:
     void countsChanged(int activeCards, int dueCards);
@@ -149,6 +155,9 @@ private Q_SLOTS:
     void deleteOrRestoreBrowseCard();
     // "Retire card", or "Restore to review" on a retired card: the selected card (ReviewRetire).
     void retireOrRestoreBrowseCard();
+    // Make project card, Make knowledge card or Follow the Project (@p kind: knowledge, project or
+    // follow_project) for the selected card (review-card-kinds.md §5).
+    void setBrowseCardKind(const QString &kind);
     // "Merge cards…": the selected cards of one document become the one the user keeps.
     void mergeBrowseCards();
     // "Compact tags": merges several tags into one, permanently and on every device.
@@ -229,6 +238,8 @@ private:
     QAction *m_browseExportAction = nullptr;
     QAction *m_browseDeleteAction = nullptr;
     QAction *m_browseRetireAction = nullptr; // "Retire card", or "Restore to review" on a retired card.
+    QAction *m_browseKindAction = nullptr; // "Make project card", or "Make knowledge card" on a project card.
+    QAction *m_browseFollowAction = nullptr; // "Follow the Project (…)": a card with a kind of its own in a Project.
     QAction *m_browseMergeAction = nullptr; // "Merge cards…": two or more selected cards.
     QTreeWidget *m_browseTable = nullptr;
     QLabel *m_browseState = nullptr;
@@ -241,7 +252,6 @@ private:
     QPushButton *m_browseUpdateHistoryButton = nullptr;
     QPushButton *m_browseReviewButton = nullptr;
     QPushButton *m_browseEditButton = nullptr;
-    QPushButton *m_browseNoteButton = nullptr;
     QPushButton *m_browseHistoryButton = nullptr;
     QPushButton *m_browseSourceButton = nullptr;
     QPushButton *m_browseAreasButton = nullptr;
@@ -394,6 +404,8 @@ private Q_SLOTS:
     void showAttentionCards();
     void showReviewLanding();
     void refreshDueQueue();
+    // Start Review: the Study entry (knowledge cards) of the whole Library, or every card of the
+    // document chosen (review-card-kinds.md §7).
     void startReview();
     void revealAnswer();
     void setMaskFlipped(bool flipped);
@@ -414,10 +426,12 @@ private Q_SLOTS:
     void undoPrevious();
     void focusReview();
     void toggleReviewVisibility();
-    void editNote();
     void deleteCard();
     // Takes the card out of review for good, keeping its history; Undo writes undo_retire.
     void retireCard();
+    // The card menu's Make project card, Make knowledge card and Follow the Project (@p kind:
+    // knowledge, project or follow_project) for the card under review.
+    void setCurrentCardKind(const QString &kind);
     void showCardInfo();
     void copyCardForAgent();
     QString currentReviewText(const ReviewCard &card) const;
@@ -462,6 +476,7 @@ private:
         QString filter; // The document filter it was made for.
         QString sessionCardId; // The card under review when it was asked for; empty outside a review.
         QStringList stems;
+        QStringList projectIds; // The Projects that hold at least one active project card.
         QList<ReviewCard> due;
         int unavailable = 0;
         int cards = 0; // Read in the background, in durationMs.
@@ -533,6 +548,23 @@ private:
     // Due cards (new + learning + review) the dashboard currently shows, once it shows counts.
     bool m_countsShown = false;
     int m_displayedDue = 0;
+    // The two Library-wide entries (review-card-kinds.md §7): due knowledge and project cards, and
+    // the Projects that hold an active project card (the Projects entry's choice).
+    int m_studyDue = 0;
+    int m_projectDue = 0;
+    QStringList m_projectEntryIds;
+    // The entry the session was started from: its kind (empty: every card of its scope) and Project.
+    QString m_sessionKind;
+    QString m_sessionProjectId;
+    // A session of @p kind's cards (empty: all), of the Project @p projectId only when given.
+    void startEntryReview(const QString &kind, const QString &projectId);
+    // The cards of @p due the session's entry offers.
+    QList<ReviewCard> entryCards(const QList<ReviewCard> &due) const;
+    // The entries' labels and whether they can start.
+    void updateEntryButtons();
+    void fillProjectsMenu();
+    // "Project card · Changed since you last saw it" over the card under review.
+    void updateCardKindLine();
     bool m_deferredRetryScheduled = false;
     QTimer *m_queueRefreshTimer = nullptr;
     bool m_queueRefreshRunning = false;
@@ -603,6 +635,9 @@ private:
     QPushButton *m_attentionButton = nullptr;
     QString m_attentionBrowserState;
     QLabel *m_reviewStatus = nullptr;
+    QLabel *m_cardKindLine = nullptr;
+    QPushButton *m_startProjectsButton = nullptr; // "Projects · M due", with the choice of a Project.
+    QMenu *m_projectsMenu = nullptr;
     QLabel *m_reviewQuestion = nullptr;
     QPushButton *m_startButton = nullptr;
     QPushButton *m_revealButton = nullptr;
@@ -698,7 +733,6 @@ private:
     void clearRecallPredictions();
     QHash<QString, QString> m_tagMerges; // Those of the last card shown; tagUsage() is counted under them.
     std::optional<QHash<QString, int>> m_tagUsage; // Cards per current tag: loaded once per session, then counted locally.
-    QToolButton *m_noteButton = nullptr;
     QWidget *m_answerRow = nullptr;
     QLabel *m_currentState = nullptr;
     QPushButton *m_tagField = nullptr;

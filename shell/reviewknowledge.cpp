@@ -355,6 +355,7 @@ struct Query {
     QStringList tags;      // Effective tag names, case-folded.
     QStringList tagGroups; // As given.
     QString project, document, state, sort;
+    QString kind; // knowledge or project: only cards of that kind (review-card-kinds.md §8).
     int limit = defaultLimit;
     bool includeAnswer = true;
     // The whole answer instead of an excerpt of excerptLength characters.
@@ -515,6 +516,7 @@ QList<Entry> findCards(const Library &library, const Query &query, const QDateTi
         if (!query.tagGroups.isEmpty() && std::none_of(entry.currentTags.begin(), entry.currentTags.end(), [&](const QString &tag) {
                 return groupTags.contains(tag.toCaseFolded());
             })) continue;
+        if (!query.kind.isEmpty() && card.reviewKind != query.kind) continue;
         if (!query.state.isEmpty()) {
             const Schedule schedule = scheduleOf(card, now);
             const bool answered = card.wasAnswered();
@@ -635,6 +637,7 @@ bool parseQuery(const QJsonObject &request, Query *query, const Library &library
         || !optionalString(request, QStringLiteral("document"), &query->document, problem)
         || !optionalString(request, QStringLiteral("state"), &query->state, problem)
         || !optionalString(request, QStringLiteral("sort"), &query->sort, problem)
+        || !optionalString(request, QStringLiteral("kind"), &query->kind, problem)
         || !optionalStrings(request, QStringLiteral("tag_groups"), &query->tagGroups, problem)
         || !optionalLimit(request, &query->limit, problem)
         || !optionalBool(request, QStringLiteral("include_answer"), &query->includeAnswer, problem)
@@ -655,6 +658,10 @@ bool parseQuery(const QJsonObject &request, Query *query, const Library &library
                              QStringLiteral("retired"), QStringLiteral("active")};
     if (!query->state.isEmpty() && !states.contains(query->state)) {
         *problem = QStringLiteral("state must be one of %1.").arg(states.join(QStringLiteral(", ")));
+        return false;
+    }
+    if (!query->kind.isEmpty() && query->kind != ReviewKinds::knowledge() && query->kind != ReviewKinds::project()) {
+        *problem = QStringLiteral("kind must be knowledge or project.");
         return false;
     }
     const QStringList sorts{QStringLiteral("relevance"), QStringLiteral("due"), QStringLiteral("last_reviewed")};
@@ -711,6 +718,11 @@ QJsonObject cardJson(const Library &library, const Entry &entry, const Query &qu
     result.insert(QStringLiteral("source"), source);
     result.insert(QStringLiteral("current_tags"), QJsonArray::fromStringList(tagLabels(entry.currentTags)));
     result.insert(QStringLiteral("answered"), card.wasAnswered());
+    // Its kind; a project card's due_at is the capped one, and it says whether its passage changed
+    // since its latest answer (review-card-kinds.md §8).
+    result.insert(QStringLiteral("review_kind"), card.reviewKind);
+    result.insert(QStringLiteral("review_kind_source"), card.reviewKindSource);
+    if (card.isProjectCard()) result.insert(QStringLiteral("passage_changed"), card.passageChanged);
     result.insert(QStringLiteral("status"), schedule.retired ? QStringLiteral("retired") : schedule.unpublished ? QStringLiteral("unpublished")
                                             : schedule.retained ? QStringLiteral("never")
                                             : schedule.overdueDays > 0 ? QStringLiteral("overdue")
@@ -1023,7 +1035,7 @@ QJsonObject search(const Library &library, const QJsonObject &request, const QDa
     if (!onlyKeys(request, {QStringLiteral("query"), QStringLiteral("tags"), QStringLiteral("tag_groups"), QStringLiteral("project"),
                             QStringLiteral("document"), QStringLiteral("state"), QStringLiteral("sort"), QStringLiteral("limit"),
                             QStringLiteral("include_answer"), QStringLiteral("full_answer"), QStringLiteral("include_history"),
-                            QStringLiteral("include_deleted")}, &problem)
+                            QStringLiteral("include_deleted"), QStringLiteral("kind")}, &problem)
         || !parseQuery(request, &query, library, &problem))
         return error(QStringLiteral("invalid_request"), problem);
     QJsonObject failure;
@@ -1452,6 +1464,12 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
         const double best = entries.first().score;
         entries.removeIf([best](const Entry &entry) { return entry.score < best * 0.2; });
     }
+    // Project cards describe work in progress, not what the user knows (review-card-kinds.md §8):
+    // they are listed apart, in rank order, and everything below reads the knowledge cards only.
+    QList<Entry> projectEntries;
+    for (const Entry &entry : std::as_const(entries))
+        if (entry.card->isProjectCard()) projectEntries.append(entry);
+    entries.removeIf([](const Entry &entry) { return entry.card->isProjectCard(); });
     const int matched = int(entries.size());
     if (entries.size() > limit) entries.resize(limit);
 
@@ -1515,7 +1533,9 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
     }
     QStringList summary;
     if (entries.isEmpty()) {
-        summary.append(QStringLiteral("No review cards match \"%1\": there is no record of what the user knows about it.").arg(topic));
+        summary.append((projectEntries.isEmpty() ? QStringLiteral("No review cards match \"%1\": there is no record of what the user knows about it.")
+                                                 : QStringLiteral("No knowledge cards match \"%1\": there is no record of what the user knows about it."))
+                           .arg(topic));
     } else {
         summary.append(QStringLiteral("\"%1\": %2 matching review card%3: %4 solid, %5 shaky, %6 not understood, %7 not yet reviewed.")
                            .arg(topic).arg(entries.size()).arg(entries.size() == 1 ? QString() : QStringLiteral("s"))
@@ -1543,6 +1563,23 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
                        {QStringLiteral("matched"), matched}, {QStringLiteral("counts"), counts}, {QStringLiteral("cards"), cards},
                        {QStringLiteral("index"), indexJson(library)}};
     if (topicCalibration.total() > 0) result.insert(QStringLiteral("calibration"), topicCalibration.json());
+    if (!projectEntries.isEmpty()) {
+        QJsonArray listed;
+        QStringList shown;
+        for (const Entry &entry : std::as_const(projectEntries)) {
+            if (listed.size() < 20) {
+                QJsonObject item{{QStringLiteral("card_id"), entry.card->id()}, {QStringLiteral("question"), entry.card->question()},
+                                 {QStringLiteral("document"), entry.documentName}};
+                if (!entry.project.isEmpty()) item.insert(QStringLiteral("project"), entry.project);
+                listed.append(item);
+            }
+            shown.append(shortQuestion(entry.card->question()));
+        }
+        result.insert(QStringLiteral("project_cards"), QJsonObject{{QStringLiteral("count"), int(projectEntries.size())}, {QStringLiteral("cards"), listed}});
+        QString line = QStringLiteral("Project cards on this topic (work in progress, not what the user knows): ") + shown.mid(0, summaryListLimit).join(QStringLiteral("; "));
+        if (shown.size() > summaryListLimit) line += QStringLiteral(" (+%1 more)").arg(shown.size() - summaryListLimit);
+        summary.append(line);
+    }
     // Cold start: when few cards cover the topic, what all the cards say about the user as a
     // learner, so an explanation of something new can still build on what they know and like.
     if (learner.value_or(matched < 3)) {
@@ -1550,7 +1587,9 @@ QJsonObject profile(const Library &library, const QJsonObject &request, const Le
         Query everything;
         QString unused;
         parseQuery(QJsonObject{}, &everything, library, &unused);
-        const QList<Entry> all = findCards(library, everything, now, &failureAll);
+        QList<Entry> all = findCards(library, everything, now, &failureAll);
+        // What the user knows: the learner overview leaves project cards out.
+        all.removeIf([](const Entry &entry) { return entry.card->isProjectCard(); });
         QStringList learnerLines;
         result.insert(QStringLiteral("learner"), learnerOverview(library, all, levelOf, groups, now, &learnerLines));
         if (!learnerLines.isEmpty()) {

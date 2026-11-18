@@ -78,6 +78,8 @@
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QPainter>
+#include <QPdfWriter>
 #include <QPrintDialog>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -594,6 +596,7 @@ private Q_SLOTS:
     void testReviewBrowseHeaderSorting();
     void testReviewBrowseExportCards();
     void testReviewBrowseMergesCards();
+    void testSectionHeadingMakesSectionReviewCard();
     void testCardBrowserFiltersByType();
     void testCardBrowserFiltersByCurrentTag();
     void testReviewSkipHistoryDetails();
@@ -609,6 +612,7 @@ private Q_SLOTS:
     void testReviewSessionKeepsCardBeingReplaced();
     void testReviewCardMenu();
     void testReviewRetireCard();
+    void testReviewCardKinds();
     void testReviewCardAgentConversations();
     void testCardHistoryInSidebar();
     void testReviewCopyForAgentNamesSharedFeedback();
@@ -9211,11 +9215,13 @@ void MainShellTest::testReviewBrowseExportCards()
     QCOMPARE(exportAction->text(), QStringLiteral("Export 3 selected…"));
     QVERIFY(!deleteAction->isEnabled()); // Several cards are deleted with the details panel's button.
 
-    const QStringList fields{QStringLiteral("question"), QStringLiteral("card_id"), QStringLiteral("document"), QStringLiteral("note"), QStringLiteral("reviews")};
+    const QStringList fields{QStringLiteral("question"), QStringLiteral("card_id"), QStringLiteral("document"), QStringLiteral("reviews")};
     const QByteArray csv = cards.cardExportData(inputs, fields, QStringLiteral("csv"));
-    QVERIFY(csv.startsWith("\xEF\xBB\xBF" "Question,Card ID,Document,Note,Number of Repetitions\r\n"));
-    QVERIFY(csv.contains("\"Why, \"\"exactly\"\"?\",id-0,paper.pdf,,0\r\n"));
-    QVERIFY(csv.contains("Question 1,id-1,paper.pdf,\"line one\nline two\",1\r\n"));
+    QVERIFY(csv.startsWith("\xEF\xBB\xBF" "Question,Card ID,Document,Number of Repetitions\r\n"));
+    QVERIFY(csv.contains("\"Why, \"\"exactly\"\"?\",id-0,paper.pdf,0\r\n"));
+    QVERIFY(csv.contains("Question 1,id-1,paper.pdf,1\r\n"));
+    // Cards have no separate note any more: export offers no Note field.
+    QVERIFY(!csv.contains("line one"));
 
     const auto json = QJsonDocument::fromJson(cards.cardExportData(inputs, fields, QStringLiteral("json"))).array();
     QCOMPARE(json.size(), 3);
@@ -9225,8 +9231,153 @@ void MainShellTest::testReviewBrowseExportCards()
 
     const QString markdown = QString::fromUtf8(cards.cardExportData(inputs, fields, QStringLiteral("md")));
     QVERIFY(markdown.contains(QStringLiteral("## Question 1\n- **Card ID:** id-1")));
-    QVERIFY(markdown.contains(QStringLiteral("- **Note:** line one  \n  line two")));
+    QVERIFY(!markdown.contains(QStringLiteral("Note")));
     QVERIFY(!markdown.contains(QStringLiteral("**Question:**")));
+}
+
+void MainShellTest::testSectionHeadingMakesSectionReviewCard()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    QDir root(library.path());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")));
+    // An imported paper (no source): "2 Method" runs over the page break to "3 Results".
+    const QString pdfPath = root.filePath(QStringLiteral("current_pdfs/paper.pdf"));
+    {
+        QPdfWriter writer(pdfPath);
+        writer.setResolution(72);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageMargins(QMarginsF(0, 0, 0, 0));
+        QPainter painter(&writer);
+        QFont heading = painter.font();
+        heading.setPointSizeF(20);
+        heading.setBold(true);
+        QFont body = painter.font();
+        body.setPointSizeF(10);
+        painter.setFont(heading);
+        painter.drawText(QPointF(60, 120), QStringLiteral("2 Method"));
+        painter.setFont(body);
+        for (int line = 0; line < 12; ++line) painter.drawText(QPointF(60, 160 + 16 * line), QStringLiteral("The method splits the batch among copies, line %1.").arg(line));
+        writer.newPage();
+        for (int line = 0; line < 3; ++line) painter.drawText(QPointF(60, 80 + 16 * line), QStringLiteral("It accumulates the gradients, line %1.").arg(line));
+        painter.setFont(heading);
+        painter.drawText(QPointF(60, 200), QStringLiteral("3 Results"));
+        painter.setFont(body);
+        painter.drawText(QPointF(60, 240), QStringLiteral("The results follow."));
+    }
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString sha = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    pdf.close();
+    {
+        QFile index(root.filePath(QStringLiteral("current_pdfs/.thoughts-library-index.json")));
+        QVERIFY(index.open(QIODevice::WriteOnly));
+        index.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("pdfs"), QJsonArray{QJsonObject{
+            {QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("kind"), QStringLiteral("unlinked")}, {QStringLiteral("pdf_sha256"), sha},
+            {QStringLiteral("document_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}}}}}).toJson());
+    }
+
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    auto *shell = new Shell(options);
+    const auto closeShell = qScopeGuard([shell] { shell->closeUrl(); delete shell; });
+    QVERIFY(shell->isValid());
+    QVERIFY(shell->openDocument(QUrl::fromLocalFile(pdfPath), options));
+    shell->show();
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    QCOMPARE(shell->m_tabs.count(), 1);
+    QObject *part = shell->m_tabs[0].part;
+    QVERIFY(part);
+
+    // Handles the modal window the next step opens, once it is shown.
+    const auto whenModal = [](std::function<void(QWidget *)> handle) {
+        auto *poll = new QTimer;
+        poll->setInterval(10);
+        QObject::connect(poll, &QTimer::timeout, [poll, handle] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal || !modal->isVisible()) return;
+            poll->stop();
+            poll->deleteLater();
+            handle(modal);
+        });
+        poll->start();
+    };
+    const auto labelsOf = [](QWidget *widget) {
+        QStringList texts;
+        for (auto *label : widget->findChildren<QLabel *>()) texts.append(label->text());
+        return texts.join(QLatin1Char('\n'));
+    };
+    const QVariantList heading{55.0 / 595, 100.0 / 842, 200.0 / 595, 126.0 / 842};
+
+    // Add Review Card for This Section…: the dialog says what it hides and suggests a question.
+    QString shown, suggested, added;
+    whenModal([&](QWidget *modal) {
+        shown = labelsOf(modal);
+        auto *editor = modal->findChild<QPlainTextEdit *>(QStringLiteral("ManualReviewQuestion"));
+        QVERIFY(editor);
+        suggested = editor->toPlainText();
+        QVERIFY(!modal->findChild<QPushButton *>(QStringLiteral("ManualReviewOnlySelection"))); // asked for the section itself
+        editor->setPlainText(QStringLiteral("How does the method split the batch?"));
+        whenModal([&](QWidget *message) {
+            added = labelsOf(message);
+            QTimer::singleShot(0, message, &QWidget::close);
+        });
+        modal->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Ok)->click();
+    });
+    QVERIFY(QMetaObject::invokeMethod(part, "requestSectionReviewCard", Qt::DirectConnection, Q_ARG(QString, pdfPath), Q_ARG(int, 1), Q_ARG(QVariantList, heading)));
+    QTRY_VERIFY(!added.isEmpty());
+    QVERIFY2(shown.contains(QStringLiteral("Hides section 2 “Method” (pages 1–2).")), qPrintable(shown));
+    QCOMPARE(suggested, QStringLiteral("Explain “Method”."));
+    QVERIFY2(added.contains(QStringLiteral("It hides section 2 “Method”; its heading stays visible.")), qPrintable(added));
+    Thoughts::ReviewStore store(library.path());
+    const auto cards = store.cards();
+    QCOMPARE(cards.size(), 1);
+    const QJsonObject primary = cards.first().record.value(QStringLiteral("primary")).toObject();
+    QCOMPARE(primary.value(QStringLiteral("question")).toString(), QStringLiteral("How does the method split the batch?"));
+    QCOMPARE(primary.value(QStringLiteral("source_kind")).toString(), QStringLiteral("pdf"));
+    const QJsonArray regions = primary.value(QStringLiteral("regions")).toArray();
+    QCOMPARE(regions.size(), 2);
+    QCOMPARE(regions.at(0).toObject().value(QStringLiteral("page")).toInt(), 1);
+    QCOMPARE(regions.at(1).toObject().value(QStringLiteral("page")).toInt(), 2);
+    // Below the heading on page 1; above "3 Results" on page 2.
+    QVERIFY(regions.at(0).toObject().value(QStringLiteral("rect")).toArray().at(1).toDouble() * 842 > 120);
+    QVERIFY(regions.at(1).toObject().value(QStringLiteral("rect")).toArray().at(3).toDouble() * 842 < 190);
+    QVERIFY(!QApplication::activeModalWidget());
+
+    // A selected heading: Add Review Card offers the section, or only the selection.
+    QString onlyFirst, onlySecond;
+    whenModal([&](QWidget *modal) {
+        onlyFirst = labelsOf(modal);
+        auto *onlySelection = modal->findChild<QPushButton *>(QStringLiteral("ManualReviewOnlySelection"));
+        QVERIFY(onlySelection);
+        whenModal([&](QWidget *plain) {
+            onlySecond = labelsOf(plain);
+            qobject_cast<QDialog *>(plain)->reject();
+        });
+        onlySelection->click();
+    });
+    QVERIFY(QMetaObject::invokeMethod(part, "requestManualReviewCard", Qt::DirectConnection, Q_ARG(QString, pdfPath), Q_ARG(int, 1), Q_ARG(QVariantList, heading), Q_ARG(bool, true)));
+    QTRY_VERIFY(!onlySecond.isEmpty());
+    QVERIFY2(onlyFirst.contains(QStringLiteral("Hides section 2 “Method”")), qPrintable(onlyFirst));
+    QVERIFY2(onlySecond.contains(QStringLiteral("Enter the question to show while the selected area is hidden.")), qPrintable(onlySecond));
+    QCOMPARE(store.cards().size(), 1);
+
+    // Selected text that is no heading: the ordinary dialog.
+    QString plainOnly;
+    whenModal([&](QWidget *modal) {
+        plainOnly = labelsOf(modal);
+        qobject_cast<QDialog *>(modal)->reject();
+    });
+    const QVariantList text{55.0 / 595, 150.0 / 842, 400.0 / 595, 164.0 / 842};
+    QVERIFY(QMetaObject::invokeMethod(part, "requestManualReviewCard", Qt::DirectConnection, Q_ARG(QString, pdfPath), Q_ARG(int, 1), Q_ARG(QVariantList, text), Q_ARG(bool, true)));
+    QTRY_VERIFY(!plainOnly.isEmpty());
+    QVERIFY2(!plainOnly.contains(QStringLiteral("Hides")), qPrintable(plainOnly));
+    QVERIFY(!QApplication::activeModalWidget());
 }
 
 void MainShellTest::testReviewBrowseMergesCards()
@@ -13424,6 +13575,172 @@ void MainShellTest::testReviewPresentationWaitsForTheRebuiltPdfsPlaces()
 // The picture of a passage: one scale for every passage of a document (its text column across the
 // panel, raised for small text), cropped to the passage's width and to whole lines, with no part
 // of another line; tinted; pages one below the other.
+// Knowledge cards and project cards in the Review window (review-card-kinds.md §5, §7): two
+// Library-wide entries with their own counts, a Projects entry narrowed to one Project, the card
+// menu's kind entries, the project card's line, its History and the card browser.
+void MainShellTest::testReviewCardKinds()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString pdfPath = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    QFile pdf(pdfPath);
+    QVERIFY(pdf.open(QIODevice::ReadOnly));
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+    const QString studied = QStringLiteral("00000000-0000-4000-8000-0000000000c1");
+    const QString madeAs = QStringLiteral("00000000-0000-4000-8000-0000000000c2");
+    const QString swapped = QStringLiteral("00000000-0000-4000-8000-0000000000c3");
+    const auto writeTestFile = [](const QString &path, const QJsonObject &object) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        const QByteArray data = QJsonDocument(object).toJson(QJsonDocument::Compact);
+        return file.open(QIODevice::WriteOnly) && file.write(data) == data.size();
+    };
+    for (const QString &cardId : {studied, madeAs, swapped}) {
+        const QJsonObject primary{{QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page"), 1},
+                                  {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}}, {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('a'))},
+                                  {QStringLiteral("question"), QStringLiteral("Question %1?").arg(cardId.right(1))},
+                                  {QStringLiteral("document_id"), QStringLiteral("doc-file1")}};
+        QJsonObject card{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                         {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("primary"), primary}};
+        if (cardId == madeAs) card.insert(QStringLiteral("review_kind"), QStringLiteral("project"));
+        QVERIFY(writeTestFile(QDir(temporary.path()).filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)), card));
+    }
+    QVERIFY(writeTestFile(QDir(temporary.path()).filePath(QStringLiteral("reviews/events/test/kind.json")),
+                          {{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), QStringLiteral("00000000-0000-4000-8000-0000000000d1")},
+                           {QStringLiteral("card_id"), swapped}, {QStringLiteral("queue_action"), QStringLiteral("set_review_kind")},
+                           {QStringLiteral("review_kind"), QStringLiteral("project")}, {QStringLiteral("reviewed_at"), QStringLiteral("2026-11-10T10:00:00Z")},
+                           {QStringLiteral("origin_id"), QStringLiteral("test")}}));
+    // A knowledge Project holds the document.
+    QVERIFY(writeTestFile(QDir(temporary.path()).filePath(QStringLiteral(".thoughts/library-projects.json")),
+                          {{QStringLiteral("projects"), QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("project-a")}, {QStringLiteral("name"), QStringLiteral("Project A")},
+                                                                               {QStringLiteral("revision"), 2}, {QStringLiteral("target"), QString()}, {QStringLiteral("review_kind"), QStringLiteral("knowledge")},
+                                                                               {QStringLiteral("documents"), QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("file1.pdf")},
+                                                                                                                                  {QStringLiteral("filename"), QStringLiteral("file1.pdf")},
+                                                                                                                                  {QStringLiteral("document_id"), QStringLiteral("doc-file1")}}}},
+                                                                               {QStringLiteral("unpublished_documents"), QJsonArray{}}}}},
+                           {QStringLiteral("pending"), QJsonArray{}}}));
+    const QVariantMap document{{QStringLiteral("pdf_path"), pdfPath}, {QStringLiteral("pdf_stem"), QStringLiteral("file1")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1}};
+    QWidget reviewHost;
+    reviewHost.resize(1000, 700);
+    reviewHost.show();
+    Thoughts::ReviewOverview overview(
+        temporary.path(), [document] { return document; }, [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {}, nullptr, {}, {},
+        [&reviewHost] { return &reviewHost; });
+    QTRY_VERIFY(queueRefreshed(overview));
+    // Two entries, each with its own count; the Projects entry lists the Projects with project cards.
+    QCOMPARE(overview.m_startButton->text(), QStringLiteral("Study · 1 due"));
+    QVERIFY(overview.m_startButton->isEnabled());
+    QVERIFY(!overview.m_startProjectsButton->isHidden());
+    QCOMPARE(overview.m_startProjectsButton->text(), QStringLiteral("Projects · 2 due"));
+    QVERIFY(overview.m_startProjectsButton->isEnabled());
+    QCOMPARE(overview.m_projectEntryIds, QStringList{QStringLiteral("project-a")});
+    overview.fillProjectsMenu();
+    QStringList entries;
+    for (QAction *action : overview.m_projectsMenu->actions())
+        if (!action->isSeparator()) entries.append(action->text());
+    QCOMPARE(entries, (QStringList{QStringLiteral("All Projects · 2 due"), QStringLiteral("Project A · 2 due")}));
+
+    // Study offers the knowledge cards only.
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QCOMPARE(overview.m_dueCards.constFirst().id(), studied);
+    QVERIFY(overview.m_cardKindLine->isHidden());
+    QVERIFY(!overview.m_startProjectsButton->isEnabled());
+    overview.showReviewLanding();
+    // Projects of one Project: its project cards, each marked.
+    overview.m_projectsMenu->findChild<QAction *>(QStringLiteral("reviewProjectsProjectAction"))->trigger();
+    QCOMPARE(overview.m_dueCards.size(), 2);
+    for (const auto &card : std::as_const(overview.m_dueCards)) QVERIFY(card.isProjectCard());
+    QVERIFY(!overview.m_cardKindLine->isHidden());
+    QCOMPARE(overview.m_cardKindLine->text(), QStringLiteral("Project card"));
+    // The card menu: Make knowledge card, and Follow the Project (Knowledge) for a card with its own kind.
+    auto *menu = overview.m_cardMenuButton->menu();
+    const auto action = [menu](const char *name) { return menu->findChild<QAction *>(QString::fromLatin1(name)); };
+    overview.updateCardMenu();
+    QCOMPARE(action("reviewKindAction")->text(), QStringLiteral("Make knowledge card"));
+    QVERIFY(action("reviewFollowProjectAction")->isVisible());
+    QCOMPARE(action("reviewFollowProjectAction")->text(), QStringLiteral("Follow the Project (Knowledge)"));
+    QCOMPARE(menu->actions().indexOf(action("reviewRetireAction")) + 1, menu->actions().indexOf(action("reviewDeleteAction")));
+    const QString shownId = overview.m_dueCards.at(overview.m_currentReview).id();
+    QSignalSpy recorded(&overview, &Thoughts::ReviewOverview::reviewRecorded);
+    action("reviewFollowProjectAction")->trigger();
+    QCOMPARE(recorded.count(), 1);
+    QVERIFY(overview.m_cardKindLine->isHidden()); // it follows its knowledge Project now
+    const auto cardOf = [&temporary](const QString &id) {
+        const auto cards = Thoughts::ReviewStore(temporary.path()).cards();
+        return *std::find_if(cards.cbegin(), cards.cend(), [&id](const Thoughts::ReviewCard &card) { return card.id() == id; });
+    };
+    QCOMPARE(cardOf(shownId).reviewKind, QStringLiteral("knowledge"));
+    QCOMPARE(cardOf(shownId).reviewKindSource, QStringLiteral("project"));
+    overview.updateCardMenu();
+    QCOMPARE(action("reviewKindAction")->text(), QStringLiteral("Make project card"));
+    QVERIFY(!action("reviewFollowProjectAction")->isVisible());
+    action("reviewKindAction")->trigger();
+    QCOMPARE(cardOf(shownId).reviewKind, QStringLiteral("project"));
+    QCOMPARE(cardOf(shownId).reviewKindSource, QStringLiteral("card"));
+    overview.showReviewLanding();
+
+    // A document's review and Review now keep every card, whatever its kind.
+    overview.m_documentFilter->setCurrentIndex(overview.m_documentFilter->findData(QStringLiteral("file1")));
+    QCOMPARE(overview.m_startButton->text(), QStringLiteral("Start Review"));
+    QVERIFY(overview.m_startProjectsButton->isHidden());
+    overview.startReview();
+    QCOMPARE(overview.m_dueCards.size(), 3);
+    overview.showReviewLanding();
+    overview.m_documentFilter->setCurrentIndex(0);
+    overview.reviewCard(madeAs);
+    QCOMPARE(overview.m_dueCards.size(), 1);
+    QVERIFY(overview.m_dueCards.constFirst().isProjectCard());
+    overview.showReviewLanding();
+
+    // The reader's Cards list reads the kind from the sidebar schedule.
+    const QJsonObject schedule = Thoughts::sidebarReviewSchedule(cardOf(madeAs), true);
+    QCOMPARE(schedule.value(QStringLiteral("review_kind")).toString(), QStringLiteral("project"));
+    QCOMPARE(schedule.value(QStringLiteral("review_kind_source")).toString(), QStringLiteral("card"));
+    QCOMPARE(schedule.value(QStringLiteral("projects_kind")).toString(), QStringLiteral("knowledge"));
+    QVERIFY(!schedule.contains(QStringLiteral("passage_changed")));
+
+    // The card browser: the mark, the details, and the kind entries in Actions and the context menu.
+    // The other project card of the session (one has a kind event, the other its record's kind).
+    const QString other = shownId == madeAs ? swapped : madeAs;
+    Thoughts::ReviewCardsWidget browser(temporary.path(), {}, {});
+    QTRY_VERIFY(browser.m_loadedAt.isValid());
+    QCOMPARE(browser.activeProjectCardCount(QStringLiteral("project-a")), 2);
+    // History lists the kind events.
+    browser.selectCard(shownId);
+    QTRY_VERIFY(browser.selectedBrowseCard() && browser.selectedBrowseCard()->card.id() == shownId);
+    browser.refreshBrowseHistory(browser.selectedBrowseCard());
+    QVERIFY2(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Follows the Project's kind · ")), qPrintable(browser.m_browseHistory->toPlainText()));
+    QVERIFY2(browser.m_browseHistory->toPlainText().contains(QStringLiteral("Made a project card · ")), qPrintable(browser.m_browseHistory->toPlainText()));
+    browser.selectCard(other);
+    QTRY_VERIFY(browser.selectedBrowseCard() && browser.selectedBrowseCard()->card.id() == other);
+    QCOMPARE(browser.m_browseKindAction->text(), QStringLiteral("Make knowledge card"));
+    QVERIFY(browser.m_browseFollowAction->isVisible());
+    const auto browseActions = browser.m_browseActionsButton->menu()->actions();
+    QCOMPARE(browseActions.indexOf(browser.m_browseRetireAction) + 1, browseActions.indexOf(browser.m_browseDeleteAction));
+    QVERIFY2(browser.m_browseDetails->toPlainText().contains(QStringLiteral("Project card, chosen for this card")), qPrintable(browser.m_browseDetails->toPlainText()));
+    QTreeWidgetItem *row = nullptr;
+    for (int index = 0; index < browser.m_browseTable->topLevelItemCount(); ++index)
+        if (browser.m_browseTable->topLevelItem(index)->data(0, Qt::UserRole).toString() == other) row = browser.m_browseTable->topLevelItem(index);
+    QVERIFY(row);
+    QVERIFY2(row->text(1).endsWith(QStringLiteral(" · Project")), qPrintable(row->text(1)));
+    QMenu context;
+    browser.populateBrowseContextMenu(&context);
+    QAction *contextKind = context.findChild<QAction *>(QStringLiteral("reviewBrowseContextKindAction"));
+    QVERIFY(contextKind);
+    QCOMPARE(contextKind->text(), QStringLiteral("Make knowledge card"));
+    QVERIFY(context.findChild<QAction *>(QStringLiteral("reviewBrowseContextFollowProjectAction")));
+    browser.m_browseKindAction->trigger();
+    QTRY_COMPARE(cardOf(other).reviewKind, QStringLiteral("knowledge"));
+    QTRY_VERIFY(!browser.m_mutating);
+    // Retire project cards… of the Project: its active project cards only.
+    QString error;
+    QVERIFY2(browser.retireProjectCards(QStringLiteral("project-a"), &error), qPrintable(error));
+    QVERIFY(cardOf(shownId).schedule.retired);
+    QVERIFY(!cardOf(other).schedule.retired);
+    QVERIFY(!cardOf(studied).schedule.retired);
+}
+
 void MainShellTest::testReviewRetireCard()
 {
     QTemporaryDir temporary;
@@ -14031,16 +14348,9 @@ void MainShellTest::testReviewCardMenu()
     QCOMPARE(doubled.unit, Thoughts::ReviewInterval::Weeks);
     QVERIFY(qAbs(doubled.amount - 5) < .000001);
     overview.previousQuestion();
-    QTimer::singleShot(0, &overview, [&] {
-        auto *dialog = overview.m_sessionPage->findChild<QDialog *>(QStringLiteral("reviewNoteDialog"));
-        QVERIFY(dialog);
-        dialog->findChild<QPlainTextEdit *>()->setPlainText(QStringLiteral("A card note"));
-        dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
-    });
-    action("reviewNoteAction")->trigger();
-    QCOMPARE(store.cards().constFirst().record.value(QStringLiteral("note")).toString(), QStringLiteral("A card note"));
-    QVERIFY(overview.m_noteButton->isVisible());
-    QCOMPARE(action("reviewNoteAction")->text(), QStringLiteral("Edit note"));
+    // Cards have no separate note any more: the card menu offers none and the session shows none.
+    QVERIFY(!overview.m_cardMenuButton->menu()->findChild<QAction *>(QStringLiteral("reviewNoteAction")));
+    QVERIFY(!overview.m_sessionPage->findChild<QToolButton *>(QStringLiteral("reviewNoteButton")));
     const auto beforeSkip = store.cards().constFirst().schedule;
     const auto tagsBeforeSkip = store.cards().constFirst().currentTags();
     // Skip postpones by 10 minutes by default without answering: the tags stay.

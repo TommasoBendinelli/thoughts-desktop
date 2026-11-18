@@ -339,6 +339,8 @@ public:
     static QString change(const QString &root, const QJsonObject &project, const QString &action, const QJsonObject &values) {
         // A source folder's display name lives in the Library record, not in the manifest.
         if (action == QLatin1String("rename_source")) return {};
+        // A Project's review card kind lives in its Library record too (review-card-kinds.md §2.3).
+        if (action == QLatin1String("set_review_kind")) return {};
         const auto filename = path(root, project.value(QStringLiteral("id")).toString());
         if (!QFileInfo::exists(filename)) return QStringLiteral("The current Project manifest is missing. Sync before editing this Project.");
         QString error; auto value = read(filename, &error);

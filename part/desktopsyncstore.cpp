@@ -1828,6 +1828,52 @@ QHash<QString, DesktopVerifiedObject> DesktopSyncStore::verifiedObjects(QString 
     return result;
 }
 
+QHash<QString, DesktopVerifiedObject> DesktopSyncStore::verifiedObjects(const QStringList &sha256s, QString *error) const
+{
+    clearError(error);
+    QHash<QString, DesktopVerifiedObject> result;
+    QSqlDatabase database = databaseFor(m_connectionName);
+    if (!database.isValid() || !database.isOpen()) {
+        fail(error, QStringLiteral("desktop synchronization store is not open"));
+        return result;
+    }
+    QStringList wanted;
+    QSet<QString> seen;
+    for (const QString &sha256 : sha256s) {
+        if (validSha256(sha256) && !seen.contains(sha256)) {
+            seen.insert(sha256);
+            wanted.append(sha256);
+        }
+    }
+    constexpr qsizetype chunk = 500;
+    for (qsizetype start = 0; start < wanted.size(); start += chunk) {
+        const QStringList part = wanted.mid(start, chunk);
+        QStringList marks;
+        marks.fill(QStringLiteral("?"), part.size());
+        QSqlQuery query(database);
+        query.setForwardOnly(true);
+        query.prepare(QStringLiteral("SELECT sha256, size_bytes, kind, semantic_role, owning_publication, verified_at_ms, metadata_json "
+                                     "FROM desktop_verified_objects WHERE sha256 IN (%1)").arg(marks.join(QLatin1Char(','))));
+        for (const QString &sha256 : part) query.addBindValue(sha256);
+        if (!query.exec()) {
+            fail(error, query.lastError().text());
+            return {};
+        }
+        while (query.next()) {
+            DesktopVerifiedObject object;
+            object.sha256 = query.value(0).toString();
+            object.sizeBytes = query.value(1).toLongLong();
+            object.kind = query.value(2).toString();
+            object.semanticRole = query.value(3).toString();
+            object.owningPublication = query.value(4).toString();
+            object.verifiedAtMs = query.value(5).toLongLong();
+            object.metadata = parsedObject(query.value(6));
+            result.insert(object.sha256, object);
+        }
+    }
+    return result;
+}
+
 std::optional<DesktopVerifiedObject> DesktopSyncStore::verifiedObject(const QString &sha256, QString *error) const
 {
     clearError(error);

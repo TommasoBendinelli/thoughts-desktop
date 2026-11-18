@@ -43,3 +43,37 @@ def test_the_note_is_rewritten_as_generated_only_when_it_changed(tmp_path):
     assert text.endswith("\n\n" + page)
     assert not build.write_note(note, page + "\n")  # the same page: nothing written, no Sync needed
     assert [path.name for path in tmp_path.iterdir()] == ["mental-model.md"]  # no temporary file left
+
+
+def test_project_cards_are_listed_apart(tmp_path, monkeypatch):
+    """Project cards describe work in progress, not what the user knows: they come under their own heading."""
+    def card(card_id, question, kind=None):
+        listed = {"card_id": card_id, "question": question, "project": "Project A", "document": {"name": "Notes"},
+                  "history": [], "status": "scheduled", "due_at": "2026-11-20T09:00:00.000Z"}
+        if kind:
+            listed["review_kind"] = kind
+        return listed
+
+    cards = [card("11111111-0000-4000-8000-000000000001", "What does the notation mean?", "knowledge"),
+             card("22222222-0000-4000-8000-000000000002", "Is the draft's second section done?", "project"),
+             card("33333333-0000-4000-8000-000000000003", "A card from before kinds?")]
+    knowledge, projects = build.by_kind(cards)
+    assert [c["card_id"][:8] for c in knowledge] == ["11111111", "33333333"]
+    assert [c["card_id"][:8] for c in projects] == ["22222222"]
+
+    request = tmp_path / "request.md"
+    monkeypatch.setattr(build, "args", type("Args", (), {"out": tmp_path / "mental-model.md", "request": request})(), raising=False)
+    monkeypatch.setattr(build, "note_data", lambda since: (0, "", []))
+    monkeypatch.setattr(build, "feedback_data", lambda since, images, first: (0, "", []))
+    since = build.when("2026-01-01T00:00:00Z")
+    assert build.write_page(cards, [], since, 3) is None
+    text = request.read_text()
+    reviews, rest = text.split("# Review cards", 1)[1].split(build.PROJECT_HEADING, 1)
+    assert "[[11111111]]" in reviews and "[[33333333]]" in reviews and "[[22222222]]" not in reviews
+    project_part = rest.split("# Feedback on documents", 1)[0]
+    assert "work in progress, not what the user knows" in build.PROJECT_HEADING
+    assert "[[22222222]]" in project_part and "The 1 project cards" in project_part
+
+    # Without project cards the input has no such heading.
+    build.write_page(knowledge, [], since, 3)
+    assert build.PROJECT_HEADING not in request.read_text()

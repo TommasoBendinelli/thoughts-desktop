@@ -63,6 +63,7 @@
 #include <QHideEvent>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QDomElement>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
@@ -2292,6 +2293,78 @@ QString PageView::createPdfLinkAnchorForSelection(const QString &anchorName)
         return error;
     }
     return QString();
+}
+
+QRectF PageView::sectionHeadingLineAt(const PageViewItem *item, const QPointF &eventPos) const
+{
+    if (!item || !item->page()) return {};
+    const Okular::Page *page = item->page();
+    if (!page->hasTextPage()) d->document->requestTextPage(item->pageNumber());
+    if (!page->hasTextPage()) return {};
+    const double x = item->absToPageX(eventPos.x()), y = item->absToPageY(eventPos.y());
+    const Okular::TextEntity::List words = page->words(nullptr, Okular::TextPage::CentralPixelTextAreaInclusionBehaviour);
+    int clicked = -1;
+    QList<double> pageHeights;
+    for (int i = 0; i < words.size(); ++i) {
+        const Okular::NormalizedRect area = words[i].area();
+        if (words[i].text().trimmed().isEmpty()) continue;
+        pageHeights.append(area.bottom - area.top);
+        if (clicked < 0 && x >= area.left - 0.003 && x <= area.right + 0.003 && y >= area.top && y <= area.bottom) clicked = i;
+    }
+    if (clicked < 0) return {};
+    // The clicked word's line, as far as its words follow each other closely (one column).
+    const Okular::NormalizedRect at = words[clicked].area();
+    QList<int> band;
+    for (int i = 0; i < words.size(); ++i) {
+        const Okular::NormalizedRect area = words[i].area();
+        const double centre = (area.top + area.bottom) / 2;
+        if (!words[i].text().trimmed().isEmpty() && centre >= at.top && centre <= at.bottom) band.append(i);
+    }
+    std::sort(band.begin(), band.end(), [&words](int a, int b) { return words[a].area().left < words[b].area().left; });
+    int first = int(band.indexOf(clicked)), last = first;
+    while (first > 0 && words[band[first]].area().left - words[band[first - 1]].area().right < 0.03) --first;
+    while (last + 1 < band.size() && words[band[last + 1]].area().left - words[band[last]].area().right < 0.03) ++last;
+    QRectF line;
+    QStringList text;
+    QList<double> lineHeights;
+    for (int k = first; k <= last; ++k) {
+        const Okular::NormalizedRect area = words[band[k]].area();
+        line |= QRectF(QPointF(area.left, area.top), QPointF(area.right, area.bottom));
+        text.append(words[band[k]].text().simplified());
+        lineHeights.append(area.bottom - area.top);
+    }
+    const QString lineText = text.join(QLatin1Char(' ')).simplified();
+    const int wordCount = int(lineText.split(QLatin1Char(' '), Qt::SkipEmptyParts).size());
+    if (!wordCount || wordCount > 15 || lineText.endsWith(QLatin1Char(',')) || lineText.endsWith(QLatin1Char(';'))) return {};
+    const auto median = [](QList<double> values) {
+        std::sort(values.begin(), values.end());
+        return values.isEmpty() ? 0.0 : values.at(values.size() / 2);
+    };
+    const bool larger = median(lineHeights) >= 1.08 * median(pageHeights);
+    static const QRegularExpression numbered(QStringLiteral(R"(^(\d+(\.\d+)*\.?|[A-Z](\.\d+)+\.?|[A-Z]\.|[IVXLC]+\.)\s+\p{Lu})"));
+    bool outlined = false;
+    if (!larger && !numbered.match(lineText).hasMatch()) {
+        const auto letters = [](const QString &value) {
+            QString folded;
+            for (const QChar c : value) if (c.isLetterOrNumber()) folded += c.toCaseFolded();
+            return folded;
+        };
+        const QString shown = letters(lineText);
+        std::function<bool(const QDomNode &)> names = [&](const QDomNode &parent) {
+            for (QDomNode node = parent.firstChild(); !node.isNull(); node = node.nextSibling()) {
+                const QDomElement element = node.toElement();
+                if (element.isNull()) continue;
+                const QString title = letters(element.tagName());
+                const Okular::DocumentViewport viewport(element.attribute(QStringLiteral("Viewport")));
+                if (title.size() >= 3 && (shown.contains(title) || title.contains(shown)) && (!viewport.isValid() || viewport.pageNumber == item->pageNumber())) return true;
+                if (names(element)) return true;
+            }
+            return false;
+        };
+        if (const Okular::DocumentSynopsis *synopsis = d->document->documentSynopsis()) outlined = shown.size() >= 3 && names(*synopsis);
+        if (!outlined) return {};
+    }
+    return line;
 }
 
 bool PageView::isPdfLinkAnchorDocument(QString *paperKey) const
@@ -7560,6 +7633,8 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
 
                 QAction *addPopupNoteAction = nullptr;
                 QAction *addFeedbackAction = nullptr;
+                QAction *addSectionCardAction = nullptr;
+                QRectF sectionHeading;
                 if (!menu) {
                     menu = new QMenu(this);
                     // A comment stays on every version of the PDF; feedback (here a text box at the
@@ -7571,6 +7646,21 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                         addFeedbackAction = menu->addAction(QIcon::fromTheme(QStringLiteral("draw-text")), i18n("Add Feedback"));
                         addFeedbackAction->setObjectName(QStringLiteral("AddFeedbackTextBox"));
                     }
+                    // A section heading of a Library PDF: a card that hides the whole section.
+                    const QUrl documentUrl = d->document->currentDocument();
+                    const QFileInfo documentInfo(documentUrl.toLocalFile());
+                    const QFileInfo currentPdfs(QDir(d->docsRoot).filePath(QStringLiteral("current_pdfs")));
+                    const QFileInfo documentDirectory(documentInfo.absolutePath());
+                    const bool libraryPdf = !d->docsRoot.isEmpty() && documentUrl.isLocalFile() && documentInfo.suffix().compare(QLatin1String("pdf"), Qt::CaseInsensitive) == 0
+                        && (documentDirectory.canonicalFilePath().isEmpty() ? documentDirectory.absoluteFilePath() : documentDirectory.canonicalFilePath())
+                            == (currentPdfs.canonicalFilePath().isEmpty() ? currentPdfs.absoluteFilePath() : currentPdfs.canonicalFilePath());
+                    if (libraryPdf && !hiddenAnswerArea().contains(QPointF(eventPos))) sectionHeading = sectionHeadingLineAt(item, eventPos);
+                    if (!sectionHeading.isEmpty()) {
+                        menu->addSeparator();
+                        addSectionCardAction = menu->addAction(QIcon::fromTheme(QStringLiteral("bookmark-new")), i18n("Add Review Card for This Section…"));
+                        addSectionCardAction->setObjectName(QStringLiteral("AddSectionReviewCard"));
+                        addSectionCardAction->setToolTip(i18n("The card hides the section's text below this heading, up to the next heading of the same or a higher level."));
+                    }
                 }
 
                 if (menu) {
@@ -7581,6 +7671,9 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                         addPopupNote(item, eventPos);
                     } else if (choice && choice == addFeedbackAction) {
                         addTextBoxAt(eventPos);
+                    } else if (choice && choice == addSectionCardAction) {
+                        Q_EMIT sectionReviewCardRequested(QFileInfo(d->document->currentDocument().toLocalFile()).absoluteFilePath(), item->pageNumber() + 1,
+                                                          {sectionHeading.left(), sectionHeading.top(), sectionHeading.right(), sectionHeading.bottom()});
                     }
                     menu->deleteLater();
                 }

@@ -608,18 +608,23 @@ async def create_review_card(
     question: Annotated[str, Field(min_length=1, max_length=500)],
     due_at: Annotated[str, Field(description="First review time as ISO 8601 with a timezone, for example 2026-10-01T09:00:00+02:00.")],
     request_id: RequestId,
+    kind: Annotated[Literal["knowledge", "project"] | None, Field(description="knowledge: material the user studies (spaced repetition). project: about work the user is writing or building; it comes back at least once a week and at once when its passage changes. Leave it out to follow the card's Project (knowledge unless the Project is set to project cards).")] = None,
 ) -> CallToolResult:
     """Create an approved local card and its source markers together from an explicit selection.
 
     Requires a source registered to exactly one Library document and complete visible blocks.
     The card appears immediately with its saved due time and verified source link.
     PDF placement remains pending until an explicitly requested Sync and successful build.
+    The answer's review_kind says which kind the card has (knowledge or project) and review_kind_source
+    where that comes from (card: the kind given here; project: its Project's; default: no Project holds it).
     Does not start Sync, publish sources, rebuild PDFs, or change the answer text.
     Retry an uncertain call only with identical arguments and the same request_id.
     """
-    result = tool_result(await command("create-review-card", payload=dict(
-        source=source, expected_source_sha256=expected_source_sha256, start_line=start_line,
-        end_line=end_line, question=question, due_at=due_at, request_id=request_id)))
+    payload = dict(source=source, expected_source_sha256=expected_source_sha256, start_line=start_line,
+                   end_line=end_line, question=question, due_at=due_at, request_id=request_id)
+    if kind is not None:
+        payload["kind"] = kind
+    result = tool_result(await command("create-review-card", payload=payload))
     # The new card and its Project (the Project alone if the card cannot be found).
     card = card_target((result.structuredContent or {}).get("card_id"))
     return linked(result, "create_review_card", card or {"source": source}, fallback={"source": source} if card else None)
@@ -857,10 +862,14 @@ async def list_review_cards(
     document: Annotated[str | None, Field(description="Exact Library PDF filename to inspect.")] = None,
     start_line: LineBoundary | None = None,
     end_line: LineBoundary | None = None,
+    kind: Annotated[Literal["knowledge", "project"] | None, Field(description="Only cards of this kind.")] = None,
 ) -> CallToolResult:
     """Inspect saved cards, due times, marks, source links and PDF placement.
 
     A retired card (taken out of review, history kept) also has retired: true and retired_at.
+    Each card has review_kind (knowledge: material the user studies; project: about work in progress) and
+    review_kind_source (card, project or default); a project card also has passage_changed (its passage
+    changed since its latest answer, so it is due now), and its due_at is at most a week after its latest answer.
 
     Supply a source path or document filename.
     Optionally supply both one-based start and exclusive end lines to find cards overlapping a source selection.
@@ -877,7 +886,7 @@ async def list_review_cards(
         raise ValueError("Provide a source file or Library PDF filename.")
     if (start_line is None) != (end_line is None) or (start_line is not None and (not source or end_line <= start_line)):
         raise ValueError("A source range needs a source, start line, and greater exclusive end line.")
-    payload = {k: v for k, v in dict(source=source, document=document, start_line=start_line, end_line=end_line).items() if v is not None}
+    payload = {k: v for k, v in dict(source=source, document=document, start_line=start_line, end_line=end_line, kind=kind).items() if v is not None}
     return tool_result(await command("list-review-cards", payload=payload))
 
 
@@ -972,6 +981,7 @@ async def search_review_cards(
     include_answer: Annotated[bool, Field(description="Include an answer excerpt of at most 600 characters: the source text between the card's markers, else its PDF text.")] = True,
     include_history: Annotated[bool, Field(description="Include each answer still in effect, newest first: time, tags, group notes and interval.")] = True,
     include_deleted: Annotated[bool | None, Field(description="Also list answer feedback the user deleted, with deleted: true and deleted_at (for studies of the feedback; off by default).")] = None,
+    kind: Annotated[Literal["knowledge", "project"] | None, Field(description="Only knowledge cards (material the user studies) or only project cards (about work the user is writing or building).")] = None,
 ) -> CallToolResult:
     """Find the user's review cards (read-only), with what they answered and when.
 
@@ -980,6 +990,9 @@ async def search_review_cards(
     due_at (null for never and retired), retired_at (only for retired cards), overdue_days, interval_days, review_count,
     lapse_count, wrong_count, last_reviewed_at, answer, history and feedback. A retired card was taken out of review by
     the user but keeps its history and schedule; it is never due. Deleted cards are never returned.
+    review_kind is knowledge or project, review_kind_source card (chosen for the card), project (its Project's) or default.
+    A project card describes work in progress, not what the user knows: it comes back at most a week after its latest
+    answer (its due_at says when), and passage_changed says its passage changed since that answer (it is due now).
     tag_groups lists the user's tag groups.
     feedback lists the passages of the card's answer the user marked during reviews, in created_at order (an empty
     list when there are none): feedback_id, polarity ("positive" = liked, "negative" = disliked), quote (the exact
@@ -993,7 +1006,7 @@ async def search_review_cards(
     """
     payload = {k: v for k, v in dict(query=query, tags=tags, tag_groups=tag_groups, project=project, document=document, state=state,
                                      sort=sort, limit=limit, include_answer=include_answer, include_history=include_history,
-                                     include_deleted=include_deleted).items() if v is not None}
+                                     include_deleted=include_deleted, kind=kind).items() if v is not None}
     return tool_result(await knowledge_command("search-review-cards", payload))
 
 
@@ -1019,6 +1032,9 @@ async def knowledge_profile(
     When fewer than 3 cards match (or with learner), learner describes all of the user's cards: counts per
     class, the documents studied most with their mix and typical interest, the groups' typical tags,
     questions they know well and struggle with, and their latest liked and disliked answer passages.
+    Only knowledge cards are classified. Project cards (about work the user is writing or building) say nothing about
+    what the user knows: when some match, they are listed apart under project_cards (count, and the first 20 with
+    card_id, question, document and project) with one summary line, and the learner overview leaves them out.
     Call it once per topic before explaining or editing, then calibrate; never change cards because of it.
     """
     payload = {k: v for k, v in dict(topic=topic, project=project, document=document, limit=limit, learner=learner).items() if v is not None}

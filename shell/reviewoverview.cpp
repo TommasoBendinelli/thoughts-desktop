@@ -2636,6 +2636,34 @@ QString deleteCardQuestion()
                 "Retire card instead stops reviewing it and keeps its history; it can be restored to review later.");
 }
 
+// "Changed since you last saw it": a project card whose passage changed since its latest answer.
+QString passageChangedText()
+{
+    return i18n("Changed since you last saw it");
+}
+
+// What a card's kind is and where it comes from (review-card-kinds.md §3, §5).
+QString cardKindText(const ReviewCard &card)
+{
+    if (card.reviewKindSource == ReviewKinds::sourceCard())
+        return card.isProjectCard() ? i18n("Project card, chosen for this card") : i18n("Knowledge card, chosen for this card");
+    if (card.reviewKindSource == ReviewKinds::sourceProject())
+        return card.isProjectCard() ? i18n("Project card, as its Project") : i18n("Knowledge card, as its Project");
+    return card.isProjectCard() ? i18n("Project card") : i18n("Knowledge card");
+}
+
+// The card menu's kind entries (review-card-kinds.md §5), as {label, kind}: Make project card or
+// Make knowledge card, then Follow the Project when the card has a kind of its own and a Project holds it.
+QList<QPair<QString, QString>> cardKindChoices(const ReviewCard &card)
+{
+    QList<QPair<QString, QString>> choices{card.isProjectCard() ? qMakePair(i18n("Make knowledge card"), ReviewKinds::knowledge())
+                                                                : qMakePair(i18n("Make project card"), ReviewKinds::project())};
+    if (card.reviewKindSource == ReviewKinds::sourceCard() && !card.kindProjectIds.isEmpty())
+        choices.append({card.projectsKind == ReviewKinds::project() ? i18n("Follow the Project (Project)") : i18n("Follow the Project (Knowledge)"),
+                        ReviewKinds::followProject()});
+    return choices;
+}
+
 QString browserDueText(const ReviewBrowserCard &item)
 {
     if (item.card.schedule.retired) return i18n("Retired");
@@ -2715,6 +2743,12 @@ QList<HistoryEntry> reviewHistoryEntries(const ReviewCard &card, const QList<Rev
                  && event.value(QStringLiteral("retracted_event_id")).toString().isEmpty() && !rating.isEmpty() && rating != QLatin1String("delete"))
             mark = i18n("Not rated");
         else if (action == QLatin1String("undo_skip")) mark = i18n("Undo Skip");
+        else if (action == ReviewKinds::action()) {
+            const QString kind = event.value(ReviewKinds::field()).toString();
+            mark = kind == ReviewKinds::project() ? i18n("Made a project card")
+                : kind == ReviewKinds::knowledge() ? i18n("Made a knowledge card")
+                : kind == ReviewKinds::followProject() ? i18n("Follows the Project's kind") : QString();
+        }
         else if (action == ReviewRetire::retireAction()) mark = i18n("Retired");
         else if (action == ReviewRetire::restoreAction()) mark = i18n("Restored to review");
         else if (action == ReviewRetire::undoAction()) mark = i18n("Undo retire");
@@ -3107,7 +3141,6 @@ QString reviewCardPromptText(const QString &docsRoot, const ReviewCard &card, QS
     ReviewCardAgentInput input;
     input.cardId = card.id();
     input.question = card.question();
-    input.note = card.record.value(QStringLiteral("note")).toString();
     input.pdfPath = pdfPath;
     input.documentName = pdfPath.isEmpty() ? QString() : readerDisplayTitle(projects, publications, docsRoot, QUrl::fromLocalFile(pdfPath));
     input.regions = QJsonArray::fromVariantList(card.regions());
@@ -3181,38 +3214,6 @@ QString reviewSourceLocationsText(const QJsonArray &candidates)
     for (auto it = locations.cbegin(); it != locations.cend(); ++it)
         parts.append(i18n("%1 (lines %2)", it.key(), it.value().join(i18n(" and "))));
     return parts.join(QStringLiteral("; "));
-}
-
-bool editCardNote(ReviewStore &store, const ReviewCard &card, QWidget *parent, QString *savedNote = nullptr)
-{
-    QDialog dialog(parent);
-    dialog.setObjectName(QStringLiteral("reviewNoteDialog"));
-    dialog.setWindowTitle(card.record.value(QStringLiteral("note")).toString().isEmpty() ? i18n("Add note") : i18n("Edit note"));
-    dialog.resize(520, 300);
-    auto *layout = new QVBoxLayout(&dialog);
-    auto *note = new QPlainTextEdit(card.record.value(QStringLiteral("note")).toString(), &dialog);
-    layout->addWidget(note);
-    auto *limit = new QLabel(&dialog);
-    layout->addWidget(limit);
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
-    layout->addWidget(buttons);
-    const auto validate = [&] {
-        const auto length = note->toPlainText().trimmed().size();
-        limit->setText(i18n("%1 / 5000 characters", length));
-        buttons->button(QDialogButtonBox::Save)->setEnabled(length <= 5000);
-    };
-    QObject::connect(note, &QPlainTextEdit::textChanged, &dialog, validate);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    validate();
-    if (dialog.exec() != QDialog::Accepted) return false;
-    QString error;
-    if (!store.updateNote(card, note->toPlainText(), &error)) {
-        KMessageBox::error(parent, error, i18n("Could Not Save Note"));
-        return false;
-    }
-    if (savedNote) *savedNote = note->toPlainText().trimmed();
-    return true;
 }
 
 QString cardDetailsHtml(const ReviewBrowserCard &item, const QString &docsRoot, const QStringList &names)
@@ -3292,8 +3293,9 @@ QString cardDetailsHtml(const ReviewBrowserCard &item, const QString &docsRoot, 
            ? field(i18n("State"), i18n("Unpublished") + QLatin1Char('\n')
                        + i18n("Its document is not published in its Project, so the card is not reviewed. Its history and schedule are kept; publish the document again to bring it back."))
            : QString())
-        + (card.record.value(QStringLiteral("note")).toString().isEmpty() ? QString()
-            : field(i18n("Note"), card.record.value(QStringLiteral("note")).toString()))
+        + field(i18n("Kind"), cardKindText(card)
+                                  + (card.isProjectCard() ? QString(QLatin1Char('\n') + i18n("Comes back at least once a week, and at once when its passage changes.")) : QString())
+                                  + (card.isProjectCard() && card.passageChanged ? QString(QLatin1Char('\n') + passageChangedText()) : QString()))
         + field(i18n("Card ID"), card.id())
         + field(i18n("Project"), names.value(0))
         + field(i18n("Document"), names.value(1))
@@ -3323,7 +3325,6 @@ QList<CardExportField> cardExportFields()
         {QStringLiteral("due"), i18n("Due"), true},
         {QStringLiteral("interval"), i18n("Interval"), true},
         {QStringLiteral("created"), i18n("Created"), false},
-        {QStringLiteral("note"), i18n("Note"), true},
         {QStringLiteral("reviews"), i18n("Number of Repetitions"), false},
         {QStringLiteral("lapses"), i18n("Lapses"), false},
         {QStringLiteral("history"), i18n("History"), false},
@@ -3352,7 +3353,6 @@ QJsonValue cardExportValue(const ReviewBrowserCard &item, const QString &key, co
         const QDateTime at = recordDate(card, QStringLiteral("created_at"));
         return at.isValid() ? at.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")) : QString();
     }
-    if (key == QLatin1String("note")) return card.record.value(QStringLiteral("note")).toString();
     if (key == QLatin1String("reviews")) return structured ? QJsonValue(card.schedule.reviewCount) : QJsonValue(QString::number(card.schedule.reviewCount));
     if (key == QLatin1String("lapses")) return structured ? QJsonValue(card.schedule.lapseCount) : QJsonValue(QString::number(card.schedule.lapseCount));
     if (key == QLatin1String("history")) {
@@ -3840,6 +3840,11 @@ QJsonObject sidebarReviewSchedule(const ReviewCard &card, bool active, bool unpu
     if (card.skippedUntil.isValid()) result.insert(QStringLiteral("skipped_until"), utc(card.skippedUntil));
     if (schedule.lastReviewedAt.isValid()) result.insert(QStringLiteral("last_reviewed_at"), utc(schedule.lastReviewedAt));
     if (schedule.retired && schedule.retiredAt.isValid()) result.insert(QStringLiteral("retired_at"), utc(schedule.retiredAt));
+    // Its kind (review-card-kinds.md §5): the Cards list marks project cards and offers the choice.
+    result.insert(QStringLiteral("review_kind"), card.reviewKind);
+    result.insert(QStringLiteral("review_kind_source"), card.reviewKindSource);
+    if (!card.kindProjectIds.isEmpty()) result.insert(QStringLiteral("projects_kind"), card.projectsKind);
+    if (card.isProjectCard() && card.passageChanged) result.insert(QStringLiteral("passage_changed"), true);
     // The interval as the Review tab's Interval column writes it; "every …" only for a length.
     const QString interval = browserIntervalLabel(card);
     if (interval != QStringLiteral("—")) result.insert(QStringLiteral("interval"), interval);
@@ -3993,6 +3998,14 @@ void ReviewCardsWidget::buildUi()
     compactTagsAction->setObjectName(QStringLiteral("reviewBrowseCompactTagsAction"));
     connect(compactTagsAction, &QAction::triggered, this, &ReviewCardsWidget::compactTags);
     actionsMenu->addSeparator();
+    // Knowledge card or project card (review-card-kinds.md §5); the text and kind follow the card.
+    m_browseKindAction = actionsMenu->addAction(i18n("Make project card"));
+    m_browseKindAction->setObjectName(QStringLiteral("reviewBrowseKindAction"));
+    connect(m_browseKindAction, &QAction::triggered, this, [this] { setBrowseCardKind(m_browseKindAction->data().toString()); });
+    m_browseFollowAction = actionsMenu->addAction(i18n("Follow the Project (Knowledge)"));
+    m_browseFollowAction->setObjectName(QStringLiteral("reviewBrowseFollowProjectAction"));
+    m_browseFollowAction->setVisible(false);
+    connect(m_browseFollowAction, &QAction::triggered, this, [this] { setBrowseCardKind(ReviewKinds::followProject()); });
     // Retire keeps the card and its history out of review; on a retired card it restores it.
     m_browseRetireAction = actionsMenu->addAction(i18n("Retire card"));
     m_browseRetireAction->setObjectName(QStringLiteral("reviewBrowseRetireAction"));
@@ -4101,17 +4114,6 @@ void ReviewCardsWidget::buildUi()
     m_browsePlaceAgainButton->setToolTip(i18n("Draw the card's answer areas on the current PDF; Thoughts marks their source text anew."));
     m_browsePlaceAgainButton->hide();
     detailsLayout->addWidget(m_browsePlaceAgainButton);
-    m_browseNoteButton = new QPushButton(i18n("Add note"), detailsWidget);
-    m_browseNoteButton->setObjectName(QStringLiteral("reviewBrowseNoteButton"));
-    detailsLayout->addWidget(m_browseNoteButton);
-    connect(m_browseNoteButton, &QPushButton::clicked, this, [this] {
-        if (m_syncInProgress || !saveBrowseQuestion()) return;
-        const auto *item = selectedBrowseCard();
-        if (!item || m_syncInProgress) return;
-        const ReviewCard card = item->card;
-        ReviewStore store(m_docsRoot, m_projectionProvider);
-        if (editCardNote(store, card, this)) reload();
-    });
 
     m_browseEditorPanel = new QWidget(detailsWidget);
     m_browseEditorPanel->setObjectName(QStringLiteral("reviewBrowseEditorPanel"));
@@ -4511,6 +4513,17 @@ void ReviewCardsWidget::populateBrowseContextMenu(QMenu *menu)
     merge->setObjectName(QStringLiteral("reviewBrowseContextMergeAction"));
     merge->setEnabled(m_browseMergeAction && m_browseMergeAction->isEnabled());
     connect(merge, &QAction::triggered, this, &ReviewCardsWidget::mergeBrowseCards);
+    // The card's kind (review-card-kinds.md §5).
+    if (const auto *item = selectedBrowseCard(); item && selected == 1 && !item->card.schedule.deleted) {
+        menu->addSeparator();
+        for (const auto &[label, kind] : cardKindChoices(item->card)) {
+            QAction *choice = menu->addAction(label);
+            choice->setObjectName(kind == ReviewKinds::followProject() ? QStringLiteral("reviewBrowseContextFollowProjectAction")
+                                                                       : QStringLiteral("reviewBrowseContextKindAction"));
+            choice->setEnabled(!m_mutating);
+            connect(choice, &QAction::triggered, this, [this, kind] { setBrowseCardKind(kind); });
+        }
+    }
 }
 
 QStringList ReviewCardsWidget::browseNames(const ReviewCard &card) const
@@ -4692,6 +4705,8 @@ void ReviewCardsWidget::refreshBrowseTable()
             browserCardStateLabel(item),
             browserCardStatusLabel(item),
             sourceFiles(item.card).join(QLatin1Char(' ')),
+            item.card.isProjectCard() ? i18n("Project card") : QString(),
+            item.card.isProjectCard() && item.card.passageChanged ? passageChangedText() : QString(),
         }.join(QLatin1Char('\n'));
         if (!query.isEmpty() && !searchable.contains(query, Qt::CaseInsensitive)) {
             continue;
@@ -4721,8 +4736,12 @@ void ReviewCardsWidget::refreshBrowseTable()
         const ReviewBrowserCard &item = m_visibleBrowseCards.at(row);
         const auto names = browseNames(item.card);
         const QDateTime createdAt = recordDate(item.card, QStringLiteral("created_at"));
+        // A project card says so after its due time, with the mark of a changed passage.
+        QString due = browserDueText(item);
+        if (item.card.isProjectCard()) due += QStringLiteral(" · ") + i18n("Project");
+        if (item.card.isProjectCard() && item.card.passageChanged) due += QStringLiteral(" · ") + passageChangedText();
         const QStringList values = {
-            item.card.question(), browserDueText(item), names.at(0), names.at(1),
+            item.card.question(), due, names.at(0), names.at(1),
             item.card.pagesLabel(), sourceFiles(item.card).join(QStringLiteral(", ")),
             browserCardStateLabel(item), browserCardStatusLabel(item),
             createdAt.isValid() ? createdAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")) : i18n("Unavailable"),
@@ -4978,12 +4997,20 @@ void ReviewCardsWidget::showBrowseCard(const ReviewBrowserCard *item)
     m_browseState->setVisible(multiple);
     m_browseDetails->setVisible(!multiple);
     m_browseReviewButton->setVisible(!multiple);
-    m_browseNoteButton->setVisible(!multiple);
     m_browseEditButton->setVisible(!multiple);
     m_browseHistoryButton->setVisible(!multiple);
     m_browseDeleteAction->setEnabled(available && !multiple);
     m_browseRetireAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
     m_browseRetireAction->setText(available && item->card.schedule.retired ? i18n("Restore to review") : i18n("Retire card"));
+    {
+        const auto choices = available ? cardKindChoices(item->card) : QList<QPair<QString, QString>>{qMakePair(i18n("Make project card"), ReviewKinds::project())};
+        m_browseKindAction->setText(choices.first().first);
+        m_browseKindAction->setData(choices.first().second);
+        m_browseKindAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
+        m_browseFollowAction->setVisible(choices.size() > 1);
+        if (choices.size() > 1) m_browseFollowAction->setText(choices.at(1).first);
+        m_browseFollowAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
+    }
     m_browseDeleteRestoreButton->setVisible(multiple);
     bool mergeable = multiple && !m_syncInProgress;
     for (auto *selectedItem : selected) {
@@ -5007,7 +5034,6 @@ void ReviewCardsWidget::showBrowseCard(const ReviewBrowserCard *item)
     m_browsePlaceAgainButton->setVisible(placeable && reviewCardNeedsPlacingAgain(item->card));
     m_browsePlaceAgainButton->setEnabled(m_browseAreasButton->isEnabled());
     m_browseReviewButton->setEnabled(available && bool(m_cardReviewer) && item->canReview());
-    m_browseNoteButton->setEnabled(available && !m_syncInProgress);
     m_browseEditButton->setEnabled(available);
     m_browseHistoryButton->setEnabled(available);
     m_browseUpdateHistoryButton->setEnabled(available && item->card.isApproved() && !item->card.schedule.deleted && !m_syncInProgress);
@@ -5050,7 +5076,6 @@ void ReviewCardsWidget::showBrowseCard(const ReviewBrowserCard *item)
     m_browseQuestionStatus->setText(i18n("Edit directly — changes save automatically"));
     m_browseDeleteRestoreButton->setText(i18n("Delete"));
 
-    m_browseNoteButton->setText(card.record.value(QStringLiteral("note")).toString().isEmpty() ? i18n("Add note") : i18n("Edit note"));
     m_browseDetails->setHtml(cardDetailsHtml(*item, m_docsRoot, browseNames(card)));
     refreshBrowseHistory(item);
 }
@@ -5654,6 +5679,70 @@ void ReviewCardsWidget::retireOrRestoreBrowseCard()
     });
 }
 
+int ReviewCardsWidget::activeProjectCardCount(const QString &projectId) const
+{
+    if (!m_libraryCountsAvailable) return -1;
+    QList<ReviewCard> cards;
+    for (const ReviewBrowserCard &item : m_browseCards) cards.append(item.card);
+    return int(ReviewStore::activeProjectCards(cards, projectId).size());
+}
+
+QList<ReviewCard> ReviewCardsWidget::activeProjectCards(const QString &projectId)
+{
+    return ReviewStore::activeProjectCards(m_store.cards(), projectId);
+}
+
+bool ReviewCardsWidget::retireProjectCards(const QString &projectId, QString *error)
+{
+    if (m_mutating) {
+        if (error) *error = i18n("Another change to the cards is being saved. Try again.");
+        return false;
+    }
+    if (!saveBrowseQuestion()) return false;
+    ++m_revision;
+    const bool saved = m_store.retireProjectCards(projectId, error);
+    reload();
+    return saved;
+}
+
+void ReviewCardsWidget::setBrowseCardKind(const QString &kind)
+{
+    const auto *item = selectedBrowseCard();
+    if (!item || item->card.schedule.deleted || m_mutating || !saveBrowseQuestion()) return;
+    const QString cardId = item->card.id();
+    ++m_revision;
+    m_mutating = true;
+    setEnabled(false);
+    const auto provider = snapshotProvider();
+    const auto root = m_docsRoot;
+    QPointer<ReviewCardsWidget> guard(this);
+    QThreadPool::globalInstance()->start([guard, root, provider, cardId, kind] {
+        ReviewStore store(root, provider);
+        QString error;
+        const bool saved = store.setCardKind(cardId, kind, &error);
+        // The card as its kind now makes it: its mark, its due time.
+        const QList<ReviewCard> changed = saved ? store.cardsWithIds({cardId}) : QList<ReviewCard>{};
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard.data(), [guard, saved, error, cardId, changed] {
+            if (!guard) return;
+            guard->m_mutating = false;
+            guard->setEnabled(true);
+            if (!saved) {
+                KMessageBox::error(guard, error, i18n("Cannot Change the Card's Kind"));
+            } else {
+                for (auto &card : guard->m_browseCards) {
+                    if (card.card.id() != cardId) continue;
+                    for (const ReviewCard &read : changed) {
+                        if (read.id() == cardId) card.card = read;
+                    }
+                }
+                guard->applyCards(guard->m_browseCards, guard->m_browseCount->toolTip().split(QLatin1Char('\n'), Qt::SkipEmptyParts));
+            }
+            guard->reload();
+        }, Qt::QueuedConnection);
+    });
+}
+
 void ReviewCardsWidget::compactTags()
 {
     const QHash<QString, int> usage = m_store.reviewTagUsage();
@@ -5861,11 +5950,23 @@ void ReviewOverview::buildUi()
     m_browseCardsButton->setObjectName(QStringLiteral("reviewBrowseCardsButton"));
     m_browseCardsButton->setAutoDefault(false);
     toolbar->addWidget(m_browseCardsButton);
+    // Library-wide review has two entries (review-card-kinds.md §7): Study (knowledge cards) and
+    // Projects (project cards, of all Projects or one); a document's review keeps every card.
     m_startButton = new QPushButton(i18n("Start Review"), this);
     m_startButton->setObjectName(QStringLiteral("reviewStartButton"));
     m_startButton->setDefault(true);
     m_startButton->setEnabled(false);
     toolbar->addWidget(m_startButton);
+    m_startProjectsButton = new QPushButton(i18n("Projects · %1 due", 0), this);
+    m_startProjectsButton->setObjectName(QStringLiteral("reviewStartProjectsButton"));
+    m_startProjectsButton->setAutoDefault(false);
+    m_startProjectsButton->setToolTip(i18n("Review the project cards: the cards about work you are writing or building"));
+    m_projectsMenu = new QMenu(m_startProjectsButton);
+    m_projectsMenu->setObjectName(QStringLiteral("reviewProjectsMenu"));
+    connect(m_projectsMenu, &QMenu::aboutToShow, this, &ReviewOverview::fillProjectsMenu);
+    m_startProjectsButton->setMenu(m_projectsMenu);
+    m_startProjectsButton->hide();
+    toolbar->addWidget(m_startProjectsButton);
     layout->addLayout(toolbar);
 
     auto *separator = new QFrame(this);
@@ -5989,7 +6090,6 @@ void ReviewOverview::buildUi()
     cardMenu->addAction(i18n("More info"), this, &ReviewOverview::showCardInfo)->setObjectName(QStringLiteral("reviewMoreInfoAction"));
     cardMenu->addAction(i18n("Copy for agent"), this, &ReviewOverview::copyCardForAgent)->setObjectName(QStringLiteral("reviewCopyForAgentAction"));
     cardMenu->addAction(i18n("Edit"), this, &ReviewOverview::editCurrentCard)->setObjectName(QStringLiteral("reviewEditAction"));
-    cardMenu->addAction(i18n("Add note"), this, &ReviewOverview::editNote)->setObjectName(QStringLiteral("reviewNoteAction"));
     cardMenu->addAction(i18n("Skip"), this, &ReviewOverview::chooseSkip)->setObjectName(QStringLiteral("reviewSkipAction"));
     cardMenu->addAction(i18n("Undo"), this, &ReviewOverview::undoPrevious)->setObjectName(QStringLiteral("reviewUndoAction"));
     // Flip hides the answer's context instead, so the passage itself prompts recall; it reads Unflip then.
@@ -6007,6 +6107,13 @@ void ReviewOverview::buildUi()
     m_agentConversationsMenu = cardMenu->addMenu(i18n("Agent conversations"));
     m_agentConversationsMenu->setObjectName(QStringLiteral("reviewAgentConversationsMenu"));
     m_agentConversationsMenu->menuAction()->setObjectName(QStringLiteral("reviewAgentConversationsAction"));
+    // Knowledge card or project card (review-card-kinds.md §5); the texts follow the card shown.
+    auto *kindAction = cardMenu->addAction(i18n("Make project card"));
+    kindAction->setObjectName(QStringLiteral("reviewKindAction"));
+    connect(kindAction, &QAction::triggered, this, [this, kindAction] { setCurrentCardKind(kindAction->data().toString()); });
+    auto *followAction = cardMenu->addAction(i18n("Follow the Project (Knowledge)"));
+    followAction->setObjectName(QStringLiteral("reviewFollowProjectAction"));
+    connect(followAction, &QAction::triggered, this, [this] { setCurrentCardKind(ReviewKinds::followProject()); });
     // Retire, right above Delete: out of review for good, history kept; Undo brings it back.
     cardMenu->addAction(i18n("Retire card"), this, &ReviewOverview::retireCard)->setObjectName(QStringLiteral("reviewRetireAction"));
     cardMenu->addAction(i18n("Delete card"), this, &ReviewOverview::deleteCard)->setObjectName(QStringLiteral("reviewDeleteAction"));
@@ -6029,13 +6136,13 @@ void ReviewOverview::buildUi()
     statusPalette.setColor(QPalette::WindowText, statusPalette.color(QPalette::PlaceholderText));
     m_reviewStatus->setPalette(statusPalette);
     sessionLayout->addWidget(m_reviewStatus);
-
-    m_noteButton = new QToolButton(m_sessionPage);
-    m_noteButton->setObjectName(QStringLiteral("reviewNoteButton"));
-    m_noteButton->setAutoRaise(true);
-    connect(m_noteButton, &QToolButton::clicked, this, &ReviewOverview::editNote);
-    sessionLayout->addWidget(m_noteButton, 0, Qt::AlignLeft);
-    m_noteButton->hide();
+    // A project card says so, and when its passage changed since it was last answered.
+    m_cardKindLine = new QLabel(m_sessionPage);
+    m_cardKindLine->setObjectName(QStringLiteral("reviewCardKindLine"));
+    m_cardKindLine->setWordWrap(true);
+    m_cardKindLine->setTextFormat(Qt::PlainText);
+    m_cardKindLine->hide();
+    sessionLayout->addWidget(m_cardKindLine);
 
     // The review in two steps (review-phases spec): under the question, before the answer is
     // shown, the groups asked before it (a slider each) and the before note; once the answer is
@@ -6287,6 +6394,10 @@ void ReviewOverview::restoreVerifiedCounts()
         const auto stem = value.toString();
         if (!stem.isEmpty() && m_documentFilter->findData(stem) < 0) m_documentFilter->addItem(stem, stem);
     }
+    // The saved counts do not say which cards are project cards: Study shows them all until the
+    // background refresh counts them again.
+    m_studyDue = counts[0].toInt() + counts[1].toInt() + counts[2].toInt();
+    m_projectDue = 0;
     displayCounts(counts[0].toInt(), counts[1].toInt(), counts[2].toInt(), counts[3].toInt());
     // Shown with the queue loaded here until the background refresh counts them again.
     m_unavailableCount = counts[3].toInt();
@@ -6528,7 +6639,7 @@ void ReviewOverview::applyDeferredState()
     // ended, after the deferral began).
     if (m_countsShown) {
         m_documentFilter->setEnabled(true);
-        m_startButton->setEnabled(m_currentReview < 0 && m_displayedDue > 0);
+        updateEntryButtons();
     }
     // Sync's end reloads by itself. A source scan that outlasts Sync only says so
     // through projection updates, which may already have come: retry until it is done.
@@ -6891,10 +7002,13 @@ void ReviewOverview::reviewCard(const QString &cardId)
     m_tagUsage.reset(); // Counted from the store once per session (see tagUsage()).
     clearRecallPredictions();
     m_singleCardSession = true;
+    // Review now keeps the card whatever its kind.
+    m_sessionKind.clear();
+    m_sessionProjectId.clear();
     m_dueCards = {selected->card};
     m_currentReview = 0;
     m_sessionComplete = false;
-    m_startButton->setEnabled(false);
+    updateEntryButtons();
     showCurrentCard();
     if (m_currentReview >= 0) Q_EMIT reviewStarted();
 }
@@ -7071,7 +7185,9 @@ void ReviewOverview::refreshDueQueue()
         applyDeferredState();
         return;
     }
-    m_dueCards = m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString());
+    const QList<ReviewCard> due = m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString());
+    // During a session the queue keeps to its entry; otherwise it is every due card (the counts).
+    m_dueCards = m_currentReview >= 0 && !m_sessionComplete ? entryCards(due) : due;
     updateDueSummary();
     if (m_currentReview < 0 && !m_sessionComplete) {
         m_reviewQuestion->clear();
@@ -7088,7 +7204,7 @@ void ReviewOverview::updateDueSummary()
     const bool reviewing = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
     if (!reviewing) displayQueueCounts(m_dueCards, m_unavailableCount);
     m_documentFilter->setEnabled(true);
-    m_startButton->setEnabled(m_currentReview < 0 && !m_dueCards.isEmpty());
+    updateEntryButtons();
     requestQueueRefresh();
 }
 
@@ -7097,7 +7213,10 @@ void ReviewOverview::displayQueueCounts(const QList<ReviewCard> &due, int unavai
     int newCards = 0;
     int learningCards = 0;
     int reviewCards = 0;
+    m_studyDue = 0;
+    m_projectDue = 0;
     for (const ReviewCard &card : due) {
+        ++(card.isProjectCard() ? m_projectDue : m_studyDue);
         if (!card.schedule.reviewed) {
             ++newCards;
         } else if (card.schedule.intervalDays == 0) {
@@ -7150,6 +7269,13 @@ void ReviewOverview::startQueueRefresh()
         }
         request.stems = stems.values();
         request.due = store.dueCardsOf(cards, now, request.filter);
+        // The Projects entry lists the Projects that hold an active project card (review-card-kinds.md §7).
+        for (const ReviewCard &card : cards) {
+            if (!card.isProjectCard() || card.schedule.deleted || card.schedule.retired || card.status() == QLatin1String("candidate")
+                || card.status() == QLatin1String("rejected")) continue;
+            for (const QString &id : card.kindProjectIds)
+                if (!request.projectIds.contains(id)) request.projectIds.append(id);
+        }
         for (const ReviewBrowserCard &item : store.browserCardsOf(cards, now)) {
             if ((request.filter.isEmpty() || item.card.pdfStem() == request.filter) && item.hasIssues) ++request.unavailable;
         }
@@ -7182,7 +7308,7 @@ void ReviewOverview::applyQueueRefresh(const QueueRefresh &result)
             // The card under review stays where the bar has it, as it was last read; the queue
             // around it is the new one.
             if (!m_singleCardSession) {
-                QList<ReviewCard> queue = result.due;
+                QList<ReviewCard> queue = entryCards(result.due);
                 const auto at = std::find_if(queue.cbegin(), queue.cend(), [&shown](const ReviewCard &card) { return card.id() == shown; });
                 const int index = at == queue.cend() ? 0 : int(std::distance(queue.cbegin(), at));
                 queue.removeIf([&shown](const ReviewCard &card) { return card.id() == shown; });
@@ -7193,9 +7319,10 @@ void ReviewOverview::applyQueueRefresh(const QueueRefresh &result)
         } else {
             m_dueCards = result.due;
         }
+        m_projectEntryIds = result.projectIds;
         displayQueueCounts(result.due, result.unavailable);
         m_documentFilter->setEnabled(true);
-        m_startButton->setEnabled(m_currentReview < 0 && !m_dueCards.isEmpty());
+        updateEntryButtons();
     }
     if (again) requestQueueRefresh();
 }
@@ -7223,6 +7350,72 @@ void ReviewOverview::displayCounts(int newCards, int learningCards, int reviewCa
 
 void ReviewOverview::startReview()
 {
+    // Library-wide, Start Review is the Study entry; a document's review keeps every card.
+    startEntryReview(m_documentFilter->currentData().toString().isEmpty() ? ReviewKinds::knowledge() : QString(), {});
+}
+
+QList<ReviewCard> ReviewOverview::entryCards(const QList<ReviewCard> &due) const
+{
+    if (m_sessionKind.isEmpty() || m_singleCardSession) return due;
+    QList<ReviewCard> offered;
+    for (const ReviewCard &card : due) {
+        if (card.reviewKind != m_sessionKind) continue;
+        if (!m_sessionProjectId.isEmpty() && !card.kindProjectIds.contains(m_sessionProjectId)) continue;
+        offered.append(card);
+    }
+    return offered;
+}
+
+void ReviewOverview::updateEntryButtons()
+{
+    const bool libraryWide = m_documentFilter->currentData().toString().isEmpty();
+    const bool idle = m_currentReview < 0;
+    m_startButton->setText(libraryWide ? i18n("Study · %1 due", m_studyDue) : i18n("Start Review"));
+    m_startButton->setToolTip(libraryWide ? i18n("Review the knowledge cards: what you are studying") : QString());
+    m_startButton->setEnabled(idle && (libraryWide ? m_studyDue : m_displayedDue) > 0);
+    m_startProjectsButton->setText(i18n("Projects · %1 due", m_projectDue));
+    // Shown once there is a project card; a document's review keeps every card.
+    m_startProjectsButton->setVisible(libraryWide && (m_projectDue > 0 || !m_projectEntryIds.isEmpty()));
+    m_startProjectsButton->setEnabled(idle && m_projectDue > 0);
+}
+
+void ReviewOverview::fillProjectsMenu()
+{
+    m_projectsMenu->clear();
+    // Due per Project, from the due cards of the whole Library.
+    QHash<QString, int> due;
+    if (m_currentReview < 0) {
+        for (const ReviewCard &card : std::as_const(m_dueCards)) {
+            if (!card.isProjectCard()) continue;
+            for (const QString &id : card.kindProjectIds) ++due[id];
+        }
+    }
+    QStringList ids = m_projectEntryIds;
+    for (auto it = due.cbegin(); it != due.cend(); ++it)
+        if (!ids.contains(it.key())) ids.append(it.key());
+    auto *all = m_projectsMenu->addAction(i18n("All Projects · %1 due", m_projectDue));
+    all->setObjectName(QStringLiteral("reviewProjectsAllAction"));
+    all->setEnabled(m_projectDue > 0);
+    connect(all, &QAction::triggered, this, [this] { startEntryReview(ReviewKinds::project(), {}); });
+    if (!ids.isEmpty()) m_projectsMenu->addSeparator();
+    const QJsonArray catalogue = ReviewKinds::catalogue(m_docsRoot);
+    QList<QPair<QString, QString>> named;
+    for (const QString &id : std::as_const(ids)) {
+        const QString name = ReviewKinds::catalogueProject(catalogue, id).value(QStringLiteral("name")).toString();
+        named.append({name.isEmpty() ? id : name, id});
+    }
+    std::sort(named.begin(), named.end(), [](const auto &a, const auto &b) { return QString::localeAwareCompare(a.first, b.first) < 0; });
+    for (const auto &[name, id] : std::as_const(named)) {
+        auto *entry = m_projectsMenu->addAction(i18n("%1 · %2 due", name, due.value(id)));
+        entry->setObjectName(QStringLiteral("reviewProjectsProjectAction"));
+        entry->setData(id);
+        entry->setEnabled(due.value(id) > 0);
+        connect(entry, &QAction::triggered, this, [this, id] { startEntryReview(ReviewKinds::project(), id); });
+    }
+}
+
+void ReviewOverview::startEntryReview(const QString &kind, const QString &projectId)
+{
     m_pendingSkip = {};
     m_reviewHidden = false;
     m_lastActionWasSkip = false;
@@ -7233,17 +7426,22 @@ void ReviewOverview::startReview()
     m_tagUsage.reset(); // Counted from the store once per session (see tagUsage()).
     clearRecallPredictions();
     m_sessionComplete = false;
+    m_sessionKind = kind;
+    m_sessionProjectId = projectId;
     if (refreshDeferred()) {
         // During Sync the counts stay frozen, but the queue follows the chosen document.
         m_dueCards = m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString());
     } else {
         refreshDueQueue();
     }
+    // A session started from one entry offers only that entry's cards.
+    m_dueCards = entryCards(m_dueCards);
     if (m_dueCards.isEmpty()) {
+        updateEntryButtons();
         return;
     }
     m_currentReview = 0;
-    m_startButton->setEnabled(false);
+    updateEntryButtons();
     showCurrentCard();
     if (m_currentReview >= 0) Q_EMIT reviewStarted();
 }
@@ -7399,6 +7597,7 @@ void ReviewOverview::updateAnswerControls()
         m_reviewStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
         m_reviewStatus->show();
     }
+    updateCardKindLine();
     updateBeforePanel();
     refreshAnswerFeedback();
     positionSessionPanel();
@@ -8027,12 +8226,18 @@ void ReviewOverview::refreshBarLabels()
         : m_interval.unit == ReviewInterval::Hours ? i18n("%1 h", amount)
         : intervalLabel(m_interval);
     setValue(m_intervalField, interval);
-    m_intervalField->setAccessibleName(i18n("Again in %1. Change the interval", intervalLabel(m_interval)));
+    // A project card comes back within a week whatever the interval (review-card-kinds.md §6.2).
+    const bool project = m_currentReview >= 0 && m_currentReview < m_dueCards.size() && m_dueCards.at(m_currentReview).isProjectCard();
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime chosenDue = m_interval.dueAt(now);
+    const bool capped = project && (!chosenDue.isValid() || chosenDue > now.addDays(ReviewKinds::projectIntervalDays()));
+    const QString again = capped ? i18n("7 days (a project card; %1 as a knowledge card)", intervalLabel(m_interval)) : intervalLabel(m_interval);
+    m_intervalField->setAccessibleName(i18n("Again in %1. Change the interval", again));
     m_intervalField->setToolTip(m_intervalField->accessibleName());
     const QString answerTags = m_selectedTags.isEmpty() ? i18n("Not rated") : reviewTagLabels(m_selectedTags);
-    m_nextButton->setAccessibleName(i18n("%1, again in %2", answerTags, intervalLabel(m_interval)));
+    m_nextButton->setAccessibleName(i18n("%1, again in %2", answerTags, again));
     m_nextButton->setToolTip(i18n("%1, again in %2\nRight-click for Never, or to answer for a whole document or project.",
-                                  answerTags, intervalLabel(m_interval)));
+                                  answerTags, again));
     positionSessionPanel();
 }
 
@@ -8279,7 +8484,7 @@ void ReviewOverview::undoSkip()
     m_pendingSkip = {};
     m_lastActionWasSkip = false;
     m_singleCardSession = m_skippedSingleCardSession;
-    m_dueCards = m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString());
+    m_dueCards = entryCards(m_store.dueCards(QDateTime::currentDateTimeUtc(), m_documentFilter->currentData().toString()));
     const auto cards = m_store.cardsWithIds({id});
     const auto selected = std::find_if(cards.cbegin(), cards.cend(), [&](const auto &card) { return card.id() == id; });
     if (selected != cards.cend() && selected->isApproved() && !selected->schedule.deleted && !selected->schedule.retained && !selected->schedule.retired
@@ -8306,26 +8511,7 @@ void ReviewOverview::undoPrevious()
 
 void ReviewOverview::updateSessionExtras()
 {
-    const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
-    const auto card = current ? m_dueCards.at(m_currentReview) : ReviewCard{};
-    const QString note = card.record.value(QStringLiteral("note")).toString();
-    m_noteButton->setVisible(current && !note.isEmpty());
-    m_noteButton->setText(i18n("Note: %1", note.simplified().left(120)));
-    m_noteButton->setToolTip(note);
     positionSessionPanel();
-}
-
-void ReviewOverview::editNote()
-{
-    if (m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
-    const auto card = m_dueCards.at(m_currentReview);
-    QString note;
-    if (!editCardNote(m_store, card, m_sessionPage, &note)) return;
-    for (auto &item : m_dueCards) {
-        if (item.id() == card.id()) item.record.insert(QStringLiteral("note"), note);
-    }
-    updateSessionExtras();
-    updateCardMenu();
 }
 
 void ReviewOverview::deleteCard()
@@ -8360,15 +8546,54 @@ void ReviewOverview::retireCard()
     Q_EMIT reviewRecorded();
 }
 
+void ReviewOverview::setCurrentCardKind(const QString &kind)
+{
+    if (m_sessionComplete || m_currentReview < 0 || m_currentReview >= m_dueCards.size()) return;
+    const QString cardId = m_dueCards.at(m_currentReview).id();
+    QString error;
+    if (!m_store.setCardKind(cardId, kind, &error)) {
+        KMessageBox::error(m_sessionPage, error, i18n("Cannot Change the Card's Kind"));
+        return;
+    }
+    // The card stays under review with its new kind (its mark and due time); the queue around it
+    // follows at the next refresh.
+    for (const ReviewCard &read : m_store.cardsWithIds({cardId})) {
+        if (read.id() != cardId) continue;
+        ReviewCard &shown = m_dueCards[m_currentReview];
+        shown.reviewKind = read.reviewKind;
+        shown.reviewKindSource = read.reviewKindSource;
+        shown.kindProjectIds = read.kindProjectIds;
+        shown.projectsKind = read.projectsKind;
+        shown.passageChanged = read.passageChanged;
+        shown.schedule.dueAt = read.schedule.dueAt;
+        shown.schedule.retained = read.schedule.retained;
+        shown.history = read.history;
+    }
+    updateCardKindLine();
+    refreshBarLabels();
+    Q_EMIT reviewRecorded();
+}
+
+void ReviewOverview::updateCardKindLine()
+{
+    const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
+    const bool project = current && m_dueCards.at(m_currentReview).isProjectCard();
+    QStringList parts;
+    if (project) parts.append(i18n("Project card"));
+    if (project && m_dueCards.at(m_currentReview).passageChanged) parts.append(passageChangedText());
+    m_cardKindLine->setText(parts.join(QStringLiteral(" · ")));
+    m_cardKindLine->setToolTip(project ? i18n("A card about work in progress: it comes back at least once a week, and at once when its passage changes.") : QString());
+    m_cardKindLine->setVisible(project);
+}
+
 void ReviewOverview::updateCardMenu()
 {
     const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size();
     auto *menu = m_cardMenuButton->menu();
     for (const auto &name : {"reviewFocusAction", "reviewMoreInfoAction", "reviewCopyForAgentAction", "reviewEditAction", "reviewRetireAction",
-                              "reviewDeleteAction", "reviewNoteAction", "reviewSkipAction"}) {
+                              "reviewDeleteAction", "reviewSkipAction"}) {
         menu->findChild<QAction *>(QString::fromLatin1(name))->setEnabled(current);
     }
-    menu->findChild<QAction *>(QStringLiteral("reviewNoteAction"))->setText(current && !m_dueCards.at(m_currentReview).record.value(QStringLiteral("note")).toString().isEmpty() ? i18n("Edit note") : i18n("Add note"));
     menu->findChild<QAction *>(QStringLiteral("reviewUndoAction"))->setEnabled(!m_reviewHistory.isEmpty() || !m_pendingSkip.id.isEmpty());
     const bool answerVisible = current && !m_ratingPanel->isHidden();
     // Like the phone, Skip is offered before the answer is revealed too.
@@ -8377,6 +8602,18 @@ void ReviewOverview::updateCardMenu()
     flip->setText(m_maskFlipped ? i18n("Unflip") : i18n("Flip"));
     flip->setVisible(current && !answerVisible);
     menu->findChild<QAction *>(QStringLiteral("reviewHideAgainAction"))->setVisible(answerVisible);
+    {
+        auto *kind = menu->findChild<QAction *>(QStringLiteral("reviewKindAction"));
+        auto *follow = menu->findChild<QAction *>(QStringLiteral("reviewFollowProjectAction"));
+        const auto choices = current ? cardKindChoices(m_dueCards.at(m_currentReview)) : QList<QPair<QString, QString>>{};
+        kind->setVisible(current);
+        if (current) {
+            kind->setText(choices.first().first);
+            kind->setData(choices.first().second);
+        }
+        follow->setVisible(choices.size() > 1);
+        if (choices.size() > 1) follow->setText(choices.at(1).first);
+    }
     m_cardMenuButton->setVisible(current || !m_reviewHistory.isEmpty() || !m_pendingSkip.id.isEmpty());
 }
 

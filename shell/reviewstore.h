@@ -83,6 +83,63 @@ QHash<QString, State> fold(const QList<QJsonObject> &events);
 }
 
 /**
+ * Knowledge cards and project cards (thoughts-server protocol/review-card-kinds.md). Knowledge cards
+ * keep today's schedule; project cards come back at least a week after their latest answer, and
+ * at once when their passage changed. A card follows its Library Projects unless the user chose
+ * its kind (a set_review_kind queue action, or the kind it was made with in its record).
+ */
+namespace ReviewKinds
+{
+QString capability();     // "review_card_kinds_v1"
+QString action();         // "set_review_kind": the review event queue action and the Library-project action
+QString field();          // "review_kind": of kind events, card records and catalogue entries
+QString knowledge();      // "knowledge"
+QString project();        // "project"
+QString followProject();  // "follow_project": the card follows its Projects again
+QString sourceCard();     // "card": the user chose the card's kind
+QString sourceProject();  // "project": a Project holds the card
+QString sourceDefault();  // "default": no Project holds it
+QString passageField();   // "passage": the passage an answer was given on
+int projectIntervalDays(); // 7: at most this many days between reviews of a project card
+// Whether @p event is a kind event (queue_action set_review_kind), valid or not.
+bool isEvent(const QJsonObject &event);
+// The kind a catalogue entry gives its cards: knowledge unless it says project.
+QString projectKind(const QJsonObject &project);
+// Section 4: the catalogue entries that hold the card, in catalogue order.
+QList<QJsonObject> cardProjects(const QJsonObject &cardRecord, const QJsonArray &projects);
+struct Kind {
+    QString kind;           // knowledge() or project()
+    QString source;         // sourceCard(), sourceProject() or sourceDefault()
+    QStringList projectIds; // The Projects that hold the card, in catalogue order.
+    QString projectsKind;   // The kind the card would follow: project() when any of them is a project Project.
+    bool isProject() const { return kind == project(); }
+};
+// Section 3: a pure function of the card's events, its record and the catalogue; the order of the
+// events does not matter.
+Kind fold(const QJsonObject &cardRecord, const QList<QJsonObject> &events, const QJsonArray &projects);
+// The card's latest valid kind event (section 3 step 1), or an empty object.
+QJsonObject latestEvent(const QString &cardId, const QList<QJsonObject> &events);
+// Section 6.1: the card's latest answer that no retraction took back, or an empty object.
+QJsonObject latestAnswer(const QString &cardId, const QList<QJsonObject> &events);
+// Section 6.3: what an answer given now carries as "passage" ({"segments": [{segment_id,
+// content_sha256}…]}), or an empty object when the card has no complete version-2 segments.
+QJsonObject passageStamp(const QJsonObject &cardRecord);
+// Section 6.3: the passage differs from the one the latest answer was given on.
+bool passageChanged(const QJsonObject &cardRecord, const QList<QJsonObject> &events);
+// Sections 6.2 and 6.3: a project card's due time from the knowledge schedule's @p scheduledDueAt
+// (invalid: not scheduled). A card never answered keeps it.
+QDateTime projectDueAt(const QJsonObject &cardRecord, const QList<QJsonObject> &events, const QDateTime &scheduledDueAt);
+// An ISO 8601 time with a zone, else invalid (kind events and answers need one).
+QDateTime parseTime(const QString &value);
+// The catalogue the fold reads: the Library-project records as this computer last received them
+// (GET /v1/library/projects, kept in .thoughts/library-projects.json), with this computer's queued
+// set_review_kind and remove actions applied. Read again only when the file changed.
+QJsonArray catalogue(const QString &docsRoot);
+// The catalogue entry @p projectId of @p projects, or an empty object.
+QJsonObject catalogueProject(const QJsonArray &projects, const QString &projectId);
+}
+
+/**
  * Free-form review labels, shared with the phone. Tags only describe an answer; the
  * chosen interval alone schedules the card. Built-ins keep stable wire IDs.
  */
@@ -313,6 +370,10 @@ struct ReviewCard {
     QDateTime skippedUntil;
     QList<QJsonObject> history;
     QJsonObject sourceLocation; // Disposable local location, never written into the card record.
+    // The record as stored, before this computer's view of its sources changed it (cards() lines a
+    // card up with the source as it is now). An edit checks that this, not the view, is unchanged.
+    QJsonObject savedRecord;
+    const QJsonObject &stored() const { return savedRecord.isEmpty() ? record : savedRecord; }
 
     QString id() const;
     QString status() const;
@@ -344,6 +405,17 @@ struct ReviewCard {
     QStringList tagsOfEvent(const QJsonObject &event) const;
 
     QHash<QString, QString> tagMerges; // ReviewTags::mergeMapping of the synced merges.
+
+    // Its kind (ReviewKinds::fold), as ReviewStore::cards() reads it. A project card's
+    // schedule.dueAt is the capped due time (ReviewKinds::projectDueAt); scheduledDueAt is the
+    // knowledge schedule's (invalid when it gives none).
+    QString reviewKind = QStringLiteral("knowledge");
+    QString reviewKindSource = QStringLiteral("default");
+    QStringList kindProjectIds;
+    QString projectsKind = QStringLiteral("knowledge");
+    bool passageChanged = false; // Project cards only: "Changed since you last saw it".
+    QDateTime scheduledDueAt;
+    bool isProjectCard() const { return reviewKind == QLatin1String("project"); }
 };
 
 // The Project document a card belongs to (protocol/project-document-publication.md §4).
@@ -549,8 +621,9 @@ public:
     bool markNeedsReanchor(const QString &cardId, QString *error = nullptr);
     // Removes the markers of deleted cards whose removal was left pending, once that is safe. Returns how many.
     int retryPendingMarkerRemovals(QStringList *errors = nullptr) const;
-    // Except for a deletion, the event records the PDF on screen (reviewVersion()): from @p cardRecord
-    // when given (the caller's copy of the card), else from the card read again. @p reviewPhases
+    // Except for a deletion, the event records the PDF on screen (reviewVersion()) and the passage the
+    // answer is given on (ReviewKinds::passageStamp): from @p cardRecord when given (the caller's copy
+    // of the card), else from the card read again. @p reviewPhases
     // (ReviewPhases::toField) is recorded with an answer given in two steps.
     bool recordRating(const QString &cardId, const QString &rating, const QDateTime &reviewedAt = QDateTime::currentDateTimeUtc(), QString *error = nullptr, const QDateTime &scheduledDueAt = {}, QString *recordedEventId = nullptr, const QString &reviewAction = {}, const QStringList &reviewTags = {},
                       const QHash<QString, QString> &groupNotes = {}, const QHash<QString, ReviewContextNotes::Note> &contextNotes = {},
@@ -655,6 +728,17 @@ public:
     bool restoreRetiredCard(const QString &cardId, QString *error = nullptr, const QDateTime &now = QDateTime::currentDateTimeUtc(),
                             QString *recordedEventId = nullptr);
     bool undoRetire(const QString &eventId, QString *error = nullptr, const QDateTime &now = QDateTime::currentDateTimeUtc());
+    // Make project card, Make knowledge card, Follow the Project (ReviewKinds): one set_review_kind
+    // queue action with @p kind (knowledge, project or follow_project), written and queued like a
+    // retire, after the card's earlier kind events (1 ms later when the clock says otherwise).
+    bool setCardKind(const QString &cardId, const QString &kind, QString *error = nullptr, const QDateTime &now = QDateTime::currentDateTimeUtc(),
+                     QString *recordedEventId = nullptr);
+    // The active (not retired, not deleted) project cards that the Project @p projectId holds, of @p cards.
+    static QList<ReviewCard> activeProjectCards(const QList<ReviewCard> &cards, const QString &projectId);
+    // "Retire project cards…" of a Project: one retire for each of its active project cards, all with
+    // the same reviewed_at, queued in one batch. @p retiredIds: the cards retired.
+    bool retireProjectCards(const QString &projectId, QString *error = nullptr, const QDateTime &now = QDateTime::currentDateTimeUtc(),
+                            QStringList *retiredIds = nullptr);
     bool setCardsDeleted(const QStringList &cardIds, bool deleted, const QDateTime &now, QString *error = nullptr);
     bool deleteCard(const QString &cardId, const QDateTime &deletedAt = QDateTime::currentDateTimeUtc(), QString *error = nullptr);
     bool restoreCard(const QString &cardId, const QDateTime &restoredAt = QDateTime::currentDateTimeUtc(), QString *error = nullptr);

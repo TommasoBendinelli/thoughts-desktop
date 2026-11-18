@@ -1768,6 +1768,24 @@ void DesktopSyncStoreTest::persistsFrontierAndVerifiedObjects()
     const auto object = reopened.verifiedObject(QString(64, QLatin1Char('a')), &error);
     QVERIFY(object.has_value());
     QCOMPARE(object->sizeBytes, 123);
+    // Only the asked receipts, across more than one query (500 each), unknown and invalid ones left out.
+    for (int index = 0; index < 1200; ++index) {
+        DesktopVerifiedObject more;
+        more.sha256 = QStringLiteral("%1").arg(index, 64, 16, QLatin1Char('0'));
+        more.sizeBytes = index;
+        more.kind = QStringLiteral("lookup");
+        QVERIFY2(reopened.upsertVerifiedObject(more, &error), qPrintable(error));
+    }
+    QStringList asked{QString(64, QLatin1Char('a')), QString(64, QLatin1Char('f')), QStringLiteral("not-a-digest")};
+    for (int index = 0; index < 1200; index += 2) asked.append(QStringLiteral("%1").arg(index, 64, 16, QLatin1Char('0')));
+    asked.append(asked.constLast());
+    const auto some = reopened.verifiedObjects(asked, &error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(some.size(), 601);
+    QCOMPARE(some.value(QString(64, QLatin1Char('a'))).sizeBytes, 123);
+    QCOMPARE(some.value(QStringLiteral("%1").arg(1198, 64, 16, QLatin1Char('0'))).sizeBytes, 1198);
+    QVERIFY(!some.contains(QStringLiteral("%1").arg(1, 64, 16, QLatin1Char('0'))));
+    QCOMPARE(reopened.verifiedObjects(&error).size(), 1201);
 }
 
 void DesktopSyncStoreTest::libraryOperationsCoalesceAndAcknowledgeByGeneration()

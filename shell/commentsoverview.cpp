@@ -49,6 +49,8 @@
 #include "documentmanagementdialog.h"
 #include "librarymodificationdates.h"
 #include "reviewoverview.h"
+#include <QActionGroup>
+#include <tuple>
 #include "syncoperationstate.h"
 #include "syncstatuslabels.h"
 
@@ -8244,6 +8246,40 @@ void CommentsOverview::createLibraryProject()
     Q_EMIT projectAttachmentChangedLocally({});
 }
 
+void CommentsOverview::setLibraryProjectReviewKind(const QJsonObject &project, const QString &kind)
+{
+    if (m_syncOperationRunning || ReviewKinds::projectKind(project) == kind) return;
+    // Reversible, so it asks nothing: cards with a kind of their own keep it, the others follow.
+    const QString error = LibraryProjectStore(m_docsRoot).enqueue(ReviewKinds::action(), project, {{ReviewKinds::field(), kind}});
+    if (!error.isEmpty()) { KMessageBox::error(this, error); return; }
+    updateLibraryTree();
+    if (m_reviewCardsWidget) m_reviewCardsWidget->reload();
+    Q_EMIT reviewCardsChangedLocally();
+}
+
+void CommentsOverview::retireLibraryProjectCards(const QJsonObject &project)
+{
+    if (m_syncOperationRunning || !m_reviewCardsWidget) return;
+    const QString projectId = project.value(QStringLiteral("id")).toString();
+    const int count = m_reviewCardsWidget->activeProjectCards(projectId).size();
+    if (count == 0) {
+        KMessageBox::information(this, i18n("This Project has no project cards in review."), i18n("Retire project cards"));
+        return;
+    }
+    if (KMessageBox::warningTwoActions(this,
+            i18np("Retire the project card of “%2”?\n\nIt keeps its history and can be restored to review. Knowledge cards are not touched.",
+                  "Retire the %1 project cards of “%2”?\n\nEach keeps its history and can be restored to review. Knowledge cards are not touched.",
+                  count, project.value(QStringLiteral("name")).toString()),
+            i18n("Retire project cards"), KGuiItem(i18np("Retire 1 card", "Retire %1 cards", count)), KStandardGuiItem::cancel()) != KMessageBox::PrimaryAction)
+        return;
+    QString error;
+    if (!m_reviewCardsWidget->retireProjectCards(projectId, &error)) {
+        KMessageBox::error(this, error, i18n("Cannot Retire Project Cards"));
+        return;
+    }
+    Q_EMIT reviewCardsChangedLocally();
+}
+
 void CommentsOverview::editLibraryProject(const QJsonObject &project, const QString &action, const QJsonObject &document)
 {
     QJsonObject values;
@@ -9216,6 +9252,33 @@ void CommentsOverview::showLibraryItemContextMenu(QTreeWidgetItem *item, QTreeWi
                 const QString name = project.value(QStringLiteral("name")).toString();
                 copyName->setEnabled(!name.isEmpty());
                 connect(copyName, &QAction::triggered, this, [name] { QGuiApplication::clipboard()->setText(name); });
+                // Knowledge cards or project cards, offered once the server keeps the choice
+                // (its catalogue lists review_kind; review-card-kinds.md §2.3).
+                if (project.contains(ReviewKinds::field())) {
+                    auto *cards = menu.addMenu(i18n("Review cards"));
+                    cards->setObjectName(QStringLiteral("libraryProjectReviewCardsMenu"));
+                    cards->menuAction()->setObjectName(QStringLiteral("libraryProjectReviewCardsAction"));
+                    const QString current = ReviewKinds::projectKind(project);
+                    auto *kinds = new QActionGroup(cards);
+                    for (const auto &[label, kind, objectName] : {std::tuple{i18n("Knowledge cards"), ReviewKinds::knowledge(), QStringLiteral("libraryProjectKnowledgeCardsAction")},
+                                                                  std::tuple{i18n("Project cards"), ReviewKinds::project(), QStringLiteral("libraryProjectProjectCardsAction")}}) {
+                        auto *choice = cards->addAction(label);
+                        choice->setObjectName(objectName);
+                        choice->setCheckable(true);
+                        choice->setChecked(current == kind);
+                        choice->setEnabled(!m_syncOperationRunning);
+                        kinds->addAction(choice);
+                        connect(choice, &QAction::triggered, this, [this, project, kind] { setLibraryProjectReviewKind(project, kind); });
+                    }
+                    cards->addSeparator();
+                    auto *retire = cards->addAction(i18n("Retire project cards…"));
+                    retire->setObjectName(QStringLiteral("libraryRetireProjectCardsAction"));
+                    // As the Library's cards were last read; unknown until they are.
+                    const int active = m_reviewCardsWidget ? m_reviewCardsWidget->activeProjectCardCount(project.value(QStringLiteral("id")).toString()) : -1;
+                    retire->setEnabled(!m_syncOperationRunning && active != 0);
+                    retire->setToolTip(i18n("Take this Project's project cards out of review, each with its history"));
+                    connect(retire, &QAction::triggered, this, [this, project] { retireLibraryProjectCards(project); });
+                }
                 action(i18n("Remove project…"), QStringLiteral("remove"));
             }
             else if (group) {
@@ -13550,7 +13613,7 @@ void CommentsOverview::startLibrarySearchUpdate()
             const QJsonObject primary = card.record.value(QStringLiteral("primary")).toObject();
             const QString answer = primary.value(QStringLiteral("answer_anchor")).toObject().value(QStringLiteral("normalized_text")).toString();
             cards.append({card.record, card.id(), card.pdfStem(), card.question(),
-                          QStringList{answer, primary.value(QStringLiteral("selected_text")).toString(), card.record.value(QStringLiteral("note")).toString()}
+                          QStringList{answer, primary.value(QStringLiteral("selected_text")).toString()}
                               .join(QLatin1Char('\n')),
                           card.page()});
         }

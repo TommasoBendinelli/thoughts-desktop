@@ -170,6 +170,17 @@ print(json.dumps(result))
                         self.assertTrue((await session.call_tool('list_review_cards', invalid)).isError)
                     for value in (0, True, 1.5, '2'):
                         self.assertTrue((await session.call_tool('create_review_card', {**request, 'start_line': value})).isError)
+                    # A card's kind (review-card-kinds.md §8): passed on when given, never otherwise.
+                    project_card = {**request, 'request_id': str(uuid.uuid4()), 'kind': 'project'}
+                    created = await session.call_tool('create_review_card', project_card)
+                    self.assertFalse(created.isError, created.content)
+                    self.assertEqual(created.structuredContent['echo'], project_card)
+                    self.assertTrue((await session.call_tool('create_review_card', {**request, 'kind': 'draft'})).isError)
+                    listed = await session.call_tool('list_review_cards', {'document': 'notes.pdf', 'kind': 'project'})
+                    self.assertEqual(listed.structuredContent['echo'], {'document': 'notes.pdf', 'kind': 'project'})
+                    create_tool = next(t for t in tools if t.name == 'create_review_card')
+                    self.assertEqual(create_tool.inputSchema['properties']['kind']['anyOf'][0]['enum'], ['knowledge', 'project'])
+                    self.assertNotIn('kind', create_tool.inputSchema.get('required', []))
                     listed = await session.call_tool('list_todos', {})
                     self.assertFalse(listed.isError, listed.content)
                     self.assertEqual(listed.structuredContent['echo'], {'include_hidden': False})
@@ -833,6 +844,42 @@ class KnowledgeToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 0, profile)
         self.assertEqual(profile['counts']['unreviewed'], 1)
         self.assertEqual(profile['cards']['unreviewed'][0]['reason'], 'never answered; retired')
+
+    def test_project_cards(self):
+        """Project cards (review-card-kinds.md §8): their kind, the capped due time, and apart from what the user knows."""
+        import sqlite3
+        catalogue = dict(projects=[dict(id='project-a', name='Project A', revision=1, target='', review_kind='project',
+                                        documents=[dict(id='rl_grpo.pdf', filename='rl_grpo.pdf', document_id='c1e62ecc-2dfb-4259-97cc-e319b1186848')],
+                                        unpublished_documents=[])], pending=[])
+        (self.home / 'docs/.thoughts').mkdir(parents=True, exist_ok=True)
+        (self.home / 'docs/.thoughts/library-projects.json').write_text(json.dumps(catalogue))
+        # The baseline card was made a knowledge card by hand; the GRPO card follows its project Project.
+        kind = dict(schema_version=3, event_id='0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', card_id=NEW_CARD, queue_action='set_review_kind',
+                    review_kind='knowledge', reviewed_at='2026-10-02T09:00:00.000Z', origin_id='android-pixel')
+        database = sqlite3.connect(self.data / 'thoughts-server/review-query.sqlite')
+        database.execute('INSERT INTO review_events VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                         (kind['event_id'], NEW_CARD, kind['reviewed_at'], 'android-pixel', '', '', 'set_review_kind', '', '', 0, json.dumps(kind)))
+        database.commit()
+        database.close()
+        code, found = self.cli('search-review-cards', request={'query': 'GRPO baseline'})
+        self.assertEqual(code, 0, found)
+        cards = {c['card_id']: c for c in found['cards']}
+        self.assertEqual((cards[GRPO_CARD]['review_kind'], cards[GRPO_CARD]['review_kind_source']), ('project', 'project'))
+        self.assertIs(cards[GRPO_CARD]['passage_changed'], False)
+        # Answered on 1 October with a due time in 2099: a project card is due a week after its answer.
+        self.assertEqual(cards[GRPO_CARD]['due_at'], '2026-10-08T12:00:00.000Z')
+        self.assertEqual((cards[NEW_CARD]['review_kind'], cards[NEW_CARD]['review_kind_source']), ('knowledge', 'card'))
+        self.assertNotIn('passage_changed', cards[NEW_CARD])
+        code, projects = self.cli('search-review-cards', request={'kind': 'project'})
+        self.assertEqual([c['card_id'] for c in projects['cards']], [GRPO_CARD])
+        code, profile = self.cli('knowledge-profile', request={'topic': 'GRPO', 'learner': False})
+        self.assertEqual(code, 0, profile)
+        self.assertEqual(profile['counts'], {'solid': 0, 'shaky': 0, 'unknown': 0, 'unreviewed': 1})
+        self.assertEqual(profile['project_cards']['count'], 1)
+        self.assertEqual(profile['project_cards']['cards'][0]['card_id'], GRPO_CARD)
+        self.assertEqual(profile['project_cards']['cards'][0]['question'], 'How does GRPO compute the advantage?')
+        self.assertIn('Project cards on this topic (work in progress, not what the user knows): How does GRPO compute the advantage?',
+                      profile['summary'].splitlines())
 
     def test_levels_file_only_on_init(self):
         code, levels = self.cli('knowledge-levels')

@@ -54,6 +54,8 @@
 #include "../part/reviewcardfeedback.h"
 #include "../part/documentfeedback.h"
 #include "../part/documentfeedbackoverlay.h"
+#include "../part/projectfeedback.h"
+#include "../part/projectreadingcontext.h"
 #include "../part/agentconversations.h"
 #include "../part/reviewfeedbackeditor.h"
 #include "../part/reviewfeedbackoverlay.h"
@@ -114,6 +116,7 @@
 #include <QMimeDatabase>
 #include <QPainterPath>
 #include <QPainter>
+#include <QPdfWriter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
@@ -547,6 +550,7 @@ private Q_SLOTS:
     void testDocumentSyncScopesDocumentFeedback();
     void testDocumentFeedbackInNormalReading();
     void testDocumentFeedbackFromTheSelection();
+    void testDocumentFeedbackInAProjectReadAsOnePdf();
     void testDocumentFeedbackFollowsTheLibraryIdentity();
     void testExistingLibraryObjectSkipsPdfUpload();
     void testUnchangedBuildReusesVerifiedPdfPublication();
@@ -763,6 +767,7 @@ private Q_SLOTS:
     void testCommentKindsAndVersions();
     void testTextSelectionCreatesManualReviewRequest();
     void testTextSelectionOverAPageBreakCreatesOneMultiAreaRequest();
+    void testSectionHeadingRightClickOffersSectionReviewCard();
     void testCheckBoxReadOnly();
     void testCrashTextEditDestroy();
     void testAnnotWindow();
@@ -3984,6 +3989,118 @@ void PartTest::testDocumentFeedbackFromTheSelection()
     QVERIFY(!written.last().contains(QStringLiteral("deleted_at")));
     QCOMPARE(feedback->states().size(), 2);
     for (const QJsonObject &record : std::as_const(written)) QCOMPARE(Thoughts::DocumentFeedback::validationError(record), QString());
+}
+
+void PartTest::testDocumentFeedbackInAProjectReadAsOnePdf()
+{
+    // A Project read as one PDF (two documents, each file1.pdf): Like, Dislike and Question… are
+    // offered, a passage of the second document is saved on that document's own page and PDF, and
+    // each document's feedback shows at its pages of the combined PDF.
+    QTemporaryDir directory;
+    QVERIFY(QDir(directory.path()).mkdir(QStringLiteral("objects")));
+    QFile input(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    QVERIFY(input.open(QIODevice::ReadOnly));
+    const QByteArray bytes = input.readAll();
+    const QString hash = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    QFile object(directory.filePath(QStringLiteral("objects/") + hash));
+    QVERIFY(object.open(QIODevice::WriteOnly));
+    object.write(bytes);
+    object.close();
+    int count = 0;
+    {
+        Okular::Document standalone(nullptr);
+        QCOMPARE(standalone.openDocument(input.fileName(), QUrl::fromLocalFile(input.fileName()), QMimeDatabase().mimeTypeForFile(input.fileName())), Okular::Document::OpenSuccess);
+        count = int(standalone.pages());
+        standalone.closeDocument();
+    }
+    const QString firstId = QStringLiteral("0190a000-0000-4000-8000-0000000000d1");
+    const QString secondId = QStringLiteral("0190a000-0000-4000-8000-0000000000d2");
+    QJsonArray entries;
+    for (const QString &id : {firstId, secondId}) {
+        const QByteArray package = QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("kind"), QStringLiteral("thoughts-document-reading-package")},
+                                                             {QStringLiteral("document_id"), id}, {QStringLiteral("filename"), QStringLiteral("notes-%1.pdf").arg(id.right(2))},
+                                                             {QStringLiteral("pdf_sha256"), hash}, {QStringLiteral("page_count"), count}}).toJson();
+        const QString packageHash = QString::fromLatin1(QCryptographicHash::hash(package, QCryptographicHash::Sha256).toHex());
+        QFile packageFile(directory.filePath(QStringLiteral("objects/") + packageHash));
+        QVERIFY(packageFile.open(QIODevice::WriteOnly));
+        packageFile.write(package);
+        packageFile.close();
+        entries.append(QJsonObject{{QStringLiteral("document_id"), id}, {QStringLiteral("title"), id}, {QStringLiteral("pdf_sha256"), hash},
+                                   {QStringLiteral("package_sha256"), packageHash}, {QStringLiteral("pdf_size_bytes"), bytes.size()}, {QStringLiteral("page_count"), count}});
+    }
+    const QByteArray manifest = QJsonDocument(QJsonObject{{QStringLiteral("kind"), QStringLiteral("thoughts-project-reading")}, {QStringLiteral("schema_version"), 1},
+                                                          {QStringLiteral("project_id"), QStringLiteral("algebra")}, {QStringLiteral("title"), QStringLiteral("Algebra")},
+                                                          {QStringLiteral("page_count"), count * 2}, {QStringLiteral("documents"), entries}}).toJson();
+    const QString manifestPath = directory.filePath(QStringLiteral("algebra.thoughts-project"));
+    QFile manifestFile(manifestPath);
+    QVERIFY(manifestFile.open(QIODevice::WriteOnly));
+    manifestFile.write(manifest);
+    manifestFile.close();
+    const auto context = Thoughts::ProjectReadingContext::load(manifestPath);
+    QVERIFY(context);
+
+    Okular::Part part(nullptr, {});
+    const QSignalBlocker quietRepository(part.m_fedoraRepository);
+    // One record already in each document: the first's on its page 1, the second's on its page 1.
+    const auto existing = [&](const QString &documentId, const QString &feedbackId) {
+        QJsonObject record = Thoughts::DocumentFeedback::create(QStringLiteral("positive"), QString(),
+                                                                Thoughts::ReviewCardFeedback::anchor(QStringLiteral("some random text"), QStringLiteral("This is "), QString(), documentId, hash,
+                                                                                                     Thoughts::ReviewCardFeedback::regionsJson({{1, QRectF(0.29, 0.162, 0.43, 0.171)}})),
+                                                                QStringLiteral("example-mac"));
+        record.insert(QStringLiteral("feedback_id"), feedbackId);
+        return record;
+    };
+    QJsonObject projections;
+    const QString prefix = Thoughts::DocumentFeedback::entityType() + QLatin1Char('\n') + Thoughts::DocumentFeedback::collection() + QLatin1Char('\n');
+    for (const QJsonObject &record : {existing(firstId, QStringLiteral("0190a000-0000-4000-8000-0000000000e1")), existing(secondId, QStringLiteral("0190a000-0000-4000-8000-0000000000e2"))})
+        projections.insert(prefix + record.value(QStringLiteral("feedback_id")).toString(), record);
+    part.m_fedoraProjections = projections;
+    QVERIFY(openDocument(&part, manifestPath));
+    QCOMPARE(int(part.m_document->pages()), count * 2);
+    part.widget()->resize(900, 800);
+    part.widget()->show();
+    part.refreshDocumentFeedback();
+    auto *feedback = part.m_pageView->documentFeedback();
+    QVERIFY(feedback->hasDocument());
+    QCOMPARE(feedback->documentId(), Thoughts::ProjectFeedback::virtualDocumentId(context->revision));
+    // Each document's record at its own pages of the combined PDF, placed exactly.
+    QCOMPARE(feedback->records().size(), 2);
+    part.m_document->requestTextPage(0);
+    part.m_document->requestTextPage(count);
+    QTRY_VERIFY(!part.m_document->page(count)->text().isEmpty());
+    QCOMPARE(feedback->rectsOf(QStringLiteral("0190a000-0000-4000-8000-0000000000e1")).value(0).first, 1);
+    QCOMPARE(feedback->rectsOf(QStringLiteral("0190a000-0000-4000-8000-0000000000e2")).value(0).first, count + 1);
+    QCOMPARE(feedback->states().value(QStringLiteral("0190a000-0000-4000-8000-0000000000e2")).toString(), QStringLiteral("exact"));
+
+    // A passage of the second document: the actions are there, and Dislike is saved on that document.
+    QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "slotSetMouseTextSelect"));
+    QList<QJsonObject> written;
+    feedback->setWriter([&](const QJsonObject &record, QString *error) {
+        const auto own = part.projectFeedbackToDocument(record, error);
+        if (own) written.append(*own);
+        return own.has_value();
+    });
+    auto area = std::make_unique<Okular::RegularAreaRect>();
+    area->appendShape(Okular::NormalizedRect(0.29, 0.162, 0.43, 0.171));
+    part.m_document->setPageTextSelection(count, std::move(area), QColor(Qt::blue));
+    QVERIFY(part.m_pageView->documentFeedbackSelectionQualifies());
+    QVERIFY(part.m_pageView->documentQuestionSelectionQualifies());
+    QVERIFY(part.m_pageView->addDocumentFeedbackFromSelection(QStringLiteral("negative")));
+    QCOMPARE(written.size(), 1);
+    const QJsonObject disliked = written.constFirst();
+    QCOMPARE(Thoughts::DocumentFeedback::validationError(disliked), QString());
+    const QJsonObject pdf = disliked.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject();
+    QCOMPARE(pdf.value(QStringLiteral("document_id")).toString(), secondId);
+    QCOMPARE(pdf.value(QStringLiteral("pdf_sha256")).toString(), hash);
+    QCOMPARE(pdf.value(QStringLiteral("regions")).toArray().first().toObject().value(QStringLiteral("page")).toInt(), 1);
+    QCOMPARE(disliked.value(Thoughts::FeedbackVersion::field()).toObject().value(QStringLiteral("pdf_sha256")).toString(), hash);
+    QCOMPARE(disliked.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString(), QStringLiteral("some random text"));
+    // An edit of the first document's record stays with the first document.
+    QJsonObject edited = feedback->record(QStringLiteral("0190a000-0000-4000-8000-0000000000e1"));
+    edited.insert(QStringLiteral("comment"), QStringLiteral("Clear."));
+    QVERIFY(feedback->write(edited));
+    QCOMPARE(written.last().value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject().value(QStringLiteral("document_id")).toString(), firstId);
+    QCOMPARE(written.last().value(QStringLiteral("anchor")).toObject().value(QStringLiteral("pdf")).toObject().value(QStringLiteral("regions")).toArray().first().toObject().value(QStringLiteral("page")).toInt(), 1);
 }
 
 void PartTest::testDocumentFeedbackFollowsTheLibraryIdentity()
@@ -20259,6 +20376,95 @@ void PartTest::testTextSelectionCreatesManualReviewRequest()
     QVERIFY((rect.at(2).toDouble() - rect.at(0).toDouble()) * (rect.at(3).toDouble() - rect.at(1).toDouble()) > 0.5);
 }
 
+void PartTest::testSectionHeadingRightClickOffersSectionReviewCard()
+{
+    const QTemporaryDir docsRoot;
+    QVERIFY(docsRoot.isValid());
+    QDir root(docsRoot.path());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")));
+    const QString pdfPath = root.filePath(QStringLiteral("current_pdfs/section-heading.pdf"));
+    {
+        QPdfWriter writer(pdfPath);
+        writer.setResolution(72);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageMargins(QMarginsF(0, 0, 0, 0));
+        QPainter painter(&writer);
+        QFont heading = painter.font();
+        heading.setPointSizeF(20);
+        heading.setBold(true);
+        QFont body = painter.font();
+        body.setPointSizeF(10);
+        painter.setFont(heading);
+        painter.drawText(QPointF(60, 120), QStringLiteral("Global batch"));
+        painter.setFont(body);
+        for (int line = 0; line < 20; ++line)
+            painter.drawText(QPointF(60, 160 + 16 * line), QStringLiteral("The global batch is split among the copies of the model, line %1.").arg(line));
+    }
+
+    Okular::Part part(nullptr, {});
+    QVERIFY(openDocument(&part, pdfPath));
+    QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "setDocsRoot", Q_ARG(QString, docsRoot.path())));
+    part.widget()->resize(800, 900);
+    part.widget()->show();
+    if (qgetenv("KDECI_CANNOT_CREATE_WINDOWS") == "1") {
+        QSKIP("KDE CI can't create a window on this platform, skipping some gui tests");
+    }
+    QVERIFY(QTest::qWaitForWindowExposed(part.widget()));
+    part.m_document->setViewportPage(0);
+    QTRY_VERIFY(part.m_document->page(0)->hasPixmap(part.m_pageView));
+    QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "slotSetMouseTextSelect"));
+    part.m_document->requestTextPage(0);
+    QTRY_VERIFY(!part.m_document->page(0)->text().isEmpty());
+
+    PageView *view = part.m_pageView;
+    QSignalSpy requestSpy(&part, &Okular::Part::requestSectionReviewCard);
+    // The page's context menu at a place on the page (normalized): its actions, choosing the section card when offered.
+    const auto menuAt = [&](const QPointF &onPage, bool choose) {
+        QStringList names;
+        bool done = false;
+        QTimer menuWatcher;
+        menuWatcher.setInterval(50);
+        QObject::connect(&menuWatcher, &QTimer::timeout, view, [&] {
+            QMenu *menu = view->findChild<QMenu *>(QStringLiteral("PopupMenu"));
+            if (!menu || !menu->isVisible()) return;
+            menuWatcher.stop();
+            for (QAction *action : menu->actions()) names.append(action->isSeparator() ? QStringLiteral("|") : action->objectName());
+            QAction *section = menu->findChild<QAction *>(QStringLiteral("AddSectionReviewCard"));
+            if (choose && section) {
+                menu->setActiveAction(section);
+                QTest::keyClick(menu, Qt::Key_Return);
+            } else {
+                menu->close();
+            }
+            done = true;
+        });
+        menuWatcher.start();
+        const QRectF place = view->reviewFeedbackRect(1, QRectF(onPage, QSizeF(0.001, 0.001)));
+        const QPointF point = place.topLeft() - QPointF(view->horizontalScrollBar()->value(), view->verticalScrollBar()->value());
+        QTest::mouseClick(view->viewport(), Qt::RightButton, Qt::NoModifier, point.toPoint(), 100);
+        QTest::qWaitFor([&done] { return done; }, 5000);
+        return names;
+    };
+
+    // On the heading: Add Review Card for This Section…, which asks for the heading's line.
+    const QStringList onHeading = menuAt(QPointF(80.0 / 595, 114.0 / 842), true);
+    QVERIFY2(onHeading.contains(QStringLiteral("AddSectionReviewCard")), qPrintable(onHeading.join(QLatin1Char(','))));
+    QTRY_COMPARE(requestSpy.count(), 1);
+    const QList<QVariant> request = requestSpy.takeFirst();
+    QCOMPARE(QFileInfo(request.at(0).toString()).absoluteFilePath(), QFileInfo(pdfPath).absoluteFilePath());
+    QCOMPARE(request.at(1).toInt(), 1);
+    const QVariantList rect = request.at(2).toList();
+    QCOMPARE(rect.size(), 4);
+    QVERIFY(rect.at(1).toDouble() < 114.0 / 842 && rect.at(3).toDouble() > 114.0 / 842);
+    QVERIFY(rect.at(3).toDouble() < 150.0 / 842); // the heading's line only
+
+    // On a line of text: no such entry.
+    const QStringList onText = menuAt(QPointF(100.0 / 595, 157.0 / 842), true);
+    QVERIFY(!onText.isEmpty());
+    QVERIFY(!onText.contains(QStringLiteral("AddSectionReviewCard")));
+    QCOMPARE(requestSpy.count(), 0);
+}
+
 void PartTest::testTextSelectionOverAPageBreakCreatesOneMultiAreaRequest()
 {
     const QTemporaryDir docsRoot;
@@ -22206,6 +22412,18 @@ void PartTest::testReviewCardScheduleText()
     retired.remove(QStringLiteral("due_from"));
     retired.insert(QStringLiteral("retired_at"), utc(now.addDays(-2)));
     QCOMPARE(text(retired).line, QStringLiteral("Retired · 3 reviews"));
+    // A project card says so after when it is due, and first that its passage changed.
+    auto project = reviewCard(now.addDays(3));
+    project.insert(QStringLiteral("review_kind"), QStringLiteral("project"));
+    QVERIFY2(text(project).line.startsWith(future.parts.first() + QStringLiteral(" · Project · ")), qPrintable(text(project).line));
+    QVERIFY(text(project).details.startsWith(QStringLiteral("Project card: ")));
+    project.insert(QStringLiteral("passage_changed"), true);
+    QVERIFY2(text(project).line.startsWith(QStringLiteral("Changed since you last saw it · ")), qPrintable(text(project).line));
+    QVERIFY(text(project).details.startsWith(QStringLiteral("Changed since you last saw it\nProject card: ")));
+    auto knowledgeCard = reviewCard(now.addDays(3));
+    knowledgeCard.insert(QStringLiteral("review_kind"), QStringLiteral("knowledge"));
+    knowledgeCard.insert(QStringLiteral("passage_changed"), true);
+    QCOMPARE(text(knowledgeCard).line, future.line); // knowledge cards are never marked
     QVERIFY(!text(retired).due);
     QVERIFY(text(retired).details.startsWith(QStringLiteral("Retired %1: not reviewed; its history and schedule are kept.\n").arg(local(now.addDays(-2)))));
     auto never = retired;
@@ -22857,6 +23075,19 @@ void PartTest::testAnnotationSidebarReviewCardPdfHighlight()
         QCOMPARE(status(), QStringLiteral("Answer highlighted in PDF"));
         QTRY_VERIFY(highlightedTextPixels() > 20);
     }
+    // A click on the highlighted card takes its highlight off and deselects it; the next click brings it back.
+    {
+        QSignalSpy cleared(reviews, &Reviews::clearReviewCardPresentationRequested);
+        clickCard(0, false);
+        QCOMPARE(cleared.size(), 1);
+        QVERIFY(reviews->m_activeReviewCardId.isEmpty());
+        QVERIFY(!view->selectionModel()->hasSelection());
+        QVERIFY(status() != QStringLiteral("Answer highlighted in PDF"));
+        clickCard(0, false);
+        QCOMPARE(status(), QStringLiteral("Answer highlighted in PDF"));
+        QVERIFY(!reviews->m_activeReviewCardId.isEmpty());
+        QCOMPARE(cleared.size(), 1);
+    }
     QSignalSpy editRequested(&part, &Okular::Part::requestEditReviewCard);
     const auto chooseEdit = [&](const QString &name) {
         QTimer::singleShot(0, &part, [name] {
@@ -22915,6 +23146,55 @@ void PartTest::testAnnotationSidebarReviewCardPdfHighlight()
     QCOMPARE(mergeRequested.takeFirst().at(0).toStringList(), (QStringList{QStringLiteral("toggle-card"), QStringLiteral("second-card")}));
     QCOMPARE(view->selectionModel()->selectedRows().size(), 2);
     QVERIFY(editRequested.isEmpty() && openRequested.isEmpty());
+    // Make project card asks the shell to change the card's kind (review-card-kinds.md §5).
+    QSignalSpy kindRequested(&part, &Okular::Part::requestReviewCardKind);
+    QString kindLabel;
+    bool followShown = true;
+    QTimer::singleShot(0, &part, [&kindLabel, &followShown] {
+        auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        QVERIFY(menu);
+        auto *action = menu->findChild<QAction *>(QStringLiteral("kindSidebarReviewCard"));
+        if (!action) { menu->close(); QFAIL("Make project card is missing"); }
+        kindLabel = action->text();
+        followShown = menu->findChild<QAction *>(QStringLiteral("followProjectSidebarReviewCard")) != nullptr;
+        menu->setActiveAction(action);
+        QTest::keyClick(menu, Qt::Key_Return);
+    });
+    QVERIFY(QMetaObject::invokeMethod(reviews, "contextMenuRequested", Q_ARG(QPoint, secondCard)));
+    QCOMPARE(kindLabel, QStringLiteral("Make project card"));
+    QVERIFY(!followShown);
+    QCOMPARE(kindRequested.size(), 1);
+    QCOMPARE(kindRequested.first().at(0).toString(), QStringLiteral("second-card"));
+    QCOMPARE(kindRequested.first().at(1).toString(), QStringLiteral("project"));
+    // Retire and Delete: on every selected card when the right-clicked card is one of them, else on that card.
+    QSignalSpy retireRequested(&part, &Okular::Part::requestRetireReviewCards);
+    QSignalSpy deleteRequested(&part, &Okular::Part::requestDeleteReviewCards);
+    const auto chooseLabelled = [&part](const QString &name, QString *label) {
+        QTimer::singleShot(0, &part, [name, label] {
+            auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+            QVERIFY(menu);
+            auto *action = menu->findChild<QAction *>(name);
+            if (!action) { menu->close(); QFAIL("Retire or Delete is missing"); }
+            *label = action->text();
+            menu->setActiveAction(action);
+            QTest::keyClick(menu, Qt::Key_Return);
+        });
+    };
+    QString retireLabel;
+    view->selectionModel()->select(view->model()->index(0, 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    view->selectionModel()->select(view->model()->index(1, 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    chooseLabelled(QStringLiteral("retireSidebarReviewCards"), &retireLabel);
+    QVERIFY(QMetaObject::invokeMethod(reviews, "contextMenuRequested", Q_ARG(QPoint, secondCard)));
+    QCOMPARE(retireLabel, QStringLiteral("Retire 2 cards"));
+    QCOMPARE(retireRequested.size(), 1);
+    QCOMPARE(retireRequested.takeFirst().at(0).toStringList(), (QStringList{QStringLiteral("toggle-card"), QStringLiteral("second-card")}));
+    QString deleteLabel;
+    view->selectionModel()->clearSelection();
+    chooseLabelled(QStringLiteral("deleteSidebarReviewCards"), &deleteLabel);
+    QVERIFY(QMetaObject::invokeMethod(reviews, "contextMenuRequested", Q_ARG(QPoint, secondCard)));
+    QCOMPARE(deleteLabel, QStringLiteral("Delete card…"));
+    QCOMPARE(deleteRequested.size(), 1);
+    QCOMPARE(deleteRequested.takeFirst().at(0).toStringList(), QStringList{QStringLiteral("second-card")});
     QVERIFY(part.focusSidebarReviewCard(QStringLiteral("toggle-card")));
     QTest::qWait(150);
     const QImage rendered = part.m_pageView->viewport()->grab().toImage();
@@ -22943,6 +23223,7 @@ void PartTest::testAnnotationSidebarReviewCardPdfHighlight()
         clickCard(0, true);
         QCOMPARE(status(), QStringLiteral("Answer highlighted in PDF"));
         QCOMPARE(part.m_document->currentPage(), 0u); // Double-click jumps to the answer.
+        QCOMPARE(view->currentIndex().row(), 0); // and leaves the card selected.
         QTRY_VERIFY(highlightedTextPixels() > 20); // Repeated double-clicks never hide the text.
         QCOMPARE(view->visualRect(view->model()->index(0, 0)).height(), compactHeight);
     }

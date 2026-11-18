@@ -117,7 +117,10 @@ public:
            ReviewCardScheduleRole, ReviewCardScheduleTagsRole, ReviewCardSchedulePartsRole, ReviewCardDueRole, ReviewCardDueOrderRole,
            // Whether the row is document feedback, whatever its type: a comment-kind feedback lists
            // with the comments (ItemTypeRole Comment) but opens, edits and deletes as feedback.
-           DocumentFeedbackRole };
+           DocumentFeedbackRole,
+           // A review card's "sidebar_schedule" as a map: its review_kind, review_kind_source and
+           // projects_kind give the Cards list menu's kind entries (review-card-kinds.md §5).
+           ReviewCardKindRole };
     // Notes are not annotations: they never appear in the Annotations list (value 2 stays unused).
     enum ItemType { Comment = 1, Feedback = 2, AgentProposal = 4, ReviewCard = 8 };
 

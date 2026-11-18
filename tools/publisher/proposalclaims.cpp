@@ -263,6 +263,55 @@ void expireProposalClaims(SourcePublisher &publisher, const Json &result)
     publisher.state.remove(pendingKey);
 }
 
+std::optional<QByteArray> withClaimedDecisions(const SourcePublisher &publisher, const QString &path, const QByteArray &text)
+{
+    QString error;
+    const QList<QJsonObject> claims = ProposalDecisions::storedClaims(proposalClaimDatabase(publisher), &error, {path});
+    if (!error.isEmpty() || claims.isEmpty()) {
+        return std::nullopt;
+    }
+    QString source = QString::fromUtf8(text);
+    if (source.toUtf8() != text) {
+        return std::nullopt;
+    }
+    QHash<QString, QString> wrappers; // proposal ID -> SHA-256 of its wrapper in `text`
+    for (const AgentProposedEdit &proposal : parseAgentProposals(path, source).proposals) {
+        wrappers.insert(proposal.id, ProposalDecisions::wrapperSha256(source, proposal));
+    }
+    // A claim stands for its decision only on the wrapper it was made on.
+    QStringList accepted, rejected;
+    for (const QJsonObject &claim : claims) {
+        const QString id = claim.value(QStringLiteral("proposal_id")).toString();
+        const auto wrapper = wrappers.constFind(id);
+        if (wrapper == wrappers.cend() || wrapper.value() != claim.value(QStringLiteral("wrapper_sha256")).toString()) {
+            continue;
+        }
+        accepted.removeAll(id);
+        rejected.removeAll(id);
+        const QString action = claim.value(QStringLiteral("action")).toString();
+        if (action == QLatin1String("accept")) {
+            accepted.append(id);
+        } else if (action == QLatin1String("reject") || action == QLatin1String("withdraw")) {
+            rejected.append(id);
+        }
+        // A partial decision also edited the text, in a way no claim records.
+    }
+    if (accepted.isEmpty() && rejected.isEmpty()) {
+        return std::nullopt;
+    }
+    for (const auto &[ids, action] : {std::pair {accepted, QStringLiteral("accept")}, std::pair {rejected, QStringLiteral("reject")}}) {
+        if (ids.isEmpty()) {
+            continue;
+        }
+        QString decided;
+        if (!decideAgentProposals(path, source, ids, action, &decided, nullptr, nullptr)) {
+            return std::nullopt;
+        }
+        source = decided;
+    }
+    return source.toUtf8();
+}
+
 int dropInapplicableProposalClaims(const QString &docsRoot, const QString &manifestPath, const QString &sourceStatePath, const QString &database,
                                    const std::function<void(const QString &)> &report)
 {
