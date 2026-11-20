@@ -9011,6 +9011,7 @@ MentalModelView::MentalModelView(QWidget *parent)
     auto *bar = new QHBoxLayout;
     m_status = new QLabel(this);
     m_status->setObjectName(QStringLiteral("mentalModelStatus"));
+    m_status->setWordWrap(true);
     bar->addWidget(m_status, 1);
     auto *reveal = new QPushButton(i18n("Show file"), this);
     connect(reveal, &QPushButton::clicked, this, [] {
@@ -9037,6 +9038,25 @@ MentalModelView::MentalModelView(QWidget *parent)
 QString MentalModelView::path()
 {
     return QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("mental-model/mental-model.md"));
+}
+
+// The Python that runs the writer, with its arguments before the script. Python from python.org has no python3 on
+// Windows, only python and the launcher py. -X utf8: Windows' Python would otherwise read the cards and write the page
+// in the ANSI code page, and stop at the first character it lacks.
+static QStringList mentalModelPython()
+{
+#ifdef Q_OS_WIN
+    if (!QStandardPaths::findExecutable(QStringLiteral("py")).isEmpty())
+        return {QStringLiteral("py"), QStringLiteral("-3"), QStringLiteral("-X"), QStringLiteral("utf8")};
+    return {QStringLiteral("python"), QStringLiteral("-X"), QStringLiteral("utf8")};
+#else
+    return {QStringLiteral("python3"), QStringLiteral("-X"), QStringLiteral("utf8")};
+#endif
+}
+
+static QString mentalModelNeedsPython()
+{
+    return i18n("The Mental Model was not rewritten: Refresh needs Python 3. Install it from python.org, then click Refresh again.");
 }
 
 void MentalModelView::rewrite()
@@ -9070,6 +9090,13 @@ void MentalModelView::rewrite()
                 Q_EMIT libraryNoteWritten();
             return;
         }
+#ifdef Q_OS_WIN
+        // Without Python, Windows' own python is a shortcut to the Microsoft Store that ends with 9009.
+        if (exitCode == 9009 || error.contains(QLatin1String("Python was not found"))) {
+            m_status->setText(mentalModelNeedsPython());
+            return;
+        }
+#endif
         // build.py ends with the reason; poppler warnings from thoughtsctl come before it.
         const QStringList lines = error.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
         m_status->setText(i18n("The Mental Model was not rewritten: %1", lines.isEmpty() ? i18n("the writer stopped") : lines.last()));
@@ -9079,25 +9106,40 @@ void MentalModelView::rewrite()
         m_writer->deleteLater();
         m_writer = nullptr;
         m_refresh->setEnabled(true);
-        m_status->setText(i18n("The Mental Model was not rewritten: python3 could not be started."));
+        m_status->setText(mentalModelNeedsPython());
     });
-    m_writer->start(QStringLiteral("python3"), {folder.filePath(QStringLiteral("build.py")), QStringLiteral("--thoughtsctl"),
-                                                 QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("thoughtsctl")),
-                                                 QStringLiteral("--out"), path()});
+    QStringList arguments = mentalModelPython();
+    const QString python = arguments.takeFirst();
+    arguments << folder.filePath(QStringLiteral("build.py")) << QStringLiteral("--thoughtsctl")
+              << QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("thoughtsctl")) << QStringLiteral("--out") << path();
+    m_writer->start(python, arguments);
+}
+
+void MentalModelView::setReviewedSince(std::function<int(const QDateTime &)> count)
+{
+    m_reviewedSince = std::move(count);
 }
 
 void MentalModelView::reload()
 {
+    // While Refresh writes, the status says so; the finished writer reloads.
+    if (m_writer) return;
     QFile file(path());
     if (!file.open(QIODevice::ReadOnly)) {
-        m_status->setText(i18n("No Mental Model yet."));
+        m_status->setText(i18n("No Mental Model yet. Click Refresh to write it from your review cards."));
         m_text->setMarkdown(i18n("A Mental Model describes you from your review cards: what you know well and what not yet, "
                                  "what interests you, how you study, and what you like in answers. Each point links to the cards "
                                  "it comes from. It is written by an agent from your cards and appears here."));
         return;
     }
     m_loaded = QFileInfo(file).lastModified();
-    m_status->setText(i18n("Written from your review cards · updated %1", QLocale().toString(m_loaded, QLocale::ShortFormat)));
+    const QString updated = QLocale().toString(m_loaded, QLocale::ShortFormat);
+    // Cards studied since it was written are not in it yet: say so, and how to add them.
+    const int studied = m_reviewedSince ? m_reviewedSince(m_loaded) : 0;
+    m_status->setText(studied > 0 ? i18np("Written from your review cards · updated %2 · 1 card reviewed since: click Refresh to add it",
+                                          "Written from your review cards · updated %2 · %1 cards reviewed since: click Refresh to add them",
+                                          studied, updated)
+                                  : i18n("Written from your review cards · updated %1", updated));
     // No HTML: quoted card text such as "docs-import-<id>" must show as written, not as a tag.
     m_text->document()->setMarkdown(QString::fromUtf8(file.readAll()),
                                     QTextDocument::MarkdownFeatures(QTextDocument::MarkdownDialectGitHub | QTextDocument::MarkdownNoHTML));
