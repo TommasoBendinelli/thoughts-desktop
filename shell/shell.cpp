@@ -8053,7 +8053,7 @@ QJsonObject Shell::handleSyncCommandRequest(const QJsonObject &request)
         return Thoughts::syncCommandError(QStringLiteral("busy"), QStringLiteral("A Sync is running. Retry the identical request when it has finished."));
     }
     if (command == QLatin1String("create-review-card") || command == QLatin1String("list-review-cards") || command == QLatin1String("delete-review-card") || command == QLatin1String("set-review-card-interval")
-        || command == QLatin1String("move-review-card") || command == QLatin1String("merge-review-cards")) {
+        || command == QLatin1String("move-review-card") || command == QLatin1String("merge-review-cards") || command == QLatin1String("answer-review-card")) {
         Thoughts::ReviewStore store(ShellUtils::docsRoot(), [this] { return effectiveFedoraProjections(); }, {},
             command == QLatin1String("list-review-cards"));
         const QString dataRoot = Thoughts::Platform::applicationDataRoot();

@@ -4085,6 +4085,22 @@ void ReviewStoreTest::sourceSelectionCreationAndRetries()
     QCOMPARE(cardHistory().size(), eventCount);
     auto conflict = action; conflict.insert(QStringLiteral("interval_amount"), 4);
     QCOMPARE(store.sourceCardCommand(conflict, bundle).value(QStringLiteral("error_code")).toString(), QStringLiteral("request_conflict"));
+    // An answer the user gave elsewhere is recorded with their tags, as the Review page's Next does.
+    QJsonObject answer{{QStringLiteral("command"), QStringLiteral("answer-review-card")}, {QStringLiteral("card_id"), id},
+        {QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)}, {QStringLiteral("tags"), QJsonArray{QStringLiteral("Partly")}},
+        {QStringLiteral("interval_unit"), QStringLiteral("days")}, {QStringLiteral("interval_amount"), 2}};
+    const auto answered = store.sourceCardCommand(answer, bundle);
+    QVERIFY2(answered.value(QStringLiteral("accepted")).toBool(), QJsonDocument(answered).toJson().constData());
+    QCOMPARE(cardHistory().size(), eventCount + 1);
+    QCOMPARE(cardHistory().last().value(QStringLiteral("review_tags")).toArray(), QJsonArray{QStringLiteral("Partly")});
+    QCOMPARE(cardHistory().last().value(QStringLiteral("rating")).toString(), QStringLiteral("custom_interval"));
+    for (const auto &card : store.cards()) if (card.id() == id) QCOMPARE(card.currentTags(), QStringList{QStringLiteral("Partly")});
+    QVERIFY(store.sourceCardCommand(answer, bundle).value(QStringLiteral("replayed")).toBool());
+    QCOMPARE(cardHistory().size(), eventCount + 1);
+    auto changedAnswer = answer; changedAnswer.insert(QStringLiteral("tags"), QJsonArray{QStringLiteral("I get it")});
+    QCOMPARE(store.sourceCardCommand(changedAnswer, bundle).value(QStringLiteral("error_code")).toString(), QStringLiteral("request_conflict"));
+    changedAnswer.insert(QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)); changedAnswer.insert(QStringLiteral("tags"), QJsonArray{});
+    QCOMPARE(store.sourceCardCommand(changedAnswer, bundle).value(QStringLiteral("error_code")).toString(), QStringLiteral("invalid_request"));
     action.insert(QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces));
     action.insert(QStringLiteral("interval_unit"), QStringLiteral("never")); action.remove(QStringLiteral("interval_amount"));
     QVERIFY(store.sourceCardCommand(action, bundle).value(QStringLiteral("accepted")).toBool());
