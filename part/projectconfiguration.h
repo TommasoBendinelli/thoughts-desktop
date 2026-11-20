@@ -403,6 +403,8 @@ public:
         if (!QFileInfo(filename).isSymLink() && existing.open(QIODevice::ReadOnly)) {
             const auto current = QJsonDocument::fromJson(existing.readAll());
             if (current.isObject() && current.object() == value) return {};
+            // Windows cannot replace a file that is still open.
+            existing.close();
         }
         return saveBytes(filename, QJsonDocument(value).toJson());
     }
