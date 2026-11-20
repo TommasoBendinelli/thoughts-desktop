@@ -9011,6 +9011,7 @@ MentalModelView::MentalModelView(QWidget *parent)
     auto *bar = new QHBoxLayout;
     m_status = new QLabel(this);
     m_status->setObjectName(QStringLiteral("mentalModelStatus"));
+    m_status->setWordWrap(true);
     bar->addWidget(m_status, 1);
     auto *reveal = new QPushButton(i18n("Show file"), this);
     connect(reveal, &QPushButton::clicked, this, [] {
@@ -9037,6 +9038,25 @@ MentalModelView::MentalModelView(QWidget *parent)
 QString MentalModelView::path()
 {
     return QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("mental-model/mental-model.md"));
+}
+
+// The Python that runs the writer, with its arguments before the script. Python from python.org has no python3 on
+// Windows, only python and the launcher py. -X utf8: Windows' Python would otherwise read the cards and write the page
+// in the ANSI code page, and stop at the first character it lacks.
+static QStringList mentalModelPython()
+{
+#ifdef Q_OS_WIN
+    if (!QStandardPaths::findExecutable(QStringLiteral("py")).isEmpty())
+        return {QStringLiteral("py"), QStringLiteral("-3"), QStringLiteral("-X"), QStringLiteral("utf8")};
+    return {QStringLiteral("python"), QStringLiteral("-X"), QStringLiteral("utf8")};
+#else
+    return {QStringLiteral("python3"), QStringLiteral("-X"), QStringLiteral("utf8")};
+#endif
+}
+
+static QString mentalModelNeedsPython()
+{
+    return i18n("The Mental Model was not rewritten: Refresh needs Python 3. Install it from python.org, then click Refresh again.");
 }
 
 void MentalModelView::rewrite()
@@ -9070,6 +9090,13 @@ void MentalModelView::rewrite()
                 Q_EMIT libraryNoteWritten();
             return;
         }
+#ifdef Q_OS_WIN
+        // Without Python, Windows' own python is a shortcut to the Microsoft Store that ends with 9009.
+        if (exitCode == 9009 || error.contains(QLatin1String("Python was not found"))) {
+            m_status->setText(mentalModelNeedsPython());
+            return;
+        }
+#endif
         // build.py ends with the reason; poppler warnings from thoughtsctl come before it.
         const QStringList lines = error.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
         m_status->setText(i18n("The Mental Model was not rewritten: %1", lines.isEmpty() ? i18n("the writer stopped") : lines.last()));
@@ -9079,11 +9106,13 @@ void MentalModelView::rewrite()
         m_writer->deleteLater();
         m_writer = nullptr;
         m_refresh->setEnabled(true);
-        m_status->setText(i18n("The Mental Model was not rewritten: python3 could not be started."));
+        m_status->setText(mentalModelNeedsPython());
     });
-    m_writer->start(QStringLiteral("python3"), {folder.filePath(QStringLiteral("build.py")), QStringLiteral("--thoughtsctl"),
-                                                 QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("thoughtsctl")),
-                                                 QStringLiteral("--out"), path()});
+    QStringList arguments = mentalModelPython();
+    const QString python = arguments.takeFirst();
+    arguments << folder.filePath(QStringLiteral("build.py")) << QStringLiteral("--thoughtsctl")
+              << QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("thoughtsctl")) << QStringLiteral("--out") << path();
+    m_writer->start(python, arguments);
 }
 
 void MentalModelView::reload()

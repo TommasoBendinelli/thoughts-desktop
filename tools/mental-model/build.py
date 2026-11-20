@@ -45,7 +45,8 @@ from pathlib import Path
 
 THOUGHTSCTL = "/Applications/Thoughts.app/Contents/MacOS/thoughtsctl"
 # Thoughts starts this with the GUI's short PATH, so the usual places of the Claude CLI are searched as well.
-CLAUDE_PLACES = ["~/.npm-global/bin", "~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin"]
+CLAUDE_PLACES = ["~/.npm-global/bin", "~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin",
+                 "~/AppData/Roaming/npm"]
 MODEL = "claude-opus-5-5"
 PROMPT = Path(__file__).with_name("prompt.md")
 # Settings for the copy of the page, next to the output: {"publish": "host:path"}.
@@ -356,14 +357,15 @@ def write_page(cards, tag_groups, since, months):
         print(f"{args.request}: {len(request)} characters, {len(pictures) + len(page_pictures)} pictures; the model was not asked")
         return None
     # The npm install of claude is a node script, so node must be found the same way.
-    path = ":".join([os.environ.get("PATH", "")] + [str(Path(p).expanduser()) for p in CLAUDE_PLACES])
+    path = os.pathsep.join([os.environ.get("PATH", "")] + [str(Path(p).expanduser()) for p in CLAUDE_PLACES])
     claude = shutil.which("claude", path=path)
     if not claude:
-        raise SystemExit("the Claude CLI (claude) was not found")
-    # No tools; the pictures go in the message itself, which needs the stream-json input format.
+        raise SystemExit("it needs the Claude CLI (claude), which was not found. Install it and sign in, then click Refresh again.")
+    # No tools; the pictures go in the message itself, which needs the stream-json input format. The prompt goes as a
+    # file: on Windows claude is claude.cmd, whose command line (cmd.exe's) is shorter than the prompt.
     result = subprocess.run([claude, "-p", "--model", MODEL, "--tools", "", "--no-session-persistence",
                              "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                             "--system-prompt", PROMPT.read_text()],
+                             "--system-prompt-file", str(PROMPT)],
                             input=json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n",
                             capture_output=True, text=True, timeout=1800, env={**os.environ, "PATH": path})
     events = []
