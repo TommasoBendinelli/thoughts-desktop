@@ -296,6 +296,9 @@ public:
     void reload();
     // Writes the document again from the cards (takes a minute or two), then reloads it.
     void rewrite();
+    // How many cards were reviewed after a time: the page asks for a Refresh when cards were studied since it was
+    // written.
+    void setReviewedSince(std::function<int(const QDateTime &)> count);
 
 Q_SIGNALS:
     // A cited card was clicked: show it in Browse cards.
@@ -309,6 +312,7 @@ private:
     QPushButton *m_refresh = nullptr;
     QTextBrowser *m_text = nullptr;
     QDateTime m_loaded;
+    std::function<int(const QDateTime &)> m_reviewedSince;
     QPointer<QProcess> m_writer; // While Refresh writes the document.
 };
 

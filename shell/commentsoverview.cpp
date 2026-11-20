@@ -4006,6 +4006,15 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
     connect(m_mentalModelView, &MentalModelView::cardRequested, this, &CommentsOverview::showReviewCardInfo);
     // A rewritten Mental Model note goes to the server with a Sync, as a note edited here would.
     connect(m_mentalModelView, &MentalModelView::libraryNoteWritten, this, &CommentsOverview::syncRequested);
+    // The page counts the cards studied since it was written, from the cards Browse loaded, and counts again when they
+    // change (a review, a Sync).
+    m_mentalModelView->setReviewedSince([this](const QDateTime &since) {
+        return int(std::count_if(m_reviewCardsWidget->libraryCards().cbegin(), m_reviewCardsWidget->libraryCards().cend(),
+                                 [&since](const ReviewBrowserCard &item) {
+                                     return !item.card.schedule.deleted && item.card.schedule.lastReviewedAt > since;
+                                 }));
+    });
+    connect(m_reviewCardsWidget, &ReviewCardsWidget::countsChanged, m_mentalModelView, &MentalModelView::reload);
     m_reviewPage->addTab(m_reviewCardsWidget, i18n("Browse cards"));
     m_reviewPage->addTab(m_mentalModelView, i18n("Mental Model"));
     connect(m_reviewPage, &QTabWidget::currentChanged, this, [this] {

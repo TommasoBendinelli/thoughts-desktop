@@ -9115,18 +9115,31 @@ void MentalModelView::rewrite()
     m_writer->start(python, arguments);
 }
 
+void MentalModelView::setReviewedSince(std::function<int(const QDateTime &)> count)
+{
+    m_reviewedSince = std::move(count);
+}
+
 void MentalModelView::reload()
 {
+    // While Refresh writes, the status says so; the finished writer reloads.
+    if (m_writer) return;
     QFile file(path());
     if (!file.open(QIODevice::ReadOnly)) {
-        m_status->setText(i18n("No Mental Model yet."));
+        m_status->setText(i18n("No Mental Model yet. Click Refresh to write it from your review cards."));
         m_text->setMarkdown(i18n("A Mental Model describes you from your review cards: what you know well and what not yet, "
                                  "what interests you, how you study, and what you like in answers. Each point links to the cards "
                                  "it comes from. It is written by an agent from your cards and appears here."));
         return;
     }
     m_loaded = QFileInfo(file).lastModified();
-    m_status->setText(i18n("Written from your review cards · updated %1", QLocale().toString(m_loaded, QLocale::ShortFormat)));
+    const QString updated = QLocale().toString(m_loaded, QLocale::ShortFormat);
+    // Cards studied since it was written are not in it yet: say so, and how to add them.
+    const int studied = m_reviewedSince ? m_reviewedSince(m_loaded) : 0;
+    m_status->setText(studied > 0 ? i18np("Written from your review cards · updated %2 · 1 card reviewed since: click Refresh to add it",
+                                          "Written from your review cards · updated %2 · %1 cards reviewed since: click Refresh to add them",
+                                          studied, updated)
+                                  : i18n("Written from your review cards · updated %1", updated));
     // No HTML: quoted card text such as "docs-import-<id>" must show as written, not as a tag.
     m_text->document()->setMarkdown(QString::fromUtf8(file.readAll()),
                                     QTextDocument::MarkdownFeatures(QTextDocument::MarkdownDialectGitHub | QTextDocument::MarkdownNoHTML));
