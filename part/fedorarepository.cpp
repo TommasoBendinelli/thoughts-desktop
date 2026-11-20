@@ -6617,9 +6617,9 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
             failManualSync(QStringLiteral("This computer's device token belongs to another server."), m_tokenWithheld);
             return;
         }
-#ifdef Q_OS_WIN
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
         failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."),
-                       QStringLiteral("Store this computer's device token with: %1").arg(Thoughts::Platform::storeSecretCommand(QStringLiteral("thoughts-server"), Thoughts::Platform::desktopDeviceAccount())));
+                       QStringLiteral("Enter the tokens the server's owner gave you for this computer in Server… (Thoughts menu on macOS, File menu elsewhere)."));
 #else
         failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."));
 #endif
