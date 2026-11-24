@@ -171,6 +171,12 @@ public:
 // Review Card browser column widths are user-controlled. They live in their own
 // config group so they survive restarts independently of the parent
 // CommentsOverview window state.
+// What an empty Library's review pages say instead of "0 cards": how a card is made.
+QString noReviewCardsText()
+{
+    return i18n("No review cards yet. Select text in a PDF, right-click it and choose Add Review Card…");
+}
+
 QString reviewCardOverviewConfigGroup()
 {
     return QStringLiteral("ReviewCardOverview");
@@ -4773,7 +4779,7 @@ void ReviewCardsWidget::refreshBrowseTable()
         m_browseTable->setCurrentItem(currentItem, 0, QItemSelectionModel::NoUpdate);
         if (!hasSelection) currentItem->setSelected(true);
     }
-    m_browseCount->setText(i18n("Showing %1 of %2 cards", m_visibleBrowseCards.size(), cardsInDocumentScope));
+    m_browseCount->setText(m_browseCards.isEmpty() ? noReviewCardsText() : i18n("Showing %1 of %2 cards", m_visibleBrowseCards.size(), cardsInDocumentScope));
     updateBrowseExportAction();
     showBrowseCard(selectedBrowseCard());
     if (auto *top = rows.value(topId); top && !top->isHidden()) {
@@ -5985,6 +5991,7 @@ void ReviewOverview::buildUi()
     overviewLayout->addWidget(today);
     m_dueSummary = new QLabel(i18n("Checking cards…"), m_overviewPage);
     m_dueSummary->setObjectName(QStringLiteral("reviewDueSummary"));
+    m_dueSummary->setWordWrap(true);
     overviewLayout->addWidget(m_dueSummary);
 
     auto *metrics = new QHBoxLayout;
@@ -7321,6 +7328,12 @@ void ReviewOverview::applyQueueRefresh(const QueueRefresh &result)
         }
         m_projectEntryIds = result.projectIds;
         displayQueueCounts(result.due, result.unavailable);
+        // No card at all, or none due: say so and what to do, not "0 cards due".
+        if (result.cards == 0) {
+            m_dueSummary->setText(noReviewCardsText());
+        } else if (result.due.isEmpty()) {
+            m_dueSummary->setText(i18n("Nothing due now."));
+        }
         m_documentFilter->setEnabled(true);
         updateEntryButtons();
     }

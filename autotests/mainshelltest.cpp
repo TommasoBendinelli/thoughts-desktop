@@ -645,6 +645,7 @@ private Q_SLOTS:
     void testReviewCountsWaitForSyncAndSourceScan_data();
     void testReviewCountsWaitForSyncAndSourceScan();
     void testReviewCanStartDuringSync();
+    void testReviewSaysHowToMakeTheFirstCard();
     void testReviewStartEnabledAfterSyncAndSourceScan();
     void testReviewDocumentPayloadUsesOpenPdf();
     void testShellMenuLabelRepair();
@@ -9963,6 +9964,24 @@ void MainShellTest::testReviewCountsWaitForSyncAndSourceScan()
     QTRY_VERIFY(queueRefreshed(overview));
     QCOMPARE(overview.m_dueCards.size(), 1);
     QVERIFY(overview.m_attentionPanel->isHidden());
+}
+
+void MainShellTest::testReviewSaysHowToMakeTheFirstCard()
+{
+    // A new Library has no card: both review pages say how one is made, not "0 cards".
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString howTo = QStringLiteral("No review cards yet. Select text in a PDF, right-click it and choose Add Review Card…");
+    {
+        Thoughts::ReviewOverview overview(temporary.path(), [] { return QVariantMap{}; },
+            [](const Thoughts::ReviewCard &, bool, QString *) { return true; }, [] {});
+        QTRY_VERIFY(queueRefreshed(overview));
+        QCOMPARE(overview.m_dueSummary->text(), howTo);
+        QVERIFY(!overview.m_startButton->isEnabled());
+    }
+    Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
+    QTRY_VERIFY(cards.m_loadedAt.isValid());
+    QTRY_COMPARE(cards.m_browseCount->text(), howTo);
 }
 
 void MainShellTest::testReviewCanStartDuringSync()
