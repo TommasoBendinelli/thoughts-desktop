@@ -22,6 +22,12 @@ SKIP_PLUGINS = {"designer", "qmllint", "qmlls", "qmltooling", "help"}
 # bin/data (XDG data on Windows) folders worth shipping; translations are left out.
 DATA = ["icons", "mime", "kf6", "kxmlgui5", "glib-2.0", "qlogging-categories6"]
 SHARE = ["poppler"]
+# What Thoughts never uses, left out of both trees (2026.11.18.1 installed 3,942 files, 396 MB): translations
+# (Thoughts speaks English, and KDE's strings alone would show half translated), the two Breeze mouse-cursor themes
+# (1,044 files, 98 MB; Windows draws its own cursors), KDE's documentation tools (966 files), and Okular's readers
+# of formats Thoughts does not open. The PostScript reader alone brings Ghostscript (24 MB).
+SKIP_DATA = ["locale", "icons/breeze_cursors", "icons/Breeze_Light", "kf6/kdoctools"]
+SKIP_GENERATORS = ["comicbook", "djvu", "dvi", "epub", "fax", "fb", "ghostview", "mobi", "tiff", "xps"]
 
 
 def pe_imports(path):
@@ -95,6 +101,13 @@ for folder in DATA:
 for folder in SHARE:
     copytree(os.path.join(CRAFT, "share", folder), os.path.join(OUT, "share", folder))
 copytree(os.path.join(CRAFT, "etc"), os.path.join(OUT, "etc"))
+for folder in SKIP_DATA:
+    shutil.rmtree(os.path.join(OUT, "bin", "data", *folder.split("/")), ignore_errors=True)
+for generator in SKIP_GENERATORS:
+    for name in (f"okularGenerator_{generator}.dll", f"okularGenerator_{generator}.json"):
+        path = os.path.join(OUT, "plugins", "okular_generators", name)
+        if os.path.exists(path):
+            os.remove(path)
 
 # A DLL Windows provides has an import library in the Windows SDK.
 system_dlls = {"winspool.drv"}
@@ -147,6 +160,8 @@ with open(os.path.join(OUT, "bin", "qt.conf"), "w") as f:
     f.write("[Paths]\nPrefix=..\n")
 
 size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(OUT) for f in fs)
-print(f"staged {OUT}: {len(shipped) - len(dropped) + len(needed - set(shipped))} programs and libraries, {size / 1e6:.0f} MB")
+files = sum(len(fs) for _, _, fs in os.walk(OUT))
+print(f"staged {OUT}: {len(shipped) - len(dropped) + len(needed - set(shipped))} programs and libraries, {files} files, "
+      f"{size / 1e6:.0f} MB")
 for line in dropped:
     print("left out", line)
