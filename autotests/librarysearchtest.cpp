@@ -34,6 +34,7 @@ private Q_SLOTS:
     void testUpdatesOnlyChangedPdfsAndKeepsUnloadedKinds();
     void testRanksExactPhrasesFirst();
     void testRanksWholeWordsAndCapitalsFirst();
+    void testRanksSourcedDocumentsFirst();
     void testFieldOpensTheSelectedResult();
     void testRebuildsAnOlderIndex();
     void testListsTheSourcesSyncKeeps();
@@ -216,6 +217,31 @@ void LibrarySearchTest::testRanksExactPhrasesFirst()
     QCOMPARE(hits.at(0).ref, QStringLiteral("k1"));
     QCOMPARE(hits.at(1).ref, QStringLiteral("c2"));
     QCOMPARE(hits.at(2).ref, QStringLiteral("c1"));
+}
+
+void LibrarySearchTest::testRanksSourcedDocumentsFirst()
+{
+    // Two PDFs with the same text match the same: the one built from a source (a note) comes before
+    // the imported one (23 Nov 2026). Without it, the path decides.
+    QTemporaryDir dir;
+    const QString imported = dir.filePath(QStringLiteral("a-imported.pdf"));
+    const QString note = dir.filePath(QStringLiteral("b-note.pdf"));
+    QVERIFY(QFile::copy(pdf(QStringLiteral("file2.pdf")), imported));
+    QVERIFY(QFile::copy(pdf(QStringLiteral("file2.pdf")), note));
+    const LibrarySearchIndex index(dir.filePath(QStringLiteral("search.sqlite")));
+    QList<LibrarySearchPdf> pdfs{{imported, QStringLiteral("Imported"), QStringLiteral("Tests"), QStringLiteral("a")},
+                                 {note, QStringLiteral("Note"), QStringLiteral("Tests"), QStringLiteral("b"), QString(), true}};
+    QVERIFY(index.update(pdfs, {}, allKinds(), nullptr, nullptr));
+    QList<LibrarySearchHit> hits = index.search(QStringLiteral("roc"));
+    QCOMPARE(hits.size(), 2);
+    QCOMPARE(hits.at(0).pdfPath, note);
+    QCOMPARE(hits.at(1).pdfPath, imported);
+    // No longer sourced: back to the path order.
+    pdfs[1].sourced = false;
+    QVERIFY(index.update(pdfs, {}, allKinds(), nullptr, nullptr));
+    hits = index.search(QStringLiteral("roc"));
+    QCOMPARE(hits.size(), 2);
+    QCOMPARE(hits.at(0).pdfPath, imported);
 }
 
 void LibrarySearchTest::testRanksWholeWordsAndCapitalsFirst()

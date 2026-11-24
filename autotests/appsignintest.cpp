@@ -1,0 +1,856 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "../part/thoughtsplatform.h"
+#include "../part/thoughtsserveraddress.h"
+#include "../shell/appsignin.h"
+#include "../shell/signindialog.h"
+
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QScopeGuard>
+#include <QSignalSpy>
+#include <QStandardPaths>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTest>
+#include <QTimeZone>
+
+using namespace Thoughts;
+
+namespace
+{
+// A Thoughts server of protocol/app-sign-in.md, as far as signing in needs it.
+class FakeServer : public QObject
+{
+public:
+    FakeServer()
+    {
+        QVERIFY(m_server.listen(QHostAddress::LocalHost));
+        connect(&m_server, &QTcpServer::newConnection, this, [this] {
+            while (QTcpSocket *socket = m_server.nextPendingConnection()) {
+                connect(socket, &QTcpSocket::readyRead, socket, [this, socket] {
+                    QByteArray &buffer = m_buffers[socket];
+                    buffer += socket->readAll();
+                    const qsizetype headerEnd = buffer.indexOf("\r\n\r\n");
+                    if (headerEnd < 0) {
+                        return;
+                    }
+                    qsizetype length = 0;
+                    for (const QByteArray &line : buffer.left(headerEnd).split('\n')) {
+                        if (line.toLower().startsWith("content-length:")) {
+                            length = line.mid(15).trimmed().toLongLong();
+                        }
+                    }
+                    if (buffer.size() < headerEnd + 4 + length) {
+                        return;
+                    }
+                    answer(socket, buffer.left(headerEnd + 4), buffer.mid(headerEnd + 4, length));
+                    m_buffers.remove(socket);
+                });
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+            }
+        });
+    }
+
+    QUrl url() const
+    {
+        return QUrl(QStringLiteral("http://127.0.0.1:%1").arg(m_server.serverPort()));
+    }
+
+    // GET /v1/ready
+    int readyStatus = 200;
+    QStringList capabilities {QStringLiteral("sync_state_v2"), QStringLiteral("app_sign_in_v1")};
+    // POST /v1/apps/sign-in: a password, or an invite with which a new password is chosen.
+    QString username = QStringLiteral("alex");
+    QString password = QStringLiteral("correct horse battery");
+    QString invite;
+    int signInStatus = 0;  // set: the answer, whatever is sent
+    QByteArray signInBody;
+    QByteArray retryAfter;
+    // GET /v1/apps/devices and sign-out, for this token.
+    QByteArray token = "app-token";
+    QJsonArray devices;
+    QStringList requests;  // "GET /v1/ready"
+    QList<QJsonObject> bodies;  // of the POSTs, in order
+    QList<QByteArray> authorizations;  // of every request
+
+private:
+    void reply(QTcpSocket *socket, int code, const QByteArray &body, const QByteArray &headers = {})
+    {
+        socket->write("HTTP/1.1 " + QByteArray::number(code) + " X\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n" + headers
+                      + "Connection: close\r\n\r\n" + body);
+        socket->disconnectFromHost();
+    }
+
+    void answer(QTcpSocket *socket, const QByteArray &head, const QByteArray &requestBody)
+    {
+        const QList<QByteArray> words = head.left(head.indexOf("\r\n")).split(' ');
+        const QString method = QString::fromLatin1(words.value(0));
+        const QString path = QUrl(QString::fromLatin1(words.value(1))).path();
+        requests.append(method + QLatin1Char(' ') + path);
+        QByteArray authorization;
+        for (const QByteArray &line : head.split('\n')) {
+            if (line.toLower().startsWith("authorization:")) {
+                authorization = line.mid(14).trimmed();
+            }
+        }
+        authorizations.append(authorization);
+        const QJsonObject body = QJsonDocument::fromJson(requestBody).object();
+        if (method == QLatin1String("POST")) {
+            bodies.append(body);
+        }
+        const bool authorized = authorization == "Bearer " + token;
+        if (method == QLatin1String("GET") && path == QLatin1String("/v1/ready")) {
+            if (readyStatus != 200) {
+                reply(socket, readyStatus, readyStatus == 503 ? R"({"detail":"Object store is unavailable"})" : R"({"detail":"Not Found"})");
+                return;
+            }
+            reply(socket, 200, QJsonDocument(QJsonObject {{QStringLiteral("status"), QStringLiteral("ready")}, {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)}}).toJson());
+            return;
+        }
+        if (method == QLatin1String("POST") && path == QLatin1String("/v1/apps/sign-in")) {
+            if (signInStatus) {
+                reply(socket, signInStatus, signInBody, retryAfter.isEmpty() ? QByteArray() : "Retry-After: " + retryAfter + "\r\n");
+                return;
+            }
+            const bool withInvite = body.contains(QStringLiteral("invite"));
+            if (withInvite && body.value(QStringLiteral("invite")).toString() != invite) {
+                reply(socket, 401, R"({"detail":"This invite does not work. It may have expired or been used already; ask for a new one."})");
+                return;
+            }
+            if (body.value(QStringLiteral("username")).toString() != username || (!withInvite && body.value(QStringLiteral("password")).toString() != password)) {
+                reply(socket, 401, R"({"detail":"Wrong username or password"})");
+                return;
+            }
+            if (withInvite) {
+                password = body.value(QStringLiteral("new_password")).toString();
+            }
+            const QJsonObject answer {
+                {QStringLiteral("username"), username},
+                {QStringLiteral("library"), QJsonObject {{QStringLiteral("id"), QStringLiteral("main")}, {QStringLiteral("name"), QStringLiteral("main")}}},
+                {QStringLiteral("devices"),
+                 QJsonObject {{QStringLiteral("app"), QJsonObject {{QStringLiteral("device_id"), QStringLiteral("macos-1a2b3c4d5e6f7a8b")}, {QStringLiteral("token"), QString::fromLatin1(token)}}},
+                              {QStringLiteral("source_sync"),
+                               QJsonObject {{QStringLiteral("device_id"), QStringLiteral("macos-sync-9c8d7e6f5a4b3c2d")}, {QStringLiteral("token"), QStringLiteral("sync-token")}}}}}};
+            reply(socket, 200, QJsonDocument(answer).toJson(), "Cache-Control: no-store\r\n");
+            return;
+        }
+        if (!authorized) {
+            reply(socket, 401, R"({"detail":"invalid token"})");
+            return;
+        }
+        if (method == QLatin1String("GET") && path == QLatin1String("/v1/apps/devices")) {
+            reply(socket, 200, QJsonDocument(QJsonObject {{QStringLiteral("devices"), devices}}).toJson());
+            return;
+        }
+        static const QRegularExpression signOut(QStringLiteral("^/v1/apps/devices/([^/]+)/sign-out$"));
+        const QRegularExpressionMatch match = signOut.match(path);
+        if (method == QLatin1String("POST") && match.hasMatch()) {
+            for (int index = 0; index < devices.size(); ++index) {
+                if (devices.at(index).toObject().value(QStringLiteral("device_id")).toString() == match.captured(1)) {
+                    devices.removeAt(index);
+                    reply(socket, 204, {});
+                    return;
+                }
+            }
+            reply(socket, 404, R"({"detail":"No such device"})");
+            return;
+        }
+        reply(socket, 404, R"({"detail":"Not Found"})");
+    }
+
+    QTcpServer m_server;
+    QHash<QTcpSocket *, QByteArray> m_buffers;
+};
+
+QJsonObject device(const QString &id, const QString &name, const QString &platform, bool current, const QString &lastSeen = {})
+{
+    return {{QStringLiteral("device_id"), id},
+            {QStringLiteral("name"), name},
+            {QStringLiteral("platform"), platform},
+            {QStringLiteral("kind"), platform == QLatin1String("web") ? QStringLiteral("web") : QStringLiteral("app")},
+            {QStringLiteral("username"), QStringLiteral("alex")},
+            {QStringLiteral("created_at"), QStringLiteral("2026-11-18T10:00:00Z")},
+            {QStringLiteral("last_seen_at"), lastSeen.isEmpty() ? QJsonValue() : QJsonValue(lastSeen)},
+            {QStringLiteral("signed_out_at"), QJsonValue()},
+            {QStringLiteral("current"), current}};
+}
+
+// A secret store in memory.
+struct Secrets {
+    QHash<QString, QByteArray> tokens;
+    bool writable = true;
+
+    AppSignIn::Hooks hooks(const FakeServer &server)
+    {
+        AppSignIn::Hooks hooks;
+        hooks.writeToken = [this](const QString &account, const QByteArray &token, QString *error) {
+            if (!writable) {
+                *error = QStringLiteral("the secret store is locked");
+                return false;
+            }
+            tokens.insert(account, token);
+            return true;
+        };
+        hooks.readToken = [this](const QString &account, const QString &) {
+            return tokens.value(account);
+        };
+        hooks.removeToken = [this](const QString &account, QString *) {
+            tokens.remove(account);
+            return true;
+        };
+        const QUrl url = server.url();
+        hooks.requestUrl = [url](const QString &) {
+            return url;
+        };
+        return hooks;
+    }
+};
+
+template<typename T>
+T *child(QWidget &parent, const QString &name)
+{
+    return parent.findChild<T *>(name);
+}
+}
+
+class AppSignInTest : public QObject
+{
+    Q_OBJECT
+
+private Q_SLOTS:
+    void initTestCase();
+    void init();
+    void cleanup();
+    void connectLinks();
+    void connectLinks_data();
+    void serverChecks();
+    void signInAnswers();
+    void devicesAnswer();
+    void deviceNames();
+    void nothingLeavesInTestModeWithoutHooks();
+    void storingRecordsBothTokensForTheServer();
+    void dialogChecksTheAddressAsTyped();
+    void dialogNeedsEverything();
+    void signInStoresBothTokens();
+    void wrongPasswordIsShown();
+    void unstoredTokensAreSignedOutAgain();
+    void inviteChoosesAPassword();
+    void linkFillsTheDialog();
+    void serverDialogListsDevices();
+    void signOutAnotherDevice();
+    void signOutOfThisComputer();
+    void oldServerHasNoDevices();
+
+private:
+    QString m_store;
+};
+
+void AppSignInTest::initTestCase()
+{
+    QStandardPaths::setTestModeEnabled(true);
+    m_store = ServerAddress::storePath();
+}
+
+void AppSignInTest::init()
+{
+    qunsetenv("THOUGHTS_SERVER_URL");
+    qunsetenv("THOUGHTS_TOKEN");
+    QFile::remove(m_store);
+}
+
+void AppSignInTest::cleanup()
+{
+    QFile::remove(m_store);
+}
+
+void AppSignInTest::connectLinks_data()
+{
+    QTest::addColumn<QString>("link");
+    QTest::addColumn<bool>("valid");
+    QTest::addColumn<QString>("server");
+    QTest::addColumn<QString>("username");
+    QTest::addColumn<QString>("invite");
+
+    QTest::newRow("password") << QStringLiteral("thoughts://connect?server=https%3A%2F%2Fthoughts.example.org&username=alex") << true
+                              << QStringLiteral("https://thoughts.example.org") << QStringLiteral("alex") << QString();
+    QTest::newRow("invite") << QStringLiteral("thoughts://connect?server=https%3A%2F%2Fthoughts.example.org&username=alex&invite=Ab-_9xYz0123456789abcdefABCDEF0123456789abc")
+                            << true << QStringLiteral("https://thoughts.example.org") << QStringLiteral("alex")
+                            << QStringLiteral("Ab-_9xYz0123456789abcdefABCDEF0123456789abc");
+    QTest::newRow("slash path") << QStringLiteral("thoughts://connect/?server=https://thoughts.example.org/base&username=alex") << true
+                                << QStringLiteral("https://thoughts.example.org/base") << QStringLiteral("alex") << QString();
+    QTest::newRow("unknown parameter kept out") << QStringLiteral("thoughts://connect?server=https://thoughts.example.org&username=alex&theme=dark") << true
+                                                << QStringLiteral("https://thoughts.example.org") << QStringLiteral("alex") << QString();
+    // Shown as typed: the dialog says what is wrong with an http address.
+    QTest::newRow("http server shown") << QStringLiteral("thoughts://connect?server=http://thoughts.example.org&username=alex") << true
+                                       << QStringLiteral("http://thoughts.example.org") << QStringLiteral("alex") << QString();
+    QTest::newRow("other scheme") << QStringLiteral("https://connect?server=https://thoughts.example.org&username=alex") << false << QString() << QString() << QString();
+    QTest::newRow("other host") << QStringLiteral("thoughts://open?server=https://thoughts.example.org&username=alex") << false << QString() << QString() << QString();
+    QTest::newRow("no server") << QStringLiteral("thoughts://connect?username=alex") << false << QString() << QString() << QString();
+    QTest::newRow("server twice") << QStringLiteral("thoughts://connect?server=https://a.example.org&server=https://b.example.org&username=alex") << false << QString()
+                                  << QString() << QString();
+    QTest::newRow("fragment") << QStringLiteral("thoughts://connect?server=https://thoughts.example.org&username=alex#invite=x") << false << QString() << QString()
+                              << QString();
+    QTest::newRow("port") << QStringLiteral("thoughts://connect:8443?server=https://thoughts.example.org") << false << QString() << QString() << QString();
+    QTest::newRow("user info") << QStringLiteral("thoughts://someone@connect?server=https://thoughts.example.org") << false << QString() << QString() << QString();
+    QTest::newRow("path") << QStringLiteral("thoughts://connect/elsewhere?server=https://thoughts.example.org") << false << QString() << QString() << QString();
+    QTest::newRow("invite not base64") << QStringLiteral("thoughts://connect?server=https://thoughts.example.org&username=alex&invite=a%20b") << false << QString()
+                                       << QString() << QString();
+}
+
+void AppSignInTest::connectLinks()
+{
+    QFETCH(QString, link);
+    QFETCH(bool, valid);
+    const QUrl url(link);
+    const std::optional<AppSignIn::ConnectLink> parsed = AppSignIn::connectLinkFromUrl(url);
+    QCOMPARE(parsed.has_value(), valid);
+    if (valid) {
+        QVERIFY(AppSignIn::isConnectLinkUrl(url));
+        QFETCH(QString, server);
+        QFETCH(QString, username);
+        QFETCH(QString, invite);
+        QCOMPARE(parsed->server, server);
+        QCOMPARE(parsed->username, username);
+        QCOMPARE(parsed->invite, invite);
+    }
+    QVERIFY(AppSignIn::isConnectLinkUrl(QUrl(QStringLiteral("THOUGHTS://connect?x=1"))));
+    QVERIFY(!AppSignIn::isConnectLinkUrl(QUrl(QStringLiteral("thoughts://open/document/x"))));
+}
+
+void AppSignInTest::serverChecks()
+{
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(200, R"({"status":"ready","capabilities":["app_sign_in_v1"]})"), AppSignIn::ServerCheck::Found);
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(200, R"({"status":"ready","capabilities":["sync_state_v2"]})"), AppSignIn::ServerCheck::TooOld);
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(503, R"({"detail":"Object store is unavailable"})"), AppSignIn::ServerCheck::NotReady);
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(404, R"({"detail":"Not Found"})"), AppSignIn::ServerCheck::NotFound);
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(200, "<html>a web page</html>"), AppSignIn::ServerCheck::NotFound);
+    QCOMPARE(AppSignIn::serverCheckFromAnswer(0, {}), AppSignIn::ServerCheck::NotFound);
+    QCOMPARE(AppSignIn::serverCheckText(AppSignIn::ServerCheck::Found), QStringLiteral("Thoughts server found"));
+    QCOMPARE(AppSignIn::serverCheckText(AppSignIn::ServerCheck::NotFound), QStringLiteral("No Thoughts server at this address"));
+    QCOMPARE(AppSignIn::serverCheckText(AppSignIn::ServerCheck::TooOld), QStringLiteral("This server is too old for signing in; ask for a device token."));
+}
+
+void AppSignInTest::signInAnswers()
+{
+    QString error;
+    const QByteArray good = R"({"username":"alex","library":{"id":"main","name":"Main"},"devices":{"app":{"device_id":"macos-1a2b3c4d5e6f7a8b","token":"t1"},)"
+                            R"("source_sync":{"device_id":"macos-sync-9c8d7e6f5a4b3c2d","token":"t2"}}})";
+    const std::optional<AppSignIn::SignedIn> signedIn = AppSignIn::signedInFromAnswer(200, good, {}, &error);
+    QVERIFY(signedIn);
+    QVERIFY(error.isEmpty());
+    QCOMPARE(signedIn->username, QStringLiteral("alex"));
+    QCOMPARE(signedIn->libraryName, QStringLiteral("Main"));
+    QCOMPARE(signedIn->appDeviceId, QStringLiteral("macos-1a2b3c4d5e6f7a8b"));
+    QCOMPARE(signedIn->appToken, QByteArray("t1"));
+    QCOMPARE(signedIn->sourceSyncDeviceId, QStringLiteral("macos-sync-9c8d7e6f5a4b3c2d"));
+    QCOMPARE(signedIn->sourceSyncToken, QByteArray("t2"));
+
+    // A phone-style answer (no source_sync) is still a sign-in.
+    QVERIFY(AppSignIn::signedInFromAnswer(200, R"({"username":"alex","devices":{"app":{"device_id":"macos-1","token":"t1"}}})", {}, &error));
+    QVERIFY(!AppSignIn::signedInFromAnswer(200, R"({"username":"alex","devices":{"app":{"device_id":"macos-1"}}})", {}, &error));
+    QCOMPARE(error, QStringLiteral("The server's answer could not be read."));
+
+    QVERIFY(!AppSignIn::signedInFromAnswer(401, R"({"detail":"Wrong username or password"})", {}, &error));
+    QCOMPARE(error, QStringLiteral("Wrong username or password"));
+    QVERIFY(!AppSignIn::signedInFromAnswer(401, R"({"detail":"This invite does not work. It may have expired or been used already; ask for a new one."})", {}, &error));
+    QCOMPARE(error, QStringLiteral("This invite does not work. It may have expired or been used already; ask for a new one."));
+    QVERIFY(!AppSignIn::signedInFromAnswer(429, R"({"detail":"Too many failed authentication attempts"})", "900", &error));
+    QCOMPARE(error, QStringLiteral("Too many failed sign-ins. Try again in 15 minutes."));
+    QVERIFY(!AppSignIn::signedInFromAnswer(429, R"({"detail":"Too many failed authentication attempts"})", "30", &error));
+    QCOMPARE(error, QStringLiteral("Too many failed sign-ins. Try again in 30 seconds."));
+    QVERIFY(!AppSignIn::signedInFromAnswer(429, {}, {}, &error));
+    QCOMPARE(error, QStringLiteral("Too many failed sign-ins. Try again later."));
+    QVERIFY(!AppSignIn::signedInFromAnswer(503, R"({"detail":"Too many sign-ins at once; try again shortly"})", "5", &error));
+    QCOMPARE(error, QStringLiteral("Too many sign-ins at once; try again shortly"));
+    QVERIFY(!AppSignIn::signedInFromAnswer(422, R"({"detail":[{"loc":["body","device_name"],"msg":"String should have at most 64 characters"}]})", {}, &error));
+    QCOMPARE(error, QStringLiteral("String should have at most 64 characters"));
+    QVERIFY(!AppSignIn::signedInFromAnswer(404, R"({"detail":"Not Found"})", {}, &error));
+    QCOMPARE(error, QStringLiteral("This server is too old for signing in; ask for a device token."));
+    QVERIFY(!AppSignIn::signedInFromAnswer(0, {}, {}, &error));
+    QCOMPARE(error, QStringLiteral("The server did not answer. Check the address and the connection."));
+    // The detail is shown as plain text of one line.
+    QVERIFY(!AppSignIn::signedInFromAnswer(401, "{\"detail\":\"<b>bold</b>\\nsecond\"}", {}, &error));
+    QCOMPARE(error, QStringLiteral("<b>bold</b> second"));
+}
+
+void AppSignInTest::devicesAnswer()
+{
+    QJsonArray list {device(QStringLiteral("macos-1"), QStringLiteral("Alex's MacBook Pro"), QStringLiteral("macos"), true, QStringLiteral("2026-11-18T17:11:00Z")),
+                     device(QStringLiteral("web-2"), QStringLiteral("Web browser (alex)"), QStringLiteral("web"), false),
+                     QJsonObject {{QStringLiteral("name"), QStringLiteral("no id")}}};
+    const std::optional<QList<AppSignIn::Device>> devices = AppSignIn::devicesFromAnswer(QJsonDocument(QJsonObject {{QStringLiteral("devices"), list}}).toJson());
+    QVERIFY(devices);
+    QCOMPARE(devices->size(), 2);
+    QCOMPARE(devices->at(0).id, QStringLiteral("macos-1"));
+    QCOMPARE(devices->at(0).name, QStringLiteral("Alex's MacBook Pro"));
+    QCOMPARE(devices->at(0).platform, QStringLiteral("macos"));
+    QCOMPARE(devices->at(0).kind, QStringLiteral("app"));
+    QCOMPARE(devices->at(0).username, QStringLiteral("alex"));
+    QVERIFY(devices->at(0).current);
+    QCOMPARE(devices->at(0).lastSeenAt, QDateTime(QDate(2026, 11, 18), QTime(17, 11), QTimeZone::UTC));
+    QVERIFY(!devices->at(1).current);
+    QVERIFY(!devices->at(1).lastSeenAt.isValid());
+    QCOMPARE(AppSignIn::platformLabel(devices->at(1).platform), QStringLiteral("Web browser"));
+    QVERIFY(!AppSignIn::devicesFromAnswer("not json"));
+    QVERIFY(!AppSignIn::devicesFromAnswer(R"({"devices":{}})"));
+    QCOMPARE(AppSignIn::devicesFromAnswer(R"({"devices":[]})")->size(), 0);
+}
+
+void AppSignInTest::deviceNames()
+{
+    QCOMPARE(AppSignIn::cleanDeviceName(QStringLiteral("  Alex's MacBook Pro \n")), QStringLiteral("Alex's MacBook Pro"));
+    QCOMPARE(AppSignIn::cleanDeviceName(QStringLiteral("a\tb\x01" "c")), QStringLiteral("abc"));
+    QCOMPARE(AppSignIn::cleanDeviceName(QString(80, QLatin1Char('x'))).size(), AppSignIn::maximumDeviceNameLength);
+    QVERIFY(AppSignIn::cleanDeviceName(QStringLiteral(" \n ")).isEmpty());
+    QVERIFY(!AppSignIn::defaultDeviceName().isEmpty());
+    QCOMPARE(AppSignIn::defaultDeviceName(), AppSignIn::cleanDeviceName(AppSignIn::defaultDeviceName()));
+}
+
+void AppSignInTest::nothingLeavesInTestModeWithoutHooks()
+{
+    // No hooks under test mode: no request to a real server and no secret store.
+    const AppSignIn::Hooks none;
+    QVERIFY(AppSignIn::requestUrl(none, QStringLiteral("https://thoughts.example.org"), QStringLiteral("/v1/ready")).isEmpty());
+    QVERIFY(AppSignIn::readToken(none, Platform::desktopDeviceAccount(), QStringLiteral("https://thoughts.example.org")).isEmpty());
+    QString error;
+    QVERIFY(!AppSignIn::writeToken(none, Platform::desktopDeviceAccount(), "token", &error));
+    QVERIFY(!AppSignIn::removeToken(none, Platform::desktopDeviceAccount(), &error));
+    // With a hook, the path is joined to the base the hook gives.
+    AppSignIn::Hooks hooks;
+    hooks.requestUrl = [](const QString &address) {
+        return QUrl(address == QLatin1String("https://thoughts.example.org/base") ? QStringLiteral("http://127.0.0.1:1/base/") : QString());
+    };
+    QCOMPARE(AppSignIn::requestUrl(hooks, QStringLiteral("https://Thoughts.example.org/base/"), QStringLiteral("/v1/ready")), QUrl(QStringLiteral("http://127.0.0.1:1/base/v1/ready")));
+    QVERIFY(AppSignIn::requestUrl(hooks, QStringLiteral("http://thoughts.example.org"), QStringLiteral("/v1/ready")).isEmpty());
+}
+
+void AppSignInTest::storingRecordsBothTokensForTheServer()
+{
+    FakeServer server;
+    Secrets secrets;
+    const AppSignIn::Hooks hooks = secrets.hooks(server);
+    QVERIFY(ServerAddress::save(QStringLiteral("https://old.example.org")));
+    AppSignIn::SignedIn signedIn;
+    signedIn.appDeviceId = QStringLiteral("macos-1");
+    signedIn.appToken = "app-token";
+    signedIn.sourceSyncDeviceId = QStringLiteral("macos-sync-1");
+    signedIn.sourceSyncToken = "sync-token";
+    QString error;
+    QVERIFY2(AppSignIn::storeSignedIn(hooks, QStringLiteral("https://Thoughts.example.org/"), signedIn, &error), qPrintable(error));
+    QCOMPARE(ServerAddress::saved(), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(secrets.tokens.value(Platform::desktopDeviceAccount()), QByteArray("app-token"));
+    QCOMPARE(secrets.tokens.value(AppSignIn::sourceSyncAccount()), QByteArray("sync-token"));
+    QCOMPARE(ServerAddress::tokenOrigin(Platform::desktopDeviceAccount()), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(ServerAddress::tokenOrigin(AppSignIn::sourceSyncAccount()), QStringLiteral("https://thoughts.example.org"));
+    QVERIFY(ServerAddress::tokenMayBeSentTo(Platform::desktopDeviceAccount(), "app-token", QStringLiteral("https://thoughts.example.org"), nullptr, {}, m_store));
+    QVERIFY(!ServerAddress::tokenMayBeSentTo(Platform::desktopDeviceAccount(), "app-token", QStringLiteral("https://old.example.org"), nullptr, {}, m_store));
+
+    QVERIFY(AppSignIn::removeStoredTokens(hooks, &error));
+    QVERIFY(secrets.tokens.isEmpty());
+
+    // THOUGHTS_SERVER_URL sets the server: the saved address stays.
+    qputenv("THOUGHTS_SERVER_URL", "https://session.example.org");
+    const auto restore = qScopeGuard([] {
+        qunsetenv("THOUGHTS_SERVER_URL");
+    });
+    QVERIFY(AppSignIn::storeSignedIn(hooks, QStringLiteral("https://session.example.org"), signedIn, &error));
+    QCOMPARE(ServerAddress::saved(), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(ServerAddress::tokenOrigin(Platform::desktopDeviceAccount()), QStringLiteral("https://session.example.org"));
+}
+
+void AppSignInTest::dialogChecksTheAddressAsTyped()
+{
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    dialog.show();
+    auto *address = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"));
+    auto *status = child<QLabel>(dialog, QStringLiteral("thoughtsSignInServerStatus"));
+    QVERIFY(address && status);
+    // Filled with the configured server, which a new computer starts with.
+    QCOMPARE(address->text(), ServerAddress::defaultUrl());
+    QTRY_COMPARE(status->text(), QStringLiteral("Thoughts server found"));
+    QCOMPARE(server.requests.count(QStringLiteral("GET /v1/ready")), 1);
+
+    // Typing waits for a pause, then asks once.
+    server.capabilities = {QStringLiteral("sync_state_v2")};
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("old.example.org"));
+    QTRY_COMPARE(status->text(), QStringLiteral("This server is too old for signing in; ask for a device token."));
+    QCOMPARE(server.requests.count(QStringLiteral("GET /v1/ready")), 2);
+
+    server.readyStatus = 404;
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("https://elsewhere.example.org"));
+    QTRY_COMPARE(status->text(), QStringLiteral("No Thoughts server at this address"));
+
+    // An address Thoughts refuses is explained without asking anyone.
+    const int asked = server.requests.size();
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("http://thoughts.example.org"));
+    QTRY_COMPARE(status->text(), QStringLiteral("The server address must start with https://."));
+    QTest::qWait(600);
+    QCOMPARE(server.requests.size(), asked);
+}
+
+void AppSignInTest::dialogNeedsEverything()
+{
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    dialog.show();
+    auto *status = child<QLabel>(dialog, QStringLiteral("thoughtsSignInServerStatus"));
+    auto *username = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername"));
+    auto *password = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword"));
+    auto *deviceName = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInDeviceName"));
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    QVERIFY(status && username && password && deviceName && signIn);
+    QTRY_COMPARE(status->text(), QStringLiteral("Thoughts server found"));
+    QCOMPARE(password->echoMode(), QLineEdit::Password);
+    QVERIFY(!child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInNewPassword"))->isVisible());
+    // The computer's own name, which the person may change.
+    QCOMPARE(deviceName->text(), AppSignIn::defaultDeviceName());
+    QVERIFY(!signIn->isEnabled());
+    QTest::keyClicks(username, QStringLiteral("alex"));
+    QVERIFY(!signIn->isEnabled());
+    QTest::keyClicks(password, QStringLiteral("x"));
+    QVERIFY(signIn->isEnabled());
+    deviceName->setText(QStringLiteral("   "));
+    QVERIFY(!signIn->isEnabled());
+    deviceName->setText(QStringLiteral("Alex's Mac"));
+    QVERIFY(signIn->isEnabled());
+    // Nothing is asked of a server that is not there.
+    server.readyStatus = 404;
+    auto *address = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"));
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("https://elsewhere.example.org"));
+    QTRY_COMPARE(status->text(), QStringLiteral("No Thoughts server at this address"));
+    QVERIFY(!signIn->isEnabled());
+    signIn->click();
+    QCOMPARE(server.requests.count(QStringLiteral("POST /v1/apps/sign-in")), 0);
+}
+
+void AppSignInTest::signInStoresBothTokens()
+{
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    dialog.show();
+    auto *address = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"));
+    address->setText(QStringLiteral("https://thoughts.example.org"));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername")), QStringLiteral(" Alex "));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword")), server.password);
+    child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInDeviceName"))->setText(QStringLiteral("Alex's MacBook Pro"));
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    QTRY_VERIFY(signIn->isEnabled());
+    signIn->click();
+    QTRY_COMPARE(signedIn.size(), 1);
+    QCOMPARE(signedIn.at(0).at(0).toString(), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(signedIn.at(0).at(1).toString(), QStringLiteral("alex"));
+    QCOMPARE(dialog.result(), int(QDialog::Accepted));
+
+    const QJsonObject body = server.bodies.constLast();
+    QCOMPARE(body.value(QStringLiteral("username")).toString(), QStringLiteral("alex"));
+    QCOMPARE(body.value(QStringLiteral("password")).toString(), server.password);
+    QCOMPARE(body.value(QStringLiteral("device_name")).toString(), QStringLiteral("Alex's MacBook Pro"));
+    QCOMPARE(body.value(QStringLiteral("platform")).toString(), AppSignIn::platform());
+    QVERIFY(!body.contains(QStringLiteral("invite")));
+    // No token goes with the sign-in itself.
+    QVERIFY(server.authorizations.constLast().isEmpty());
+
+    QCOMPARE(secrets.tokens.value(Platform::desktopDeviceAccount()), QByteArray("app-token"));
+    QCOMPARE(secrets.tokens.value(AppSignIn::sourceSyncAccount()), QByteArray("sync-token"));
+    QCOMPARE(ServerAddress::saved(), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(ServerAddress::tokenOrigin(Platform::desktopDeviceAccount()), QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(ServerAddress::tokenOrigin(AppSignIn::sourceSyncAccount()), QStringLiteral("https://thoughts.example.org"));
+    // The password is not kept.
+    QVERIFY(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword"))->text().isEmpty());
+}
+
+void AppSignInTest::wrongPasswordIsShown()
+{
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    dialog.show();
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername")), QStringLiteral("alex"));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword")), QStringLiteral("not the password"));
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    auto *error = child<QLabel>(dialog, QStringLiteral("thoughtsSignInError"));
+    QTRY_VERIFY(signIn->isEnabled());
+    signIn->click();
+    QCOMPARE(error->text(), QStringLiteral("Signing in…"));
+    QVERIFY(!signIn->isEnabled());
+    QTRY_COMPARE(error->text(), QStringLiteral("Wrong username or password"));
+    QVERIFY(error->isVisible());
+    QVERIFY(signIn->isEnabled());
+    QVERIFY(dialog.isVisible());
+    QCOMPARE(signedIn.size(), 0);
+    QVERIFY(secrets.tokens.isEmpty());
+
+    // Too many tries: when to try again.
+    server.signInStatus = 429;
+    server.signInBody = R"({"detail":"Too many failed authentication attempts"})";
+    server.retryAfter = "600";
+    signIn->click();
+    QTRY_COMPARE(error->text(), QStringLiteral("Too many failed sign-ins. Try again in 10 minutes."));
+    server.signInStatus = 503;
+    server.signInBody = R"({"detail":"Too many sign-ins at once; try again shortly"})";
+    server.retryAfter = "5";
+    signIn->click();
+    QTRY_COMPARE(error->text(), QStringLiteral("Too many sign-ins at once; try again shortly"));
+    QVERIFY(secrets.tokens.isEmpty());
+}
+
+void AppSignInTest::unstoredTokensAreSignedOutAgain()
+{
+    FakeServer server;
+    server.devices = {device(QStringLiteral("macos-1a2b3c4d5e6f7a8b"), QStringLiteral("Alex's Mac"), QStringLiteral("macos"), true)};
+    Secrets secrets;
+    secrets.writable = false;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    dialog.show();
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername")), QStringLiteral("alex"));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword")), server.password);
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    QTRY_VERIFY(signIn->isEnabled());
+    signIn->click();
+    auto *error = child<QLabel>(dialog, QStringLiteral("thoughtsSignInError"));
+    QTRY_COMPARE(error->text(), QStringLiteral("Signed in, but the tokens could not be stored: the secret store is locked"));
+    // The device the server just issued is ended again with its own token.
+    QTRY_COMPARE(server.requests.constLast(), QStringLiteral("POST /v1/apps/devices/macos-1a2b3c4d5e6f7a8b/sign-out"));
+    QCOMPARE(server.authorizations.constLast(), QByteArray("Bearer app-token"));
+    QCOMPARE(signedIn.size(), 0);
+    QVERIFY(dialog.isVisible());
+}
+
+void AppSignInTest::inviteChoosesAPassword()
+{
+    FakeServer server;
+    server.invite = QStringLiteral("Ab-_9xYz0123456789abcdefABCDEF0123456789abc");
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    dialog.fill({QStringLiteral("https://thoughts.example.org"), QStringLiteral("alex"), server.invite});
+    dialog.show();
+    QVERIFY(dialog.inviteMode());
+    auto *password = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword"));
+    auto *newPassword = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInNewPassword"));
+    auto *again = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInNewPasswordAgain"));
+    auto *hint = child<QLabel>(dialog, QStringLiteral("thoughtsSignInPasswordHint"));
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    QVERIFY(!password->isVisible());
+    QVERIFY(newPassword->isVisible() && again->isVisible());
+    QCOMPARE(newPassword->echoMode(), QLineEdit::Password);
+    QCOMPARE(again->echoMode(), QLineEdit::Password);
+    QCOMPARE(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername"))->text(), QStringLiteral("alex"));
+    QTRY_COMPARE(child<QLabel>(dialog, QStringLiteral("thoughtsSignInServerStatus"))->text(), QStringLiteral("Thoughts server found"));
+    QCOMPARE(hint->text(), QStringLiteral("At least 10 characters."));
+
+    QTest::keyClicks(newPassword, QStringLiteral("short"));
+    QTest::keyClicks(again, QStringLiteral("short"));
+    QCOMPARE(hint->text(), QStringLiteral("At least 10 characters."));
+    QVERIFY(!signIn->isEnabled());
+    newPassword->setText(QStringLiteral("a long new password"));
+    again->setText(QStringLiteral("a long new passwore"));
+    QCOMPARE(hint->text(), QStringLiteral("The passwords do not match."));
+    QVERIFY(!signIn->isEnabled());
+    again->setText(QStringLiteral("a long new password"));
+    QVERIFY(hint->text().isEmpty());
+    QVERIFY(signIn->isEnabled());
+    signIn->click();
+    QTRY_COMPARE(signedIn.size(), 1);
+    const QJsonObject body = server.bodies.constLast();
+    QCOMPARE(body.value(QStringLiteral("invite")).toString(), server.invite);
+    QCOMPARE(body.value(QStringLiteral("new_password")).toString(), QStringLiteral("a long new password"));
+    QVERIFY(!body.contains(QStringLiteral("password")));
+    QCOMPARE(server.password, QStringLiteral("a long new password"));
+    QCOMPARE(secrets.tokens.value(Platform::desktopDeviceAccount()), QByteArray("app-token"));
+
+    // A used invite says so.
+    SignInDialog second(secrets.hooks(server));
+    second.fill({QStringLiteral("https://thoughts.example.org"), QStringLiteral("alex"), QStringLiteral("used")});
+    second.show();
+    child<QLineEdit>(second, QStringLiteral("thoughtsSignInNewPassword"))->setText(QStringLiteral("another long password"));
+    child<QLineEdit>(second, QStringLiteral("thoughtsSignInNewPasswordAgain"))->setText(QStringLiteral("another long password"));
+    auto *secondSignIn = child<QPushButton>(second, QStringLiteral("thoughtsSignInButton"));
+    QTRY_VERIFY(secondSignIn->isEnabled());
+    secondSignIn->click();
+    QTRY_COMPARE(child<QLabel>(second, QStringLiteral("thoughtsSignInError"))->text(),
+                 QStringLiteral("This invite does not work. It may have expired or been used already; ask for a new one."));
+}
+
+void AppSignInTest::linkFillsTheDialog()
+{
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    const std::optional<AppSignIn::ConnectLink> link =
+        AppSignIn::connectLinkFromUrl(QUrl(QStringLiteral("thoughts://connect?server=https%3A%2F%2Fthoughts.example.org&username=alex")));
+    QVERIFY(link);
+    dialog.fill(*link);
+    dialog.show();
+    // The server is in plain sight, and nothing is sent but the check.
+    QCOMPARE(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"))->text(), QStringLiteral("https://thoughts.example.org"));
+    QVERIFY(child<QLabel>(dialog, QStringLiteral("thoughtsSignInIntro"))->isVisible());
+    QCOMPARE(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername"))->text(), QStringLiteral("alex"));
+    QVERIFY(!dialog.inviteMode());
+    QTRY_COMPARE(child<QLabel>(dialog, QStringLiteral("thoughtsSignInServerStatus"))->text(), QStringLiteral("Thoughts server found"));
+    QTest::qWait(200);
+    QCOMPARE(server.requests, QStringList {QStringLiteral("GET /v1/ready")});
+    QCOMPARE(signedIn.size(), 0);
+    QVERIFY(secrets.tokens.isEmpty());
+}
+
+void AppSignInTest::serverDialogListsDevices()
+{
+    FakeServer server;
+    server.devices = {device(QStringLiteral("macos-1a2b3c4d5e6f7a8b"), QStringLiteral("Alex's MacBook Pro"), QStringLiteral("macos"), true, QStringLiteral("2026-11-18T17:11:00Z")),
+                      device(QStringLiteral("android-0123456789abcdef"), QStringLiteral("Alex's Pixel"), QStringLiteral("android"), false),
+                      device(QStringLiteral("web-0123456789abcdef"), QStringLiteral("Web browser (alex)"), QStringLiteral("web"), false)};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    QWidget window;
+    auto *section = new ServerAccountSection(secrets.hooks(server), &window);
+    window.show();
+    auto *address = child<QLabel>(window, QStringLiteral("thoughtsServerAccountAddress"));
+    auto *state = child<QLabel>(window, QStringLiteral("thoughtsServerAccountState"));
+    auto *signIn = child<QPushButton>(window, QStringLiteral("thoughtsServerAccountSignIn"));
+    auto *devices = child<QWidget>(window, QStringLiteral("thoughtsServerAccountDevices"));
+    QVERIFY(address && state && signIn && devices);
+    QVERIFY(section->signedIn());
+    QCOMPARE(address->text(), QStringLiteral("Server: https://thoughts.example.org"));
+    QCOMPARE(signIn->text(), QStringLiteral("Sign In to Another Server…"));
+    QTRY_VERIFY(devices->isVisible());
+    QCOMPARE(state->text(), QStringLiteral("Signed in as alex."));
+    QCOMPARE(server.authorizations.constLast(), QByteArray("Bearer app-token"));
+    const QList<QWidget *> rows = devices->findChildren<QWidget *>(QStringLiteral("thoughtsServerAccountDevice"));
+    QCOMPARE(rows.size(), 3);
+    QCOMPARE(rows.at(0)->property("deviceId").toString(), QStringLiteral("macos-1a2b3c4d5e6f7a8b"));
+    const QString thisOne = rows.at(0)->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountDeviceText"))->text();
+    QVERIFY2(thisOne.startsWith(QStringLiteral("Alex's MacBook Pro\n")), qPrintable(thisOne));
+    QVERIFY2(thisOne.contains(QStringLiteral("This ")), qPrintable(thisOne));
+    QVERIFY2(thisOne.contains(QStringLiteral("last seen")), qPrintable(thisOne));
+    // This computer signs out with its own button, the others with theirs.
+    QVERIFY(!rows.at(0)->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountDeviceSignOut")));
+    QVERIFY(rows.at(1)->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountDeviceSignOut")));
+    QVERIFY(rows.at(1)->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountDeviceText"))->text().contains(QStringLiteral("Android")));
+    QVERIFY(rows.at(2)->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountDeviceText"))->text().contains(QStringLiteral("Web browser")));
+    QVERIFY(child<QPushButton>(window, QStringLiteral("thoughtsServerAccountSignOutThisComputer"))->isVisible());
+
+    QSignalSpy signInRequested(section, &ServerAccountSection::signInRequested);
+    signIn->click();
+    QCOMPARE(signInRequested.size(), 1);
+
+    // Not signed in: no devices, Sign In….
+    secrets.tokens.clear();
+    section->refresh();
+    QCOMPARE(state->text(), QStringLiteral("Not signed in."));
+    QCOMPARE(signIn->text(), QStringLiteral("Sign In…"));
+    QVERIFY(!devices->isVisible());
+    QTest::qWait(300);
+    QVERIFY(!devices->isVisible());
+}
+
+void AppSignInTest::signOutAnotherDevice()
+{
+    FakeServer server;
+    server.devices = {device(QStringLiteral("macos-1a2b3c4d5e6f7a8b"), QStringLiteral("Alex's MacBook Pro"), QStringLiteral("macos"), true),
+                      device(QStringLiteral("android-0123456789abcdef"), QStringLiteral("Alex's Pixel"), QStringLiteral("android"), false)};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    QWidget window;
+    auto *section = new ServerAccountSection(secrets.hooks(server), &window);
+    QSignalSpy signedOut(section, &ServerAccountSection::signedOut);
+    window.show();
+    auto *devices = child<QWidget>(window, QStringLiteral("thoughtsServerAccountDevices"));
+    QTRY_COMPARE(devices->findChildren<QWidget *>(QStringLiteral("thoughtsServerAccountDevice")).size(), 2);
+    QPushButton *phone = devices->findChildren<QWidget *>(QStringLiteral("thoughtsServerAccountDevice"))
+                             .at(1)
+                             ->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountDeviceSignOut"));
+    QVERIFY(phone);
+    phone->click();
+    // Asked first; Cancel changes nothing.
+    auto *box = section->findChild<QMessageBox *>(QStringLiteral("thoughtsServerAccountSignOutConfirm"));
+    QVERIFY(box);
+    QVERIFY(box->text().contains(QStringLiteral("Alex's Pixel")));
+    box->button(QMessageBox::Cancel)->click();
+    QTest::qWait(100);
+    QCOMPARE(server.requests.count(QStringLiteral("POST /v1/apps/devices/android-0123456789abcdef/sign-out")), 0);
+
+    devices->findChildren<QWidget *>(QStringLiteral("thoughtsServerAccountDevice")).at(1)->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountDeviceSignOut"))->click();
+    box = section->findChild<QMessageBox *>(QStringLiteral("thoughtsServerAccountSignOutConfirm"));
+    QVERIFY(box);
+    box->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountSignOutConfirmButton"))->click();
+    QTRY_COMPARE(server.requests.count(QStringLiteral("POST /v1/apps/devices/android-0123456789abcdef/sign-out")), 1);
+    QTRY_COMPARE(devices->findChildren<QWidget *>(QStringLiteral("thoughtsServerAccountDevice")).size(), 1);
+    QCOMPARE(signedOut.size(), 0);
+    QCOMPARE(secrets.tokens.value(Platform::desktopDeviceAccount()), QByteArray("app-token"));
+}
+
+void AppSignInTest::signOutOfThisComputer()
+{
+    FakeServer server;
+    server.devices = {device(QStringLiteral("macos-1a2b3c4d5e6f7a8b"), QStringLiteral("Alex's MacBook Pro"), QStringLiteral("macos"), true)};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    secrets.tokens.insert(AppSignIn::sourceSyncAccount(), "sync-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    QWidget window;
+    auto *section = new ServerAccountSection(secrets.hooks(server), &window);
+    QSignalSpy signedOut(section, &ServerAccountSection::signedOut);
+    window.show();
+    auto *signOut = child<QPushButton>(window, QStringLiteral("thoughtsServerAccountSignOutThisComputer"));
+    QTRY_VERIFY(signOut->isVisible());
+    signOut->click();
+    auto *box = section->findChild<QMessageBox *>(QStringLiteral("thoughtsServerAccountSignOutConfirm"));
+    QVERIFY(box);
+    QVERIFY2(box->text().contains(QStringLiteral("https://thoughts.example.org")), qPrintable(box->text()));
+    box->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountSignOutConfirmButton"))->click();
+    QTRY_COMPARE(signedOut.size(), 1);
+    QCOMPARE(server.requests.count(QStringLiteral("POST /v1/apps/devices/macos-1a2b3c4d5e6f7a8b/sign-out")), 1);
+    QVERIFY(secrets.tokens.isEmpty());
+    QCOMPARE(child<QLabel>(window, QStringLiteral("thoughtsServerAccountState"))->text(), QStringLiteral("Not signed in."));
+    QCOMPARE(child<QPushButton>(window, QStringLiteral("thoughtsServerAccountSignIn"))->text(), QStringLiteral("Sign In…"));
+}
+
+void AppSignInTest::oldServerHasNoDevices()
+{
+    FakeServer server;
+    server.capabilities = {QStringLiteral("sync_state_v2")};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    QWidget window;
+    auto *section = new ServerAccountSection(secrets.hooks(server), &window);
+    QSignalSpy checked(section, &ServerAccountSection::serverChecked);
+    window.show();
+    QTRY_COMPARE(checked.size(), 1);
+    QCOMPARE(checked.at(0).at(0).value<AppSignIn::ServerCheck>(), AppSignIn::ServerCheck::TooOld);
+    QTest::qWait(200);
+    QVERIFY(!child<QWidget>(window, QStringLiteral("thoughtsServerAccountDevices"))->isVisible());
+    QCOMPARE(server.requests.count(QStringLiteral("GET /v1/apps/devices")), 0);
+    // A token entered by hand still connects: it is "signed in" without a list.
+    QCOMPARE(child<QLabel>(window, QStringLiteral("thoughtsServerAccountState"))->text(), QStringLiteral("Signed in."));
+
+    // Without a token: a device token is the way in.
+    secrets.tokens.clear();
+    section->refresh();
+    QTRY_COMPARE(child<QLabel>(window, QStringLiteral("thoughtsServerAccountState"))->text(), QStringLiteral("This server is too old for signing in; ask for a device token."));
+}
+
+QTEST_MAIN(AppSignInTest)
+#include "appsignintest.moc"

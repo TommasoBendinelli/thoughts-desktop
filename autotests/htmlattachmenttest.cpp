@@ -21,6 +21,15 @@ private Q_SLOTS:
         QCOMPARE(Thoughts::htmlAttachmentPath(QUrl("thoughts-html:docs-demo/markdown/source/demo.htm")), QString("docs-demo/markdown/source/demo.htm"));
         QVERIFY(!Thoughts::isHtmlSourcePath(QStringLiteral("docs-demo/tex/source/../secret.html")));
         QVERIFY(!Thoughts::isHtmlSourcePath(QStringLiteral("docs-demo/tex/source/a\\b.html")));
+        // A Project's default folder has pages like a docs folder (24 Nov 2026).
+        const QString project = QStringLiteral(".thoughts/projects/") + QString(64, QLatin1Char('0')) + QStringLiteral("/default");
+        QCOMPARE(Thoughts::htmlAttachmentPath(QUrl(QStringLiteral("thoughts-html:") + project + QStringLiteral("/tex/support/html/prompts.html"))),
+                 project + QStringLiteral("/tex/support/html/prompts.html"));
+        QCOMPARE(Thoughts::htmlSourceFolder(project + QStringLiteral("/tex/support/html/prompts.html")), project);
+        QVERIFY(!Thoughts::isHtmlSourcePath(project + QStringLiteral("/prompts.html")));
+        QVERIFY(!Thoughts::isHtmlSourcePath(project + QStringLiteral("/tex/.hidden/prompts.html")));
+        QVERIFY(!Thoughts::isHtmlSourcePath(QStringLiteral(".thoughts/projects/0/default/tex/support/html/prompts.html")));
+        QVERIFY(!Thoughts::isHtmlSourcePath(QStringLiteral(".thoughts/tex/support/html/prompts.html")));
         for (const QString &uri : {"thoughts-html:../secret.html", "thoughts-html:docs-demo/tex/support/html/../plot.html", "thoughts-html:docs-demo/tex/support/html/plot.html?path=secret", "https://example.com/plot.html"}) QVERIFY(Thoughts::htmlAttachmentPath(QUrl(uri)).isEmpty());
     }
     void offlineHttp() {

@@ -332,6 +332,10 @@ target_link_libraries(thoughtsplatform PUBLIC Qt6::Core)
 if(WIN32)
     target_link_libraries(thoughtsplatform PRIVATE advapi32 user32)
 endif()
+if(APPLE)
+    # The computer's name (SCDynamicStoreCopyComputerName), which a signed-in Mac is listed by.
+    target_link_libraries(thoughtsplatform PRIVATE "-framework SystemConfiguration" "-framework CoreFoundation")
+endif()
 
 if(BUILD_DESKTOP)
     # Agent proposals in sources (protocol/agent-proposals.md) and the decision
@@ -422,6 +426,7 @@ set(okularcore_SRCS
    core/chooseenginedialog.cpp
    core/document.cpp
    core/htmlattachment.cpp
+   core/htmllivepage.cpp
    core/documentcommands.cpp
    core/fontinfo.cpp
    core/form.cpp
@@ -607,6 +612,7 @@ if(BUILD_DESKTOP)
     part/pdfversions.cpp
     part/reviewcardfeedback.cpp
     part/documentfeedback.cpp
+    part/readingoverlays.cpp
     part/sourcechangetracker.cpp
     part/synctransferledger.cpp
   )
@@ -714,12 +720,18 @@ if(BUILD_DESKTOP)
     part/reviewfeedbackeditor.cpp
     part/reviewfeedbackoverlay.cpp
     part/documentfeedbackoverlay.cpp
+    part/readingoverlaylayer.cpp
+    part/readingoverlaylist.cpp
     part/htmldocumentview.cpp
+    # Its sources are per platform (htmllivewebview_mac.mm, _stub.cpp): listed for AUTOMOC.
+    part/htmllivewebview.h
     part/htmlreader.cpp
     part/htmlattachmentreader.cpp
     part/parthtml.cpp
     part/partattachment.cpp
+    part/snapshotdrawingdialog.cpp
     part/html-viewer/html-viewer.qrc
+    part/html-live/html-live.qrc
     part/magnifierview.cpp
     part/pageviewutils.cpp
     part/pdflinkoverridedialog.cpp
@@ -781,11 +793,15 @@ if(THOUGHTS_HTML_VIEW)
     target_compile_definitions(okularpart PRIVATE THOUGHTS_HAVE_QTWEBVIEW=1)
     if(APPLE)
         enable_language(OBJCXX)
-        target_sources(okularpart PRIVATE part/htmlmacnative.mm)
+        # Live HTML pages: a WKWebView of their own (part/htmllivewebview.h).
+        target_sources(okularpart PRIVATE part/htmlmacnative.mm part/htmllivewebview_mac.mm)
         target_link_libraries(okularpart "-framework WebKit" "-framework AppKit")
+    else()
+        target_sources(okularpart PRIVATE part/htmllivewebview_stub.cpp)
     endif()
 else()
     target_compile_definitions(okularpart PRIVATE THOUGHTS_HAVE_QTWEBVIEW=0)
+    target_sources(okularpart PRIVATE part/htmllivewebview_stub.cpp)
 endif()
 if(Poppler_Qt6_FOUND)
     target_link_libraries(okularpart Poppler::Qt6)

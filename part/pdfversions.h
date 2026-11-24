@@ -95,6 +95,7 @@ private:
     QString m_cacheRoot;
     Download m_download;
     SyncClient *m_client = nullptr;
+    quint64 m_clientGeneration = 0;
     QHash<QString, QList<QPair<QPointer<QObject>, Done>>> m_waiting;
 };
 }

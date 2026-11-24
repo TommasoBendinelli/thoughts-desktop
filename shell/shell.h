@@ -16,8 +16,10 @@
 #include <QAction>
 #include <QByteArray>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QIcon>
+#include <QImage>
 #include <QJsonObject>
 #include <QList>
 #include <QMimeDatabase>
@@ -45,6 +47,7 @@ namespace Thoughts { class ReaderDisplayTitleStore; class SyncStateWatch; }
 #endif
 #include <QStackedWidget>
 
+#include "appsignin.h"
 #include "documentsyncpresentation.h"
 #include "welcomescreen.h"
 
@@ -79,6 +82,9 @@ class AgentNotesWindow;
 namespace AgentNotes
 {
 struct Filter;
+struct Recipient;
+struct DocumentSources;
+struct ProposalAuthorship;
 }
 class BuildTerminalLauncher;
 class CommentsOverview;
@@ -130,6 +136,12 @@ public:
     bool openDocument(const QUrl &url, const QString &serializedOptions);
 
     static void showCommentsOverviewOnStartup();
+    // At start, when no device token is stored for the configured server: Sign In over the
+    // Library instead of staying unconnected. Not under THOUGHTS_TOKEN, in tests, or where the
+    // system has no secret store for the tokens.
+    static void offerSignInOnStartup();
+    // Sign In over the Library, filled from a thoughts://connect link when one is given.
+    static void showSignIn(const std::optional<Thoughts::AppSignIn::ConnectLink> &link = std::nullopt);
     // Shows a window when Thoughts is reactivated (for example from the Dock) with none visible.
     static void showWindowOnReactivation();
     // Brings the Library forward on its Review Card tab with this card selected.
@@ -137,6 +149,10 @@ public:
     // A page link (thoughts://open/document/<id>?page=N&first=F&version=<sha256>, see
     // thoughtspagelink.h): the Library PDF at that page, with a note when the page was not
     // there or the PDF changed since the link was made; a message when it cannot be opened.
+    // This computer's server's "Open in Thoughts" page of a document
+    // (https://<server>/open/document/<id>?..., Thoughts::serverPageLink) opens the same way.
+    // A link to a reading overlay (thoughts://open/document?document_id=<id>&overlay=<overlay_id>,
+    // Thoughts::parseOverlayLink) opens the document with the Overlay tab on that overlay, shown.
     static void openPageLink(const QUrl &url);
     // File › Agent Notes: the notes agents sent to the phone, with this note selected if given.
     static void showAgentNotes(const QString &noteId = QString());
@@ -188,6 +204,8 @@ protected:
     void dropEvent(QDropEvent *event) override;
 
 private Q_SLOTS:
+    // A page tab's Part answers requestHtmlAttachmentPicture (a null picture: none could be taken).
+    void htmlAttachmentPictureReady(const QString &requestId, const QImage &picture);
     // The answer of the gateway part's checkFedoraRemoteWork (see startRemoteWorkWatch).
     void remoteWorkChecked(bool pending, const QString &stateKey);
     // A part's fedoraRemoteWorkFound: a PDF build that a Sync left running on the
@@ -222,6 +240,23 @@ private Q_SLOTS:
      */
     void openNewlySignedFile(const QString &path, int pageNumber);
     void openDocumentLink(const QUrl &url, const QString &destination, const QString &viewport);
+    // A reader's link to this computer's server's "Open in Thoughts" page (Part::requestOpenPageLink).
+    void openReaderPageLink(const QUrl &url);
+    // A reader's link to a place in a Library PDF (Part::requestOpenPdfPlaceLink).
+    void openReaderPdfPlaceLink(const QString &href);
+    // Ask About This in a reading overlay mark's popup (Part::requestAskAboutReadingOverlayMark):
+    // the mark's page as Send Page to Agent draws it, the mark's lines washed and outlined in its
+    // kind's colour, titled and worded for the agent that made the overlay, in Send Page's composer.
+    void askAboutReadingOverlayMark(const QJsonObject &request);
+    // A reading overlay mark's note (Part::requestReadingOverlayMarkNote): the agent note fetched by
+    // its id (no list has it) and its picture, given back to the Part (null when not had).
+    void loadReadingOverlayMarkNote(const QString &noteId);
+    // A click on that picture (Part::requestOpenAgentNote): the note in the Agent Notes window,
+    // fetched first when this Mac does not have it yet.
+    void openReadingOverlayMarkNote(const QString &noteId);
+    // A Part started or stopped keeping an earlier version (Part::keptVersionChanged): the tabs'
+    // marks, with their titles.
+    void refreshTabVersionMarks();
     void recordNavigationViewport(bool historyEntry);
     void navigateHistory(bool forward);
 
@@ -256,14 +291,12 @@ private Q_SLOTS:
     void createSectionReviewCard(const QString &pdfPath, int page, const QVariantList &rect);
     void createHtmlReviewCard(const QString &pdfPath, const QVariantMap &fields);
     void editSidebarReviewCard(const QString &cardId);
+    void coverSidebarReviewCardDocument(const QString &cardId);
     void openSidebarReviewCard(const QString &cardId);
     // Review now in a reader's Cards list: that card alone in the Review window.
     void reviewSidebarReviewCard(const QString &cardId);
     // Merge cards… in a reader's Cards list: those cards of its document become one.
     void mergeSidebarReviewCards(const QStringList &cardIds);
-    // Make project card, Make knowledge card or Follow the Project in a reader's Cards list
-    // (review-card-kinds.md §5): @p kind is knowledge, project or follow_project.
-    void setSidebarReviewCardKind(const QString &cardId, const QString &kind);
     void retireSidebarReviewCards(const QStringList &cardIds);
     void deleteSidebarReviewCards(const QStringList &cardIds);
     void addOutlineDocumentActions(QMenu *menu, const QString &pdfPath, int page, const QString &title);
@@ -312,6 +345,8 @@ private Q_SLOTS:
     void updateSyncOperationJournalEvent(const QString &traceId, const QJsonObject &event);
     void updateCommentsOverviewRenderState(const QJsonObject &state);
     void updateCommentsOverviewAgentProposalResolution(const QString &operationId, const QStringList &proposalIds, const QString &action, const QString &status, const QString &message);
+    // A reader tab saved an Accept or Reject to its source (Part::agentProposalsDecidedLocally).
+    void readerProposalDecided();
     void openTrackedDocument(const QString &pdfPath);
     void openTrackedComment(const QString &pdfPath, const QString &annotationId, int page);
     void openTrackedFeedback(const QString &pdfPath, const QString &feedbackId);
@@ -376,13 +411,40 @@ private:
     KParts::ReadWritePart *showHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request, int besideTab);
     void readRecentFilesSettings();
     void addTabContextMenuActions(QMenu *menu, int tab);
-    // A page's tab menu: Open in Browser, its document, Copy page name (no file of its own).
+    // A page's tab menu: Open in Browser, its document, Copy page name, Copy for agent, Send to Agent
+    // (no file of its own).
     void addHtmlAttachmentTabMenuActions(QMenu *menu, int tab);
     // Move Tab to New Window and Close Other Tabs, for every tab.
     void addTabWindowMenuActions(QMenu *menu, const QPointer<QWidget> &tabPage);
     // Copy for agent for @p tab: its document, source and place, then the cards reviewed and the
     // text feedback on the PDF version on screen. The tab menu and File > Copy for Agent use it.
     void copyTabForAgent(int tab);
+    // What Copy for agent copies for @p tab (empty when it has no local file).
+    QString agentTextOfTab(int tab);
+    // Send to Agent for @p tab (its menu's Send to Agent, File > Send to Agent): at once, without a
+    // dialog, exactly what Copy for agent copies, with the page on screen as Send Page to Agent draws
+    // it (an HTML page's tab: the page as its web view shows it), to @p session
+    // (origin.conversation_id, copy_for_agent); remembered as the last session.
+    // The reader says "Sent to <session>" (or why not) in its notice; @p done hears the same.
+    void sendTabToSession(int tab, const Thoughts::AgentNotes::Recipient &session, std::function<void(bool ok, const QString &notice)> done = {});
+    // sendTabToSession for an HTML page's tab: @p text with the picture its Part takes of the page.
+    void sendHtmlPageTabToSession(int tab, const Thoughts::AgentNotes::Recipient &session, const QString &text,
+                                  const std::function<void(bool ok, const QString &notice)> &tell);
+    // Pictures asked of page tabs' Parts (requestHtmlAttachmentPicture), by request id.
+    QHash<QString, std::function<void(const QImage &)>> m_htmlPagePictureRequests;
+    // File > Send to Last Agent (⌘⇧A): to the session sent to last; none yet: the sessions to pick
+    // from, in a menu over the reader.
+    void sendTabToLastSession(int tab);
+    // @p menu: the sessions (AgentSessionList), a click sending @p tab's page (asked when clicked),
+    // in the order of their proposals on @p tab's document.
+    void fillSendToAgentMenu(QMenu *menu, std::function<int()> tab);
+    // @p tab's document as Send to Agent's order reads it: its source and the other documents'.
+    Thoughts::AgentNotes::DocumentSources documentSourcesOfTab(int tab) const;
+    // Every proposal the record store at @p storePath ever held (pending, and decided ones as they
+    // were before), with the conversation that wrote it; for a worker thread.
+    static QList<Thoughts::AgentNotes::ProposalAuthorship> readProposalAuthorship(const QString &storePath);
+    // Lets AgentSessionList read them in the background (once per run).
+    static void installProposalLoader();
     void closeOtherTabs(QWidget *tabPage);
     bool closeTabInternal(int tab, bool promptToSave);
     void detachTab(int tab, const QPoint &globalPosition);
@@ -392,6 +454,8 @@ private:
     bool transferTabTo(Shell *destination, QWidget *page, int insertionIndex);
     void applyTransferredTabMetadata(int tab, const TransferredTab &transferredTab);
     KParts::ReadWritePart *trackedCommentPart(const QString &pdfPath, bool allowOpen, QString *error);
+    // trackedCommentPart for the Library's opening of a @p kind (comment, proposal), timed.
+    KParts::ReadWritePart *trackedOpenPart(const QString &kind, const QString &pdfPath, QString *error);
     void tryOpenTrackedFeedback(const QString &pdfPath, const QString &feedbackId, quint64 requestGeneration, int attempt);
     void tryOpenTrackedComment(const QString &pdfPath, const QString &annotationId, int page, quint64 requestGeneration, int attempt);
     void tryOpenTrackedLogicalComment(const QString &pdfPath, const QString &commentId, int page, const QVariantMap &location, quint64 requestGeneration, int attempt);
@@ -491,11 +555,19 @@ private:
     // (else no path), titled as the reader titles it.
     static QString agentNoteDocumentPath(const QString &documentId, const QString &filename, QString *title);
     static void openAgentNoteDocument(const QString &documentId, const QString &path);
-    // A link of an agent note's picture: a Library PDF at its page in a reader, or a web page in the browser.
+    // A link of an agent note's picture: a Library PDF at its page (and the place on it) in a
+    // reader, or a web page in the browser.
     static void openAgentNoteLink(const QString &href);
+    // A link to a place in a Library PDF (thoughts-pdf-link:<file>.pdf?page=N&x=&y=&rect=,
+    // part/pdfplacelink.h): the PDF in the window that tracks it, at the page, with (x, y) near
+    // the top and rect highlighted for a moment. False when @p href is no such link; a PDF this
+    // Mac does not have yet is explained in a message.
+    static bool openPdfPlaceLink(const QString &href);
     // @p part: a sidebar's reader (its page goes to the agent); none: the window, which sends
     // the page of the reader in front.
     static Thoughts::AgentNotesView *createAgentNotesView(bool sidebar, KParts::ReadOnlyPart *part = nullptr);
+    // The name a page sent to an agent gives @p part's document (the reader's title for it).
+    static QString readerDocumentTitle(KParts::ReadOnlyPart *part, const QString &path, const QString &documentId);
     // The Agent Notes button: a dot on its icon and the count in its tooltip while notes are unread.
     void updateAgentNotesAction(int unread);
     static Shell *shellForCommentsOverview(const QString &pdfPath = QString());
@@ -540,6 +612,10 @@ private:
     QString queueSourceConflictContents(const QVariantMap &bundle, const QByteArray &contents, QString *error);
     void connectSourceConflictSignals(KParts::ReadWritePart *part);
     void triggerFedoraSyncWithInitiationControl(const QString &initiationControl);
+    // Signed in or out, or a server address or token saved by hand: the app's requests and the
+    // repository read the server and tokens again and a Sync connects, once no Sync runs.
+    static void reconnectToServer();
+    static void syncAfterServerChange(int attempts = 0);
     // An agent's proposals and new PDF builds reach Fedora without this computer knowing. One
     // watch per process asks the server, through the first window: every 20 seconds, or at once
     // when a server with sync_state_wait_v1 says its state changed (SyncStateWatch).
@@ -553,9 +629,20 @@ private:
     static void resetAutomaticSyncForTesting();
     // The Sync that follows a proposal decision made on this computer.
     static void proposalDecided();
+    // Edit… and Cover the Whole Document… of a reader tab's Cards list.
+    void editSidebarReviewCardAreas(KParts::ReadWritePart *sourcePart, const QString &cardId, bool wholeDocument);
     static void startProposalDecisionSync();
     // Forgets a pending one; `delayMs` replaces the delay after a decision (0: the real one).
     static void resetProposalDecisionSyncForTesting(int delayMs = 0);
+    // The Sync that sends the changes made on this computer (localchangesync.h): the outbox
+    // as a pending-changes snapshot shows it, its first state read directly, and the timer.
+    static void observeLocalChanges(const QJsonObject &snapshot);
+    static void seedLocalChanges(const QJsonObject &snapshot);
+    static void armLocalChangeSync(qint64 atMs);
+    static void startLocalChangeSync();
+    // Forgets the outbox and a wanted Sync; `quietMs` and `maximumWaitMs` replace the delays
+    // (0: the real ones; the others become a third of `quietMs`).
+    static void resetLocalChangeSyncForTesting(int quietMs = 0, int maximumWaitMs = 0);
     // Compacts the Sync journal once, while no Sync runs and nobody uses the app.
     static void startSyncJournalUpkeep();
     // Writes what the caches hold to the developer log.
@@ -598,6 +685,11 @@ private:
 
     Thoughts::ReaderDisplayTitleStore *m_readerDisplayTitles = nullptr;
     void refreshReaderTabTitles();
+    // A reader tab's icon: a dot while its Part keeps an earlier version on screen (a newer one is
+    // ready), else its document type's (none where tabs are pills of their title).
+    QIcon readerTabIcon(int tab) const;
+    // The dot of a tab that keeps an earlier version (one icon, so tests can tell it).
+    static QIcon keptVersionTabIcon();
     void selectReaderTitle(KParts::ReadWritePart *part, const QString &documentId, const QString &title, const QString &projectId = {});
     struct TabState {
         explicit TabState(KParts::ReadWritePart *p)
@@ -750,6 +842,10 @@ private:
     QString m_pendingSourceProject;
     QString m_pendingSourceTarget;
     quint64 m_trackedCommentOpenGeneration = 0;
+    // The Library's opening of a comment or proposal in progress, for the developer log:
+    // since the request, and how long finding or opening its tab took.
+    QElapsedTimer m_trackedOpenClock;
+    qint64 m_trackedOpenTabMs = 0;
 };
 
 #endif

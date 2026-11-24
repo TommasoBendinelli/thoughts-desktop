@@ -179,6 +179,10 @@ public:
         Problem problem = Problem::Unavailable;
         // A verified, editable file that can be opened without claiming a line match.
         QString fallbackSourcePath;
+        // requireExactPassage on a published build: the line in the build's own source snapshot
+        // (SyncTeX's line moved to the line holding the selected text), before it is mapped to
+        // the current file. Also set when that mapping fails; 0 when unknown.
+        int snapshotLine = 0;
     };
 
     struct AnchorRestoreResult {

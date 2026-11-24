@@ -1,4 +1,5 @@
 #include "documentidentity.h"
+#include "fileidentitycache.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "markdownfolderimport.h"
@@ -289,13 +290,12 @@ private:
     }
     QJsonObject read() const {
         m_error.clear();
-        QFile file(m_path);
-        if (!file.exists()) return {{QStringLiteral("projects"), QJsonArray{}}, {QStringLiteral("pending"), QJsonArray{}}};
-        if (!file.open(QIODevice::ReadOnly)) { m_error = QStringLiteral("The project catalogue could not be read."); return {}; }
-        QJsonParseError error;
-        const auto value = QJsonDocument::fromJson(file.readAll(), &error);
-        if (error.error != QJsonParseError::NoError || !value.isObject()) { m_error = QStringLiteral("The project catalogue is damaged; it has been preserved."); return {}; }
-        return value.object();
+        if (!QFile::exists(m_path)) return {{QStringLiteral("projects"), QJsonArray{}}, {QStringLiteral("pending"), QJsonArray{}}};
+        // Read and parsed again only when it changed (about 1 MB, read by every Library load and change check).
+        const CachedJsonFile file = cachedJsonFile(m_path);
+        if (!file.opened) { m_error = QStringLiteral("The project catalogue could not be read."); return {}; }
+        if (file.error != QJsonParseError::NoError || !file.document.isObject()) { m_error = QStringLiteral("The project catalogue is damaged; it has been preserved."); return {}; }
+        return file.document.object();
     }
     QString write(const QJsonObject &value) const {
         QDir().mkpath(QFileInfo(m_path).absolutePath());

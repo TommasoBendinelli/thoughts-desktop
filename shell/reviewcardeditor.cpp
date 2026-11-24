@@ -21,6 +21,7 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QScrollArea>
 #include <QVBoxLayout>
@@ -160,12 +161,38 @@ protected:
 };
 }
 
+void fillReviewCardKindChoice(QComboBox *choice, const ReviewCard &card)
+{
+    if (!choice) return;
+    const QSignalBlocker blocker(choice);
+    choice->clear();
+    choice->addItem(i18n("Knowledge card"), ReviewKinds::knowledge());
+    choice->addItem(i18n("Project card"), ReviewKinds::project());
+    if (!card.kindProjectIds.isEmpty())
+        choice->addItem(card.projectsKind == ReviewKinds::project() ? i18n("As its Project (Project card)") : i18n("As its Project (Knowledge card)"),
+                        ReviewKinds::followProject());
+    choice->setToolTip(i18n("A knowledge card is material you study. A project card is about work in progress: it comes back at most a week after "
+                            "its latest answer, and at once when its passage changes."));
+    const QString initial = card.reviewKindSource == ReviewKinds::sourceProject() && !card.kindProjectIds.isEmpty() ? ReviewKinds::followProject()
+        : card.isProjectCard() ? ReviewKinds::project() : ReviewKinds::knowledge();
+    choice->setProperty("thoughtsInitialKind", initial);
+    choice->setCurrentIndex(qMax(0, choice->findData(initial)));
+}
+
+QString chosenReviewCardKind(const QComboBox *choice)
+{
+    if (!choice) return {};
+    const QString chosen = choice->currentData().toString();
+    return chosen != choice->property("thoughtsInitialKind").toString() ? chosen : QString();
+}
+
 struct ReviewCardEditor::Private {
     std::unique_ptr<Poppler::Document> pdf;
     QVariantList originalRegions;
     RegionCanvas *canvas = nullptr;
     QSpinBox *page = nullptr;
     QPlainTextEdit *question = nullptr;
+    QComboBox *kind = nullptr;
     QLabel *error = nullptr;
     QPushButton *save = nullptr;
 };
@@ -187,6 +214,17 @@ ReviewCardEditor::ReviewCardEditor(const ReviewCard &card, const QString &pdfPat
     d->question->setObjectName(QStringLiteral("reviewCardQuestion"));
     d->question->setMaximumHeight(90);
     layout->addWidget(d->question);
+    if (options.offerKind) {
+        // The card's kind, as in the review's Edit (the Cards list's menu no longer has it, 23 Nov 2026).
+        auto *kindRow = new QHBoxLayout;
+        kindRow->addWidget(new QLabel(i18n("Kind"), this));
+        d->kind = new QComboBox(this);
+        d->kind->setObjectName(QStringLiteral("reviewCardKind"));
+        fillReviewCardKindChoice(d->kind, card);
+        kindRow->addWidget(d->kind);
+        kindRow->addStretch();
+        layout->addLayout(kindRow);
+    }
     auto *hint = new QLabel(i18n("Drag an area to move it, drag a corner to resize it, or drag on the page to add an area."), this);
     hint->setWordWrap(true);
     layout->addWidget(hint);
@@ -203,6 +241,10 @@ ReviewCardEditor::ReviewCardEditor(const ReviewCard &card, const QString &pdfPat
     zoom->addItem(QStringLiteral("200%"), 2.0);
     row->addWidget(zoom);
     row->addStretch();
+    auto *wholeDocument = new QPushButton(i18n("Whole document"), this);
+    wholeDocument->setObjectName(QStringLiteral("reviewCardWholeDocument"));
+    wholeDocument->setToolTip(i18n("One area on each page around its text, from below the title to the end of the document."));
+    row->addWidget(wholeDocument);
     auto *remove = new QPushButton(i18n("Remove selected area"), this);
     remove->setObjectName(QStringLiteral("reviewCardRemoveArea"));
     row->addWidget(remove);
@@ -295,6 +337,19 @@ ReviewCardEditor::ReviewCardEditor(const ReviewCard &card, const QString &pdfPat
     connect(d->question, &QPlainTextEdit::textChanged, this, validate);
     d->canvas->changed = validate;
     connect(remove, &QPushButton::clicked, this, [this] { d->canvas->removeSelected(); });
+    // The whole document: one area per page around its text, the title left visible.
+    connect(wholeDocument, &QPushButton::clicked, this, [this, page, showPage] {
+        if (!d->pdf) return;
+        const auto areas = wholeDocumentReviewAreas(d->pdf.get());
+        if (areas.isEmpty()) {
+            d->error->setText(i18n("No text was found in this PDF to cover."));
+            return;
+        }
+        d->canvas->areas.clear();
+        for (const auto &area : areas) d->canvas->areas.append({area.page, area.rect});
+        if (page->value() == areas.first().page) showPage(areas.first().page);
+        else page->setValue(areas.first().page);
+    });
     connect(buttons, &QDialogButtonBox::accepted, this, [this, save] {
         QString error;
         if (!save || !save(regions(), question(), d->pdf->numPages(), &error)) {
@@ -318,6 +373,7 @@ QVariantList ReviewCardEditor::areas() const {
     return result;
 }
 QString ReviewCardEditor::question() const { return d->question->toPlainText().trimmed(); }
+QString ReviewCardEditor::kind() const { return chosenReviewCardKind(d->kind); }
 void ReviewCardEditor::showArea(int index) {
     if (index < 0 || index >= d->canvas->areas.size() || !d->page) return;
     d->page->setValue(d->canvas->areas[index].page);
@@ -534,7 +590,7 @@ bool chooseNewReviewCardAreas(QWidget *parent, const QString &docsRoot, const QS
 }
 
 bool editReviewCardAreas(QWidget *parent, ReviewStore &store, const QString &docsRoot, const ReviewCard &card,
-                         const QString &pdfPath, bool placeAgain) {
+                         const QString &pdfPath, bool placeAgain, bool wholeDocument, bool offerKind) {
     const QString pdfSha256 = fileSha256(pdfPath);
     if (pdfSha256.isEmpty()) {
         QMessageBox::warning(parent, i18n("Cannot Edit Review Card"), i18n("The card's PDF is unavailable: %1", pdfPath));
@@ -548,10 +604,26 @@ bool editReviewCardAreas(QWidget *parent, ReviewStore &store, const QString &doc
         options.saveText = i18n("Place Card");
         options.scopeText = i18n("Draw the card's answer areas on the current PDF. Each area marks its own passage of the source.");
     }
+    options.offerKind = offerKind;
     if (!samePdf) {
         // Regions of another build would point at the wrong text: start from an empty page.
         options.useAreas = true;
         options.page = card.page();
+    }
+    if (wholeDocument) {
+        const auto areas = wholeDocumentReviewAreas(pdfPath);
+        if (areas.isEmpty()) {
+            QMessageBox::warning(parent, i18n("Cannot Cover the Whole Document"), i18n("No text was found in the card's PDF."));
+            return false;
+        }
+        options.title = i18n("Cover the Whole Document");
+        options.scopeText = i18n("Every page's text below the title is the answer. Adjust an area if needed; the card's markers in the source move with them, and it keeps its reviews.");
+        options.useAreas = true;
+        options.areas.clear();
+        for (const auto &area : areas)
+            options.areas.append(QVariantMap{{QStringLiteral("page"), area.page},
+                                             {QStringLiteral("rect"), QVariantList{area.rect.left(), area.rect.top(), area.rect.right(), area.rect.bottom()}}});
+        options.page = areas.first().page;
     }
     const QString bundleRoot = defaultReviewSourceBundleRoot();
     ReviewCardEditor *self = nullptr;
@@ -580,6 +652,11 @@ bool editReviewCardAreas(QWidget *parent, ReviewStore &store, const QString &doc
         return store.replaceCardAreas(card, pdfSha256, question, plan, error);
     }, options, parent);
     self = &editor;
-    return editor.exec() == QDialog::Accepted;
+    if (editor.exec() != QDialog::Accepted) return false;
+    if (const QString kind = editor.kind(); !kind.isEmpty()) {
+        QString error;
+        if (!store.setCardKind(card.id(), kind, &error)) QMessageBox::warning(parent, i18n("Cannot Change the Card's Kind"), error);
+    }
+    return true;
 }
 }

@@ -11,11 +11,22 @@
 #include <QRegularExpression>
 #include <functional>
 namespace Thoughts {
+// HTML of a source folder's tex/ or markdown/ tree: a connected docs-* folder or a Project's default
+// folder .thoughts/projects/<64 hex>/default (legacy .../documents), as part/sourceowner.h and the
+// server's source_resources.is_html_source_path define them.
+inline QString htmlSourceFolder(const QString &path)
+{
+    static const QRegularExpression owner(QStringLiteral("^(docs-[A-Za-z0-9_.-]+|\\.thoughts/projects/[0-9a-f]{64}/(?:default|documents))/"));
+    const auto folder = owner.match(path);
+    return folder.hasMatch() ? folder.captured(1) : QString();
+}
+
 inline bool isHtmlSourcePath(const QString &path)
 {
-    const auto parts = path.split(QLatin1Char('/'));
-    if (parts.size() < 3 || !QRegularExpression(QStringLiteral("^docs-[A-Za-z0-9_.-]+$")).match(parts[0]).hasMatch()
-        || (parts[1] != QLatin1String("tex") && parts[1] != QLatin1String("markdown"))
+    const QString folder = htmlSourceFolder(path);
+    if (folder.isEmpty()) return false;
+    const auto parts = path.mid(folder.size() + 1).split(QLatin1Char('/'));
+    if (parts.size() < 2 || (parts[0] != QLatin1String("tex") && parts[0] != QLatin1String("markdown"))
         || path.contains(QRegularExpression(QStringLiteral("[\\x00-\\x1f\\\\?#%]")))) return false;
     for (const auto &part : parts) if (part.isEmpty() || part.startsWith(QLatin1Char('.'))) return false;
     const auto suffix = QFileInfo(path).suffix().toLower();
@@ -61,4 +72,12 @@ OKULARCORE_EXPORT bool openHtmlAttachment(const QUrl &link, const QUrl &pdf, QSt
 OKULARCORE_EXPORT void setHtmlAttachmentHandler(const QObject *document, QObject *receiver, std::function<void(const QUrl &link)> handler);
 // Called by the document for an activated thoughts-html: link: true when a reader took it.
 OKULARCORE_EXPORT bool handleHtmlAttachmentLink(const QObject *document, const QUrl &link);
+// The reader of @p document that opens some of its PDF's web links inside Thoughts (the Part: a
+// page of this computer's Thoughts server that opens a Library document): an activated http(s)
+// link goes to @p handler while @p receiver lives, and opens in the browser when the handler
+// returns false or there is none. A thoughts-pdf-link: (a place in a Library PDF) goes to the
+// handler too, and nowhere else.
+OKULARCORE_EXPORT void setWebLinkHandler(const QObject *document, QObject *receiver, std::function<bool(const QUrl &link)> handler);
+// Called by the document for an activated http(s) or thoughts-pdf-link: link: true when a reader took it.
+OKULARCORE_EXPORT bool handleWebLink(const QObject *document, const QUrl &link);
 }

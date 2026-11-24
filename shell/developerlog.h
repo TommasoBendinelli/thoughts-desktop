@@ -57,6 +57,8 @@ class DeveloperActivity
 public:
     explicit DeveloperActivity(const QString &name, const QJsonObject &metadata = {});
     ~DeveloperActivity();
+    // Adds a field to the .finished event, e.g. what the activity found.
+    void add(const QString &key, const QJsonValue &value) { m_metadata.insert(key, value); }
 private:
     QString m_name;
     QJsonObject m_metadata;

@@ -10,6 +10,7 @@
 #include "../part/currentannotationindex.h"
 #include "../part/sourceowner.h"
 #include "../part/thoughtignore.h"
+#include "../part/fileidentitycache.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -1089,6 +1090,23 @@ bool observeAgentProposalSource(const QString &docsRoot, const QString &sourcePa
     if (latestBatch) latest = *latestBatch;
     else if (!ProposalHistory::latest(docsRoot, &latest, error)) return false;
     if (proposals.isEmpty() && vanishedFrom(latest).isEmpty()) return true;
+    if (latestBatch && vanishedFrom(latest).isEmpty()) {
+        // Every proposal is recorded as it is, and none vanished: the loop
+        // below would add nothing. Skip its lock file, which each Library load
+        // created and removed once per source, and the second read of the
+        // source; the check that the source is still what was parsed stays.
+        const bool unchanged = std::all_of(proposals.cbegin(), proposals.cend(), [&](const AgentProposedEdit &proposal) {
+            const auto previous = latest.value(proposal.id);
+            const auto previousKind = previous.value(QStringLiteral("kind")).toString();
+            return !previous.isEmpty() && previousKind != QLatin1String("accepted") && previousKind != QLatin1String("rejected")
+                && previousKind != QLatin1String("deleted_from_source") && previous.value(QStringLiteral("snapshot")).toObject() == proposalSnapshot(proposal, path);
+        });
+        if (unchanged) {
+            const std::optional<QByteArray> current = cachedFileBytes(sourcePath);
+            if (!current || *current != source) return fail(error, QStringLiteral("The proposal source changed during observation."));
+            return true;
+        }
+    }
     if (!QDir().mkpath(ProposalHistory::directory(docsRoot))) return fail(error, QStringLiteral("Cannot create proposal history directory."));
     QLockFile observationLock(QDir(ProposalHistory::directory(docsRoot)).filePath(QStringLiteral("proposal_observation.lock")));
     if (!observationLock.tryLock(5000)) return fail(error, QStringLiteral("Proposal history observation is busy."));

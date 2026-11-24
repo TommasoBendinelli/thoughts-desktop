@@ -1405,7 +1405,8 @@ QString answerNoteKey() { return QStringLiteral("note"); }
 QString beforeNoteKey() { return QStringLiteral("before_note"); }
 QString answerNoteName() { return QStringLiteral("Note"); }
 QString beforeNoteName() { return QStringLiteral("Before note"); }
-int groupNoteMaxLength() { return 500; }
+// As long as the user likes (20 Nov 2026: 500 cut notes off); the phone keeps the same ceiling.
+int groupNoteMaxLength() { return 20000; }
 
 QString cutGroupNote(const QString &text)
 {
@@ -2000,6 +2001,20 @@ void ReviewStore::recoverSourceTransactions()
 void ReviewStore::migrateLegacyStore()
 {
     const QString root = rootPath();
+    // Every store this app writes is current, so a root needs checking once per process. The check
+    // reads every card file; it ran on the main thread each time the sidebar's cards were
+    // refreshed (after every Sync, after each feedback), and with a few hundred cards and a
+    // scanner checking each file opened, that froze the window for seconds (19 Nov).
+    static QMutex checkedMutex;
+    static QSet<QString> checked;
+    {
+        QMutexLocker lock(&checkedMutex);
+        if (checked.contains(root)) return;
+    }
+    const auto markChecked = [&root] {
+        QMutexLocker lock(&checkedMutex);
+        checked.insert(root);
+    };
     const QDir cardsDirectory(QDir(root).filePath(QStringLiteral("cards")));
     const QStringList cardFiles = cardsDirectory.entryList({QStringLiteral("*.json")}, QDir::Files);
     bool hasLegacyCards = false;
@@ -2012,6 +2027,7 @@ void ReviewStore::migrateLegacyStore()
         }
     }
     if (!hasLegacyCards) {
+        markChecked();
         return;
     }
 
@@ -2027,6 +2043,7 @@ void ReviewStore::migrateLegacyStore()
     QDir().mkpath(QDir(root).filePath(QStringLiteral("cards")));
     QDir().mkpath(QDir(root).filePath(QStringLiteral("events")));
     QDir().mkpath(QDir(root).filePath(QStringLiteral("exclusions")));
+    markChecked();
 }
 
 QString ReviewStore::rootPath() const
@@ -3147,6 +3164,35 @@ QString agentFeedbackLabel(const QJsonObject &record)
     return record.value(QStringLiteral("polarity")).toString() == ReviewCardFeedback::negative() ? QStringLiteral("Disliked") : QStringLiteral("Liked");
 }
 
+// What each kind asks of the agent: a question wants an answer, not an edit; likes and dislikes
+// are what to keep and what to change. The last line is the request: proposals for the
+// feedback, agent notes for the questions, so the text asks the same whether it is pasted or
+// sent with Send to Agent. The phone writes the same
+// lines (ui/reader/AgentDocumentDescription.kt).
+void agentFeedbackGuidance(const QList<QJsonObject> &text, QStringList &lines)
+{
+    const bool openQuestion = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) {
+        return DocumentFeedback::kindOf(record) == DocumentFeedback::question() && !DocumentFeedback::isResolved(record);
+    });
+    const bool likes = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) { return DocumentFeedback::kindOf(record).isEmpty(); });
+    const bool marks = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) {
+        const QString kind = DocumentFeedback::kindOf(record);
+        return kind == DocumentFeedback::drawing() || kind == DocumentFeedback::textBox();
+    });
+    if (openQuestion) {
+        lines.append(QStringLiteral("A Question asks you something; it is not a request to change the text, so make no proposal for it unless I ask for one."));
+    }
+    if (likes) lines.append(QStringLiteral("Liked and Disliked passages say what to keep and what to change; a change goes in a proposal."));
+    const bool changes = likes || marks;
+    if (changes && openQuestion) {
+        lines.append(QStringLiteral("Make proposals for my feedback above, and answer my questions with agent notes (send_note, attached to this document)."));
+    } else if (changes) {
+        lines.append(QStringLiteral("Make proposals for my feedback above."));
+    } else if (openQuestion) {
+        lines.append(QStringLiteral("Answer my questions above with agent notes (send_note, attached to this document)."));
+    }
+}
+
 QString agentTagLabel(const QString &tag)
 {
     if (tag == ReviewTags::correct()) return QStringLiteral("Correct");
@@ -3230,21 +3276,42 @@ QString agentVersionFeedback(const QList<ReviewCard> &cards, const QList<QJsonOb
         if (!DocumentFeedback::isPageMark(record)) line += QStringLiteral(": \"%1\"").arg(agentQuote(record));
         const QString comment = record.value(QStringLiteral("comment")).toString().simplified();
         if (!comment.isEmpty()) line += QStringLiteral(" — ") + comment;
+        line += DocumentFeedback::agentPicturesNote(record);
         if (DocumentFeedback::canResolve(record) && DocumentFeedback::isResolved(record)) line += QStringLiteral(" (resolved)");
         lines.append(line);
     }
-    // What each kind asks of the agent: a question wants an answer, not an edit; likes and
-    // dislikes are what to keep and what to change.
-    const bool openQuestion = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) {
-        return DocumentFeedback::kindOf(record) == DocumentFeedback::question() && !DocumentFeedback::isResolved(record);
-    });
-    const bool likes = std::any_of(text.cbegin(), text.cend(), [](const QJsonObject &record) { return DocumentFeedback::kindOf(record).isEmpty(); });
-    if (openQuestion) {
-        lines.append(QStringLiteral("Answer each Question in your reply. A question asks you something; it is not a request to change the text, so "
-                                    "make no proposal for it unless I ask for one."));
-    }
-    if (likes) lines.append(QStringLiteral("Liked and Disliked passages say what to keep and what to change; a change goes in a proposal."));
+    agentFeedbackGuidance(text, lines);
     return lines.isEmpty() ? QString() : lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
+}
+
+QString agentHtmlPageFeedback(const QList<QJsonObject> &textFeedback, const QString &path, const QString &pageSha256)
+{
+    if (path.isEmpty() || pageSha256.isEmpty()) return {};
+    // Feedback in a page belongs to the page's version (its HTML's SHA-256), as on the PDF it
+    // belongs to the PDF's; comments never go to agents.
+    QList<QJsonObject> text;
+    for (const QJsonObject &record : textFeedback) {
+        if (record.value(QStringLiteral("deleted")).toBool() || !DocumentFeedback::isAttachmentFeedback(record)) continue;
+        if (DocumentFeedback::kindOf(record) == DocumentFeedback::other()) continue;
+        const QJsonObject page = record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject();
+        if (page.value(QStringLiteral("path")).toString() == path && page.value(QStringLiteral("sha256")).toString() == pageSha256) text.append(record);
+    }
+    if (text.isEmpty()) return {};
+    ReviewCardFeedback::sortByCreation(text);
+    QStringList lines{QStringLiteral("Feedback on this version of the page:")};
+    for (const QJsonObject &record : std::as_const(text)) {
+        // A drawing is made on a snapshot of the page: its points say nothing without the picture.
+        QString line = DocumentFeedback::isDrawing(record)
+            ? QStringLiteral("- Drawing on a snapshot of the page (the Thoughts document_feedback tool shows it as a picture)")
+            : QStringLiteral("- %1: \"%2\"").arg(agentFeedbackLabel(record), agentQuote(record));
+        const QString comment = record.value(QStringLiteral("comment")).toString().simplified();
+        if (!comment.isEmpty()) line += QStringLiteral(" — ") + comment;
+        line += DocumentFeedback::agentPicturesNote(record);
+        if (DocumentFeedback::canResolve(record) && DocumentFeedback::isResolved(record)) line += QStringLiteral(" (resolved)");
+        lines.append(line);
+    }
+    agentFeedbackGuidance(text, lines);
+    return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
 }
 
 QString cardDocumentId(const ReviewCard &card, const QString &docsRoot)
@@ -3257,6 +3324,109 @@ QString cardDocumentId(const ReviewCard &card, const QString &docsRoot)
         if (!id.isEmpty()) return id;
     }
     return DocumentIdentityStore(docsRoot).byFilename(card.pdfStem() + QStringLiteral(".pdf")).value(QStringLiteral("document_id")).toString();
+}
+
+namespace ReviewAutoRetire
+{
+QString originId() { return QStringLiteral("thoughts-passage-check"); }
+QString passageRemovedField() { return QStringLiteral("passage_removed"); }
+int noticeDays() { return 7; }
+
+bool isAutomatic(const QJsonObject &event)
+{
+    return objectString(event, QStringLiteral("origin_id")) == originId();
+}
+
+std::optional<Notice> retirementOf(const ReviewCard &card)
+{
+    if (!card.schedule.retired || card.schedule.deleted || card.schedule.retireEventId.isEmpty()) return std::nullopt;
+    for (const QJsonObject &event : card.history) {
+        if (objectString(event, QStringLiteral("event_id")) != card.schedule.retireEventId) continue;
+        if (!isAutomatic(event) || objectString(event, QStringLiteral("queue_action")) != ReviewRetire::retireAction()) return std::nullopt;
+        const QJsonObject removed = event.value(passageRemovedField()).toObject();
+        Notice notice{card.schedule.retireEventId, card.id(), card.question(), card.schedule.retiredAt, objectString(removed, QStringLiteral("pdf")), {}};
+        if (notice.pdf.isEmpty() && !card.pdfStem().isEmpty()) notice.pdf = card.pdfStem() + QStringLiteral(".pdf");
+        for (const QJsonValue &file : removed.value(QStringLiteral("source_files")).toArray())
+            if (!file.toString().trimmed().isEmpty()) notice.sourceFiles.append(file.toString().trimmed());
+        return notice;
+    }
+    return std::nullopt;
+}
+
+QList<Notice> pendingNotices(const QList<ReviewCard> &cards, const QHash<QString, QDateTime> &shown, const QDateTime &now)
+{
+    QList<Notice> notices;
+    const QDateTime oldest = now.toUTC().addDays(-noticeDays());
+    for (const ReviewCard &card : cards) {
+        const std::optional<Notice> notice = retirementOf(card);
+        if (!notice || shown.contains(notice->eventId) || !notice->retiredAt.isValid() || notice->retiredAt < oldest) continue;
+        notices.append(*notice);
+    }
+    std::sort(notices.begin(), notices.end(), [](const Notice &a, const Notice &b) {
+        return a.retiredAt == b.retiredAt ? a.eventId < b.eventId : a.retiredAt < b.retiredAt;
+    });
+    return notices;
+}
+
+QString noteName(const Notice &notice, const QJsonArray &projects)
+{
+    if (!notice.pdf.isEmpty()) {
+        for (const QJsonValue &project : projects) {
+            for (const QJsonValue &value : project.toObject().value(QStringLiteral("documents")).toArray()) {
+                const QJsonObject document = value.toObject();
+                const QString name = objectString(document, QStringLiteral("name")).trimmed();
+                if (!name.isEmpty() && objectString(document, QStringLiteral("filename")) == notice.pdf) return name;
+            }
+        }
+    }
+    if (!notice.sourceFiles.isEmpty()) return QFileInfo(notice.sourceFiles.constFirst()).fileName();
+    return notice.pdf;
+}
+
+QString shownNoticesPath()
+{
+    return QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("review-auto-retire-notices.json"));
+}
+
+QHash<QString, QDateTime> shownNotices(const QString &path)
+{
+    QHash<QString, QDateTime> shown;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return shown;
+    const QJsonObject events = QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("shown")).toObject();
+    for (auto it = events.begin(); it != events.end(); ++it) shown.insert(it.key(), parseUtc(it.value().toString()));
+    return shown;
+}
+
+bool rememberShown(const QList<Notice> &notices, const QDateTime &now, const QString &path)
+{
+    if (notices.isEmpty()) return true;
+    QHash<QString, QDateTime> shown = shownNotices(path);
+    const QDateTime at = now.toUTC();
+    bool changed = false;
+    for (auto it = shown.begin(); it != shown.end();) {
+        if (it.value().isValid() && it.value() < at.addDays(-30)) {
+            it = shown.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    // A notice still on screen is remembered once, with when it was first shown.
+    for (const Notice &notice : notices) {
+        if (shown.contains(notice.eventId)) continue;
+        shown.insert(notice.eventId, at);
+        changed = true;
+    }
+    if (!changed) return true;
+    QJsonObject events;
+    for (auto it = shown.cbegin(); it != shown.cend(); ++it) events.insert(it.key(), it.value().toString(Qt::ISODateWithMs));
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) return false;
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    file.write(QJsonDocument(QJsonObject{{QStringLiteral("schema_version"), 1}, {QStringLiteral("shown"), events}}).toJson(QJsonDocument::Compact));
+    return file.commit();
+}
 }
 
 QList<ReviewCard> ReviewStore::activeCards(QStringList *errors, const QString &pdfStem) const

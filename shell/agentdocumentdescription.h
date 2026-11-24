@@ -98,4 +98,27 @@ inline QString agentDocumentDescription(const QString &docsRoot, const QJsonArra
     if (!selection.isEmpty()) lines.append(QStringLiteral("Selected text: \"%1\"").arg(selection));
     return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
 }
+
+// "Copy for agent" on an HTML page's tab, after its document's description: the page (its title,
+// its source in the Library, the part of it on screen) and the text selected in it. A live page
+// (thoughts-server protocol/html-live-pages.md, @p liveAddress) says so and gives its address: what
+// it shows comes from there, and its source is only the stub that names it.
+inline QString agentHtmlPageDescription(const QString &docsRoot, const QString &path, const QString &title, const QString &hash, const QString &selectedText,
+                                        const QString &liveAddress = QString())
+{
+    QStringList lines{QStringLiteral("HTML page: \"%1\"").arg(title.isEmpty() ? QFileInfo(path).fileName() : title)};
+    if (!liveAddress.isEmpty()) {
+        lines.append(QStringLiteral("Live page: it shows %1 as that address serves it now (loaded from the network on this device), not HTML kept in the Library.")
+                         .arg(liveAddress));
+    }
+    const QString source = QDir(docsRoot).filePath(path);
+    lines.append(QStringLiteral("Page source: %1%2").arg(QFileInfo::exists(source) ? source : path,
+                                                         liveAddress.isEmpty() ? QString() : QStringLiteral("  (the live page's stub; a snapshot or add_html_page with replace makes it an embedded page)")));
+    if (!hash.isEmpty() && hash != QLatin1String("#")) lines.append(QStringLiteral("Part of the page on screen: %1").arg(hash));
+    QString selection = selectedText;
+    selection.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
+    selection = selection.trimmed();
+    if (!selection.isEmpty()) lines.append(QStringLiteral("Selected text: \"%1\"").arg(selection));
+    return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
+}
 }

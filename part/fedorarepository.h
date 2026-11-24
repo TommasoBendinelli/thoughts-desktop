@@ -22,6 +22,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace Thoughts
 {
@@ -172,6 +173,12 @@ public:
     OKULARPART_EXPORT static void exportProjectPdf(const QString &docsRoot, const QJsonObject &project, const QString &destination,
         QObject *owner, std::function<void(const QString &)> progress, std::function<void(bool, const QString &)> completed);
     OKULARPART_EXPORT static void openNoteAttachment(const QString &docsRoot, const QJsonObject &attachment, QObject *owner, std::function<void(const QString &)> failed);
+    // Library generation folders a reader tab still shows a PDF from: an earlier version kept on
+    // screen while a newer one is ready. The cleanup of obsolete generations keeps each one until
+    // every hold on it is released (holds count; any thread).
+    OKULARPART_EXPORT static void holdLibraryGeneration(const QString &directory);
+    OKULARPART_EXPORT static void releaseLibraryGeneration(const QString &directory);
+    OKULARPART_EXPORT static QSet<QString> heldLibraryGenerations();
     ~FedoraRepository() override;
 
     void captureDocument(const QString &pdfStem);
@@ -200,9 +207,21 @@ public:
     OKULARPART_EXPORT bool enqueueReviewCardFeedback(const QJsonObject &record, QString *error = nullptr);
     // Queues one document_feedback record (documentfeedback.h) and publishes the new projections.
     OKULARPART_EXPORT bool enqueueDocumentFeedback(const QJsonObject &record, QString *error = nullptr);
+    // Queues the user's revision of a reading overlay (readingoverlays.h: Delete Mark, Delete
+    // Overlay) and publishes the new projections. It waits until the server accepts it.
+    OKULARPART_EXPORT bool enqueueReadingOverlay(const QJsonObject &record, QString *error = nullptr);
     // Several feedback records in one store write (Change passage: the new record and the old one's tombstone).
     OKULARPART_EXPORT bool enqueueReviewCardFeedbackBatch(const QList<QJsonObject> &records, QString *error = nullptr);
     OKULARPART_EXPORT bool enqueueDocumentFeedbackBatch(const QList<QJsonObject> &records, QString *error = nullptr);
+    // The snapshots of drawings in HTML attachments (document-feedback.md 10.1): pictures of the page,
+    // kept on this computer by their SHA-256 (thoughts-server/feedback-snapshots) before the record
+    // is queued, so the list shows them offline, and uploaded before the record. keep returns the
+    // SHA-256, or empty with @p error; feedbackSnapshot the verified bytes, empty when not here.
+    OKULARPART_EXPORT QString keepFeedbackSnapshot(const QByteArray &bytes, QString *error = nullptr);
+    OKULARPART_EXPORT QByteArray feedbackSnapshot(const QString &sha256) const;
+    // Downloads a snapshot this computer does not have (a drawing made elsewhere) and keeps it;
+    // @p done(true) once it is here, at once when it already is.
+    OKULARPART_EXPORT void fetchFeedbackSnapshot(const QString &sha256, QObject *context, std::function<void(bool found)> done);
     // Queues one agent_conversation record (agentconversations.h) and publishes the new projections.
     OKULARPART_EXPORT bool enqueueAgentConversation(const QJsonObject &record, QString *error = nullptr);
     // Re-insert the markers of anchor-removed comments (a pure source edit; no
@@ -274,6 +293,12 @@ public:
     // could not build a PDF. Empty while a Sync runs and after one without warnings.
     OKULARPART_EXPORT QString manualSyncWarningCode() const;
     OKULARPART_EXPORT QString manualSyncWarning() const;
+    // Signing in or out (or a token stored by hand) changed the server address or this
+    // computer's tokens while Thoughts runs: the next request reads them again, so Thoughts
+    // connects without a restart. A running Sync ends on the server it started with; the
+    // connection changes after it (serverConnectionReloadPending meanwhile).
+    OKULARPART_EXPORT void reloadServerConnection();
+    OKULARPART_EXPORT bool serverConnectionReloadPending() const;
 
 Q_SIGNALS:
     void projectionsChanged(const QJsonObject &projections, qint64 frontier);
@@ -708,6 +733,10 @@ private:
     quint64 m_sourceCommentGeneration = 0;
     bool m_sourceCommentRunning = false;
     std::unique_ptr<Thoughts::SyncClient> m_client;
+    // Clients of an earlier connection (reloadServerConnection), kept so that their requests
+    // still under way finish.
+    std::vector<std::unique_ptr<Thoughts::SyncClient>> m_retiredClients;
+    bool m_serverConnectionReloadPending = false;
     QStringList m_serverCapabilities;
     bool m_serverCapabilitiesFresh = false;
     std::unique_ptr<Thoughts::SyncTransferLedger> m_syncTransferLedger;
@@ -774,8 +803,13 @@ private:
     int m_documentFeedbackKindsSupport = -1;
     int m_documentFeedbackDrawingSupport = -1;
     int m_documentFeedbackTextSupport = -1;
+    int m_documentFeedbackHtmlDrawingSupport = -1;
+    // Pictures on comments (document-feedback.md §12).
+    int m_documentFeedbackPicturesSupport = -1;
     // Whether this Sync's server accepts agent_conversation (agent_conversations_v1): -1 not asked yet, 0 no, 1 yes.
     int m_agentConversationsSupport = -1;
+    // Whether this Sync's server accepts reading_overlay (reading_overlays_v1): -1 not asked yet, 0 no, 1 yes.
+    int m_readingOverlaysSupport = -1;
     // Tag groups shown as sliders (a group with "scale"): review_tag_scales_v1.
     int m_reviewTagScaleSupport = -1;
     // Tag groups under a section header (a group with "section"): review_tag_sections_v1.
@@ -785,6 +819,11 @@ private:
     // Whether the server reads decision claims (proposal_decisions_v1): -1 unknown.
     int m_proposalDecisionsSupport = -1;
     QSet<QString> m_uploadedReviewSourceObjects;
+    // Snapshots of drawings the server has (this Sync), and those neither the server nor this
+    // computer has: their drawings stay queued until a later Sync finds them.
+    QSet<QString> m_uploadedFeedbackSnapshots;
+    QSet<QString> m_missingFeedbackSnapshots;
+    QString feedbackSnapshotPath(const QString &sha256) const;
     bool m_traceEventsSupported = false;
     std::unique_ptr<Thoughts::TraceSseParser> m_buildTraceParser;
     QPointer<QNetworkReply> m_buildTraceReply;

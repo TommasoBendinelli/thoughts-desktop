@@ -11,6 +11,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QSysInfo>
 #include <QThread>
 #include <QUuid>
 
@@ -34,6 +35,7 @@
 #include <unistd.h>
 #endif
 #ifdef Q_OS_MACOS
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 #endif
@@ -362,6 +364,31 @@ QString desktopDeviceAccount()
 #else
     return QStringLiteral("thoughts-linux");
 #endif
+}
+
+QString computerName()
+{
+#if defined(Q_OS_MACOS)
+    // The name in System Settings › General › Sharing, e.g. "Alex's MacBook Pro".
+    if (CFStringRef name = SCDynamicStoreCopyComputerName(nullptr, nullptr)) {
+        const QString text = QString::fromCFString(name).trimmed();
+        CFRelease(name);
+        if (!text.isEmpty()) {
+            return text;
+        }
+    }
+#elif defined(Q_OS_WIN)
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+    if (GetComputerNameW(name, &size) && size > 0) {
+        return QString::fromWCharArray(name, int(size));
+    }
+#endif
+    QString host = QSysInfo::machineHostName().trimmed();
+    if (host.endsWith(QLatin1String(".local"), Qt::CaseInsensitive)) {
+        host.chop(6);
+    }
+    return host;
 }
 
 QString desktopOriginId()

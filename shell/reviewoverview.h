@@ -7,6 +7,7 @@
 #ifndef THOUGHTS_REVIEWOVERVIEW_H
 #define THOUGHTS_REVIEWOVERVIEW_H
 
+#include "reviewdraftsync.h"
 #include "reviewfeedbackpanel.h"
 #include "reviewstore.h"
 #include "reviewinterval.h"
@@ -96,6 +97,10 @@ QJsonObject sidebarReviewSchedule(const ReviewCard &card, bool active, bool unpu
 QJsonObject recallPredictionRequest(const ReviewCard &card, const QList<ReviewCard> &documentCards, const QString &answer, const QString &document,
                                     const ReviewTags::TagGroup &recall, const QDateTime &now);
 
+// The Library's notice of cards Thoughts retired (ReviewAutoRetire), oldest first: one card names
+// its question and @p noteName (the note its passage left); several name the first three questions.
+QString autoRetireNoticeText(const QList<ReviewAutoRetire::Notice> &notices, const QString &noteName = {});
+
 class ReviewCardsWidget : public QWidget
 {
     Q_OBJECT
@@ -135,9 +140,23 @@ public:
     QList<ReviewCard> activeProjectCards(const QString &projectId);
     // Retire project cards… of a Project (ReviewStore::retireProjectCards), then reads the cards again.
     bool retireProjectCards(const QString &projectId, QString *error = nullptr);
+    // "Restore to review" of @p cardId, as Browse's (a restore event of this Mac), then reads the
+    // cards again. False when it cannot start now (another change is being saved, or the card is
+    // not retired).
+    bool restoreRetiredCard(const QString &cardId);
+    // The note a notice of a card Thoughts retired names (ReviewAutoRetire::noteName with the
+    // Library Projects as last read).
+    QString autoRetireNoteName(const ReviewAutoRetire::Notice &notice) const;
+    // Where the notices shown are remembered (ReviewAutoRetire::shownNoticesPath(); tests: another file).
+    QString autoRetireNoticesPath() const { return m_autoRetireNoticesPath; }
+    void setAutoRetireNoticesPath(const QString &path) { m_autoRetireNoticesPath = path; }
 
 Q_SIGNALS:
     void countsChanged(int activeCards, int dueCards);
+    // The cards were read and Thoughts retired some of them that the user was not told about yet
+    // (ReviewAutoRetire::pendingNotices, oldest first); emitted after countsChanged on every read
+    // until they are remembered as shown (ReviewAutoRetire::rememberShown).
+    void retiredByThoughts(const QList<Thoughts::ReviewAutoRetire::Notice> &notices);
     void openSourceRequested(const QString &sourcePath, int line);
     // History: open the PDF version @p pdfPath at @p page, marking @p regions ({page, rect}) when
     // given. @p current: the card's Library PDF; else an earlier version, read-only, as @p title.
@@ -146,6 +165,8 @@ Q_SIGNALS:
 private Q_SLOTS:
     void refreshBrowseTable();
     void refreshBrowseTypeCounts(const QString &selectedDocument);
+    // The Project filter changed: the Document filter lists that Project's documents, then the table.
+    void browseProjectChosen();
     void sortBrowseTable();
     void browseSelectionChanged();
     void browseQuestionChanged();
@@ -155,8 +176,8 @@ private Q_SLOTS:
     void deleteOrRestoreBrowseCard();
     // "Retire card", or "Restore to review" on a retired card: the selected card (ReviewRetire).
     void retireOrRestoreBrowseCard();
-    // Make project card, Make knowledge card or Follow the Project (@p kind: knowledge, project or
-    // follow_project) for the selected card (review-card-kinds.md §5).
+    // The kind chosen in Edit card's Kind row (@p kind: knowledge, project or follow_project) for
+    // the selected card (review-card-kinds.md §5).
     void setBrowseCardKind(const QString &kind);
     // "Merge cards…": the selected cards of one document become the one the user keeps.
     void mergeBrowseCards();
@@ -169,12 +190,22 @@ private Q_SLOTS:
 
 private:
     void sortVisibleBrowseCards();
+    // Writes the retire (or with @p restore the restore) of @p cardId off the GUI thread, shows it,
+    // then reads the cards again.
+    void recordRetireOrRestore(const QString &cardId, bool restore);
     void startReload();
     void applyCards(QList<ReviewBrowserCard> cards, const QStringList &errors);
     ReviewStore::ProjectionProvider snapshotProvider() const;
     void buildUi();
     void configureBrowseHeader();
     QStringList browseNames(const ReviewCard &card) const;
+    // The PDF stems (Library filenames without .pdf) of the Project the Project filter names;
+    // nothing for All projects.
+    std::optional<QSet<QString>> browseProjectStems() const;
+    // The Project filter's entries: All projects, then each Library Project by name; the choice kept.
+    void refreshBrowseProjectChoices();
+    // The Document filter's entries: the documents with cards, of the chosen Project; the choice kept.
+    void refreshBrowseDocumentChoices();
     QJsonArray m_browseProjects;
     void saveBrowseHeaderState();
     void showBrowseCard(const ReviewBrowserCard *item);
@@ -224,8 +255,10 @@ private:
     QSet<QString> m_libraryDueCardIds;
     int m_activeCardCount = 0;
     int m_dueCardCount = 0;
+    QString m_autoRetireNoticesPath = ReviewAutoRetire::shownNoticesPath();
 
     QLineEdit *m_browseSearch = nullptr;
+    QComboBox *m_browseProjectFilter = nullptr;
     QComboBox *m_browseDocumentFilter = nullptr;
     QComboBox *m_browseStateFilter = nullptr;
     QComboBox *m_browseTypeFilter = nullptr; // Linked, PDF only, linking pending, or a link problem.
@@ -238,8 +271,7 @@ private:
     QAction *m_browseExportAction = nullptr;
     QAction *m_browseDeleteAction = nullptr;
     QAction *m_browseRetireAction = nullptr; // "Retire card", or "Restore to review" on a retired card.
-    QAction *m_browseKindAction = nullptr; // "Make project card", or "Make knowledge card" on a project card.
-    QAction *m_browseFollowAction = nullptr; // "Follow the Project (…)": a card with a kind of its own in a Project.
+    QComboBox *m_browseKindChoice = nullptr; // Edit card's Kind row (fillReviewCardKindChoice).
     QAction *m_browseMergeAction = nullptr; // "Merge cards…": two or more selected cards.
     QTreeWidget *m_browseTable = nullptr;
     QLabel *m_browseState = nullptr;
@@ -380,6 +412,10 @@ Q_SIGNALS:
     void cardHistoryRequested(const QString &cardId);
     /** maskedHistoryCard() changed. */
     void maskedHistoryCardChanged(const QString &cardId);
+    /** Another device recorded the answer of the card under review (protocol/review-drafts.md
+        §4.2): a Sync brings it, and the review moves on. Emitted about 10 s after the news, so that
+        the answer reaches the server first. */
+    void syncRequested();
 
 public Q_SLOTS:
     // The card menu's Show history and maskedHistoryCard(), as the review stands now.
@@ -680,7 +716,14 @@ private:
         // The card's last answer when the step began (invalid: never answered): the answer the
         // step kept on disk belongs to (keptBeforeStep).
         QDateTime answeredAt = {};
+        // What the Thoughts server holds of the step (review drafts, protocol/review-drafts.md):
+        // Unknown: never written from here, or kept before there were drafts; Written: the server
+        // holds these picks and this note (written from here, or taken from another device);
+        // Unsent: changed here since it was last written.
+        enum class Draft { Unknown, Written, Unsent };
+        Draft draft = Draft::Unknown;
         bool locked() const { return answerShownAt.isValid() && !reopened; }
+        bool hasContent() const { return !tags.isEmpty() || !note.trimmed().isEmpty(); }
     };
     // The before step of each card is kept on this computer until that card's answer is recorded,
     // also through a restart: a card that leaves the review before it is answered (unavailable for
@@ -693,11 +736,48 @@ private:
     BeforeStep keptBeforeStep(const ReviewCard &card) const;
     // Keeps m_before as it is now (after a pick, the note, Reveal, the pencil).
     void keepBeforeStep();
-    // The cards' answers were recorded (or the cards deleted or merged away): their steps go.
-    void forgetBeforeSteps(const QStringList &cardIds);
+    // The cards' answers were recorded (or the cards deleted or merged away): their steps go. With
+    // @p draftReason (ReviewDraftSync::answeredReason() or clearedReason()) their drafts on the
+    // server go too, so that the other devices hear of it: the card shown, and those that had a
+    // step kept here or a draft on the server.
+    void forgetBeforeSteps(const QStringList &cardIds, const QString &draftReason = {});
     // Each group asked before and after starts the after step at the step picked before (Reveal).
     void startAfterStepAtPrediction();
     QTimer *m_beforeNoteSaveTimer = nullptr; // Typing in the before note is kept a moment later.
+    // The before step on the user's other devices (protocol/review-drafts.md §4): written to the
+    // Thoughts server as it is filled in, read when a card is shown, heard while a review is open.
+    ReviewDraftSync *m_draftSync = nullptr;
+    // Typing in the before note is written to the server 600 ms after the last keystroke (at once
+    // when the note loses focus, on Reveal, and when another card is shown).
+    QTimer *m_beforeDraftTimer = nullptr;
+    // Another device answered the card shown: syncRequested() about 10 s later.
+    QTimer *m_answeredElsewhereTimer = nullptr;
+    // That card, until Sync brings its answer: then the review moves on (reloadFromProjections).
+    QString m_answeredElsewhereCardId;
+    // Writes m_before to the server now (PUT), the note typed a moment ago with it.
+    void writeBeforeDraft();
+    // The changes request is open while the card shown has a before step.
+    void updateDraftWatching();
+    // Whether @p cardId is the card shown, with a before step.
+    bool isBeforeStepShown(const QString &cardId) const;
+    // §4.2: the server's draft of a card shown (@p found), adopted, or this computer's step written.
+    void beforeDraftFetched(const QString &cardId, bool found, const ReviewDraftSync::Draft &draft);
+    // §4.2: a change from another device, applied to the card shown or to the steps kept here.
+    void beforeDraftChanged(const ReviewDraftSync::Draft &change);
+    // A write of this computer was stored: the step it wrote is Written.
+    void beforeDraftWritten(const ReviewDraftSync::Draft &record);
+    // §4.3: @p draft began before the card's last answer as this computer knows it (@p lastAnswer).
+    static bool staleBeforeDraft(const ReviewDraftSync::Draft &draft, const QDateTime &lastAnswer);
+    // The card shown takes @p draft's picks and note (sliders, note, summary line).
+    void takeBeforeDraft(const ReviewDraftSync::Draft &draft);
+    // The card shown lost its before step on another device (answered or cleared there).
+    void clearBeforeStepFromElsewhere(const QString &why);
+    // The sliders and the summary line follow m_before's picks, without rebuilding the rows.
+    void showBeforePicks();
+    // Keeps @p change of another device as the step of a card not shown (keptBeforeStep).
+    void keepBeforeDraftOfOtherCard(const ReviewDraftSync::Draft &change);
+    // The tags of @p tags that are steps of the groups asked before the answer, once each.
+    QStringList askedBeforeTags(const QStringList &tags) const;
     // showCurrentCard(), keeping @p kept when it is the before step of the card shown: the same
     // card shown again (after Edit), or the step carried into the card a merge made of it.
     void showCurrentCard(const BeforeStep &kept);

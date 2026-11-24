@@ -3,8 +3,11 @@
 
 #include "documentfeedback.h"
 #include "htmldocumentview.h"
+#include "reviewcardfeedback.h"
 
 #include <QDebug>
+#include <QFile>
+#include <QJsonDocument>
 #include <QSet>
 #include <QTimer>
 
@@ -93,9 +96,10 @@ bool HtmlAttachmentReader::open(const HtmlAttachmentTarget &target, const Owner 
         return false;
     }
     m_owner = owner;
-    if (m_target.file == target.file && m_target.path == target.path && m_url.isValid() && m_view->isAttachment()) {
+    if (!m_live && m_target.file == target.file && m_target.path == target.path && m_url.isValid() && m_view->isAttachment()) {
         return true;
     }
+    m_live = false;
     ++m_generation;
     m_ready = false;
     m_loadError.clear();
@@ -118,9 +122,48 @@ bool HtmlAttachmentReader::open(const HtmlAttachmentTarget &target, const Owner 
     return true;
 }
 
+bool HtmlAttachmentReader::openLive(const HtmlAttachmentTarget &target, const Owner &owner, const QUrl &address, bool load)
+{
+    if (!target.isValid() || !address.isValid() || !m_view) {
+        return false;
+    }
+    m_owner = owner;
+    if (m_live && m_target.path == target.path && m_url == address && (m_view->isLive() || !load)) {
+        m_target = target;
+        return true;
+    }
+    ++m_generation;
+    m_ready = false;
+    m_loadError.clear();
+    m_afterReady.clear();
+    m_placement = {};
+    m_lastSelection = {};
+    m_pageState = {};
+    // No loopback server: the page is at its own address.
+    delete m_serverOwner;
+    m_serverOwner = nullptr;
+    m_live = true;
+    m_target = target;
+    m_url = address;
+    if (load) {
+        m_view->loadLive(address);
+    } else {
+        m_view->unload();
+    }
+    return true;
+}
+
+void HtmlAttachmentReader::loadLiveNow()
+{
+    if (m_live && m_view && m_url.isValid()) {
+        m_view->loadLive(m_url);
+    }
+}
+
 void HtmlAttachmentReader::close()
 {
     ++m_generation;
+    m_live = false;
     m_ready = false;
     m_afterReady.clear();
     m_target = {};
@@ -138,6 +181,64 @@ void HtmlAttachmentReader::close()
     }
     delete m_serverOwner;
     m_serverOwner = nullptr;
+}
+
+namespace
+{
+QString resourceText(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+}
+}
+
+QJsonObject HtmlAttachmentReader::liveSelectionArguments()
+{
+    return {{QStringLiteral("context"), ReviewCardFeedback::contextLength}, {QStringLiteral("longest"), ReviewCardFeedback::maximumQuote}};
+}
+
+QJsonObject HtmlAttachmentReader::liveSelection(const QString &scriptResult)
+{
+    const QJsonObject answer = QJsonDocument::fromJson(scriptResult.toUtf8()).object();
+    // The page's text, never taken beyond what a quote may hold (attachmentAnchor cuts it exactly);
+    // a prefix keeps its end, the text right before the selection.
+    const auto text = [&answer](const QString &key, qsizetype longest, bool end = false) {
+        const QString value = answer.value(key).toString();
+        return value.size() <= longest ? value : end ? value.right(longest) : value.left(longest);
+    };
+    const QString exact = text(QStringLiteral("exact"), ReviewCardFeedback::maximumQuote + 1).trimmed();
+    if (exact.isEmpty()) {
+        return {};
+    }
+    QString hash = text(QStringLiteral("hash"), 513);
+    if (!validHash(hash)) {
+        hash.clear();
+    }
+    return {{QStringLiteral("type"), QStringLiteral("selection")},
+            {QStringLiteral("text"), exact},
+            {QStringLiteral("text_quote"),
+             QJsonObject{{QStringLiteral("exact"), exact},
+                         {QStringLiteral("prefix"), text(QStringLiteral("prefix"), 4 * ReviewCardFeedback::contextLength, true)},
+                         {QStringLiteral("suffix"), text(QStringLiteral("suffix"), 4 * ReviewCardFeedback::contextLength)}}},
+            {QStringLiteral("page_state"), QJsonObject{{QStringLiteral("hash"), hash}}}};
+}
+
+void HtmlAttachmentReader::readLiveSelection(std::function<void(const QJsonObject &)> done)
+{
+    if (!m_live || !m_view) {
+        done({});
+        return;
+    }
+    // The viewer's text index (the same quotes as on embedded pages), then the selection's reader:
+    // both only in the isolated world, where the page cannot reach them.
+    static const QString script =
+        resourceText(QStringLiteral(":/thoughts/html-viewer/text.js")) + QLatin1Char('\n') + resourceText(QStringLiteral(":/thoughts/html-live/selection.js"));
+    m_view->callLive(script, liveSelectionArguments(), [done](bool ok, const QString &result, const QString &error) {
+        if (!ok) {
+            qWarning().noquote() << "Live page: the selection could not be read:" << error;
+        }
+        done(ok ? liveSelection(result) : QJsonObject());
+    });
 }
 
 void HtmlAttachmentReader::whenReady(std::function<void()> run)
@@ -236,7 +337,8 @@ QList<QJsonObject> HtmlAttachmentReader::pageFeedback() const
 {
     QList<QJsonObject> out;
     for (const QJsonObject &record : m_feedback) {
-        if (DocumentFeedback::isAttachmentFeedback(record) && !record.value(QStringLiteral("deleted")).toBool()
+        // A drawing is on its snapshot, never on the live page (its quote "Drawing" is no passage).
+        if (DocumentFeedback::isAttachmentFeedback(record) && !DocumentFeedback::isPageMark(record) && !record.value(QStringLiteral("deleted")).toBool()
             && str(record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject(), QStringLiteral("path")) == m_target.path) {
             out.append(record);
         }
@@ -287,7 +389,8 @@ bool HtmlAttachmentReader::presentReview(const QJsonObject &card, bool inverted)
     m_reviewRevealed = false;
     m_reviewBlocks = 0;
     m_reviewState = QStringLiteral("pending");
-    if (!m_loadError.isEmpty()) {
+    // A live page has no viewer to mask its text: review cards need an embedded page.
+    if (!m_loadError.isEmpty() || m_live) {
         // The page cannot be shown (no web view): the stored answer, after the caller is done.
         m_reviewState = QStringLiteral("not_found");
         const QString cardId = m_reviewCardId;
@@ -418,6 +521,11 @@ void HtmlAttachmentReader::showFeedback(const QJsonObject &record)
 
 void HtmlAttachmentReader::showPlace(const QString &hash, const QString &id, const QString &kind)
 {
+    // A live page has no viewer to find the passage in: its feedback is only listed
+    // (html-live-pages.md §2.1).
+    if (m_live) {
+        return;
+    }
     const QString state = validHash(hash) ? hash : QString();
     whenReady([this, id, kind, state, generation = m_generation] {
         if (generation != m_generation) {
@@ -428,6 +536,29 @@ void HtmlAttachmentReader::showPlace(const QString &hash, const QString &id, con
         QTimer::singleShot(400, this, [this, id, kind, generation] {
             if (generation == m_generation && m_view) {
                 m_view->call(QStringLiteral("scrollTo"), QJsonArray{QJsonObject{{QStringLiteral("item_id"), id}, {QStringLiteral("kind"), kind}}});
+            }
+        });
+    });
+}
+
+void HtmlAttachmentReader::restorePosition(const QJsonObject &position)
+{
+    if (position.isEmpty()) {
+        return;
+    }
+    const QString hash = str(position.value(QStringLiteral("page_state")).toObject(), QStringLiteral("hash"));
+    const QJsonValue scrollY = position.value(QStringLiteral("scroll_y"));
+    whenReady([this, hash, scrollY, generation = m_generation] {
+        if (generation != m_generation) {
+            return;
+        }
+        if (validHash(hash) && !hash.isEmpty()) {
+            m_view->call(QStringLiteral("setPageState"), QJsonArray{QJsonObject{{QStringLiteral("hash"), hash}}});
+        }
+        // After the page re-rendered its tab, as showPlace does.
+        QTimer::singleShot(hash.isEmpty() ? 0 : 400, this, [this, scrollY, generation] {
+            if (generation == m_generation && m_view && scrollY.isDouble()) {
+                m_view->call(QStringLiteral("scrollTo"), QJsonArray{QJsonObject{{QStringLiteral("scroll_y"), scrollY}}});
             }
         });
     });

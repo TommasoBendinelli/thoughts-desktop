@@ -7,6 +7,7 @@
 #include <QRegularExpression>
 #include <QStringDecoder>
 
+#include "fileidentitycache.h"
 #include "sourceowner.h"
 
 namespace Thoughts {
@@ -39,23 +40,13 @@ class ThoughtIgnore {
         return QStringLiteral("^(?:") + expression + QStringLiteral(")$");
     }
 
-public:
-    explicit ThoughtIgnore(const QString &root) {
-        const QString path = QDir(root).filePath(QStringLiteral(".ThoughtIgnore"));
-        const QFileInfo info(path);
-        // Without a policy file, skip Git data and Finder metadata only. A
-        // Project's default folder also skips the build leftovers written
-        // inside it (spec Rule 4).
-        QString contents = isDefaultFolder(root) ? QStringLiteral(".git/\n.DS_Store\nbuild/\npdf/\n") : QStringLiteral(".git/\n.DS_Store\n");
-        if (info.exists() || info.isSymLink()) {
-            if (!info.isFile() || info.isSymLink()) { m_error = QStringLiteral(".ThoughtIgnore is not a regular file."); return; }
-            if (info.size() > 4 * 1024 * 1024) { m_error = QStringLiteral(".ThoughtIgnore exceeds the 4 MiB limit."); return; }
-            QFile file(path);
-            if (!file.open(QIODevice::ReadOnly)) { m_error = QStringLiteral(".ThoughtIgnore could not be read."); return; }
-            QStringDecoder decoder(QStringDecoder::Utf8);
-            contents = decoder.decode(file.readAll());
-            if (decoder.hasError()) { m_error = QStringLiteral(".ThoughtIgnore is not valid UTF-8."); return; }
-        }
+    struct Policy {
+        QList<Rule> rules;
+        QString error;
+    };
+
+    static Policy parse(const QString &contents) {
+        Policy policy;
         for (QString line : contents.split(QLatin1Char('\n'))) {
             line = line.trimmed();
             if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) continue;
@@ -66,12 +57,51 @@ public:
             while (line.startsWith(QLatin1Char('/'))) line.remove(0, 1);
             while (line.endsWith(QLatin1Char('/'))) line.chop(1);
             if (line.isEmpty() || line == QLatin1String(".") || line == QLatin1String("..") || line.contains(QLatin1Char('\\'))) {
-                m_error = QStringLiteral(".ThoughtIgnore contains an invalid rule."); return;
+                policy.error = QStringLiteral(".ThoughtIgnore contains an invalid rule."); return policy;
             }
             const QRegularExpression expression(regularExpression(line));
-            if (!expression.isValid()) { m_error = QStringLiteral(".ThoughtIgnore contains an invalid pattern."); return; }
-            m_rules.append({expression, !line.contains(QLatin1Char('/')) && !anchored, directoryOnly, excluded});
+            if (!expression.isValid()) { policy.error = QStringLiteral(".ThoughtIgnore contains an invalid pattern."); return policy; }
+            policy.rules.append({expression, !line.contains(QLatin1Char('/')) && !anchored, directoryOnly, excluded});
         }
+        return policy;
+    }
+
+    // Every folder's policy file, read and compiled again only when it
+    // changed: a Library load and each change check consult it for every
+    // source, which read and compiled it hundreds of times each.
+    static FileIdentityCache<Policy> &policies() {
+        static FileIdentityCache<Policy> cache(4096);
+        return cache;
+    }
+
+public:
+    explicit ThoughtIgnore(const QString &root) {
+        const QString path = QDir(root).filePath(QStringLiteral(".ThoughtIgnore"));
+        const QFileInfo info(path);
+        // Without a policy file, skip Git data and Finder metadata only. A
+        // Project's default folder also skips the build leftovers written
+        // inside it (spec Rule 4).
+        if (info.exists() || info.isSymLink()) {
+            if (!info.isFile() || info.isSymLink()) { m_error = QStringLiteral(".ThoughtIgnore is not a regular file."); return; }
+            if (info.size() > 4 * 1024 * 1024) { m_error = QStringLiteral(".ThoughtIgnore exceeds the 4 MiB limit."); return; }
+            const Policy policy = policies().value(path, [](const QString &file) {
+                Policy result;
+                QFile input(file);
+                if (!input.open(QIODevice::ReadOnly)) { result.error = QStringLiteral(".ThoughtIgnore could not be read."); return result; }
+                QStringDecoder decoder(QStringDecoder::Utf8);
+                const QString contents = decoder.decode(input.readAll());
+                if (decoder.hasError()) { result.error = QStringLiteral(".ThoughtIgnore is not valid UTF-8."); return result; }
+                return parse(contents);
+            });
+            m_rules = policy.rules;
+            m_error = policy.error;
+            return;
+        }
+        static const Policy folderDefaults = parse(QStringLiteral(".git/\n.DS_Store\n"));
+        static const Policy defaultFolderDefaults = parse(QStringLiteral(".git/\n.DS_Store\nbuild/\npdf/\n"));
+        const Policy &policy = isDefaultFolder(root) ? defaultFolderDefaults : folderDefaults;
+        m_rules = policy.rules;
+        m_error = policy.error;
     }
 
     // Written for a new project that has no .ThoughtIgnore of its own. Sync

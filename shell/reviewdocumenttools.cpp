@@ -690,6 +690,58 @@ FloatEnvironment enclosingFloat(const QList<FloatEnvironment> &floats, const QLi
     }
     return best;
 }
+// The lines of @p from that @p to still has, unchanged, by a shortest edit script between them
+// (Myers): (*map)[i] is the line of @p to (one-based) that line i + 1 of @p from became, or 0 for
+// a line removed or changed. False when more than @p maxEdits lines were added or removed.
+bool unchangedLines(const QList<QByteArray> &from, const QList<QByteArray> &to, QList<int> *map, int maxEdits = 2000) {
+    const int n = int(from.size()), m = int(to.size());
+    map->fill(0, n);
+    int prefix = 0, suffix = 0;
+    for (; prefix < n && prefix < m && from[prefix] == to[prefix]; ++prefix) (*map)[prefix] = prefix + 1;
+    for (; suffix < n - prefix && suffix < m - prefix && from[n - 1 - suffix] == to[m - 1 - suffix]; ++suffix) (*map)[n - 1 - suffix] = m - suffix;
+    // Between them: x counts lines of from[prefix...], y lines of to[prefix...]; diagonal k = x - y.
+    const int rows = n - prefix - suffix, columns = m - prefix - suffix;
+    if (!rows || !columns) return true;
+    const int limit = std::min(rows + columns, maxEdits), offset = limit + 1;
+    // furthest[offset + k]: the furthest x on diagonal k (-1: off the texts); trace[d]: furthest
+    // after d edits, for k = -d..d.
+    std::vector<int> furthest(2 * offset + 1, -1);
+    std::vector<std::vector<int>> trace;
+    // The step onto diagonal k after d edits: from k + 1 (a line added to @p to) or k - 1 (one
+    // removed from @p from), whichever reaches further; the x it starts at, or -1.
+    const auto step = [rows, columns](const auto &previous, int d, int k, bool *added) {
+        const int above = k + 1 <= d - 1 ? previous(k + 1) : -1, left = k - 1 >= -(d - 1) ? previous(k - 1) : -1;
+        const bool down = above >= 0 && above - k <= columns, right = left >= 0 && left + 1 <= rows;
+        *added = down && (!right || above >= left + 1);
+        return *added ? above : right ? left + 1 : -1;
+    };
+    int edits = -1;
+    for (int d = 0; d <= limit && edits < 0; ++d) {
+        for (int k = -d; k <= d; k += 2) {
+            bool added = false;
+            int x = d ? step([&](int diagonal) { return furthest[offset + diagonal]; }, d, k, &added) : 0;
+            if (x < 0) { furthest[offset + k] = -1; continue; }
+            int y = x - k;
+            while (x < rows && y < columns && from[prefix + x] == to[prefix + y]) { ++x; ++y; }
+            furthest[offset + k] = x;
+            if (x == rows && y == columns) { edits = d; break; }
+        }
+        trace.emplace_back(furthest.begin() + offset - d, furthest.begin() + offset + d + 1);
+    }
+    if (edits < 0) return false;
+    int x = rows, y = columns;
+    for (int d = edits; d > 0; --d) {
+        const auto &previous = trace[d - 1];
+        const int k = x - y;
+        bool added = false;
+        const int start = step([&](int diagonal) { return previous[diagonal + d - 1]; }, d, k, &added);
+        for (; x > start; --x, --y) (*map)[prefix + x - 1] = prefix + y;
+        x = added ? start : start - 1;
+        y = x - (added ? k + 1 : k - 1);
+    }
+    for (; x > 0; --x, --y) (*map)[prefix + x - 1] = prefix + y;
+    return true;
+}
 // A page's text in visual lines, top to bottom: boxes whose vertical centres fall in one band.
 struct PageTextLine { qreal top = 0, bottom = 0; QList<const Poppler::TextBox *> boxes; };
 QList<PageTextLine> pageTextLines(const std::vector<std::unique_ptr<Poppler::TextBox>> &boxes) {
@@ -1123,6 +1175,67 @@ ReviewTextPlacement locateReviewTextInSource(const QString &path, const QByteArr
     return placement;
 }
 
+QList<ReviewArea> wholeDocumentReviewAreas(Poppler::Document *pdf)
+{
+    QList<ReviewArea> areas;
+    if (!pdf) return areas;
+    const int count = pdf->numPages();
+    std::vector<std::vector<std::unique_ptr<Poppler::TextBox>>> boxes(count);
+    QList<QList<PageTextLine>> lines;
+    QList<QSizeF> sizes;
+    for (int i = 0; i < count; ++i) {
+        const std::unique_ptr<Poppler::Page> page = pdf->page(i);
+        sizes.append(page ? page->pageSizeF() : QSizeF());
+        if (page) boxes[i] = page->textList();
+        lines.append(pageTextLines(boxes[i]));
+    }
+    for (int i = 0; i < count; ++i) {
+        const QSizeF size = sizes[i];
+        if (size.width() <= 0 || size.height() <= 0) continue;
+        QList<QList<PageTextLine>> neighbours;
+        if (i > 0) neighbours.append(lines[i - 1]);
+        if (i + 1 < count) neighbours.append(lines[i + 1]);
+        // The running header, footer and page number stay out (pageFurniture).
+        const auto furniture = pageFurniture(lines[i], size.height(), neighbours);
+        QList<PageTextLine> body;
+        for (const auto &line : lines[i]) {
+            PageTextLine kept{line.top, line.bottom, {}};
+            for (const auto *box : line.boxes) if (!furniture.contains(box)) kept.boxes.append(box);
+            if (!kept.boxes.isEmpty()) body.append(kept);
+        }
+        if (i == 0 && body.size() > 1) {
+            // The title stays visible: the first lines set larger than the text below them.
+            QList<qreal> heights;
+            for (const auto &line : std::as_const(body)) heights.append(line.bottom - line.top);
+            std::sort(heights.begin(), heights.end());
+            const qreal usual = heights.at(heights.size() / 2);
+            qsizetype title = 0;
+            while (title + 1 < body.size() && body[title].bottom - body[title].top >= 1.3 * usual) ++title;
+            body = body.mid(title);
+        }
+        if (body.isEmpty()) continue;
+        qreal left = std::numeric_limits<qreal>::max(), right = std::numeric_limits<qreal>::lowest();
+        for (const auto &line : std::as_const(body)) {
+            for (const auto *box : line.boxes) {
+                left = std::min(left, box->boundingBox().left());
+                right = std::max(right, box->boundingBox().right());
+            }
+        }
+        const qreal top = std::max<qreal>(0, body.first().top - 2), bottom = std::min(size.height(), body.last().bottom + 2);
+        left = std::max<qreal>(0, left - 2);
+        right = std::min(size.width(), right + 2);
+        if (right <= left || bottom <= top) continue;
+        areas.append({i + 1, QRectF(QPointF(left / size.width(), top / size.height()), QPointF(right / size.width(), bottom / size.height())), true});
+    }
+    return areas;
+}
+
+QList<ReviewArea> wholeDocumentReviewAreas(const QString &pdfPath)
+{
+    const auto pdf = document(read(pdfPath));
+    return wholeDocumentReviewAreas(pdf.get());
+}
+
 ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
                                          const QString &pdfSha256, const QList<ReviewArea> &areas, const QString &cardId,
                                          bool replaceCardMarkers) {
@@ -1198,7 +1311,7 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         if (auto *first = pageAt(areas.first().page)) plan.pageVisualSha256 = fingerprint(*first);
         return plan;
     };
-    const auto registered = DocumentIdentityStore(docsRoot).forFile(pdfPath, pdfSha256);
+    const auto registered = DocumentIdentityStore(docsRoot).forVersion(pdfPath, pdfSha256);
     if (registered.value(QStringLiteral("kind")).toString() == QLatin1String("unlinked")) return finishWithoutSource();
     const auto pointer = QJsonDocument::fromJson(read(QDir(bundleRoot).filePath(QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())))).object();
     const auto artifactSha = pointer.value(QStringLiteral("artifact_sha256")).toString();
@@ -1292,6 +1405,59 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         builtFromCurrent.insert(path, same);
         return same;
     };
+    // The build's text of a source changed since the build (proposals accepted before the new PDF
+    // arrives), and where each of its lines is now: toBase[i] is the line of the text the markers go
+    // into (the current source, without the card's own markers when they move) that line i + 1
+    // became, unchanged, or 0 for a line changed or removed since (a line diff of the two).
+    // ownMarker[i]: line i + 1 is one of the card's own markers, which move anyway. Not usable
+    // without the build's text in the bundle, or when too much changed to compare.
+    struct BuiltText { bool usable = false; QByteArray text; QList<int> toBase; QList<bool> ownMarker; };
+    QHash<QString, BuiltText> builtTexts;
+    const auto builtTextOf = [&](const QString &path, const QString &id) -> BuiltText {
+        if (builtTexts.contains(path)) return builtTexts.value(path);
+        BuiltText found;
+        const auto [expected, builtObject] = builtEntry(id);
+        const auto built = !expected.isEmpty() && QRegularExpression(QStringLiteral("^[a-f0-9]{64}$")).match(builtObject).hasMatch()
+            ? read(QDir(bundleRoot).filePath(QStringLiteral("objects/%1").arg(builtObject))) : QByteArray();
+        if (!expected.isEmpty() && digest(built) == expected) {
+            QByteArray from = built, to = sourceAt(path);
+            QList<int> withoutMarkers; // the build's line numbers in `from`, when the card's markers are removed
+            bool comparable = true;
+            if (replaceCardMarkers) {
+                const auto strip = stripReviewCardMarkers(id, to, cardId);
+                const auto builtStrip = stripReviewCardMarkers(id, built, cardId);
+                comparable = strip.error.isEmpty() && builtStrip.error.isEmpty();
+                from = builtStrip.text; to = strip.text; withoutMarkers = builtStrip.lineMap;
+            }
+            QList<int> unchanged;
+            if (comparable && unchangedLines(from.split('\n'), to.split('\n'), &unchanged)) {
+                found.usable = true;
+                found.text = built;
+                const int count = int(built.count('\n')) + 1;
+                for (int line = 1; line <= count; ++line) {
+                    const int at = replaceCardMarkers ? withoutMarkers.value(line - 1) : line;
+                    found.ownMarker.append(!at);
+                    found.toBase.append(at ? unchanged.value(at - 1) : 0);
+                }
+            }
+        }
+        builtTexts.insert(path, found);
+        return found;
+    };
+    // Lines first..last of the build where they are now (toBase), or {0, 0} when one of them
+    // changed since or lines were added between them: the passage must be as the PDF shows it.
+    const auto unchangedPassage = [](const BuiltText &built, int first, int last) -> QPair<int, int> {
+        int from = 0, to = 0;
+        for (int line = first; line <= last; ++line) {
+            if (line < 1 || line > built.toBase.size()) return {0, 0};
+            if (built.ownMarker[line - 1]) continue;
+            const int at = built.toBase[line - 1];
+            if (!at || (to && at != to + 1)) return {0, 0};
+            if (!from) from = at;
+            to = at;
+        }
+        return {from, to};
+    };
     // The manifest's name of a source file the resolver found but could not place.
     const auto sourceIdOf = [&](const QString &path) {
         const QString wanted = QFileInfo(path).canonicalFilePath();
@@ -1304,8 +1470,16 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
     const QString staleFailure = replaceCardMarkers
         ? QStringLiteral("The source changed since this PDF was built. Sync before placing the card.")
         : QStringLiteral("The TeX changed since this PDF was built. Sync before creating the card.");
-    // byText: placed by its text in the current source, not by the build's lines.
-    struct AreaLines { QString path, id; QList<int> lines; int first = 0, last = 0; bool whole = false, byText = false; };
+    const QString passageChangedFailure = replaceCardMarkers
+        ? QStringLiteral("This passage changed since the PDF was built. Wait for the new PDF (it arrives with the next Sync), then place the card.")
+        : QStringLiteral("This passage changed since the PDF was built. Wait for the new PDF (it arrives with the next Sync), then create the card.");
+    // byText: placed by its text in the current source, not by the build's lines. built: placed by
+    // the build's lines of a source changed since; lines number the build's text, and baseFirst and
+    // baseLast are the passage in the text the markers go into.
+    struct AreaLines {
+        QString path, id; QList<int> lines; int first = 0, last = 0; bool whole = false, byText = false;
+        bool built = false; int baseFirst = 0, baseLast = 0;
+    };
     QList<AreaLines> mappedAreas;
     for (int i = 0; i < areas.size(); ++i) {
         const int pageNumber = areas[i].page;
@@ -1313,6 +1487,10 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         QString firstFailure, generatedError;
         QMap<QString, QList<int>> mapped;
         QHash<QString, QString> ids;
+        // The same in the build's own lines (snapshotLine), for a source changed since the build:
+        // the resolver maps its words to current lines only where their lines are unchanged.
+        QMap<QString, QList<int>> builtMapped;
+        QString builtFailure;
         // The area's words in reading order, and the editable files the resolver found for them.
         QStringList words, furniture;
         QSet<QString> files;
@@ -1332,8 +1510,13 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             // Skip such letterless words; the real words around them still have to
             // map, and the marked passage spans every line between them.
             const auto text = box->text();
-            if (!result.success && result.problem == Okular::DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation
-                && std::none_of(text.cbegin(), text.cend(), [](QChar c) { return c.isLetter(); })) {
+            const bool skipped = !result.success && result.problem == Okular::DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation
+                && std::none_of(text.cbegin(), text.cend(), [](QChar c) { return c.isLetter(); });
+            const QString builtPath = result.success ? result.sourcePath : result.fallbackSourcePath;
+            if (result.snapshotLine > 0 && !builtPath.isEmpty()) builtMapped[builtPath].append(result.snapshotLine);
+            else if (!skipped && builtFailure.isEmpty())
+                builtFailure = QStringLiteral("%1 (selected text: %2)").arg(result.success ? QStringLiteral("the build's source line is unknown") : result.failureReason, text);
+            if (skipped) {
                 if (generatedError.isEmpty()) generatedError = QStringLiteral("%1 (selected text: %2)").arg(result.failureReason, text);
                 if (!result.fallbackSourcePath.isEmpty() && plan.fallbackSource.isEmpty()) plan.fallbackSource = QDir(docsRoot).relativeFilePath(result.fallbackSourcePath);
                 continue;
@@ -1352,11 +1535,14 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
                                        "not the note's source. Select text of the note itself.").arg(furniture.join(QLatin1Char(' '))), i);
         const QString mappingFailure = !firstFailure.isEmpty() ? firstFailure : !generatedError.isEmpty() ? generatedError
             : QStringLiteral("The selected region has no verifiable source-linked text.");
+        const QString builtMappingFailure = !builtFailure.isEmpty() ? builtFailure : !generatedError.isEmpty() ? generatedError
+            : QStringLiteral("The selected region has no verifiable source-linked text.");
+        const auto idOf = [&](const QString &path) { return ids.contains(path) ? ids.value(path) : sourceIdOf(path); };
         // When the build's lines cannot place the area, its whole text placed once in the
         // current source still can. Never a guess: a missing, short or repeated text keeps the
         // line mapping's error.
         const QString textFile = files.size() == 1 ? *files.cbegin() : QString();
-        const QString textId = textFile.isEmpty() ? QString() : ids.contains(textFile) ? ids.value(textFile) : sourceIdOf(textFile);
+        const QString textId = textFile.isEmpty() ? QString() : idOf(textFile);
         AreaLines lines;
         const auto placeByText = [&] {
             if (textId.isEmpty()) return false;
@@ -1370,29 +1556,32 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             }
             return true;
         };
-        // The area's lines from the build's line mapping, or the reason they cannot be used.
-        const auto placeByLines = [&]() -> QString {
-            if (mapped.isEmpty()) return mappingFailure;
+        // The area's lines from the build's line mapping, or the reason they cannot be used: the
+        // lines of @p found (by file), failures and checks as in @p textOf (the text they number:
+        // the source as it is, or the build's text of a source changed since).
+        const auto placeByLines = [&](const QMap<QString, QList<int>> &found, const QString &failure, const QString &unmapped,
+                                      const std::function<QByteArray(const QString &)> &textOf) -> QString {
+            if (found.isEmpty()) return unmapped;
             // A rectangle around a float stands for the whole environment; words in it from
             // generated or unmapped content are then part of the float, not a failure.
             QString file;
             FloatEnvironment around;
             if (!areas[i].textSelection) {
                 int candidates = 0;
-                for (auto it = mapped.cbegin(); it != mapped.cend(); ++it) {
-                    if (!ids.value(it.key()).endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) continue;
-                    const auto environment = enclosingFloat(texFloatEnvironments(sourceAt(it.key())), it.value());
+                for (auto it = found.cbegin(); it != found.cend(); ++it) {
+                    if (!idOf(it.key()).endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) continue;
+                    const auto environment = enclosingFloat(texFloatEnvironments(textOf(it.key())), it.value());
                     if (!environment.begin) continue;
                     ++candidates; file = it.key(); around = environment;
                 }
                 if (candidates != 1) { file.clear(); around = {}; }
             }
             if (!around.begin) {
-                if (mapped.size() > 1) return QStringLiteral("Select content from one TeX source file.");
-                if (!firstFailure.isEmpty()) return firstFailure;
-                file = mapped.firstKey();
+                if (found.size() > 1) return QStringLiteral("Select content from one TeX source file.");
+                if (!failure.isEmpty()) return failure;
+                file = found.firstKey();
             }
-            lines = {file, ids.value(file), mapped.value(file)};
+            lines = {file, idOf(file), found.value(file)};
             std::sort(lines.lines.begin(), lines.lines.end());
             lines.lines.erase(std::unique(lines.lines.begin(), lines.lines.end()), lines.lines.end());
             if (around.begin) {
@@ -1400,7 +1589,7 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
                 return {};
             }
             lines.first = lines.lines.first(); lines.last = lines.lines.last();
-            const auto sourceLines = sourceAt(file).split('\n');
+            const auto sourceLines = textOf(file).split('\n');
             for (int line = lines.first; line <= lines.last; ++line) {
                 if (line < 1 || line > sourceLines.size()) return QStringLiteral("The source line range is invalid.");
                 if (!lines.lines.contains(line) && !ignorableSourceLine(sourceLines[line - 1], file.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)))
@@ -1411,12 +1600,28 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             return {};
         };
         if (!textId.isEmpty() && !builtFrom(textFile, textId)) {
-            // The source changed since the build (a proposal accepted without a rebuild): the
-            // build's lines name lines of another text, so only the text can place the area.
-            if (!placeByText()) return fail(mapped.isEmpty() || !firstFailure.isEmpty() ? mappingFailure : staleFailure, i);
-        } else if (const QString error = placeByLines(); !error.isEmpty() && !placeByText()) {
+            // The source changed since the build (a proposal accepted, the new PDF not here yet):
+            // the build's lines number the build's text. The area's whole text placed in the
+            // current source, or its lines in the build's text, checked there as if it were
+            // current, where they are unchanged since: the markers go where those lines are now.
+            if (!placeByText()) {
+                const BuiltText built = builtTextOf(textFile, textId);
+                if (!built.usable) return fail(mapped.isEmpty() || !firstFailure.isEmpty() ? mappingFailure : staleFailure, i);
+                if (const QString error = placeByLines(builtMapped, builtFailure, builtMappingFailure,
+                                                       [&built](const QString &) { return built.text; }); !error.isEmpty())
+                    return fail(error, i);
+                const auto [baseFirst, baseLast] = unchangedPassage(built, lines.first, lines.last);
+                if (!baseFirst) return fail(passageChangedFailure, i);
+                lines.built = true;
+                lines.baseFirst = baseFirst;
+                lines.baseLast = baseLast;
+            }
+        } else if (const QString error = placeByLines(mapped, firstFailure, mappingFailure, [&](const QString &path) { return sourceAt(path); });
+                   !error.isEmpty() && !placeByText()) {
             return fail(error, i);
         }
+        // Lines of the current source must come from a build of it.
+        if (!lines.byText && !lines.built && !builtFrom(lines.path, lines.id)) return fail(staleFailure, i);
         if (i > 0 && lines.path != mappedAreas.first().path)
             return fail(QStringLiteral("Its text is in %1, but the first area's is in %2. A card's areas must come from one source file.")
                 .arg(lines.id, mappedAreas.first().id), i);
@@ -1432,6 +1637,13 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         if (mappedAreas[i].byText) continue;
         for (const int line : std::as_const(mappedAreas[i].lines)) if (!lineOwner.contains(line)) lineOwner.insert(line, i);
     }
+    // The line a word elsewhere maps to, numbered as lineOwner is: the build's own line when the
+    // areas were placed by the build's lines of a source changed since (one source: all or none).
+    const bool builtLines = std::any_of(mappedAreas.cbegin(), mappedAreas.cend(), [](const AreaLines &area) { return area.built; });
+    const auto ownerLine = [&](const Okular::DocsCommentSynchronizer::SourceResolutionResult &mapped) {
+        if (builtLines) return (mapped.success ? mapped.sourcePath : mapped.fallbackSourcePath) == sourcePath ? mapped.snapshotLine : 0;
+        return mapped.success && mapped.sourcePath == sourcePath ? mapped.line : 0;
+    };
     QSet<int> areaPages;
     for (const auto &area : areas) areaPages.insert(area.page);
     for (const int number : std::as_const(areaPages)) {
@@ -1445,8 +1657,8 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
             if (inside) continue;
             const auto center = box->boundingBox().center();
             const auto mapped = resolver.resolveSource({stem, number, center.x(), center.y(), box->text(), pdfPath, true});
-            if (mapped.success && mapped.sourcePath == sourcePath && lineOwner.contains(mapped.line))
-                return fail(QStringLiteral("The selection covers only part of a source line. Select the complete passage."), lineOwner.value(mapped.line));
+            if (const int line = ownerLine(mapped); lineOwner.contains(line))
+                return fail(QStringLiteral("The selection covers only part of a source line. Select the complete passage."), lineOwner.value(line));
         }
     }
     for (const auto &value : pdfSegments) {
@@ -1463,11 +1675,11 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
                 if (box->text().trimmed().isEmpty() || isFurniture(number, box)) continue;
                 const auto center = box->boundingBox().center();
                 const auto mapped = resolver.resolveSource({stem, number, center.x(), center.y(), box->text(), pdfPath, true});
-                if (mapped.success && mapped.sourcePath == sourcePath && lineOwner.contains(mapped.line))
+                if (const int line = ownerLine(mapped); lineOwner.contains(line))
                     return fail(areas.size() > 1
                         ? QStringLiteral("Its source text also appears on page %1. Add an area there too, or choose a passage that appears once.").arg(number)
                         : QStringLiteral("The selected source also renders on another page. Select a passage with one complete occurrence."),
-                        lineOwner.value(mapped.line));
+                        lineOwner.value(line));
             }
         }
     }
@@ -1481,11 +1693,11 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
     QByteArray base = source;
     QList<int> lineMap;
     for (int i = 0; i < source.count('\n') + 1; ++i) lineMap.append(i + 1);
-    // Text placement read the source as it is now: then it must still be that, and the build
-    // may be older.
+    // Text placement, and the build's lines mapped to the current ones, read the source as it is
+    // now: then it must still be that, and the build may be older.
     const bool byText = std::any_of(mappedAreas.cbegin(), mappedAreas.cend(), [](const AreaLines &area) { return area.byText; });
-    if (byText && source != sourceAt(sourcePath)) return fail(staleFailure);
-    const bool stale = byText && !builtFrom(sourcePath, sourceId);
+    if ((byText || builtLines) && source != sourceAt(sourcePath)) return fail(staleFailure);
+    const bool stale = (byText || builtLines) && !builtFrom(sourcePath, sourceId);
     if (replaceCardMarkers) {
         // The card's own markers move: the source without them must be the build's source
         // without them, whether or not the PDF was built after they were placed.
@@ -1505,6 +1717,14 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         return fail(QStringLiteral("The TeX changed since this PDF was built. Sync before creating the card."));
     }
     const auto baseLine = [&lineMap](int line) { return line >= 1 && line <= lineMap.size() ? lineMap[line - 1] : 0; };
+    // Each area's lines in the text the markers go into (base): built areas already are.
+    for (int i = 0; i < mappedAreas.size(); ++i) {
+        auto &area = mappedAreas[i];
+        if (area.built) { area.first = area.baseFirst; area.last = area.baseLast; continue; }
+        area.first = baseLine(area.first);
+        area.last = baseLine(area.last);
+        if (!area.first || !area.last) return fail(QStringLiteral("The source line range is invalid."), i);
+    }
     // One segment per passage: areas whose lines overlap mark one passage together.
     QList<int> order(mappedAreas.size());
     std::iota(order.begin(), order.end(), 0);
@@ -1520,11 +1740,7 @@ ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString 
         }
     }
     QList<QPair<int, int>> ranges;
-    for (const auto &passage : std::as_const(passages)) {
-        const int first = baseLine(passage.first), last = baseLine(passage.last);
-        if (!first || !last) return fail(QStringLiteral("The source line range is invalid."), passage.areas.first());
-        ranges.append({first, last});
-    }
+    for (const auto &passage : std::as_const(passages)) ranges.append({passage.first, passage.last});
     int failedRange = -1;
     const auto answerAnchor = plan.answerAnchor;
     const auto fallbackSource = plan.fallbackSource;
@@ -2164,7 +2380,7 @@ ReviewSectionPlan planReviewSectionCard(const QString &docsRoot, const QString &
         }
     };
     // Built from source or not, as planReviewSourceAnchors decides for the heading's page.
-    bool withoutSource = DocumentIdentityStore(docsRoot).forFile(pdfPath, pdfSha256).value(QStringLiteral("kind")).toString() == QLatin1String("unlinked");
+    bool withoutSource = DocumentIdentityStore(docsRoot).forVersion(pdfPath, pdfSha256).value(QStringLiteral("kind")).toString() == QLatin1String("unlinked");
     QJsonObject manifest;
     if (!withoutSource) {
         const auto pointer = QJsonDocument::fromJson(read(QDir(bundleRoot).filePath(QStringLiteral("documents/%1.json").arg(QFileInfo(pdfPath).fileName())))).object();

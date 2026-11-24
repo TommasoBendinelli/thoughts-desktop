@@ -15,6 +15,10 @@ namespace Thoughts::HtmlMacNative
 // Makes the Qt view of `widget`'s window the native first responder again, so keys reach Qt
 // after a programmatic setFocus() elsewhere (otherwise they keep going to the page).
 void focusQt(QWidget *widget);
+// Closes the open Qt popup (QApplication::activePopupWidget) when the reader presses a mouse button
+// on a WKWebView: that click goes to the web view, so Qt's own close-on-outside-click never sees
+// it. The click only closes the popup, as a click outside a popup does elsewhere. Safe to call again.
+void closePopupsOnWebViewClicks();
 // True when the WKWebView behind `webView` is the window's first responder.
 bool webViewHasNativeFocus(QWindow *webView);
 // 0 follow the app, 1 light, 2 dark.
@@ -33,4 +37,8 @@ void removeMessageHandler(void *handle, QWindow *webView, const QString &name);
 void watchUserInput();
 // Milliseconds since the reader last did so in the window that shows `webView`; -1 if never.
 qint64 millisecondsSinceUserInput(QWindow *webView);
+// The same three for a WKWebView of Thoughts' own (an NSView *, the live pages' HtmlLiveWebView).
+qint64 millisecondsSinceUserInputInView(void *view);
+bool viewHasNativeFocus(void *view);
+void snapshotView(void *webView, std::function<void(const QImage &)> done);
 }

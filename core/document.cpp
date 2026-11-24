@@ -3130,6 +3130,12 @@ bool Document::historyAtEnd() const
 
 QVariant Document::metaData(const QString &key, const QVariant &option) const
 {
+    // The local file the pages on screen were read from: for a Library PDF its file in the
+    // immutable Library generation it was opened from, which keeps those bytes when a newer
+    // version is published at currentDocument()'s path.
+    if (key == QLatin1String("OpenedFilePath")) {
+        return d->m_generator ? QVariant(d->m_docFileName) : QVariant();
+    }
     // if option starts with "src:" assume that we are handling a
     // source reference
     if (key == QLatin1String("NamedViewport") && option.toString().startsWith(QLatin1String("src:"), Qt::CaseInsensitive) && d->m_synctex_scanner) {
@@ -4371,12 +4377,25 @@ void Document::processAction(const Action *action)
             if (!Thoughts::openHtmlAttachment(browse->url(), currentDocument(), &message)) Q_EMIT error(message, -1);
             break;
         }
+        // A place in a Library PDF (thoughts-pdf-link:<file>.pdf?page=N&x=&y=&rect=, as agent
+        // notes and the phone write links between PDFs): the reader opens it.
+        if (scheme == QLatin1String("thoughts-pdf-link")) {
+            if (!Thoughts::handleWebLink(this, browse->url())) {
+                Q_EMIT error(i18n("Thoughts cannot open this link here: %1", browse->url().toDisplayString()), -1);
+            }
+            break;
+        }
         // Semantic document links (LaTeX commands, or the Markdown links that mean them)
         // that only the Fedora build resolves.
         if (scheme.startsWith(QLatin1String("manual-")) && scheme.endsWith(QLatin1String("link"))) {
             Q_EMIT error(
                 i18n("This PDF contains an unresolved Thoughts document link. Rebuild and sync the PDF before opening this link."),
                 -1);
+            break;
+        }
+        // A web link the reader opens inside Thoughts (a page of the Thoughts server that opens a
+        // Library document); every other one opens in the browser.
+        if ((scheme == QLatin1String("https") || scheme == QLatin1String("http")) && Thoughts::handleWebLink(this, browse->url())) {
             break;
         }
         // if the url is a mailto one, invoke mailer

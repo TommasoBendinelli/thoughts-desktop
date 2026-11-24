@@ -474,6 +474,15 @@ private Q_SLOTS:
         QVERIFY(!Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-one", QStringLiteral("https://first.example.org"), &issuedFor, [] { return true; }, broken));
         QVERIFY(issuedFor.isEmpty());
     }
+
+    void signingInMovesTheConnectionGeneration()
+    {
+        // What keeps a token compares this to the value it read the token at.
+        const quint64 before = Thoughts::ServerAddress::connectionGeneration();
+        QCOMPARE(Thoughts::ServerAddress::connectionGeneration(), before);
+        Thoughts::ServerAddress::connectionChanged();
+        QCOMPARE(Thoughts::ServerAddress::connectionGeneration(), before + 1);
+    }
 };
 
 QTEST_GUILESS_MAIN(ThoughtsServerAddressTest)

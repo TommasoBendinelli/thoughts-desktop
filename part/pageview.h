@@ -35,12 +35,15 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <functional>
+#include <optional>
 
 #include "okularpart_export.h"
+#include "reviewfeedbackeditor.h"
 #include "signaturepartutils.h"
 
 class QMenu;
 class QMimeData;
+class QImage;
 class QPainter;
 class QJsonObject;
 class KActionCollection;
@@ -51,6 +54,7 @@ struct AgentProposalDecisionState;
 namespace Thoughts
 {
 class DocumentFeedbackOverlay;
+class ReadingOverlayLayer;
 class ReviewFeedbackEditor;
 class ReviewFeedbackOverlay;
 }
@@ -83,6 +87,9 @@ class PageView : public QAbstractScrollArea, public Okular::DocumentObserver, pu
     Q_OBJECT
 
 public:
+    // A reading overlay mark's popup with a note (its picture) is this wide (openReadingOverlayMarkPopup).
+    static constexpr int readingOverlayNotePopupWidth = 440;
+
     enum class ReviewMaskStyle { Hidden, SidebarHighlight, Revealed };
     void setCommentSourceConnectors(const QJsonArray &connectors);
     PageView(QWidget *parent, Okular::Document *document);
@@ -111,7 +118,19 @@ public:
     void setupViewerActions(KActionCollection *ac);
     void setupActions(KActionCollection *ac);
     void setupActionsPostGUIActivated();
-    void updateActionState(bool docHasPages, bool docHasFormWidgets);
+    OKULARPART_EXPORT void updateActionState(bool docHasPages, bool docHasFormWidgets);
+    // What the reader shows instead of the PDF's pages: an HTML attachment page, where the pencil
+    // draws on a snapshot of the page (setHtmlPagePencil, instead of its mode) and the PDF's other
+    // tools do nothing, or the HTML edition, where none of them does. Those tools are greyed out
+    // meanwhile, with "Works on PDF pages"; the mode in use stays for the PDF.
+    enum class ShownInstead {
+        Nothing,
+        HtmlPage,
+        HtmlEdition,
+    };
+    OKULARPART_EXPORT void setShownInstead(ShownInstead shown);
+    OKULARPART_EXPORT ShownInstead shownInstead() const;
+    OKULARPART_EXPORT void setHtmlPagePencil(std::function<void()> drawOnPage);
 
     // misc methods (from RMB menu/children)
     bool canFitPageWidth() const;
@@ -178,14 +197,28 @@ public:
     Q_INVOKABLE bool pdfLinkAnchorDocument() const;
     Q_INVOKABLE QString createPdfLinkAnchorForSelection(const QString &anchorName);
     Q_INVOKABLE bool selectAgentProposal(const QString &proposalId);
-    bool agentProposalOverlaysReady() const;
+    Q_INVOKABLE bool agentProposalOverlaysReady() const;
+    // Whether the PDF on screen was built with the proposal @p proposalId, from its source
+    // artifact; @p known is false without one that matches the PDF (or before it was read).
+    bool agentProposalBuiltIntoPdf(const QString &proposalId, bool *known) const;
     Q_INVOKABLE void refreshAgentProposalOverlays();
     void setAgentProposalTextHighlight(int page, std::unique_ptr<Okular::RegularAreaRect> area);
     void clearAgentProposalTextHighlight();
     // Marks @p regions (1-based page, normalized rect) like a text selection and scrolls to the
     // first; nothing is stored. For a passage in an earlier version of a PDF.
     void showPassageRegions(const QList<QPair<int, QRectF>> &regions);
+    // A link to a place of page @p page (0-based): @p point (normalized, of the page as shown;
+    // without it the top left of @p rect, else the page's top) a little below the top of the
+    // view, and @p rect marked like a found proposal until the next click or for a few seconds.
+    void showPlace(int page, std::optional<QPointF> point, std::optional<QRectF> rect);
+    OKULARPART_EXPORT bool placeHighlightShown() const;
+    OKULARPART_EXPORT void setPlaceHighlightDuration(int milliseconds);
     void openAgentProposalWindow(const AgentProposalSidebarEntry &proposal);
+    // The open proposal window of @p proposalId goes beside its passage, @p rect (normalized) of
+    // page @p page (0-based), once the view has moved there; unless the user moved it.
+    void placeAgentProposalWindowNear(const QString &proposalId, int page, const QRectF &rect);
+    // @p rect (normalized) of page @p page as it is on screen now, in global coordinates.
+    OKULARPART_EXPORT QRect globalPageRect(int page, const QRectF &rect) const;
     void showAgentProposalLocationUnavailable(const QString &proposalId);
     void showAgentProposalBuildRequired(const QString &proposalId);
     void setAgentProposalOperationPending(const QString &proposalId, bool pending, const QString &message = QString());
@@ -233,7 +266,9 @@ public Q_SLOTS:
     void closeReviewAnnotationWindow();
     void openReviewAnnotationWindow(Okular::Annotation *annotation, int pageNumber);
     void setReviewSelection(Okular::Annotation *annotation, int pageNumber);
-    QVariantMap reviewDocumentPayload() const;
+    // The PDF a card is made on: the open document's file, or @p shownPath when the pages on
+    // screen are an earlier version kept there.
+    QVariantMap reviewDocumentPayload(const QString &shownPath = QString()) const;
     bool showReviewMask(int page, const QVariantList &rects);
     void setReviewCardHighlights(const QVariantList &cards);
     OKULARPART_EXPORT bool showReviewMasks(const QVariantList &regions, ReviewMaskStyle style = ReviewMaskStyle::Hidden, bool navigate = true);
@@ -283,6 +318,27 @@ public Q_SLOTS:
     // known document ID and the selection does not qualify for answer feedback.
     OKULARPART_EXPORT Thoughts::DocumentFeedbackOverlay *documentFeedback() const;
     OKULARPART_EXPORT bool documentFeedbackVisible() const;
+    // Reading overlays (reading-overlays.md §4): agents' reading guides over the Library PDF being
+    // read, drawn under the user's own markup while Visible markup › Reading overlays is on.
+    OKULARPART_EXPORT Thoughts::ReadingOverlayLayer *readingOverlays() const;
+    OKULARPART_EXPORT bool readingOverlaysVisible() const;
+    // The mark under @p contentPoint ({overlay_id, mark_id}), when overlays show and nothing hides
+    // it (a masked review answer); @p marker says whether it is the mark's comment marker.
+    OKULARPART_EXPORT QStringList readingOverlayMarkAt(const QPointF &contentPoint, bool *marker = nullptr);
+    // Goes to a mark and flashes it; false, with a note on the page, when it is not in this version.
+    OKULARPART_EXPORT bool flashReadingOverlayMark(const QString &overlayId, const QString &markId);
+    OKULARPART_EXPORT bool readingOverlayFlashShown() const;
+    // The popup of a mark's comment marker (only the marker opens it; a click on the wash does
+    // nothing): the kind, the comment, the start of the quote, the byline (agent label · overlay
+    // title; a click shows the mark in the Overlay tab), a question field and Ask About This. It
+    // closes on a click outside or Escape. Delete Mark is in the Overlay tab.
+    // A mark with a note (note_id, reading-overlays.md "Mark notes") shows the note's picture in
+    // place of the comment, fitted to a wider popup and scrolling when taller than 60 % of the
+    // screen; a click on it opens the note. Until the picture is here (readingOverlayNoteRequested,
+    // then setReadingOverlayNoteImage), or when it cannot be had, the comment shows.
+    OKULARPART_EXPORT QWidget *openReadingOverlayMarkPopup(const QString &overlayId, const QString &markId);
+    // The picture of a mark's note (null: it could not be had; asked for again next time).
+    OKULARPART_EXPORT void setReadingOverlayNoteImage(const QString &noteId, const QImage &image);
     OKULARPART_EXPORT bool reviewingCard() const;
     OKULARPART_EXPORT bool answerMasked() const;
     // ⌘Z for the user's own annotations in this view: whether the newest one can be taken back
@@ -300,6 +356,10 @@ public Q_SLOTS:
     OKULARPART_EXPORT Thoughts::ReviewFeedbackEditor *openNewDocumentFeedbackEditor(const QString &kind = QString());
     // At the passage, or at @p anchor (global) for feedback made in an HTML attachment.
     OKULARPART_EXPORT Thoughts::ReviewFeedbackEditor *openDocumentFeedbackEditor(const QString &feedbackId, const QRect &anchor = QRect());
+    // Where the pictures of document feedback are kept (document-feedback.md §12); without it the
+    // editors offer no pictures.
+    OKULARPART_EXPORT void setFeedbackPictureStore(const Thoughts::ReviewFeedbackEditor::PictureStore &store);
+    OKULARPART_EXPORT Thoughts::ReviewFeedbackEditor::PictureStore feedbackPictureStore() const;
     // Goes to the passage of @p feedbackId; with @p edit also opens its editor there.
     OKULARPART_EXPORT bool showDocumentFeedback(const QString &feedbackId, bool edit);
     OKULARPART_EXPORT bool deleteDocumentFeedback(const QString &feedbackId);
@@ -341,6 +401,14 @@ public Q_SLOTS:
 Q_SIGNALS:
     void reviewFeedbackChanged();
     void documentFeedbackChanged();
+    // The overlays, their marks' places or what shows of them changed.
+    void readingOverlaysChanged();
+    // A mark's popup: Ask About This with the question typed (empty: none), and its byline.
+    void readingOverlayQuestionAsked(const QString &overlayId, const QString &markId, const QString &question);
+    void readingOverlayMarkRevealRequested(const QString &overlayId, const QString &markId);
+    // A mark's popup needs its note's picture; a click on the picture opens the note.
+    void readingOverlayNoteRequested(const QString &noteId);
+    void readingOverlayNoteOpenRequested(const QString &noteId);
     // The user gave new feedback or a new comment, already in the document.
     void documentFeedbackAdded(const QString &feedbackId);
     // What canUndoAnnotation() answers may have changed.
@@ -371,7 +439,14 @@ Q_SIGNALS:
     void commentRelatedOpenOverviewRequested(const QString &pdfPath, const QString &annotationId, int page);
     void agentProposalReviewRequested(const QString &proposalId);
     void agentProposalOverlaysReloaded();
+    // The proposal window was closed (by its button, a decision, or another document).
+    void agentProposalWindowClosed(const QString &proposalId);
+    // Developer log: the proposal places of the PDF were read, @p durationMs after the first
+    // reading of a burst began (@p superseded readings were restarted meanwhile).
+    void agentProposalOverlaysTimed(qint64 durationMs, int overlays, int superseded);
     void agentProposalResolutionRequested(const QString &proposalId, const QString &action);
+    void agentProposalUndoRequested();
+    void agentProposalRedoRequested();
     void agentProposalOpenSourceRequested(const QString &sourcePath, int line);
     void manualReviewCardRequested(const QString &pdfPath, int page, const QVariantList &rect, bool textSelection);
     // A text selection running over several pages: one area ({page, rect}) per page, in page order.
@@ -419,6 +494,8 @@ protected:
     void scrollContentsBy(int dx, int dy) override;
 
 private:
+    // The proposal window in the view's top right corner (no passage to be beside yet, or none).
+    void placeAgentProposalWindowInCorner();
     void refreshAnnotationRelatedInfo(const QString &annotationId, const QString &status = QString());
     // draw background and items on the opened qpainter
     void drawDocumentOnPainter(const QRect contentsRect, QPainter *p);
@@ -427,12 +504,20 @@ private:
     void paintReviewMask(QPainter *painter, const QRect &contentsRect) const;
     QRect reviewFeedbackGlobalRect(const QString &feedbackId) const;
     QRect feedbackGlobalRect(const QList<QPair<int, QRectF>> &rects) const;
+    // The part of a global rectangle the viewport shows (the whole rectangle when none of it is shown).
+    QRect visiblePart(const QRect &global) const;
     // "Feedback deleted · Undo" for 5 s; @p undo writes the restoring revision.
     void showFeedbackUndo(const std::function<bool(QString *error)> &undo, const QString &label = QString());
     // Ends a passage change whose highlight, card or answer is gone.
     void endPassageChangeIfStale();
     void showPassageChangeBanner();
     void paintDocumentFeedback(QPainter *painter, const QRect &contentsRect) const;
+    // The reading overlays of the PDF (under the user's own markup) and the mark being flashed.
+    void paintReadingOverlays(QPainter *painter, const QRect &contentsRect) const;
+    // A mark's popup below its marker (or its first line), on the screen.
+    void placeReadingOverlayMarkPopup(QWidget *popup, const QString &overlayId, const QString &markId);
+    // The note's picture in a mark's popup, in place of the comment.
+    void showReadingOverlayNoteImage(QWidget *popup, const QImage &image);
     // The pencil: a stroke on the page under the pointer, one drawing for the strokes of a page while
     // the tool stays on, and Annotations on the last drawing when it goes off.
     // Drawings show whatever "Visible markup" hides: that choice is about highlights.
@@ -451,6 +536,10 @@ private:
     void slotFollowPencil();
     void rememberAnnotation(const QString &feedbackId, bool stroke = false);
     int newestAnnotationStep() const;
+    // The tools' enabled state and tips for what is shown (setShownInstead).
+    void applyShownInsteadToTools();
+    // The button of the mouse mode in use.
+    QAction *mouseModeAction() const;
     void stopDrawing();
     void endDrawing();
     // The Text tool: a click on the page away from text boxes places a box to type in (or ends the
@@ -480,7 +569,10 @@ private:
     // Why a text box cannot be placed now: a masked answer, or a PDF that is not a Library document.
     QString textBoxRefusal() const;
     void paintCommentSourceConnectors(QPainter *painter, const QRect &contentsRect) const;
-    void reloadAgentProposalOverlays();
+    // Reads the proposal places of the PDF on screen. @p keepCurrent (the same document read
+    // again): the places already read stay usable until the new ones arrive, and a reading under
+    // way is followed by another instead of being thrown away.
+    void reloadAgentProposalOverlays(bool keepCurrent = false);
     void paintAgentProposalOverlays(QPainter *painter, const QRect &contentsRect) const;
     QList<QPair<QString, QRectF>> agentProposalMarkers() const;
     QString agentProposalMarkerAt(const QPoint &eventPos) const;
@@ -572,6 +664,8 @@ private:
     class PageViewPrivate *d;
 
 private Q_SLOTS:
+    // Puts the proposal window beside the passage placeAgentProposalWindowNear named.
+    void applyAgentProposalWindowPlacement();
     // used to decouple the notifyViewportChanged calle
     void slotRealNotifyViewportChanged(bool smoothMove);
     // activated either directly or via queued connection on notifySetup

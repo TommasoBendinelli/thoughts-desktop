@@ -12,6 +12,8 @@ set(okular_SRCS
    agentnoteswindow.cpp
    agentnotecomposer.cpp
    agentnotedrawing.cpp
+   appsignin.cpp
+   signindialog.cpp
    main.cpp
    developerlog.cpp
    developerlogdialog.cpp
@@ -24,6 +26,7 @@ set(okular_SRCS
    documentstyleinformation.cpp
    documentsyncpresentation.cpp
    reviewoverview.cpp
+   reviewdraftsync.cpp
    reviewfeedbackpanel.cpp
    reviewstore.cpp
    reviewtagplan.cpp
@@ -38,6 +41,7 @@ set(okular_SRCS
    thoughtscommandprotocol.cpp
    todocommands.cpp
    updatecheck.cpp
+   visualstudiocode.cpp
    welcomescreen.cpp
 
    ../gui/recentitemsmodel.cpp
@@ -88,7 +92,7 @@ list(APPEND okular_SRCS "${CMAKE_CURRENT_BINARY_DIR}/mental-model.qrc")
 
 if(APPLE)
     enable_language(OBJCXX)
-    list(APPEND okular_SRCS macquitevent.mm readerchromemac.mm agentnotesnotifiermac.mm)
+    list(APPEND okular_SRCS macquitevent.mm readerchromemac.mm agentnotesnotifiermac.mm visualstudiocodemac.mm)
 else()
     list(APPEND okular_SRCS readerchrome.cpp)
 endif()

@@ -37,6 +37,7 @@
 #include <iterator>
 
 #include "../shell/reviewstore.h"
+#include "../shell/agentdocumentdescription.h"
 #include "../core/htmlattachment.h"
 #include "../part/reviewcardfeedback.h"
 #include "../part/feedbackversion.h"
@@ -196,6 +197,7 @@ private Q_SLOTS:
     void wholeDocumentCardsBecomeDocumentNotes();
     void reviewEventsRecordThePdfVersion();
     void agentVersionFeedbackKeepsOnlyTheVersionOnScreen();
+    void agentHtmlPageFeedbackKeepsThisPageVersion();
     void cardWritesRecordThePdfVersion();
     void sourceSelectionCreationAndRetries();
     void pdfOnlyCardMovesIntoASourceDocumentWithItsHistory();
@@ -295,6 +297,9 @@ private Q_SLOTS:
     void htmlCardHasNoPdfGeometryAndWaitsForTheServer();
     void htmlAttachmentCardIsFoundByItsText();
     void areaOfAProposalAcceptedSinceTheBuildIsPlacedByText();
+    void cardOnAnOlderBuildIsPlacedWhereItsPassageIsNow();
+    void passageChangedSinceTheBuildWaitsForTheNewPdf();
+    void placingAgainOnAnOlderBuildFollowsUnrelatedChanges();
     void areasIgnoreRunningHeadersFootersAndPageNumbers();
     void wordOnTwoNearbyLinesIsPlacedByTheAreasText();
     void mathAreaIsPlacedByItsProse();
@@ -306,6 +311,7 @@ private Q_SLOTS:
     void retireFoldMatchesTheConformanceCases();
     void retireAndRestoreKeepTheScheduleAndLeaveTheQueue();
     void retireUndoAndIndex();
+    void thoughtsRetiresACardWhosePassageWasRemoved();
     void reviewKindsMatchTheConformanceCases();
     void projectCardsAreDueWithinAWeek();
     void answersRecordTheirPassage();
@@ -1480,12 +1486,13 @@ void ReviewStoreTest::groupNotesAreRecordedWithTheAnswer()
     const QDateTime at(QDate(2026, 10, 10), QTime(20, 0), QTimeZone::UTC);
     QString error;
 
-    // Notes are trimmed and cut to 500 characters (code points); empty ones are left out.
+    // Notes are trimmed and cut to 20000 characters (code points); empty ones are left out.
     const QString emoji = QString::fromUtf8("\xF0\x9F\x99\x82");
     QString longNote;
-    for (int index = 0; index < 501; ++index) longNote += emoji;
-    QCOMPARE(ReviewTags::cleanGroupNote(longNote).size(), 1000);
-    QCOMPARE(ReviewTags::cutGroupNote(QString(600, QLatin1Char('x'))).size(), 500);
+    for (int index = 0; index < 20001; ++index) longNote += emoji;
+    QCOMPARE(ReviewTags::cleanGroupNote(longNote).size(), 40000);
+    QCOMPARE(ReviewTags::cutGroupNote(QString(20600, QLatin1Char('x'))).size(), 20000);
+    QCOMPARE(ReviewTags::cutGroupNote(QString(600, QLatin1Char('x'))).size(), 600);
     const QHash<QString, QString> notes{{QStringLiteral("u"), QStringLiteral("  Mostly there\nproof still fuzzy  ")},
                                         {ReviewTags::otherGroupNoteKey(), longNote},
                                         {ReviewTags::answerNoteKey(), QStringLiteral(" Check the proof again ")},
@@ -3061,6 +3068,67 @@ void ReviewStoreTest::wholeDocumentCardsBecomeDocumentNotes()
 
 // A reader tab's Copy for agent: only the cards answered, and the feedback given, on the PDF version
 // on screen; answers, answer feedback and text feedback of other versions are left out.
+void ReviewStoreTest::agentHtmlPageFeedbackKeepsThisPageVersion()
+{
+    const QString path = QStringLiteral("docs-ideas/tex/support/html/plots.html");
+    const QString page(64, QLatin1Char('c'));
+    const QString older(64, QLatin1Char('d'));
+    // A record made in a page: no PDF regions, the page's path and version in its anchor.
+    const auto inPage = [](const QString &id, const QString &created, const QString &polarity, const QString &kind, const QString &quote, const QString &comment,
+                           const QString &pagePath, const QString &pageSha) {
+        QJsonObject record{{QStringLiteral("feedback_id"), id}, {QStringLiteral("created_at"), created}, {QStringLiteral("polarity"), polarity},
+                           {QStringLiteral("comment"), comment}, {QStringLiteral("view"), Thoughts::DocumentFeedback::attachmentView()},
+                           {QStringLiteral("anchor"), QJsonObject{{QStringLiteral("quote"), QJsonObject{{QStringLiteral("exact"), quote}}},
+                                                                  {QStringLiteral("pdf"), QJsonObject{{QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+                                                                                                      {QStringLiteral("regions"), QJsonArray()}}},
+                                                                  {QStringLiteral("html_attachment"), QJsonObject{{QStringLiteral("path"), pagePath},
+                                                                                                                  {QStringLiteral("sha256"), pageSha}}}}}};
+        if (!kind.isEmpty()) record.insert(QStringLiteral("kind"), kind);
+        return record;
+    };
+    const QString positive = Thoughts::ReviewCardFeedback::positive();
+    const QString neutral = Thoughts::ReviewCardFeedback::neutral();
+    const QJsonObject liked = inPage(QStringLiteral("p1"), QStringLiteral("2026-11-18T10:00:00Z"), positive, {}, QStringLiteral("the curve flattens"), QStringLiteral("Clear"), path, page);
+    const QJsonObject drawing = inPage(QStringLiteral("p2"), QStringLiteral("2026-11-18T11:00:00Z"), neutral, Thoughts::DocumentFeedback::drawing(),
+                                       QStringLiteral("Drawing"), QStringLiteral("This bump"), path, page);
+    const QJsonObject question = inPage(QStringLiteral("p3"), QStringLiteral("2026-11-18T12:00:00Z"), neutral, Thoughts::DocumentFeedback::question(),
+                                        QStringLiteral("24.0"), QStringLiteral("Which run?"), path, page);
+    // Left out: a comment (never for agents), an older version of the page, another page, a
+    // deleted record and feedback on the PDF.
+    const QJsonObject comment = inPage(QStringLiteral("p4"), QStringLiteral("2026-11-18T13:00:00Z"), neutral, Thoughts::DocumentFeedback::other(),
+                                       QStringLiteral("legend"), QStringLiteral("note to self"), path, page);
+    const QJsonObject stale = inPage(QStringLiteral("p5"), QStringLiteral("2026-11-17T10:00:00Z"), positive, {}, QStringLiteral("old"), {}, path, older);
+    const QJsonObject other = inPage(QStringLiteral("p6"), QStringLiteral("2026-11-18T14:00:00Z"), positive, {}, QStringLiteral("other page"), {},
+                                     QStringLiteral("docs-ideas/tex/support/html/other.html"), page);
+    QJsonObject deleted = inPage(QStringLiteral("p7"), QStringLiteral("2026-11-18T15:00:00Z"), positive, {}, QStringLiteral("gone"), {}, path, page);
+    deleted.insert(QStringLiteral("deleted"), true);
+    QJsonObject onPdf = liked;
+    onPdf.remove(QStringLiteral("view"));
+    onPdf.insert(QStringLiteral("feedback_id"), QStringLiteral("p8"));
+
+    QCOMPARE(Thoughts::agentHtmlPageFeedback({question, comment, stale, other, deleted, onPdf, drawing, liked}, path, page),
+             QStringLiteral("Feedback on this version of the page:\n"
+                            "- Liked: \"the curve flattens\" — Clear\n"
+                            "- Drawing on a snapshot of the page (the Thoughts document_feedback tool shows it as a picture) — This bump\n"
+                            "- Question: \"24.0\" — Which run?\n"
+                            "A Question asks you something; it is not a request to change the text, so make no proposal for it unless I ask for one.\n"
+                            "Liked and Disliked passages say what to keep and what to change; a change goes in a proposal.\n"
+                            "Make proposals for my feedback above, and answer my questions with agent notes (send_note, attached to this document).\n"));
+    QCOMPARE(Thoughts::agentHtmlPageFeedback({comment, stale, other, deleted}, path, page), QString());
+    QCOMPARE(Thoughts::agentHtmlPageFeedback({liked}, path, QString()), QString());
+
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    QCOMPARE(Thoughts::agentHtmlPageDescription(root.path(), path, QStringLiteral("Searcher training"), QStringLiteral("#curves"), QStringLiteral("  24.0\n fact ")),
+             QStringLiteral("HTML page: \"Searcher training\"\nPage source: %1\nPart of the page on screen: #curves\nSelected text: \"24.0 fact\"\n").arg(path));
+    QVERIFY(QDir(root.path()).mkpath(QFileInfo(path).path()));
+    QFile file(QDir(root.path()).filePath(path));
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.close();
+    QCOMPARE(Thoughts::agentHtmlPageDescription(root.path(), path, QString(), QString(), QString()),
+             QStringLiteral("HTML page: \"plots.html\"\nPage source: %1\n").arg(QDir(root.path()).filePath(path)));
+}
+
 void ReviewStoreTest::agentVersionFeedbackKeepsOnlyTheVersionOnScreen()
 {
     const QString current(64, QLatin1Char('a'));
@@ -3153,7 +3221,8 @@ void ReviewStoreTest::agentVersionFeedbackKeepsOnlyTheVersionOnScreen()
                                   "- Question (page 6): \"the learning rate\" — Why 0.1? (resolved)\n"
                                   "- Text box (page 8) — check this\n"
                                   "- Drawing (page 3)\n"
-                                  "Liked and Disliked passages say what to keep and what to change; a change goes in a proposal.\n")
+                                  "Liked and Disliked passages say what to keep and what to change; a change goes in a proposal.\n"
+                                  "Make proposals for my feedback above.\n")
                        .arg(at1, at2));
     // An open question asks for an answer, not an edit; a closed one asks nothing.
     auto open = question;
@@ -3161,8 +3230,17 @@ void ReviewStoreTest::agentVersionFeedbackKeepsOnlyTheVersionOnScreen()
     QCOMPARE(Thoughts::agentVersionFeedback({}, {}, {open}, groups, current),
              QStringLiteral("Text feedback on this PDF version:\n"
                             "- Question (page 6): \"the learning rate\" — Why 0.1?\n"
-                            "Answer each Question in your reply. A question asks you something; it is not a request to change the text, so "
-                            "make no proposal for it unless I ask for one.\n"));
+                            "A Question asks you something; it is not a request to change the text, so make no proposal for it unless I ask for one.\n"
+                            "Answer my questions above with agent notes (send_note, attached to this document).\n"));
+    // Pictures on a comment (document-feedback.md §12): counted, and the tool that shows them named.
+    const QJsonObject pictured = Thoughts::DocumentFeedback::withPictures(
+        feedback(QStringLiteral("t9"), {}, Thoughts::ReviewCardFeedback::negative(), QStringLiteral("the routes"), QStringLiteral("Like this"), current, 4),
+        {Thoughts::DocumentFeedback::snapshotJson(QString(64, QLatin1Char('a')), QStringLiteral("image/jpeg"), 10, 10)});
+    QCOMPARE(Thoughts::agentVersionFeedback({}, {}, {pictured}, groups, current),
+             QStringLiteral("Text feedback on this PDF version:\n"
+                            "- Disliked (page 4): \"the routes\" — Like this [1 picture: the Thoughts document_feedback tool shows it]\n"
+                            "Liked and Disliked passages say what to keep and what to change; a change goes in a proposal.\n"
+                            "Make proposals for my feedback above.\n"));
     QCOMPARE(Thoughts::agentVersionFeedback({}, {}, {question}, groups, current),
              QStringLiteral("Text feedback on this PDF version:\n- Question (page 6): \"the learning rate\" — Why 0.1? (resolved)\n"));
     // The user's rule (10 November): likes, dislikes and questions belong to the version they were
@@ -4774,7 +4852,9 @@ void ReviewStoreTest::manualLinkingOutcomes()
     if (linked) QVERIFY(currentBytes.contains(card.id().toUtf8()));
     else QCOMPARE(currentBytes, mode == QLatin1String("stale_answer") ? rewritten : mode == QLatin1String("changed_after_preparation") ? source + "Another author edit.\n" : source);
     if (mode == QLatin1String("stale_source")) QVERIFY(currentBytes.startsWith(QByteArray("\\ReviewCardMaskStart{" + card.id().toUtf8() + "}{0}%\n" + answer.toUtf8() + "\n\\ReviewCardMaskEnd{")));
-    if (mode == QLatin1String("stale_answer")) QVERIFY2(card.linkingReason().contains(QStringLiteral("could not be mapped safely")), qPrintable(card.linkingReason()));
+    // The answer's own line changed since the build: the card waits for the new PDF.
+    if (mode == QLatin1String("stale_answer"))
+        QCOMPARE(card.linkingReason(), QStringLiteral("This passage changed since the PDF was built. Wait for the new PDF (it arrives with the next Sync), then create the card."));
     if (mode == QLatin1String("ambiguous")) QVERIFY(card.linkingReason().contains(QStringLiteral("historical source line")));
     if (mode == QLatin1String("citation_only")) QVERIFY2(card.linkingReason().contains(QStringLiteral("could not be mapped safely (selected text: [3],)")), qPrintable(card.linkingReason()));
     ReviewStore reopened(dir.path());
@@ -6834,6 +6914,192 @@ void ReviewStoreTest::areaOfAProposalAcceptedSinceTheBuildIsPlacedByText()
     QCOMPARE(moved.replacement, markReviewSourceRanges(doc.sourceId, current, {{64, 69}}, id).replacement);
 }
 
+namespace {
+// A note's PDF built before two proposals were accepted: one added a line above the heading, one
+// rewrote the paragraph below it. Accepting changes the TeX at once; the new PDF comes with a
+// later Sync.
+const QByteArray olderBuild("\\documentclass{article}\n\\begin{document}\n"
+                            "\\section*{Alpha bravo charlie}\n"                     // 3
+                            "\n"
+                            "Delta echo foxtrot golf.\n"                            // 5
+                            "\n"
+                            "Hotel india juliet kilo.\n"                            // 7
+                            "\\end{document}\n");
+const QByteArray acceptedSince("\\documentclass{article}\n\\begin{document}\n"
+                               "Lima mike november oscar.\n"                        // 3, added
+                               "\\section*{Alpha bravo charlie}\n"                  // 4
+                               "\n"
+                               "Delta echo foxtrot golf, rewritten with more words.\n" // 6, rewritten
+                               "\n"
+                               "Hotel india juliet kilo.\n"                         // 8
+                               "\\end{document}\n");
+const QList<QList<LinkedDocument::Line>> olderBuildPages {
+    {{QStringLiteral("Alpha bravo charlie"), 3, 100}, {QStringLiteral("Delta echo foxtrot golf."), 5, 200},
+     {QStringLiteral("Hotel india juliet kilo."), 7, 300}}};
+const QString passageChanged = QStringLiteral("This passage changed since the PDF was built. Wait for the new PDF (it arrives with the next Sync), then create the card.");
+bool overwrite(const QString &path, const QByteArray &bytes)
+{
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(bytes) == bytes.size();
+}
+}
+
+void ReviewStoreTest::cardOnAnOlderBuildIsPlacedWhereItsPassageIsNow()
+{
+    // 19 November: a card on a note's title, made while the PDF on screen was still the build
+    // from before the accepted proposals, was refused with "The TeX changed since this PDF was
+    // built. Sync before creating the card." The title had not changed.
+    QTemporaryDir dir;
+    LinkedDocument doc;
+    QVERIFY(doc.build(dir.path(), acceptedSince, olderBuildPages, {}, olderBuild));
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // The heading is line 3 of the build and line 4 now: the markers go around line 4.
+    const auto heading = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(100)}}, id);
+    QVERIFY2(heading.error.isEmpty(), qPrintable(heading.error));
+    const auto expected = markReviewSourceRanges(doc.sourceId, acceptedSince, {{4, 4}}, id);
+    QVERIFY2(expected.error.isEmpty(), qPrintable(expected.error));
+    QCOMPARE(heading.original, acceptedSince);
+    QCOMPARE(heading.replacement, expected.replacement);
+    QCOMPARE(heading.anchor, expected.anchor);
+    QCOMPARE(heading.regions.size(), 1);
+    // The paragraph after the rewritten one: line 7 of the build, line 8 now.
+    const auto last = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(300)}}, id);
+    QVERIFY2(last.error.isEmpty(), qPrintable(last.error));
+    QCOMPARE(last.replacement, markReviewSourceRanges(doc.sourceId, acceptedSince, {{8, 8}}, id).replacement);
+    // Both, as two passages of one card.
+    const auto both = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha,
+        {{1, LinkedDocument::band(300)}, {1, LinkedDocument::band(100)}}, id);
+    QVERIFY2(both.error.isEmpty(), qPrintable(both.error));
+    QCOMPARE(both.replacement, markReviewSourceRanges(doc.sourceId, acceptedSince, {{4, 4}, {8, 8}}, id).replacement);
+    QCOMPARE(doc.current(), acceptedSince);
+
+    ReviewStore store(dir.path());
+    ReviewCard card;
+    QString error;
+    QVERIFY2(store.createManualCard(doc.document, 1, rectList(LinkedDocument::band(100)), QStringLiteral("What is the heading?"),
+        heading.pageVisualSha256, &card, &error, 0, {}, &heading, id), qPrintable(error));
+    QCOMPARE(card.linkingState(), QStringLiteral("linked"));
+    QCOMPARE(doc.current(), heading.replacement);
+    QCOMPARE(stripReviewCardMarkers(doc.sourceId, doc.current(), id).text, acceptedSince);
+}
+
+void ReviewStoreTest::passageChangedSinceTheBuildWaitsForTheNewPdf()
+{
+    QTemporaryDir dir;
+    LinkedDocument doc;
+    QVERIFY(doc.build(dir.path(), acceptedSince, olderBuildPages, {}, olderBuild));
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // The rewritten paragraph itself.
+    auto plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(200)}}, id);
+    QCOMPARE(plan.error, passageChanged);
+    QCOMPARE(plan.failedArea, 0);
+    QVERIFY(plan.replacement.isEmpty());
+    // One area from the unchanged heading into it.
+    const QRectF headingAndParagraph(QPointF(0.0, 82 / 842.0), QPointF(1.0, 208 / 842.0));
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, headingAndParagraph}}, id);
+    QCOMPARE(plan.error, passageChanged);
+    QCOMPARE(plan.failedArea, 0);
+    // A second area on it.
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(100)}, {1, LinkedDocument::band(200)}}, id);
+    QCOMPARE(plan.error, passageChanged);
+    QCOMPARE(plan.failedArea, 1);
+    QCOMPARE(doc.current(), acceptedSince);
+
+    // Every line of the passage is unchanged, but a line was added between them.
+    {
+        QByteArray inserted = olderBuild;
+        inserted.replace("Delta echo foxtrot golf.\n", "Delta echo foxtrot golf.\nPapa quebec romeo sierra.\n");
+        QTemporaryDir other;
+        LinkedDocument added;
+        QVERIFY(added.build(other.path(), inserted, olderBuildPages, {}, olderBuild));
+        const QRectF paragraphs(QPointF(0.0, 182 / 842.0), QPointF(1.0, 308 / 842.0));
+        const auto split = planReviewSourceAnchors(other.path(), added.bundle, added.pdfPath, added.pdfSha, {{1, paragraphs}}, id);
+        QCOMPARE(split.error, passageChanged);
+        // Each paragraph alone is unchanged.
+        const auto first = planReviewSourceAnchors(other.path(), added.bundle, added.pdfPath, added.pdfSha, {{1, LinkedDocument::band(200)}}, id);
+        QVERIFY2(first.error.isEmpty(), qPrintable(first.error));
+        QCOMPARE(first.replacement, markReviewSourceRanges(added.sourceId, inserted, {{5, 5}}, id).replacement);
+        QCOMPARE(added.current(), inserted);
+    }
+
+    // Without the build's text in the bundle the source cannot be compared: as before.
+    QVERIFY(QFile::remove(QDir(doc.bundle).filePath(QStringLiteral("objects/") + sha256Hex(olderBuild))));
+    plan = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(100)}}, id);
+    QCOMPARE(plan.error, QStringLiteral("the mapped source snapshot is unavailable (selected text: Alpha)"));
+    QVERIFY(plan.replacement.isEmpty());
+    QCOMPARE(doc.current(), acceptedSince);
+}
+
+void ReviewStoreTest::placingAgainOnAnOlderBuildFollowsUnrelatedChanges()
+{
+    // Since the PDF was built a proposal added a paragraph before the last one.
+    const QByteArray added("\\documentclass{article}\n\\begin{document}\nAlpha bravo charlie.\n\nDelta echo foxtrot.\n\nGolf hotel india.\n\n"
+                           "Mike november oscar.\n\nJuliet kilo lima.\n\\end{document}\n");
+    const QString sourceId = QStringLiteral("docs-test/tex/source/main.tex");
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // The card was made on this PDF (built before its markers), then the paragraph was added.
+    {
+        QTemporaryDir dir;
+        LinkedDocument doc;
+        QVERIFY(doc.build(dir.path(), fourParagraphs, fourParagraphPages));
+        const auto first = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{1, LinkedDocument::band(100)}}, id);
+        QVERIFY2(first.error.isEmpty(), qPrintable(first.error));
+        ReviewStore store(dir.path());
+        ReviewCard card;
+        QString error;
+        QVERIFY2(store.createManualCard(doc.document, 1, rectList(LinkedDocument::band(100)), QStringLiteral("Which words?"),
+            first.pageVisualSha256, &card, &error, 0, {}, &first, id), qPrintable(error));
+        card = store.cards().first();
+        const QByteArray accepted = markReviewSourceRanges(sourceId, added, {{3, 3}}, id).replacement;
+        QCOMPARE(stripReviewCardMarkers(sourceId, doc.current(), id).text, fourParagraphs);
+        QVERIFY(overwrite(doc.sourcePath, accepted));
+        // Placing it on the last paragraph: line 9 of the build, line 11 now.
+        const auto moved = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{2, LinkedDocument::band(200)}}, id, true);
+        QVERIFY2(moved.error.isEmpty(), qPrintable(moved.error));
+        QCOMPARE(moved.original, accepted);
+        QCOMPARE(moved.replacement, markReviewSourceRanges(sourceId, added, {{11, 11}}, id).replacement);
+        QVERIFY2(store.replaceCardAreas(card, doc.pdfSha, QStringLiteral("Which words now?"), moved, &error), qPrintable(error));
+        QCOMPARE(doc.current(), moved.replacement);
+        QCOMPARE(store.cards().first().record.value(QStringLiteral("primary")).toObject().value(QStringLiteral("source_anchor")).toObject(), moved.anchor);
+    }
+    // A PDF built after the markers were placed (its lines count them), before the paragraph.
+    const QByteArray builtMarked = markReviewSourceRanges(sourceId, fourParagraphs, {{3, 3}}, id).replacement;
+    const QList<QList<LinkedDocument::Line>> shifted {
+        {{QStringLiteral("Alpha bravo charlie."), 4, 100}, {QStringLiteral("Delta echo foxtrot."), 7, 200}},
+        {{QStringLiteral("Golf hotel india."), 9, 100}, {QStringLiteral("Juliet kilo lima."), 11, 200}}};
+    {
+        QTemporaryDir dir;
+        LinkedDocument doc;
+        const QByteArray accepted = markReviewSourceRanges(sourceId, added, {{3, 3}}, id).replacement;
+        QVERIFY(doc.build(dir.path(), accepted, shifted, {}, builtMarked));
+        // The card's own passage and the last paragraph.
+        const auto moved = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha,
+            {{1, LinkedDocument::band(100)}, {2, LinkedDocument::band(200)}}, id, true);
+        QVERIFY2(moved.error.isEmpty(), qPrintable(moved.error));
+        QCOMPARE(moved.original, accepted);
+        QCOMPARE(moved.replacement, markReviewSourceRanges(sourceId, added, {{3, 3}, {11, 11}}, id).replacement);
+        QCOMPARE(doc.current(), accepted);
+    }
+    // Onto a paragraph rewritten since: refused, with the message for placing.
+    {
+        QByteArray rewritten = fourParagraphs;
+        rewritten.replace("Golf hotel india.\n", "Golf hotel india, and more words since the build.\n");
+        QTemporaryDir dir;
+        LinkedDocument doc;
+        const QByteArray accepted = markReviewSourceRanges(sourceId, rewritten, {{3, 3}}, id).replacement;
+        QVERIFY(doc.build(dir.path(), accepted, shifted, {}, builtMarked));
+        const auto moved = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{2, LinkedDocument::band(100)}}, id, true);
+        QCOMPARE(moved.error, QStringLiteral("This passage changed since the PDF was built. Wait for the new PDF (it arrives with the next Sync), then place the card."));
+        QCOMPARE(moved.failedArea, 0);
+        QVERIFY(moved.replacement.isEmpty());
+        // The unchanged last paragraph still can.
+        const auto last = planReviewSourceAnchors(dir.path(), doc.bundle, doc.pdfPath, doc.pdfSha, {{2, LinkedDocument::band(200)}}, id, true);
+        QVERIFY2(last.error.isEmpty(), qPrintable(last.error));
+        QCOMPARE(last.replacement, markReviewSourceRanges(sourceId, rewritten, {{9, 9}}, id).replacement);
+        QCOMPARE(doc.current(), accepted);
+    }
+}
+
 void ReviewStoreTest::wordOnTwoNearbyLinesIsPlacedByTheAreasText()
 {
     // The PDF rebuilt from the accepted source: the build's source is the current one. SyncTeX
@@ -7267,4 +7533,141 @@ void ReviewStoreTest::retireUndoAndIndex()
     const QJsonObject listedCard = listed.value(QStringLiteral("cards")).toArray().at(0).toObject();
     QVERIFY(listedCard.value(QStringLiteral("retired")).toBool());
     QCOMPARE(listedCard.value(QStringLiteral("retired_at")).toString(), QStringLiteral("2026-10-27T09:00:10.000Z"));
+}
+
+// Thoughts retires a card whose whole passage was removed from its note (server
+// review_card_auto_retire_v1): an ordinary retire event of origin thoughts-passage-check. The card
+// is retired and out of the queue, overdue as it was; the Library tells it once (pendingNotices,
+// remembered in a file of this Mac, also across restarts), never for a retirement older than a
+// week when first seen; the user's Restore to review brings it back.
+void ReviewStoreTest::thoughtsRetiresACardWhosePassageWasRemoved()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QDateTime now(QDate(2026, 11, 23), QTime(10, 0), QTimeZone::UTC);
+    const QString cardId = QStringLiteral("00000000-0000-4000-8000-0000000000f1");
+    const QString oldCardId = QStringLiteral("00000000-0000-4000-8000-0000000000f2");
+    const QString userCardId = QStringLiteral("00000000-0000-4000-8000-0000000000f3");
+    for (const QString &id : {cardId, oldCardId, userCardId})
+        QVERIFY(writeObject(QDir(temporary.path()).filePath(QStringLiteral("reviews/cards/%1.json").arg(id)),
+                            reviewCard(id, QStringLiteral("grpo"), QString(64, QLatin1Char('a')))));
+    // Answered ten days ago with a five-day interval: overdue.
+    QVERIFY(writeObject(QDir(temporary.path()).filePath(QStringLiteral("reviews/events/test/answer.json")),
+                        QJsonObject{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), QStringLiteral("00000000-0000-4000-8000-0000000000a1")},
+                                    {QStringLiteral("card_id"), cardId}, {QStringLiteral("rating"), QStringLiteral("custom_interval")},
+                                    {QStringLiteral("review_tags"), QJsonArray{QStringLiteral("Recalled")}},
+                                    {QStringLiteral("reviewed_at"), now.addDays(-10).toString(Qt::ISODateWithMs)},
+                                    {QStringLiteral("scheduled_due_at"), now.addDays(-5).toString(Qt::ISODateWithMs)}}));
+    // The server's events, as Sync brings them.
+    const auto serverEvent = [&temporary](const QString &eventId, const QString &id, const QString &action, const QDateTime &at) {
+        QJsonObject event{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), eventId}, {QStringLiteral("card_id"), id},
+                          {QStringLiteral("queue_action"), action}, {QStringLiteral("reviewed_at"), at.toString(Qt::ISODateWithMs)},
+                          {QStringLiteral("origin_id"), QStringLiteral("thoughts-passage-check")},
+                          {QStringLiteral("reason"), action == QLatin1String("retire") ? QStringLiteral("passage_removed") : QStringLiteral("passage_returned")}};
+        if (action == QLatin1String("retire"))
+            event.insert(QStringLiteral("passage_removed"), QJsonObject{{QStringLiteral("source_files"), QJsonArray{QStringLiteral("docs-concepts-a6fe5d/tex/source/grpo.tex")}},
+                                                                        {QStringLiteral("pdf"), QStringLiteral("grpo.pdf")}});
+        return writeObject(QDir(temporary.path()).filePath(QStringLiteral("reviews/events/thoughts-passage-check/%1.json").arg(eventId)), event);
+    };
+    ReviewStore store(temporary.path());
+    const auto cardOf = [&store](const QString &id) {
+        const auto cards = store.cards();
+        return *std::find_if(cards.cbegin(), cards.cend(), [&id](const ReviewCard &card) { return card.id() == id; });
+    };
+    const auto dueIds = [&store, &now] {
+        QStringList ids;
+        for (const auto &card : store.dueCards(now)) ids.append(card.id());
+        ids.sort();
+        return ids;
+    };
+    QCOMPARE(dueIds(), (QStringList{cardId, oldCardId, userCardId}));
+    const ReviewSchedule before = cardOf(cardId).schedule;
+    QVERIFY(before.dueAt < now);
+
+    const QString retireId = QStringLiteral("6f1c0000-0000-4000-8000-0000000000b1");
+    QVERIFY(serverEvent(retireId, cardId, QStringLiteral("retire"), now.addSecs(-3600)));
+    // Thoughts retired this one eight days ago: a fresh Mac syncing history is not told.
+    QVERIFY(serverEvent(QStringLiteral("6f1c0000-0000-4000-8000-0000000000b2"), oldCardId, QStringLiteral("retire"), now.addDays(-8)));
+    // The user's own retire is no notice.
+    QString error;
+    QVERIFY2(store.retireCard(userCardId, &error, now.addSecs(-60)), qPrintable(error));
+
+    // Retired like any retired card: schedule kept, out of the queue and its overdue count.
+    const ReviewCard retired = cardOf(cardId);
+    QVERIFY(retired.schedule.retired);
+    QCOMPARE(retired.schedule.retireEventId, retireId);
+    QCOMPARE(retired.schedule.retiredAt, now.addSecs(-3600));
+    QCOMPARE(retired.schedule.dueAt, before.dueAt);
+    QVERIFY(!ReviewStore::isDueNow(retired, now));
+    QCOMPARE(dueIds(), QStringList{});
+    const auto browser = store.browserCards(now);
+    const auto item = std::find_if(browser.cbegin(), browser.cend(), [&](const ReviewBrowserCard &card) { return card.card.id() == cardId; });
+    QVERIFY(item != browser.cend());
+    QCOMPARE(item->state, ReviewBrowserState::Retired);
+    QVERIFY(item->matchesFilter(QStringLiteral("retired")));
+    QVERIFY(ReviewAutoRetire::isAutomatic(retired.history.constLast()));
+    QVERIFY(!ReviewAutoRetire::isAutomatic(cardOf(userCardId).history.constLast()));
+
+    // Exactly one notice, with what it names.
+    const QString shownPath = QDir(temporary.path()).filePath(QStringLiteral("application-data/review-auto-retire-notices.json"));
+    QVERIFY(ReviewAutoRetire::shownNotices(shownPath).isEmpty());
+    QList<ReviewAutoRetire::Notice> pending = ReviewAutoRetire::pendingNotices(store.cards(), ReviewAutoRetire::shownNotices(shownPath), now);
+    QCOMPARE(pending.size(), 1);
+    const ReviewAutoRetire::Notice notice = pending.constFirst();
+    QCOMPARE(notice.eventId, retireId);
+    QCOMPARE(notice.cardId, cardId);
+    QCOMPARE(notice.question, QStringLiteral("What is hidden?"));
+    QCOMPARE(notice.retiredAt, now.addSecs(-3600));
+    QCOMPARE(notice.pdf, QStringLiteral("grpo.pdf"));
+    QCOMPARE(notice.sourceFiles, QStringList{QStringLiteral("docs-concepts-a6fe5d/tex/source/grpo.tex")});
+    // The note: its Project document's name, else its source's file name.
+    const QJsonArray projects{QJsonObject{{QStringLiteral("name"), QStringLiteral("Concepts")},
+                                          {QStringLiteral("documents"), QJsonArray{QJsonObject{{QStringLiteral("filename"), QStringLiteral("other.pdf")}, {QStringLiteral("name"), QStringLiteral("Other")}},
+                                                                                   QJsonObject{{QStringLiteral("filename"), QStringLiteral("grpo.pdf")}, {QStringLiteral("name"), QStringLiteral("GRPO")}}}}}};
+    QCOMPARE(ReviewAutoRetire::noteName(notice, projects), QStringLiteral("GRPO"));
+    QCOMPARE(ReviewAutoRetire::noteName(notice, {}), QStringLiteral("grpo.tex"));
+    ReviewAutoRetire::Notice withoutSource = notice;
+    withoutSource.sourceFiles.clear();
+    QCOMPARE(ReviewAutoRetire::noteName(withoutSource, {}), QStringLiteral("grpo.pdf"));
+    // Only its age keeps the older retirement out.
+    QCOMPARE(ReviewAutoRetire::pendingNotices(store.cards(), {}, now.addDays(-2)).size(), 2);
+
+    // Shown once: not again on the next read, nor after a restart (the record is read again).
+    QVERIFY(ReviewAutoRetire::rememberShown(pending, now, shownPath));
+    QCOMPARE(ReviewAutoRetire::shownNotices(shownPath).value(retireId), now);
+    QVERIFY(ReviewAutoRetire::pendingNotices(store.cards(), ReviewAutoRetire::shownNotices(shownPath), now.addSecs(60)).isEmpty());
+    {
+        ReviewStore restarted(temporary.path());
+        QVERIFY(ReviewAutoRetire::pendingNotices(restarted.cards(), ReviewAutoRetire::shownNotices(shownPath), now.addSecs(120)).isEmpty());
+    }
+    // Remembering it again keeps when it was first shown.
+    QVERIFY(ReviewAutoRetire::rememberShown(pending, now.addSecs(300), shownPath));
+    QCOMPARE(ReviewAutoRetire::shownNotices(shownPath).value(retireId), now);
+
+    // Restore to review (a restore of this computer): active and overdue again, no notice.
+    QString restoreId;
+    QVERIFY2(store.restoreRetiredCard(cardId, &error, now.addSecs(600), &restoreId), qPrintable(error));
+    const ReviewCard restored = cardOf(cardId);
+    QVERIFY(!restored.schedule.retired);
+    QCOMPARE(restored.schedule.dueAt, before.dueAt);
+    QVERIFY(ReviewStore::isDueNow(restored, now.addSecs(601)));
+    QCOMPARE(restored.history.constLast().value(QStringLiteral("event_id")).toString(), restoreId);
+    QVERIFY(!ReviewAutoRetire::isAutomatic(restored.history.constLast()));
+    QVERIFY(ReviewAutoRetire::pendingNotices(store.cards(), {}, now.addSecs(601)).isEmpty());
+
+    // Thoughts retires it again later: a new retirement, told again; its restore when the passage is back ends it.
+    const QString againId = QStringLiteral("6f1c0000-0000-4000-8000-0000000000b3");
+    QVERIFY(serverEvent(againId, cardId, QStringLiteral("retire"), now.addSecs(900)));
+    pending = ReviewAutoRetire::pendingNotices(store.cards(), ReviewAutoRetire::shownNotices(shownPath), now.addSecs(960));
+    QCOMPARE(pending.size(), 1);
+    QCOMPARE(pending.constFirst().eventId, againId);
+    QVERIFY(serverEvent(QStringLiteral("6f1c0000-0000-4000-8000-0000000000b4"), cardId, QStringLiteral("restore"), now.addSecs(1200)));
+    QVERIFY(!cardOf(cardId).schedule.retired);
+    QVERIFY(ReviewAutoRetire::pendingNotices(store.cards(), {}, now.addSecs(1260)).isEmpty());
+
+    // The record forgets what it showed more than 30 days ago.
+    QVERIFY(ReviewAutoRetire::rememberShown(pending, now.addDays(31), shownPath));
+    const auto shown = ReviewAutoRetire::shownNotices(shownPath);
+    QVERIFY(!shown.contains(retireId));
+    QCOMPARE(shown.value(againId), now.addDays(31));
 }

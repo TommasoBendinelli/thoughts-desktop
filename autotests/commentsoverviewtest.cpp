@@ -19,10 +19,13 @@
 #include "../part/docscommentsynchronizer.h"
 #include "../part/libraryprojectstore.h"
 #include "../part/librarysourceinventory.h"
+#include "../part/fileidentitycache.h"
+#include "../part/thoughtsplatform.h"
 #include "../shell/librarymodificationdates.h"
 #include "../shell/documentmanagementdialog.h"
 #include "../shell/developerlog.h"
 #include "../shell/librarysearch.h"
+#include "../shell/signindialog.h"
 #include "../part/thoughtsserveraddress.h"
 
 #include <QApplication>
@@ -67,6 +70,7 @@
 #include <QScrollBar>
 #include <QShortcut>
 #include <QSignalSpy>
+#include <QToolButton>
 #include <QDesktopServices>
 #include <QSplitter>
 #include <QStandardPaths>
@@ -90,6 +94,7 @@
 #include <QWheelEvent>
 
 #include <KConfigGroup>
+#include <KMessageWidget>
 #include <KSharedConfig>
 
 #include <algorithm>
@@ -100,6 +105,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+
+#ifdef Q_OS_MACOS
+#include <fcntl.h>
+#include <sys/attr.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace
@@ -570,6 +582,7 @@ private Q_SLOTS:
     void testCreatedProjectManifestFollowsFedora();
     void testLibraryDateFormatting();
     void testLibraryMetadataColumns();
+    void testLibraryListsSourcedDocumentsFirst();
     void testLibraryPagesByKindAndDueCards();
     void testLibraryHeaderColumnsMenu();
     void testProjectPagesCountBuiltDocuments();
@@ -610,7 +623,7 @@ private Q_SLOTS:
     void testMoveSourceDocumentStaysInItsTwoFolders();
     void testUnlinkedDocumentMenu();
     void testDocumentSettingsTransaction();
-    void testProjectMenuCopiesProjectName();
+    void testProjectMenuHasNoCopyProjectName();
     void testProjectMenuChoosesReviewCardKind();
     void testLibrarySummarySaysLoadingUntilFirstLoad();
     void testLibraryMenuSurvivesRefresh_data();
@@ -632,6 +645,7 @@ private Q_SLOTS:
     void testDiaryEntriesListedInDiaryNotTodos();
     void testOverviewTabs();
     void testReviewCardsRefreshWhenSourceLocationsChange();
+    void testLibraryTellsOfCardsThoughtsRetired();
     void testPersistentBrowsersKeepState();
     void testSyncStateChangeUpdatesDocumentRowsInPlace();
     void testTabSwitchScales_data();
@@ -687,6 +701,7 @@ private Q_SLOTS:
     void testFedoraDetailsDialog();
     void testServerDialogSavesAddress();
     void testServerDialogAsksForTheTokenOfAnotherServer();
+    void testServerDialogOffersSignIn();
     void testDocumentSyncPresentationAggregation();
     void testDocumentSyncActivityPresentation();
     void testSyncOutcomeSummary();
@@ -710,12 +725,18 @@ private Q_SLOTS:
     void testFilteringActivationAndRefresh();
     void testRevealCommentClearsFiltersAndSelectsExactRecord();
     void testShiftSelectsCommentRange();
+    void testSmallWindowKeepsTheCommentListAndMovableDividers();
     void testDoubleClickNavigationWaitsForRelease();
     void testRowRevealPreservesHorizontalPosition();
     void testReloadPreservesScrollPosition();
     void testStartupCombinesLibraryLoads();
     void testSourceEditReloadsOnlyItsDocuments();
     void testCatalogueChangeDuringAFullReloadOfIt();
+    void testUnchangedLibraryIsNotReadAgain();
+    void testClonedLibraryPdfKeepsItsDigest();
+    void testCatalogueCheckIgnoresFilesItDoesNotCompare();
+    void testCatalogueCheckWaitsForTheFullReload();
+    void benchmarkLibraryShapedLoad();
     void testSourceEditRebuildsLibraryTreeOnce();
     void testLibraryChangeBurstRebuildsTreeOnce();
     void testLibraryMarksFailedDocuments();
@@ -1063,6 +1084,141 @@ void CommentsOverviewTest::testReviewCardsRefreshWhenSourceLocationsChange()
     overview.setFedoraProjections({});
     QTRY_VERIFY(!refreshed.isEmpty());
     QCOMPARE(overview.m_reviewSourceLocationIndex, sourceLocations);
+}
+
+// Thoughts retires a card whose whole passage was removed from its note (an ordinary retire event
+// of origin thoughts-passage-check, which Sync brings). The Library says so once, above its tabs:
+// one card with Restore, several with Show; the card's History says who retired and restored it.
+void CommentsOverviewTest::testLibraryTellsOfCardsThoughtsRetired()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString shownPath = temporary.filePath(QStringLiteral("application-data/review-auto-retire-notices.json"));
+    Thoughts::LibraryProjectStore projects(temporary.path());
+    const QJsonObject document{{QStringLiteral("id"), QStringLiteral("grpo.pdf")}, {QStringLiteral("filename"), QStringLiteral("grpo.pdf")},
+                               {QStringLiteral("document_id"), QStringLiteral("aaaaaaaa-0000-4000-8000-00000000000b")}, {QStringLiteral("name"), QStringLiteral("GRPO")}};
+    const QJsonObject project{{QStringLiteral("id"), QStringLiteral("new:concepts")}, {QStringLiteral("name"), QStringLiteral("Concepts")},
+                              {QStringLiteral("documents"), QJsonArray{document}}, {QStringLiteral("revision"), 1}};
+    QVERIFY(projects.receive({{QStringLiteral("projects"), QJsonArray{project}}}).isEmpty());
+    QVERIFY(registerCatalogueProject(temporary.path(), project));
+    QStringList cardIds;
+    for (int index = 1; index <= 6; ++index) {
+        const QString cardId = QStringLiteral("00000000-0000-4000-8000-0000000000c%1").arg(index);
+        cardIds.append(cardId);
+        const QJsonObject card{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")}, {QStringLiteral("card_id"), cardId},
+                               {QStringLiteral("status"), QStringLiteral("approved")},
+                               {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("grpo")}, {QStringLiteral("pdf_sha256"), QString(64, QLatin1Char('a'))},
+                                                                       {QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{0.1, 0.2, 0.5, 0.4}},
+                                                                       {QStringLiteral("question"), QStringLiteral("Question %1?").arg(index)}}}};
+        QVERIFY(writeFile(temporary.filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)), QJsonDocument(card).toJson()));
+    }
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    // The server's events, as Sync brings them.
+    const auto serverEvent = [&temporary](const QString &cardId, const QString &action, const QDateTime &at) {
+        const QString eventId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QJsonObject event{{QStringLiteral("schema_version"), 3}, {QStringLiteral("event_id"), eventId}, {QStringLiteral("card_id"), cardId},
+                          {QStringLiteral("queue_action"), action}, {QStringLiteral("reviewed_at"), at.toString(Qt::ISODateWithMs)},
+                          {QStringLiteral("origin_id"), QStringLiteral("thoughts-passage-check")},
+                          {QStringLiteral("reason"), action == QLatin1String("retire") ? QStringLiteral("passage_removed") : QStringLiteral("passage_returned")}};
+        if (action == QLatin1String("retire"))
+            event.insert(QStringLiteral("passage_removed"), QJsonObject{{QStringLiteral("source_files"), QJsonArray{QStringLiteral("docs-concepts-a6fe5d/tex/source/grpo.tex")}},
+                                                                        {QStringLiteral("pdf"), QStringLiteral("grpo.pdf")}});
+        return writeFile(temporary.filePath(QStringLiteral("reviews/events/thoughts-passage-check/%1.json").arg(eventId)), QJsonDocument(event).toJson()) ? eventId : QString();
+    };
+    const auto cardOf = [&temporary](const QString &id) {
+        const auto cards = Thoughts::ReviewStore(temporary.path()).cards();
+        return *std::find_if(cards.cbegin(), cards.cend(), [&id](const Thoughts::ReviewCard &card) { return card.id() == id; });
+    };
+    const QString firstRetire = serverEvent(cardIds.at(0), QStringLiteral("retire"), now.addSecs(-3600));
+    QVERIFY(!firstRetire.isEmpty());
+
+    Thoughts::CommentsOverview overview(temporary.path());
+    auto *cards = overview.m_reviewCardsWidget;
+    cards->setAutoRetireNoticesPath(shownPath);
+    QSignalSpy read(cards, &Thoughts::ReviewCardsWidget::countsChanged);
+    overview.show();
+    KMessageWidget *notice = overview.m_autoRetireNotice;
+    QVERIFY(notice);
+    QTRY_VERIFY(notice->isVisible());
+    QCOMPARE(notice->text(), QStringLiteral("Thoughts retired the card “Question 1?”: its passage is no longer in GRPO."));
+    QVERIFY(notice->actions().contains(overview.m_autoRetireRestoreAction));
+    QVERIFY(!notice->actions().contains(overview.m_autoRetireShowAction));
+    QCOMPARE(overview.m_autoRetireRestoreAction->text(), QStringLiteral("Restore"));
+    QVERIFY(notice->isCloseButtonVisible());
+    // Remembered as shown; the retired card is out of the due count like any retired card.
+    QVERIFY(Thoughts::ReviewAutoRetire::shownNotices(shownPath).contains(firstRetire));
+    QCOMPARE(cards->dueCardCount(), 5);
+    // Read again: still one notice of one card.
+    read.clear();
+    overview.reloadReviewCards();
+    QTRY_VERIFY(!read.isEmpty());
+    QCOMPARE(overview.m_autoRetireNotices.size(), 1);
+    QVERIFY(notice->isVisible());
+    // The History says who retired it.
+    cards->selectCard(cardIds.at(0));
+    QTRY_VERIFY(cards->selectedBrowseCard() && cards->selectedBrowseCard()->card.id() == cardIds.at(0));
+    QTRY_VERIFY2(cards->m_browseHistory->toPlainText().contains(QStringLiteral("Retired by Thoughts: its passage was removed from the note · ")),
+                 qPrintable(cards->m_browseHistory->toPlainText()));
+
+    // A restart tells nothing again.
+    {
+        Thoughts::CommentsOverview restarted(temporary.path());
+        restarted.m_reviewCardsWidget->setAutoRetireNoticesPath(shownPath);
+        QSignalSpy restartedRead(restarted.m_reviewCardsWidget, &Thoughts::ReviewCardsWidget::countsChanged);
+        QSignalSpy told(restarted.m_reviewCardsWidget, &Thoughts::ReviewCardsWidget::retiredByThoughts);
+        restarted.show();
+        QTRY_VERIFY(!restartedRead.isEmpty());
+        QCOMPARE(told.count(), 0);
+        QVERIFY(restarted.m_autoRetireNotice->isHidden());
+    }
+
+    // Restore: the user's restore of this Mac; the notice goes.
+    overview.m_autoRetireRestoreAction->trigger();
+    QTRY_VERIFY(notice->isHidden());
+    QTRY_VERIFY(!cardOf(cardIds.at(0)).schedule.retired);
+    QVERIFY(!Thoughts::ReviewAutoRetire::isAutomatic(cardOf(cardIds.at(0)).history.constLast()));
+    QTRY_COMPARE(cards->dueCardCount(), 6);
+
+    // Several: the first three questions, and Show.
+    for (int index = 1; index < 5; ++index) QVERIFY(!serverEvent(cardIds.at(index), QStringLiteral("retire"), now.addSecs(-600 + index)).isEmpty());
+    // Older than a week when first seen: never told.
+    QVERIFY(!serverEvent(cardIds.at(5), QStringLiteral("retire"), now.addDays(-8).addSecs(-1)).isEmpty());
+    QSignalSpy told(cards, &Thoughts::ReviewCardsWidget::retiredByThoughts);
+    overview.reloadReviewCards();
+    QTRY_VERIFY(notice->isVisible());
+    QCOMPARE(told.count(), 1);
+    QCOMPARE(overview.m_autoRetireNotices.size(), 4);
+    QVERIFY(cardOf(cardIds.at(5)).schedule.retired);
+    QCOMPARE(cards->dueCardCount(), 1);
+    QCOMPARE(notice->text(), QStringLiteral("Thoughts retired 4 cards whose passages are no longer in their notes: “Question 2?”, “Question 3?”, “Question 4?” and 1 more."));
+    QVERIFY(notice->actions().contains(overview.m_autoRetireShowAction));
+    QVERIFY(!notice->actions().contains(overview.m_autoRetireRestoreAction));
+    // A card restored elsewhere leaves the notice (Thoughts restores it when its passage is back).
+    QVERIFY(!serverEvent(cardIds.at(4), QStringLiteral("restore"), now.addSecs(-60)).isEmpty());
+    overview.reloadReviewCards();
+    QTRY_COMPARE(overview.m_autoRetireNotices.size(), 3);
+    QCOMPARE(notice->text(), QStringLiteral("Thoughts retired 3 cards whose passages are no longer in their notes: “Question 2?”, “Question 3?”, “Question 4?”."));
+    QCOMPARE(cards->dueCardCount(), 2);
+    cards->selectCard(cardIds.at(4));
+    QTRY_VERIFY(cards->selectedBrowseCard() && cards->selectedBrowseCard()->card.id() == cardIds.at(4));
+    QTRY_VERIFY2(cards->m_browseHistory->toPlainText().contains(QStringLiteral("Restored by Thoughts: its passage is back · ")), qPrintable(cards->m_browseHistory->toPlainText()));
+    cards->selectCard(cardIds.at(0));
+    QTRY_VERIFY(cards->selectedBrowseCard() && cards->selectedBrowseCard()->card.id() == cardIds.at(0));
+    QTRY_VERIFY(cards->m_browseHistory->toPlainText().contains(QStringLiteral("Restored to review · ")));
+    // Show: Browse cards with the retired cards.
+    overview.m_autoRetireShowAction->trigger();
+    QTRY_VERIFY(notice->isHidden());
+    QCOMPARE(overview.m_tabs->currentWidget(), overview.m_reviewPage);
+    QCOMPARE(overview.m_reviewPage->currentWidget(), cards);
+    QCOMPARE(cards->m_browseStateFilter->currentData().toString(), QStringLiteral("retired"));
+    QVERIFY(overview.m_autoRetireNotices.isEmpty());
+    QCOMPARE(Thoughts::autoRetireNoticeText({}), QString());
+    // Two: both named.
+    Thoughts::ReviewAutoRetire::Notice first, second;
+    first.question = QStringLiteral("What does GRPO\nnormalise?");
+    second.question = QStringLiteral("Why a group baseline?");
+    QCOMPARE(Thoughts::autoRetireNoticeText({first, second}),
+             QStringLiteral("Thoughts retired 2 cards whose passages are no longer in their notes: “What does GRPO normalise?”, “Why a group baseline?”."));
 }
 
 // A Sync that starts or ends changes the Sync state of every document at once.
@@ -1814,6 +1970,54 @@ void CommentsOverviewTest::testProjectPagesCountBuiltDocuments()
     QCOMPARE(projectRow->toolTip(5), QStringLiteral("Pages of the built PDFs; 1 document is not built yet."));
 }
 
+void CommentsOverviewTest::testLibraryListsSourcedDocumentsFirst()
+{
+    // In a Project, the documents with a source (LaTeX, Markdown) come before imported PDFs, each
+    // in the Project's order; unpublished ones after, sourced first too (23 Nov 2026).
+    QTemporaryDir directory;
+    const QString root = directory.path();
+    const QString projectId = QStringLiteral("test-library-sources-first");
+    const QString folderId = QStringLiteral("10000000-0000-4000-8000-000000000001");
+    const QString path = Thoughts::ProjectConfiguration::path(root, projectId);
+    const QString folder = QDir(root).relativeFilePath(QFileInfo(path).path());
+    const QStringList ids{QStringLiteral("20000000-0000-4000-8000-000000000001"), QStringLiteral("20000000-0000-4000-8000-000000000002"),
+                          QStringLiteral("20000000-0000-4000-8000-000000000003"), QStringLiteral("20000000-0000-4000-8000-000000000004")};
+    QJsonArray declarations;
+    for (const QString &id : ids)
+        declarations.append(QJsonObject{{QStringLiteral("document_id"), id}, {QStringLiteral("format"), QStringLiteral("pdf")},
+            {QStringLiteral("included"), id < ids.at(2)}, {QStringLiteral("source"), QJsonObject{{QStringLiteral("folder_id"), folderId}, {QStringLiteral("path"), QString(id + QStringLiteral(".pdf"))}}}});
+    const QJsonObject manifest{{QStringLiteral("schema_version"), 5}, {QStringLiteral("kind"), QStringLiteral("thoughts-project")},
+        {QStringLiteral("id"), projectId}, {QStringLiteral("name"), QStringLiteral("Example")},
+        {QStringLiteral("default_folder_id"), folderId}, {QStringLiteral("source_folders"), QJsonArray{QJsonObject{
+            {QStringLiteral("folder_id"), folderId}, {QStringLiteral("path"), folder},
+            {QStringLiteral("document_id"), QStringLiteral("30000000-0000-4000-8000-000000000001")}}}},
+        {QStringLiteral("documents"), declarations}};
+    QVERIFY(Thoughts::ProjectConfiguration::save(path, manifest).isEmpty());
+    const auto entry = [&](int index, const QString &name, const QString &source, bool published = true) {
+        QJsonObject doc{{QStringLiteral("document_id"), ids.at(index)}, {QStringLiteral("id"), ids.at(index)}, {QStringLiteral("name"), name},
+                        {QStringLiteral("filename"), QString(name + QStringLiteral(".pdf"))}, {QStringLiteral("page_count"), 1}};
+        // As the server lists them: a note has its source file, an imported PDF is marked imported.
+        if (!source.isEmpty()) doc.insert(QStringLiteral("source_file"), source);
+        else doc.insert(QStringLiteral("imported"), true);
+        if (!published) doc.insert(QStringLiteral("published"), false);
+        return doc;
+    };
+    const QJsonObject project{{QStringLiteral("id"), projectId}, {QStringLiteral("name"), QStringLiteral("Example")},
+        {QStringLiteral("documents"), QJsonArray{entry(0, QStringLiteral("Imported paper"), QString()), entry(1, QStringLiteral("My note"), QStringLiteral("docs-x/tex/source/note.tex"))}},
+        {QStringLiteral("unpublished_documents"), QJsonArray{entry(2, QStringLiteral("Old paper"), QString(), false), entry(3, QStringLiteral("Old note"), QStringLiteral("docs-x/tex/source/old.tex"), false)}}};
+    QVERIFY(writeFile(root + QStringLiteral("/.thoughts/library-projects.json"), QJsonDocument(QJsonObject{
+        {QStringLiteral("projects"), QJsonArray{project}}}).toJson()));
+    Thoughts::CommentsOverview overview(root);
+    overview.m_catalogPollTimer->stop();
+    overview.updateLibraryTree();
+    auto *tree = overview.m_libraryTree;
+    QCOMPARE(tree->topLevelItemCount(), 1);
+    auto *documents = tree->topLevelItem(0)->child(0);
+    QStringList names;
+    for (int row = 0; row < documents->childCount(); ++row) names.append(documents->child(row)->text(0));
+    QCOMPARE(names, (QStringList{QStringLiteral("My note"), QStringLiteral("Imported paper"), QStringLiteral("Old note"), QStringLiteral("Old paper")}));
+}
+
 void CommentsOverviewTest::testLibraryMetadataColumns()
 {
     QTemporaryDir directory;
@@ -2147,9 +2351,22 @@ void CommentsOverviewTest::testLibraryHeaderColumnsMenu()
         QCOMPARE(libraryColumns(tree).first, (QStringList{QStringLiteral("Project"), QStringLiteral("Pages"), QStringLiteral("Date"),
             QStringLiteral("Size"), QStringLiteral("Files"), QStringLiteral("Review cards"), QStringLiteral("Due cards")}));
         QCOMPARE(tree->header()->sortIndicatorSection(), 0);
-        QCOMPARE(tree->header()->sectionResizeMode(0), QHeaderView::Stretch);
-        QCOMPARE(tree->header()->sectionResizeMode(9), QHeaderView::ResizeToContents);
+        // Every column can be resized (20 Nov 2026); the last shown one takes what is left.
+        for (int column = 0; column < tree->header()->count(); ++column) QCOMPARE(tree->header()->sectionResizeMode(column), QHeaderView::Interactive);
+        QVERIFY(tree->header()->stretchLastSection());
         QVERIFY(!tree->header()->isFirstSectionMovable());
+        // A width the user sets is saved and comes back on the next start; so does Project's.
+        const QByteArray beforeResize = saved();
+        tree->header()->resizeSection(1, 173);
+        tree->header()->resizeSection(0, 241);
+        QTRY_VERIFY(saved() != beforeResize);
+        {
+            Thoughts::CommentsOverview again(root);
+            again.m_catalogPollTimer->stop();
+            again.updateLibraryTree();
+            QCOMPARE(again.m_libraryTree->header()->sectionSize(1), 173);
+            QCOMPARE(again.m_libraryTree->header()->sectionSize(0), 241);
+        }
         // Restore default columns brings back the default order and columns and forgets the saved ones.
         withLibraryHeaderMenu(overview, [](QMenu *menu) {
             QVERIFY(menuAction(menu, QStringLiteral("Due cards"))->isChecked());
@@ -3408,7 +3625,7 @@ void CommentsOverviewTest::testLibrarySummarySaysLoadingUntilFirstLoad()
     QVERIFY(!summary->text().startsWith(QStringLiteral("0 entries")));
 }
 
-void CommentsOverviewTest::testProjectMenuCopiesProjectName()
+void CommentsOverviewTest::testProjectMenuHasNoCopyProjectName()
 {
     QTemporaryDir temporary;
     Thoughts::LibraryProjectStore store(temporary.path());
@@ -3424,21 +3641,17 @@ void CommentsOverviewTest::testProjectMenuCopiesProjectName()
     auto *tree = overview.findChild<QTreeWidget *>(QStringLiteral("thoughtsOverviewLibraryTree"));
     QVERIFY(tree);
     QTRY_COMPARE(tree->topLevelItemCount(), 1);
-    QGuiApplication::clipboard()->clear();
     QStringList labels;
     QTimer::singleShot(0, &overview, [&] {
         auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
         QVERIFY(menu);
         QTimer::singleShot(3000, menu, &QMenu::close);
         for (auto *action : menu->actions()) labels.append(action->text());
-        auto *copy = menu->findChild<QAction *>(QStringLiteral("libraryCopyProjectNameAction"));
-        QVERIFY(copy);
-        copy->trigger();
         menu->close();
     });
     overview.showLibraryItemContextMenu(tree->topLevelItem(0), tree, {}, true);
-    QVERIFY2(labels.indexOf(QStringLiteral("Copy project name")) == labels.indexOf(QStringLiteral("Rename…")) + 1, qPrintable(labels.join(QLatin1Char('|'))));
-    QCOMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("Benchmark-Conf"));
+    // A Project's menu has Rename… but no Copy project name.
+    QVERIFY2(labels.contains(QStringLiteral("Rename…")) && !labels.contains(QStringLiteral("Copy project name")), qPrintable(labels.join(QLatin1Char('|'))));
 }
 
 // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow, as a
@@ -5038,7 +5251,8 @@ void CommentsOverviewTest::testSourceProjectCatalogueOrder()
             QVERIFY(details->text().contains(QStringLiteral("2402.pdf")));
         }
     }
-    const QStringList expected {first, second, imported, anotherImport, local};
+    // Documents with a source first (also one not built yet), then imported PDFs, each in the Project's order.
+    const QStringList expected {first, second, local, imported, anotherImport};
     for (const int column : {0, 3}) {
         for (const Qt::SortOrder direction : {Qt::AscendingOrder, Qt::DescendingOrder}) {
             tree->sortItems(column, direction);
@@ -5050,7 +5264,8 @@ void CommentsOverviewTest::testSourceProjectCatalogueOrder()
     QVERIFY(store.enqueue(QStringLiteral("order"), project, {{QStringLiteral("documents"), QJsonArray {anotherImport, second, imported, first, local}}}).isEmpty());
     QCOMPARE(store.pending().last().toObject().value(QStringLiteral("project_id")).toString(), projectId);
     overview.reload();
-    QTRY_COMPARE(order(), (QStringList {anotherImport, second, imported, first, local}));
+    // The new order holds within each group: sources (second, first, local), then imports (anotherImport, imported).
+    QTRY_COMPARE(order(), (QStringList {second, first, local, anotherImport, imported}));
     QVERIFY(store.receive({{QStringLiteral("projects"), QJsonArray {project}}}, store.pending().last().toObject().value(QStringLiteral("operation_id")).toString()).isEmpty());
     // Keep a desktop reorder of the Project configuration visible before explicit Sync, with local additions.
     const QString configurationPath = Thoughts::ProjectConfiguration::path(root, projectId);
@@ -5063,13 +5278,13 @@ void CommentsOverviewTest::testSourceProjectCatalogueOrder()
     configuration.insert(QStringLiteral("documents"), reordered);
     QVERIFY(Thoughts::ProjectConfiguration::save(configurationPath, configuration).isEmpty());
     overview.reload();
-    QTRY_COMPARE(order(), (QStringList {imported, first, second, anotherImport, local}));
+    QTRY_COMPARE(order(), (QStringList {first, second, local, imported, anotherImport}));
     // Sorting by build date keeps the Documents group and the Project order.
     QCOMPARE(tree->headerItem()->text(1), QStringLiteral("Date"));
     for (const Qt::SortOrder direction : {Qt::DescendingOrder, Qt::AscendingOrder}) {
         tree->sortItems(1, direction);
         QCOMPARE(tree->topLevelItem(0)->child(0)->text(0), QStringLiteral("Documents"));
-        QCOMPARE(order(), (QStringList {imported, first, second, anotherImport, local}));
+        QCOMPARE(order(), (QStringList {first, second, local, imported, anotherImport}));
     }
 }
 
@@ -8781,13 +8996,23 @@ void CommentsOverviewTest::testServerDialogSavesAddress()
     qunsetenv("THOUGHTS_SERVER_URL");
 
     Thoughts::CommentsOverview overview(temporary.path());
+    QSignalSpy reconnected(&overview, &Thoughts::CommentsOverview::serverConnectionChanged);
     overview.showServerDetails();
     auto *dialog = overview.findChild<QDialog *>(QStringLiteral("thoughtsOverviewFedoraDetailsDialog"));
     QVERIFY(dialog);
+    // The address and the device token wait behind "Use a device token instead".
+    auto *useToken = dialog->findChild<QToolButton *>(QStringLiteral("thoughtsOverviewServerUseToken"));
+    auto *tokenFields = dialog->findChild<QWidget *>(QStringLiteral("thoughtsOverviewServerTokenFields"));
+    QVERIFY(useToken && tokenFields);
+    QCOMPARE(useToken->text(), QStringLiteral("Use a device token instead"));
+    QVERIFY(tokenFields->isHidden());
+    useToken->click();
+    QVERIFY(!tokenFields->isHidden());
     auto *address = dialog->findChild<QLineEdit *>(QStringLiteral("thoughtsOverviewServerAddress"));
     auto *save = dialog->findChild<QPushButton *>(QStringLiteral("thoughtsOverviewServerAddressSave"));
     auto *status = dialog->findChild<QLabel *>(QStringLiteral("thoughtsOverviewServerAddressStatus"));
     QVERIFY(address && save && status);
+    QVERIFY(tokenFields->isAncestorOf(address));
     QCOMPARE(address->text(), previous);
     QVERIFY(!address->isReadOnly());
     QVERIFY(!save->isEnabled());
@@ -8805,7 +9030,10 @@ void CommentsOverviewTest::testServerDialogSavesAddress()
     QCOMPARE(Thoughts::ServerAddress::saved(), QStringLiteral("https://thoughts.example.org"));
     QCOMPARE(address->text(), QStringLiteral("https://thoughts.example.org"));
     QVERIFY(!save->isEnabled());
-    QCOMPARE(status->text(), QStringLiteral("Saved. Quit and reopen Thoughts to connect to https://thoughts.example.org."));
+    QCOMPARE(status->text(), QStringLiteral("Saved. Thoughts now connects to https://thoughts.example.org."));
+    // Connected at once, without quitting.
+    QCOMPARE(reconnected.size(), 1);
+    QCOMPARE(dialog->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountAddress"))->text(), QStringLiteral("Server: https://thoughts.example.org"));
     dialog->close();
     delete dialog;
 
@@ -8859,9 +9087,11 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
         storedToken = token;
         return true;
     });
+    QSignalSpy reconnected(&overview, &Thoughts::CommentsOverview::serverConnectionChanged);
     overview.showServerDetails();
     auto *dialog = overview.findChild<QDialog *>(QStringLiteral("thoughtsOverviewFedoraDetailsDialog"));
     QVERIFY(dialog);
+    dialog->findChild<QToolButton *>(QStringLiteral("thoughtsOverviewServerUseToken"))->click();
     auto *address = dialog->findChild<QLineEdit *>(QStringLiteral("thoughtsOverviewServerAddress"));
     auto *save = dialog->findChild<QPushButton *>(QStringLiteral("thoughtsOverviewServerAddressSave"));
     auto *status = dialog->findChild<QLabel *>(QStringLiteral("thoughtsOverviewServerAddressStatus"));
@@ -8886,7 +9116,7 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     address->clear();
     QTest::keyClicks(address, second);
     QTest::mouseClick(save, Qt::LeftButton);
-    QCOMPARE(status->text(), QStringLiteral("Saved. Quit and reopen Thoughts to connect to https://second.example.org."));
+    QCOMPARE(status->text(), QStringLiteral("Saved. Thoughts now connects to https://second.example.org."));
     QVERIFY(!tokenStatus->isHidden());
     QVERIFY(!tokenRow->isHidden());
     QCOMPARE(tokenStatus->text(), QStringLiteral("This computer's device token was issued for https://first.example.org and is not sent to https://second.example.org. "
@@ -8907,7 +9137,9 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     QCOMPARE(storedAccount, account);
     QCOMPARE(storedToken, QByteArray("token-two"));
     QVERIFY(tokenRow->isHidden());
-    QCOMPARE(tokenStatus->text(), QStringLiteral("Stored the device token of https://second.example.org. Quit and reopen Thoughts to connect."));
+    QCOMPARE(tokenStatus->text(), QStringLiteral("Stored the device token of https://second.example.org. Thoughts connects with it now."));
+    // Two saved addresses and the stored token: each connects at once.
+    QCOMPARE(reconnected.size(), 3);
     QVERIFY(token->text().isEmpty());
     QVERIFY(Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-two", second));
     QVERIFY(!Thoughts::ServerAddress::tokenMayBeSentTo(account, "token-two", first));
@@ -8924,6 +9156,76 @@ void CommentsOverviewTest::testServerDialogAsksForTheTokenOfAnotherServer()
     QCOMPARE(tokenStatus->text(), QStringLiteral("This computer's device token was issued for https://second.example.org and is not sent to https://third.example.org. "
                                                  "Give the token for this session in THOUGHTS_TOKEN."));
     QVERIFY(dialog->findChild<QWidget *>(QStringLiteral("thoughtsOverviewServerTokenRow"))->isHidden());
+    dialog->close();
+    delete dialog;
+}
+
+void CommentsOverviewTest::testServerDialogOffersSignIn()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString store = Thoughts::ServerAddress::storePath();
+    QFile::remove(store);
+    const bool hadServer = qEnvironmentVariableIsSet("THOUGHTS_SERVER_URL");
+    const QByteArray previousServer = qgetenv("THOUGHTS_SERVER_URL");
+    const auto restore = qScopeGuard([hadServer, previousServer, store] {
+        if (hadServer) {
+            qputenv("THOUGHTS_SERVER_URL", previousServer);
+        } else {
+            qunsetenv("THOUGHTS_SERVER_URL");
+        }
+        QFile::remove(store);
+    });
+    qunsetenv("THOUGHTS_SERVER_URL");
+    QVERIFY(Thoughts::ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+
+    Thoughts::CommentsOverview overview(temporary.path());
+    QHash<QString, QByteArray> secrets;
+    Thoughts::AppSignIn::Hooks hooks;
+    hooks.writeToken = [&secrets](const QString &account, const QByteArray &token, QString *) {
+        secrets.insert(account, token);
+        return true;
+    };
+    hooks.readToken = [&secrets](const QString &account, const QString &) {
+        return secrets.value(account);
+    };
+    hooks.removeToken = [&secrets](const QString &account, QString *) {
+        secrets.remove(account);
+        return true;
+    };
+    overview.setServerAccountHooks(hooks);
+    QSignalSpy reconnected(&overview, &Thoughts::CommentsOverview::serverConnectionChanged);
+    overview.showServerDetails();
+    auto *dialog = overview.findChild<QDialog *>(QStringLiteral("thoughtsOverviewFedoraDetailsDialog"));
+    QVERIFY(dialog);
+    auto *state = dialog->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountState"));
+    auto *signIn = dialog->findChild<QPushButton *>(QStringLiteral("thoughtsServerAccountSignIn"));
+    QVERIFY(state && signIn);
+    QCOMPARE(dialog->findChild<QLabel *>(QStringLiteral("thoughtsServerAccountAddress"))->text(), QStringLiteral("Server: https://thoughts.example.org"));
+    QCOMPARE(state->text(), QStringLiteral("Not signed in."));
+    QCOMPARE(signIn->text(), QStringLiteral("Sign In…"));
+
+    // Sign In… opens Sign In over the Server dialog, which would otherwise block it.
+    signIn->click();
+    auto *signInDialog = overview.findChild<Thoughts::SignInDialog *>(QStringLiteral("thoughtsSignInDialog"));
+    QVERIFY(signInDialog);
+    QCOMPARE(signInDialog->parentWidget(), dialog);
+    QVERIFY(signInDialog->isVisible());
+    QCOMPARE(signInDialog->findChild<QLineEdit *>(QStringLiteral("thoughtsSignInServer"))->text(), QStringLiteral("https://thoughts.example.org"));
+
+    // A link while it is open fills the same dialog.
+    overview.showSignIn(Thoughts::AppSignIn::ConnectLink {QStringLiteral("https://other.example.org"), QStringLiteral("alex"), QStringLiteral("abc")});
+    QCOMPARE(overview.findChildren<Thoughts::SignInDialog *>().size(), 1);
+    QVERIFY(signInDialog->inviteMode());
+    QCOMPARE(signInDialog->findChild<QLineEdit *>(QStringLiteral("thoughtsSignInServer"))->text(), QStringLiteral("https://other.example.org"));
+
+    // Signed in: the app connects at once and the Server dialog says so.
+    secrets.insert(Thoughts::Platform::desktopDeviceAccount(), "app-token");
+    Q_EMIT signInDialog->signedIn(QStringLiteral("https://thoughts.example.org"), QStringLiteral("alex"));
+    QCOMPARE(reconnected.size(), 1);
+    QCOMPARE(state->text(), QStringLiteral("Signed in."));
+    QCOMPARE(signIn->text(), QStringLiteral("Sign In to Another Server…"));
+    signInDialog->close();
     dialog->close();
     delete dialog;
 }
@@ -11130,6 +11432,47 @@ void CommentsOverviewTest::testShiftSelectsCommentRange()
     QTRY_VERIFY(details->isVisible());
 }
 
+void CommentsOverviewTest::testSmallWindowKeepsTheCommentListAndMovableDividers()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.path();
+    QVERIFY(writeFile(root + QStringLiteral("/comments/.layout/alpha.json"), QJsonDocument(layout(QStringLiteral("alpha"))).toJson()));
+    QVERIFY(writeFile(root + QStringLiteral("/current_pdfs/alpha.pdf"), QByteArrayLiteral("placeholder")));
+    QVERIFY(writeFile(root + QStringLiteral("/comments/alpha_comments.jsonl"),
+                      jsonLine(comment(QStringLiteral("first"), QStringLiteral("First comment"), 1, QStringLiteral("2026-07-30T08:00:00Z"), QStringLiteral("anchored")))));
+
+    Thoughts::CommentsOverview overview(root);
+    overview.resize(1000, 700);
+    overview.show();
+    QTRY_COMPARE(overview.commentCount(), 1);
+    auto *table = overview.findChild<QTreeView *>(QStringLiteral("commentsOverviewTable"));
+    auto *details = overview.findChild<QWidget *>(QStringLiteral("commentsOverviewDetails"));
+    auto *contentSplitter = overview.findChild<QSplitter *>(QStringLiteral("commentsOverviewContentSplitter"));
+    QVERIFY(table && details && contentSplitter);
+    const QModelIndex first = table->model()->index(0, 0);
+    QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier, table->visualRect(first).intersected(table->viewport()->rect()).center());
+    QTRY_VERIFY(details->isVisible());
+    // The widest set of buttons the panel shows, for a proposal removed outside Thoughts
+    // (18 Nov: the list was squeezed to "Your comm" beside it, and no divider moved).
+    for (const char *name : {"commentsOverviewUndo", "commentsOverviewRedo", "commentsOverviewCopyProposal", "commentsOverviewDismissProposal", "commentsOverviewRestoreProposal"}) {
+        auto *button = overview.findChild<QPushButton *>(QString::fromLatin1(name));
+        QVERIFY2(button, name);
+        button->show();
+    }
+    QApplication::processEvents();
+    QTRY_VERIFY2(table->width() >= 260, qPrintable(QStringLiteral("Comment list %1 px wide").arg(table->width())));
+    // The divider between the list and the details moves both ways.
+    const int total = contentSplitter->sizes().value(0) + contentSplitter->sizes().value(1);
+    contentSplitter->setSizes({total - details->minimumSizeHint().width(), details->minimumSizeHint().width()});
+    QApplication::processEvents();
+    const int wide = table->width();
+    contentSplitter->setSizes({260, total - 260});
+    QApplication::processEvents();
+    QVERIFY2(wide > table->width() + 40, qPrintable(QStringLiteral("list %1 then %2 px").arg(wide).arg(table->width())));
+    QVERIFY(details->minimumSizeHint().width() < 420);
+}
+
 void CommentsOverviewTest::testStartupCombinesLibraryLoads()
 {
     QTemporaryDir temporary;
@@ -11139,7 +11482,7 @@ void CommentsOverviewTest::testStartupCombinesLibraryLoads()
     options.captureStacks = false;
     Thoughts::DeveloperLog log(options);
     Thoughts::CommentsOverview overview(temporary.path());
-    overview.m_catalogPollTimer->setInterval(25);
+    overview.m_catalogCheckDelayMs = 25;
     const QJsonObject note {{QStringLiteral("schema_version"), 1},
                             {QStringLiteral("comment_id"), QStringLiteral("startup-note")},
                             {QStringLiteral("thread_root_id"), QStringLiteral("startup-note")},
@@ -11224,6 +11567,496 @@ void CommentsOverviewTest::testCatalogueChangeDuringAFullReloadOfIt()
     QTRY_COMPARE(eventCount(QStringLiteral("library.reload.queued")), loads + 3);
     QCOMPARE(eventCount(QStringLiteral("library.reload.covered")), 1);
     QTRY_VERIFY(!overview.m_fullReloadRunning);
+}
+
+#ifdef Q_OS_MACOS
+// The APFS clone ID (getattrlist(2), ATTR_CMNEXT_CLONEID); empty where the volume has none.
+static QString fileCloneIdForTest(const QString &path)
+{
+    struct Reply {
+        quint32 length;
+        attribute_set_t returned;
+        quint64 cloneId;
+    } __attribute__((aligned(4), packed));
+    attrlist request {};
+    request.bitmapcount = ATTR_BIT_MAP_COUNT;
+    request.commonattr = ATTR_CMN_RETURNED_ATTRS;
+    request.forkattr = ATTR_CMNEXT_CLONEID;
+    Reply reply {};
+    if (::getattrlist(QFile::encodeName(path).constData(), &request, &reply, sizeof(reply), FSOPT_ATTR_CMN_EXTENDED) != 0
+        || !(reply.returned.forkattr & ATTR_CMNEXT_CLONEID) || reply.cloneId == 0)
+        return {};
+    return QString::number(reply.cloneId);
+}
+#endif
+
+// A Library as Sync leaves it, in small: the index and generation manifest,
+// two documents built from a source with a live proposal, two imported PDFs
+// with comments, review resolutions and a layout.
+static bool writeLibraryFixture(const QString &root)
+{
+    const QStringList built {QStringLiteral("alpha.pdf"), QStringLiteral("beta.pdf")};
+    const QStringList imported {QStringLiteral("gamma.pdf"), QStringLiteral("delta.pdf")};
+    QJsonArray entries, publications;
+    for (const QString &filename : built + imported) {
+        const QByteArray bytes = QStringLiteral("%PDF-1.7 %1").arg(filename).toUtf8();
+        if (!writeFile(root + QStringLiteral("/current_pdfs/") + filename, bytes)) return false;
+        const QString digest = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        const bool source = built.contains(filename);
+        entries.append(QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("kind"), source ? QStringLiteral("source_linked") : QStringLiteral("unlinked")},
+                                    {QStringLiteral("pdf_sha256"), digest}, {QStringLiteral("project"), source ? QStringLiteral("docs-test") : QString()},
+                                    {QStringLiteral("display_name"), QFileInfo(filename).completeBaseName().toUpper()},
+                                    {QStringLiteral("published_at"), QStringLiteral("2026-11-01T10:00:00Z")}});
+        publications.append(QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("sha256"), digest}, {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("page_count"), 1}}}});
+    }
+    const QString sourceIndex(64, QLatin1Char('c'));
+    const QString revision(64, QLatin1Char('d'));
+    const QByteArray source = QByteArrayLiteral(
+        "\\section{Fixture}\nBefore \\agentProposedEdit[created=2026-10-10T12:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]"
+        "{fixture-proposal}{Use the current wording.}{old version}{new version} after.\n");
+    QByteArray resolutions = jsonLine(comment(QStringLiteral("resolved-elsewhere"), QStringLiteral("Resolved"), 1, QStringLiteral("2026-10-01T08:00:00Z"), QStringLiteral("anchored")));
+    return writeFile(root + QStringLiteral("/current_pdfs/.thoughts-library-index.json"), QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1},
+                         {QStringLiteral("library_revision"), revision}, {QStringLiteral("source_index_sha256"), sourceIndex}, {QStringLiteral("pdfs"), entries}}).toJson())
+        && writeFile(root + QStringLiteral("/current_pdfs/.thoughts-generation.json"), QJsonDocument(QJsonObject {{QStringLiteral("library_revision"), revision},
+                         {QStringLiteral("source_index_sha256"), sourceIndex}, {QStringLiteral("publications"), publications}}).toJson())
+        && writeFile(root + QStringLiteral("/docs-test/tex/source/main.tex"), source)
+        && writeFile(root + QStringLiteral("/docs-test/.ThoughtIgnore"), QByteArrayLiteral("build/\n*.log\n"))
+        && registerSourceProject(root, QStringLiteral("a2e1f9d4-3c55-4d8e-9a0b-6f1e2d3c4b5a"), QStringLiteral("Fixture"), {QStringLiteral("docs-test")})
+        && writeAgentEditProposalBundle(root, QStringLiteral("alpha.pdf"), QStringLiteral("fixture-proposal"), QStringLiteral("old version"), QStringLiteral("new version"), true)
+        && writeReviewCommentBundle(root, QStringLiteral("beta.pdf"), QJsonArray())
+        && writeFile(root + QStringLiteral("/comments/gamma_comments.jsonl"), jsonLine(comment(QStringLiteral("gamma-1"), QStringLiteral("First note"), 1, QStringLiteral("2026-10-02T08:00:00Z"), QStringLiteral("anchored"))))
+        && writeFile(root + QStringLiteral("/comments/delta_comments.jsonl"), jsonLine(comment(QStringLiteral("delta-1"), QStringLiteral("Other note"), 1, QStringLiteral("2026-10-02T09:00:00Z"), QStringLiteral("anchored"))))
+        && writeFile(root + QStringLiteral("/comments/review_resolutions.jsonl"), resolutions)
+        && writeFile(root + QStringLiteral("/comments/.layout/delta.json"), QJsonDocument(layout(QStringLiteral("delta"))).toJson());
+}
+
+static const Thoughts::TrackedComment *findComment(const QList<Thoughts::TrackedCommentDocument> &documents, const QString &id)
+{
+    for (const auto &document : documents)
+        for (const auto &comment : document.comments)
+            if (comment.id == id) return &comment;
+    return nullptr;
+}
+
+// The Library re-read every file of every document on each load: the Library
+// index once per PDF, each sidecar with the shared review resolutions, each
+// source pointer, project settings and sources (19 Nov: 3 to 21 s per load on a
+// computer that scans every file opened). A second load with nothing changed
+// now opens none of them, returns the same documents, and a changed file is
+// read again.
+void CommentsOverviewTest::testUnchangedLibraryIsNotReadAgain()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.path();
+    Thoughts::DeveloperLog::Options options;
+    options.directory = temporary.filePath(QStringLiteral("logs"));
+    options.captureStacks = false;
+    Thoughts::DeveloperLog log(options);
+    QVERIFY(writeLibraryFixture(root));
+
+    bool valid = false;
+    const auto first = Thoughts::loadTrackedCommentDocuments(root, {}, &valid, {}, true);
+    QVERIFY(valid);
+    QCOMPARE(first.size(), 4);
+    QVERIFY(findComment(first, QStringLiteral("fixture-proposal")));
+    QVERIFY(findComment(first, QStringLiteral("gamma-1")));
+    QVERIFY(findComment(first, QStringLiteral("delta-1")));
+
+    // A file the Library does not read changes nothing.
+    QVERIFY(writeFile(root + QStringLiteral("/docs-test/notes.log"), QByteArrayLiteral("unrelated\n")));
+    for (bool discovery : {true, false}) {
+        const Thoughts::FileReadCounts before = Thoughts::fileReadCounts();
+        const auto again = Thoughts::loadTrackedCommentDocuments(root, {}, &valid, {}, discovery);
+        const Thoughts::FileReadCounts reads = Thoughts::fileReadCounts() - before;
+        QVERIFY(valid);
+        QVERIFY(again == first);
+        QCOMPARE(reads.reads, 0);
+        QCOMPARE(reads.pdfHashes, 0);
+        QVERIFY(reads.hits > 0);
+    }
+    // The developer log tells: the last load read nothing, per stage and in all.
+    QJsonObject finished;
+    QJsonArray stages;
+    for (const QJsonValue &value : Thoughts::DeveloperLog::performanceEvents()) {
+        const QJsonObject event = value.toObject();
+        if (event.value(QStringLiteral("event")) == QLatin1String("library.load.finished")) finished = event.value(QStringLiteral("data")).toObject();
+        if (event.value(QStringLiteral("event")) == QLatin1String("library.load.stage")
+            && event.value(QStringLiteral("data")).toObject().value(QStringLiteral("load_id")) == finished.value(QStringLiteral("load_id")))
+            stages.append(event.value(QStringLiteral("data")));
+    }
+    QVERIFY(finished.contains(QStringLiteral("files_read")));
+    QCOMPARE(finished.value(QStringLiteral("files_read")).toInteger(), 0);
+    QVERIFY(finished.value(QStringLiteral("cache_hits")).toInteger() > 0);
+
+    // An edit in place to the same size, one atomic replacement and a new
+    // proposal: read again, and only they.
+    QJsonObject edited = comment(QStringLiteral("gamma-1"), QStringLiteral("Final note"), 1, QStringLiteral("2026-10-02T08:00:00Z"), QStringLiteral("anchored"));
+    QVERIFY(writeFile(root + QStringLiteral("/comments/gamma_comments.jsonl"), jsonLine(edited)));
+    QSaveFile layoutFile(root + QStringLiteral("/comments/.layout/delta.json"));
+    QVERIFY(layoutFile.open(QIODevice::WriteOnly));
+    layoutFile.write(QJsonDocument(QJsonObject {{QStringLiteral("version"), 1}, {QStringLiteral("sources"), QJsonArray()}}).toJson());
+    QVERIFY(layoutFile.commit());
+    const QString source = root + QStringLiteral("/docs-test/tex/source/main.tex");
+    QVERIFY(writeFile(source, readFile(source) + QByteArrayLiteral(
+        "\\agentProposedEdit[created=2026-10-11T12:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]{fixture-second}{Second.}{this}{that}\n")));
+    const Thoughts::FileReadCounts before = Thoughts::fileReadCounts();
+    const auto changed = Thoughts::loadTrackedCommentDocuments(root, {}, &valid, {}, true);
+    const Thoughts::FileReadCounts reads = Thoughts::fileReadCounts() - before;
+    QVERIFY(reads.reads > 0);
+    QCOMPARE(reads.pdfHashes, 0);
+    QVERIFY(findComment(changed, QStringLiteral("gamma-1")));
+    QCOMPARE(findComment(changed, QStringLiteral("gamma-1"))->contents, QStringLiteral("Final note"));
+    QVERIFY(findComment(changed, QStringLiteral("fixture-second")));
+    const auto delta = std::find_if(changed.cbegin(), changed.cend(), [](const auto &document) { return document.stem == QLatin1String("delta"); });
+    QVERIFY(delta != changed.cend());
+    // The layout without sources is no longer valid (readLayout()).
+    QVERIFY(delta->state != Thoughts::TrackedCommentDocument::SourceLinked);
+    // The same as a reader without anything kept would see.
+    Thoughts::clearFileIdentityCaches();
+    QVERIFY(Thoughts::loadTrackedCommentDocuments(root, {}, &valid, {}, true) == changed);
+}
+
+// Each Library generation clones the PDFs it keeps from the one before, so all
+// of them had a new inode after every Sync and were read whole again to check
+// their SHA-256 (49 MB per load on 19 Nov). A pure clone of a checked PDF keeps
+// its digest; a clone changed afterwards is checked again.
+void CommentsOverviewTest::testClonedLibraryPdfKeepsItsDigest()
+{
+#ifndef Q_OS_MACOS
+    QSKIP("APFS clones");
+#else
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.path();
+    const QString first = root + QStringLiteral("/.thoughts-library-stage-") + QString(64, QLatin1Char('1'));
+    const QString second = root + QStringLiteral("/.thoughts-library-stage-") + QString(64, QLatin1Char('2'));
+    QVERIFY(QDir().mkpath(first));
+    QVERIFY(QFile::link(first, root + QStringLiteral("/current_pdfs")));
+    const QByteArray pdf = QByteArray("%PDF-1.7 ") + QByteArray(64 * 1024, 'p');
+    const QString pdfSha256 = QString::fromLatin1(QCryptographicHash::hash(pdf, QCryptographicHash::Sha256).toHex());
+    QVERIFY(writeFile(first + QStringLiteral("/paper.pdf"), pdf));
+    const QByteArray index = QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1}, {QStringLiteral("pdfs"), QJsonArray {QJsonObject {
+        {QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("kind"), QStringLiteral("source_linked")}, {QStringLiteral("pdf_sha256"), pdfSha256},
+        {QStringLiteral("project"), QStringLiteral("docs-test")}}}}}).toJson();
+    QVERIFY(writeFile(first + QStringLiteral("/.thoughts-library-index.json"), index));
+    // The source artifact that describes this exact PDF: one segment.
+    const QJsonObject artifact {{QStringLiteral("schema_version"), 1}, {QStringLiteral("kind"), QStringLiteral("thoughts-document-source-artifact")},
+        {QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("sources"), QJsonArray()},
+        {QStringLiteral("agent_proposals"), QJsonArray()}, {QStringLiteral("proposal_objects"), QJsonArray()},
+        {QStringLiteral("pdf"), QJsonObject {{QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("pdf_sha256"), pdfSha256}, {QStringLiteral("page_count"), 1},
+            {QStringLiteral("segments"), QJsonArray {QJsonObject {{QStringLiteral("source_id"), QStringLiteral("docs-test/tex/source/main.tex")}, {QStringLiteral("start_page"), 1}, {QStringLiteral("page_count"), 1}}}}}}};
+    const QByteArray artifactBytes = QJsonDocument(artifact).toJson(QJsonDocument::Compact);
+    const QString artifactSha256 = QString::fromLatin1(QCryptographicHash::hash(artifactBytes, QCryptographicHash::Sha256).toHex());
+    const QString bundle = root + QStringLiteral("/.runtime/target/source-bundle");
+    QVERIFY(writeFile(bundle + QStringLiteral("/objects/") + artifactSha256, artifactBytes));
+    QVERIFY(writeFile(bundle + QStringLiteral("/documents/paper.pdf.json"), QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1},
+        {QStringLiteral("artifact_sha256"), artifactSha256}, {QStringLiteral("filename"), QStringLiteral("paper.pdf")}, {QStringLiteral("pdf_sha256"), pdfSha256}}).toJson()));
+    QVERIFY(QFile::setPermissions(first + QStringLiteral("/paper.pdf"), QFileDevice::ReadOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther));
+
+    const auto load = [&root](qint64 *hashed) {
+        const Thoughts::FileReadCounts before = Thoughts::fileReadCounts();
+        const auto documents = Thoughts::loadTrackedCommentDocuments(root);
+        *hashed = (Thoughts::fileReadCounts() - before).pdfHashes;
+        return documents;
+    };
+    qint64 hashed = 0;
+    const auto checked = load(&hashed);
+    QCOMPARE(checked.size(), 1);
+    QCOMPARE(checked.constFirst().librarySegments.size(), 1);
+    QCOMPARE(hashed, 1);
+
+    // The next generation: a clone of the PDF, made read-only, then activated.
+    QVERIFY(QDir().mkpath(second));
+    QVERIFY(Thoughts::Platform::cloneOrLinkFile(first + QStringLiteral("/paper.pdf"), second + QStringLiteral("/paper.pdf")));
+    QVERIFY(writeFile(second + QStringLiteral("/.thoughts-library-index.json"), index));
+    QVERIFY(QFile::setPermissions(second + QStringLiteral("/paper.pdf"), QFileDevice::ReadOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther));
+    if (fileCloneIdForTest(second + QStringLiteral("/paper.pdf")).isEmpty()) QSKIP("The temporary volume does not report clone IDs.");
+    QVERIFY(QFile::remove(root + QStringLiteral("/current_pdfs")));
+    QVERIFY(QFile::link(second, root + QStringLiteral("/current_pdfs")));
+    QVERIFY(load(&hashed) == checked);
+    QCOMPARE(hashed, 0);
+    QVERIFY(load(&hashed) == checked);
+    QCOMPARE(hashed, 0);
+
+    // The clone written in place, same size, its modification time put back:
+    // not the checked bytes any more.
+    const QString clone = second + QStringLiteral("/paper.pdf");
+    QVERIFY(QFile::setPermissions(clone, QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    struct stat before {};
+    QCOMPARE(::stat(QFile::encodeName(clone).constData(), &before), 0);
+    QByteArray changed = pdf;
+    changed[20] = 'q';
+    QVERIFY(writeFile(clone, changed));
+    const struct timespec times[2] = {before.st_atimespec, before.st_mtimespec};
+    QCOMPARE(::utimensat(AT_FDCWD, QFile::encodeName(clone).constData(), times, 0), 0);
+    const auto rechecked = load(&hashed);
+    QCOMPARE(hashed, 1);
+    QCOMPARE(rechecked.size(), 1);
+    QVERIFY(rechecked.constFirst().librarySegments.isEmpty());
+#endif
+}
+
+// Each load observed its sources and so created and removed a lock file in
+// comments/.history, which asked for another change check after every load;
+// the check also ran during loads and Syncs, every 2 to 5 s at times (19 Nov).
+// Only a file the check compares asks for one.
+void CommentsOverviewTest::testCatalogueCheckIgnoresFilesItDoesNotCompare()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = QDir::cleanPath(temporary.path());
+    Thoughts::DeveloperLog::Options options;
+    options.directory = temporary.filePath(QStringLiteral("logs"));
+    options.captureStacks = false;
+    Thoughts::DeveloperLog log(options);
+    const auto eventCount = [](const QString &name) {
+        int count = 0;
+        for (const QJsonValue &value : Thoughts::DeveloperLog::performanceEvents()) {
+            if (value.toObject().value(QStringLiteral("event")).toString() == name) ++count;
+        }
+        return count;
+    };
+    QVERIFY(writeFile(root + QStringLiteral("/current_pdfs/paper.pdf"), QByteArrayLiteral("%PDF-paper")));
+    Thoughts::CommentsOverview overview(root);
+    overview.m_catalogCheckSpacingMs = 0;
+    overview.show();
+    const auto settled = [&overview] {
+        return !overview.m_fullReloadRunning && !overview.m_reloadTimer->isActive() && !overview.m_catalogSignatureCheckRunning
+            && !overview.m_catalogPollTimer->isActive() && !overview.m_catalogSignature.isEmpty() && !overview.m_catalogCheckRequested;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(settled(), 10000);
+    for (const QString &relative : {QStringLiteral("comments/.history/proposal_observation.lock"), QStringLiteral("comments/.history/agent-requests.json"),
+                                    QStringLiteral("comments/.conflicts/paper/1.json"), QStringLiteral(".thoughts/document-identities.json"),
+                                    QStringLiteral(".thoughts/library-source-inventory.json"), QStringLiteral(".thoughts/project-imports/x/receipt.json"),
+                                    QStringLiteral(".runtime/current-annotations.sqlite-wal")}) {
+        overview.handleDocsPathsChanged({root + QLatin1Char('/') + relative});
+        QVERIFY2(!overview.m_catalogCheckRequested, qPrintable(relative));
+    }
+    for (const QString &relative : QStringList {QStringLiteral("comments/paper_comments.jsonl"), QStringLiteral("comments/review_resolutions.jsonl"),
+                                    QStringLiteral("comments/.layout/paper.json"), QStringLiteral("current_pdfs/paper.pdf"), QStringLiteral("current_pdfs"),
+                                    QStringLiteral(".thoughts-library-stage-") + QString(64, QLatin1Char('a')) + QStringLiteral("/paper.pdf"),
+                                    QStringLiteral(".thoughts/library-projects.json"), QStringLiteral(".thoughts/projects/") + QString(64, QLatin1Char('b')) + QStringLiteral("/default/thoughts-project.json")}) {
+        overview.handleDocsPathsChanged({root + QLatin1Char('/') + relative});
+        QVERIFY2(overview.m_catalogCheckRequested, qPrintable(relative));
+        QTRY_VERIFY(settled());
+    }
+
+    // Another program's comment reaches the Library through the change stream.
+    const int changes = eventCount(QStringLiteral("library.catalog_changed"));
+    QVERIFY(writeFile(root + QStringLiteral("/comments/paper_comments.jsonl"),
+                      jsonLine(comment(QStringLiteral("paper-1"), QStringLiteral("From elsewhere"), 1, QStringLiteral("2026-10-02T08:00:00Z"), QStringLiteral("anchored")))));
+    QTRY_VERIFY_WITH_TIMEOUT(eventCount(QStringLiteral("library.catalog_changed")) > changes, 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(overview.commentCount(), 1, 10000);
+}
+
+// A check asked for during a full reload runs after it, and finds nothing
+// to read again when the reload already read the change (a Sync's files):
+// after each Sync the Library loaded a second time.
+void CommentsOverviewTest::testCatalogueCheckWaitsForTheFullReload()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = QDir::cleanPath(temporary.path());
+    Thoughts::DeveloperLog::Options options;
+    options.directory = temporary.filePath(QStringLiteral("logs"));
+    options.captureStacks = false;
+    Thoughts::DeveloperLog log(options);
+    const auto eventCount = [](const QString &name) {
+        int count = 0;
+        for (const QJsonValue &value : Thoughts::DeveloperLog::performanceEvents()) {
+            if (value.toObject().value(QStringLiteral("event")).toString() == name) ++count;
+        }
+        return count;
+    };
+    QVERIFY(writeFile(root + QStringLiteral("/current_pdfs/paper.pdf"), QByteArrayLiteral("%PDF-paper")));
+    Thoughts::CommentsOverview overview(root);
+    overview.m_catalogCheckSpacingMs = 0;
+    overview.show();
+    const auto settled = [&overview] {
+        return !overview.m_fullReloadRunning && !overview.m_reloadTimer->isActive() && !overview.m_catalogSignatureCheckRunning
+            && !overview.m_catalogPollTimer->isActive() && !overview.m_catalogSignature.isEmpty() && !overview.m_catalogCheckRequested;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(settled(), 10000);
+
+    // No check while a full reload runs.
+    const int checks = eventCount(QStringLiteral("library.catalog_poll.started"));
+    overview.m_fullReloadRunning = true;
+    overview.requestCatalogCheck(false, QStringLiteral("test"));
+    QTest::qWait(3 * Thoughts::CommentsOverview::CatalogCheckDelayMs);
+    QCOMPARE(eventCount(QStringLiteral("library.catalog_poll.started")), checks);
+    QVERIFY(overview.m_catalogCheckRequested);
+    overview.finishFullReload(overview.m_documents, true, std::nullopt, overview.m_catalogSignature);
+    QTRY_COMPARE(eventCount(QStringLiteral("library.catalog_poll.started")), checks + 1);
+    QTRY_VERIFY(settled());
+
+    // A Sync's files, read by the reload at its end: the check that follows reloads nothing.
+    overview.syncStarted(QDateTime::currentDateTimeUtc());
+    QVERIFY(writeFile(root + QStringLiteral("/comments/paper_comments.jsonl"),
+                      jsonLine(comment(QStringLiteral("paper-1"), QStringLiteral("Synced"), 1, QStringLiteral("2026-10-02T08:00:00Z"), QStringLiteral("anchored")))));
+    overview.handleDocsPathsChanged({root + QStringLiteral("/comments/paper_comments.jsonl")});
+    QTest::qWait(3 * Thoughts::CommentsOverview::CatalogCheckDelayMs);
+    // Not during the Sync either.
+    QCOMPARE(eventCount(QStringLiteral("library.catalog_poll.started")), checks + 1);
+    const int loads = eventCount(QStringLiteral("library.reload.queued"));
+    overview.syncFinished(true, QString());
+    QTRY_VERIFY_WITH_TIMEOUT(settled(), 10000);
+    QTest::qWait(3 * Thoughts::CommentsOverview::CatalogCheckDelayMs);
+    QVERIFY(settled());
+    QCOMPARE(overview.commentCount(), 1);
+    QVERIFY(eventCount(QStringLiteral("library.catalog_poll.started")) > checks + 1);
+    QCOMPARE(eventCount(QStringLiteral("library.reload.queued")), loads + 1);
+    QCOMPARE(eventCount(QStringLiteral("library.catalog_changed")), 0);
+}
+
+// Opt-in (THOUGHTS_LIBRARY_LOAD_BENCHMARK=1): a Library shaped like a large
+// one (280 PDFs, 183 of them built from 35 source folders of 12 sources, 40
+// sidecars, 1000 review resolutions), loaded cold, again unchanged, after a new
+// Library generation, and checked for changes. It prints each step's time; run
+// under a file-open tracer to count the files each step opens: before each
+// step it tries to open a missing marker file, .benchmark-<step>.
+void CommentsOverviewTest::benchmarkLibraryShapedLoad()
+{
+    if (qEnvironmentVariableIsEmpty("THOUGHTS_LIBRARY_LOAD_BENCHMARK")) QSKIP("Set THOUGHTS_LIBRARY_LOAD_BENCHMARK=1 to run.");
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.path();
+    const QString firstStage = root + QStringLiteral("/.thoughts-library-stage-") + QString(64, QLatin1Char('1'));
+    QVERIFY(QDir().mkpath(firstStage));
+    QVERIFY(QFile::link(firstStage, root + QStringLiteral("/current_pdfs")));
+    constexpr int Folders = 35;
+    for (int folder = 0; folder < Folders; ++folder) {
+        const QString name = QStringLiteral("docs-bench%1").arg(folder, 2, 10, QLatin1Char('0'));
+        QVERIFY(writeFile(root + QLatin1Char('/') + name + QStringLiteral("/.ThoughtIgnore"), QByteArrayLiteral("build/\n*.log\n")));
+        for (int source = 0; source < 12; ++source) {
+            QByteArray text = QStringLiteral("\\section{Part %1 of %2}\n").arg(source).arg(name).toUtf8() + QByteArray(2048, 'x') + '\n';
+            if (source == 0 && folder % 4 == 0) {
+                text += QStringLiteral("\\agentProposedEdit[created=2026-10-10T12:00:00.000Z,conversation_id=0b6c5b7e-1d2a-4c3b-9f8e-112233445566]"
+                                       "{bench-%1}{Use the current wording.}{old version}{new version}\n").arg(folder).toUtf8();
+            }
+            const QString path = source == 0 ? QStringLiteral("/tex/source/main.tex") : QStringLiteral("/tex/fragments/part%1.tex").arg(source);
+            QVERIFY(writeFile(root + QLatin1Char('/') + name + path, text));
+        }
+        QVERIFY(registerSourceProject(root, QStringLiteral("00000000-0000-4000-8000-%1").arg(folder, 12, 10, QLatin1Char('0')), name, {name}));
+    }
+    QJsonArray entries, publications;
+    const QString revision(64, QLatin1Char('d'));
+    const QString sourceIndex(64, QLatin1Char('c'));
+    const QString bundle = root + QStringLiteral("/.runtime/target/source-bundle");
+    QByteArray resolutions;
+    for (int index = 0; index < 1000; ++index) {
+        resolutions += jsonLine(comment(QStringLiteral("resolution-%1").arg(index), QStringLiteral("Resolved elsewhere"), 1, QStringLiteral("2026-10-01T08:00:00Z"), QStringLiteral("anchored")));
+    }
+    QVERIFY(writeFile(root + QStringLiteral("/comments/review_resolutions.jsonl"), resolutions));
+    for (int index = 0; index < 280; ++index) {
+        const QString filename = QStringLiteral("bench-%1.pdf").arg(index, 3, 10, QLatin1Char('0'));
+        const QByteArray bytes = QByteArrayLiteral("%PDF-1.7 ") + QByteArray(32 * 1024, char('a' + index % 26)) + QByteArray::number(index);
+        QVERIFY(writeFile(firstStage + QLatin1Char('/') + filename, bytes));
+        const QString digest = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        const bool built = index < 183;
+        const QString folder = QStringLiteral("docs-bench%1").arg(index % Folders, 2, 10, QLatin1Char('0'));
+        entries.append(QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("kind"), built ? QStringLiteral("source_linked") : QStringLiteral("unlinked")},
+                                    {QStringLiteral("pdf_sha256"), digest}, {QStringLiteral("project"), built ? folder : QString()},
+                                    {QStringLiteral("display_name"), QStringLiteral("Document %1").arg(index)}, {QStringLiteral("published_at"), QStringLiteral("2026-11-01T10:00:00Z")}});
+        publications.append(QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("sha256"), digest}, {QStringLiteral("metadata"), QJsonObject {{QStringLiteral("page_count"), 1}}}});
+        if (built) {
+            const QJsonObject artifact {{QStringLiteral("schema_version"), 1}, {QStringLiteral("kind"), QStringLiteral("thoughts-document-source-artifact")},
+                {QStringLiteral("filename"), filename}, {QStringLiteral("agent_proposals"), QJsonArray()}, {QStringLiteral("proposal_objects"), QJsonArray()},
+                {QStringLiteral("sources"), QJsonArray {QJsonObject {{QStringLiteral("path"), QString(folder + QStringLiteral("/tex/source/main.tex"))}},
+                                                        QJsonObject {{QStringLiteral("path"), QString(folder + QStringLiteral("/tex/fragments/part1.tex"))}}}},
+                {QStringLiteral("pdf"), QJsonObject {{QStringLiteral("filename"), filename}, {QStringLiteral("pdf_sha256"), digest}, {QStringLiteral("page_count"), 1},
+                    {QStringLiteral("segments"), QJsonArray {QJsonObject {{QStringLiteral("source_id"), QString(folder + QStringLiteral("/tex/source/main.tex"))}, {QStringLiteral("start_page"), 1}, {QStringLiteral("page_count"), 1}}}}}}};
+            const QByteArray artifactBytes = QJsonDocument(artifact).toJson(QJsonDocument::Compact);
+            const QString artifactSha256 = QString::fromLatin1(QCryptographicHash::hash(artifactBytes, QCryptographicHash::Sha256).toHex());
+            QVERIFY(writeFile(bundle + QStringLiteral("/objects/") + artifactSha256, artifactBytes));
+            QVERIFY(writeFile(bundle + QStringLiteral("/documents/") + filename + QStringLiteral(".json"), QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1},
+                {QStringLiteral("artifact_sha256"), artifactSha256}, {QStringLiteral("filename"), filename}, {QStringLiteral("pdf_sha256"), digest}}).toJson()));
+        }
+        if (index % 7 == 0) {
+            const QString stem = QFileInfo(filename).completeBaseName();
+            QByteArray sidecar;
+            for (int note = 0; note < 3; ++note) {
+                sidecar += jsonLine(comment(QStringLiteral("%1-%2").arg(stem).arg(note), QStringLiteral("Comment %1").arg(note), 1, QStringLiteral("2026-10-02T08:00:00Z"), QStringLiteral("anchored")));
+            }
+            QVERIFY(writeFile(root + QStringLiteral("/comments/") + stem + QStringLiteral("_comments.jsonl"), sidecar));
+        }
+        if (index % 15 == 0) {
+            QVERIFY(writeFile(root + QStringLiteral("/comments/.layout/") + QFileInfo(filename).completeBaseName() + QStringLiteral(".json"), QJsonDocument(layout(QFileInfo(filename).completeBaseName())).toJson()));
+        }
+    }
+    const QByteArray index = QJsonDocument(QJsonObject {{QStringLiteral("schema_version"), 1}, {QStringLiteral("library_revision"), revision},
+                                                         {QStringLiteral("source_index_sha256"), sourceIndex}, {QStringLiteral("pdfs"), entries}}).toJson();
+    const QByteArray generation = QJsonDocument(QJsonObject {{QStringLiteral("library_revision"), revision}, {QStringLiteral("source_index_sha256"), sourceIndex},
+                                                              {QStringLiteral("publications"), publications}}).toJson();
+    QVERIFY(writeFile(firstStage + QStringLiteral("/.thoughts-library-index.json"), index));
+    QVERIFY(writeFile(firstStage + QStringLiteral("/.thoughts-generation.json"), generation));
+
+    const auto step = [&root](const QString &name, const std::function<int()> &work) {
+        QFile marker(root + QStringLiteral("/.benchmark-") + name);
+        Q_UNUSED(marker.open(QIODevice::ReadOnly))
+        QElapsedTimer elapsed;
+        elapsed.start();
+        const int count = work();
+        qInfo().noquote() << QStringLiteral("benchmark %1: %2 ms, %3").arg(name).arg(elapsed.elapsed()).arg(count);
+    };
+    bool valid = false;
+    const auto load = [&](bool discovery) { return int(Thoughts::loadTrackedCommentDocuments(root, {}, &valid, {}, discovery).size()); };
+    step(QStringLiteral("cold"), [&] { return load(true); });
+    step(QStringLiteral("unchanged"), [&] { return load(true); });
+    step(QStringLiteral("unchanged-again"), [&] { return load(false); });
+    // A new Library generation, as Sync activates one: every PDF cloned, the metadata rewritten.
+    const QString secondStage = root + QStringLiteral("/.thoughts-library-stage-") + QString(64, QLatin1Char('2'));
+    QVERIFY(QDir().mkpath(secondStage));
+    for (const QString &filename : QDir(firstStage).entryList({QStringLiteral("*.pdf")}, QDir::Files)) {
+        QVERIFY(Thoughts::Platform::cloneOrLinkFile(firstStage + QLatin1Char('/') + filename, secondStage + QLatin1Char('/') + filename));
+        QVERIFY(QFile::setPermissions(secondStage + QLatin1Char('/') + filename, QFileDevice::ReadOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther));
+    }
+    QVERIFY(writeFile(secondStage + QStringLiteral("/.thoughts-library-index.json"), index));
+    QVERIFY(writeFile(secondStage + QStringLiteral("/.thoughts-generation.json"), generation));
+    QVERIFY(QFile::remove(root + QStringLiteral("/current_pdfs")));
+    QVERIFY(QFile::link(secondStage, root + QStringLiteral("/current_pdfs")));
+    step(QStringLiteral("new-generation"), [&] { return load(true); });
+    step(QStringLiteral("after-generation"), [&] { return load(true); });
+
+    Thoughts::CommentsOverview overview(root);
+    const auto settled = [&overview] {
+        return !overview.m_fullReloadRunning && !overview.m_catalogSignatureCheckRunning && !overview.m_catalogPollTimer->isActive()
+            && !overview.m_catalogSignature.isEmpty();
+    };
+    // The window's first showing, and a reload of it (as each Sync ends with), with everything else it reads.
+    step(QStringLiteral("window-shown"), [&] {
+        overview.show();
+        QTest::qWait(10);
+        for (QElapsedTimer waited; !settled() && (!waited.isValid() || waited.elapsed() < 60000);) {
+            if (!waited.isValid()) waited.start();
+            QTest::qWait(5);
+        }
+        return 0;
+    });
+    QTest::qWait(2500);
+    QTRY_VERIFY_WITH_TIMEOUT(settled(), 60000);
+    step(QStringLiteral("window-reload"), [&] {
+        overview.requestReload();
+        QTest::qWait(10);
+        for (QElapsedTimer waited; !settled() && (!waited.isValid() || waited.elapsed() < 60000);) {
+            if (!waited.isValid()) waited.start();
+            QTest::qWait(5);
+        }
+        return 0;
+    });
+    QTest::qWait(2500);
+    QTRY_VERIFY_WITH_TIMEOUT(settled(), 60000);
+    step(QStringLiteral("change-check"), [&] {
+        overview.requestCatalogCheck(false);
+        QTest::qWait(10);
+        for (QElapsedTimer waited; !settled() || overview.m_catalogPollTimer->isActive();) {
+            if (!waited.isValid()) waited.start();
+            if (waited.elapsed() > 60000) break;
+            QTest::qWait(5);
+        }
+        return 1;
+    });
+    step(QStringLiteral("end"), [] { return 0; });
 }
 
 void CommentsOverviewTest::testSourceEditReloadsOnlyItsDocuments()

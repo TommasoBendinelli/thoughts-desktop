@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "../shell/reviewcardeditor.h"
 #include <QTest>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QDir>
+#include <QComboBox>
 #include <QCryptographicHash>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -14,6 +18,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUuid>
+#include <algorithm>
 
 using namespace Thoughts;
 class ReviewCardEditorTest : public QObject
@@ -185,6 +190,68 @@ private Q_SLOTS:
         QCOMPARE(step, 3);
         QCOMPARE(messages.size(), 2);
         QCOMPARE(messages[0], QStringLiteral("The card can't be linked to source text: Sync this document to install its verified source information."));
+    }
+    // The Cards list's Edit… offers the card's kind (its menu no longer does, 23 Nov 2026) and
+    // records a kind chosen once saved; a direct editor has no Kind row.
+    void editOffersTheCardsKind() {
+        QTemporaryDir docs;
+        QVERIFY(docs.isValid());
+        QFile pdf(path);
+        QVERIFY(pdf.open(QIODevice::ReadOnly));
+        const QString hash = QString::fromLatin1(QCryptographicHash::hash(pdf.readAll(), QCryptographicHash::Sha256).toHex());
+        const QString cardId = QStringLiteral("00000000-0000-4000-8000-0000000000d1");
+        const QJsonObject record{{QStringLiteral("schema_version"), 3}, {QStringLiteral("card_type"), QStringLiteral("visual_region")},
+                                 {QStringLiteral("card_id"), cardId}, {QStringLiteral("status"), QStringLiteral("approved")}, {QStringLiteral("revision"), 1},
+                                 {QStringLiteral("primary"), QJsonObject{{QStringLiteral("pdf_stem"), QStringLiteral("simple-multipage")}, {QStringLiteral("pdf_sha256"), hash},
+                                                                         {QStringLiteral("page"), 1}, {QStringLiteral("rect"), QJsonArray{.1, .2, .5, .4}},
+                                                                         {QStringLiteral("page_visual_sha256"), QString(64, QLatin1Char('b'))},
+                                                                         {QStringLiteral("question"), QStringLiteral("What is on this page?")}}}};
+        QVERIFY(QDir().mkpath(docs.filePath(QStringLiteral("reviews/cards"))));
+        QFile file(docs.filePath(QStringLiteral("reviews/cards/%1.json").arg(cardId)));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(record).toJson());
+        file.close();
+        ReviewStore store(docs.path());
+        const auto cardOf = [&store, &cardId] {
+            const auto cards = store.cards();
+            return *std::find_if(cards.cbegin(), cards.cend(), [&cardId](const ReviewCard &card) { return card.id() == cardId; });
+        };
+        const ReviewCard stored = cardOf();
+        QCOMPARE(stored.reviewKind, QStringLiteral("knowledge"));
+        {
+            ReviewCardEditor plain(stored, path, {});
+            QVERIFY(!plain.findChild<QComboBox *>(QStringLiteral("reviewCardKind")));
+            QVERIFY(plain.kind().isEmpty());
+        }
+        QStringList offered;
+        QString initial;
+        bool saved = false;
+        QTimer driver;
+        driver.setInterval(30);
+        QObject::connect(&driver, &QTimer::timeout, this, [&] {
+            auto *editor = qobject_cast<ReviewCardEditor *>(QApplication::activeModalWidget());
+            if (!editor || !editor->isVisible() || saved) return;
+            auto *kind = editor->findChild<QComboBox *>(QStringLiteral("reviewCardKind"));
+            if (!kind) { editor->reject(); return; }
+            for (int index = 0; index < kind->count(); ++index) offered.append(kind->itemText(index));
+            initial = kind->currentData().toString();
+            QVERIFY(editor->kind().isEmpty());
+            kind->setCurrentIndex(kind->findData(QStringLiteral("project")));
+            QCOMPARE(editor->kind(), QStringLiteral("project"));
+            saved = true;
+            QMetaObject::invokeMethod(editor->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save), "click", Qt::QueuedConnection);
+        });
+        driver.start();
+        const bool edited = editReviewCardAreas(nullptr, store, docs.path(), stored, path, false, false, true);
+        driver.stop();
+        QVERIFY(edited);
+        // No Project holds it: Knowledge card or Project card.
+        QCOMPARE(offered, (QStringList{QStringLiteral("Knowledge card"), QStringLiteral("Project card")}));
+        QCOMPARE(initial, QStringLiteral("knowledge"));
+        const ReviewCard changed = cardOf();
+        QCOMPARE(changed.reviewKind, QStringLiteral("project"));
+        QCOMPARE(changed.reviewKindSource, QStringLiteral("card"));
+        QCOMPARE(changed.question(), QStringLiteral("What is on this page?"));
     }
 };
 QTEST_MAIN(ReviewCardEditorTest)

@@ -1,4 +1,5 @@
 #include "projectreadingcontext.h"
+#include "projectconfiguration.h"
 #include <QSettings>
 #include "projectreadinggeneration.h"
 #include "documentidentity.h"
@@ -23,6 +24,7 @@
 #include "noteattachment.h"
 #include "reviewcardfeedback.h"
 #include "documentfeedback.h"
+#include "readingoverlays.h"
 #include "feedbackversion.h"
 #include "thoughtsplatform.h"
 #include "thoughtsserveraddress.h"
@@ -3477,6 +3479,52 @@ FedoraRepository *FedoraRepository::instance(const QString &docsRoot)
     return repository;
 }
 
+namespace
+{
+// Canonical generation folder -> holds on it.
+QMutex &heldGenerationsMutex()
+{
+    static QMutex mutex;
+    return mutex;
+}
+
+QHash<QString, int> &heldGenerations()
+{
+    static QHash<QString, int> held;
+    return held;
+}
+
+QString generationKey(const QString &directory)
+{
+    const QFileInfo info(directory);
+    const QString canonical = info.canonicalFilePath();
+    return QDir::cleanPath(canonical.isEmpty() ? info.absoluteFilePath() : canonical);
+}
+}
+
+void FedoraRepository::holdLibraryGeneration(const QString &directory)
+{
+    if (directory.isEmpty()) return;
+    const QMutexLocker locker(&heldGenerationsMutex());
+    ++heldGenerations()[generationKey(directory)];
+}
+
+void FedoraRepository::releaseLibraryGeneration(const QString &directory)
+{
+    if (directory.isEmpty()) return;
+    const QMutexLocker locker(&heldGenerationsMutex());
+    const QString key = generationKey(directory);
+    const auto found = heldGenerations().find(key);
+    if (found != heldGenerations().end() && --found.value() <= 0) heldGenerations().erase(found);
+}
+
+QSet<QString> FedoraRepository::heldLibraryGenerations()
+{
+    const QMutexLocker locker(&heldGenerationsMutex());
+    const QList<QString> keys = heldGenerations().keys();
+    return QSet<QString>(keys.cbegin(), keys.cend());
+}
+
 FedoraRepository::FedoraRepository(QString docsRoot, QObject *parent)
     : QObject(parent)
     , m_docsRoot(std::move(docsRoot))
@@ -3528,6 +3576,16 @@ FedoraRepository::FedoraRepository(QString docsRoot, QObject *parent)
     m_reviewProjections = reviewProjections(effectiveProjections());
     m_reviewProjectionsKnown = true;
     scheduleSourceCommentRefresh();
+    // A sign-in while a Sync ran: the new connection is used once that Sync is over.
+    connect(this, &FedoraRepository::manualSyncStateChanged, this, [this](ManualSyncState state) {
+        if (state != ManualSyncState::Running && m_serverConnectionReloadPending) {
+            QTimer::singleShot(0, this, [this] {
+                if (m_serverConnectionReloadPending) {
+                    reloadServerConnection();
+                }
+            });
+        }
+    });
     connect(this, &FedoraRepository::libraryChanged, this, [this] {
         completeLibraryBuildActivationIfReady();
         if (m_syncCoordinator.running() && m_syncCoordinator.phase == ManualSyncPhase::Library) {
@@ -3767,9 +3825,11 @@ static bool isCommentProjection(const QString &type)
 
 // Answer and document feedback tombstones are kept too: a deletion is sticky (an edit made
 // without seeing it must not bring the highlight back), and Undo writes the tombstone's revision + 1.
+// So are those of reading overlays: an overlay or mark the user deleted stays deleted.
 static bool keepsTombstones(const QString &type)
 {
-    return isCommentProjection(type) || type == Thoughts::ReviewCardFeedback::entityType() || type == Thoughts::DocumentFeedback::entityType();
+    return isCommentProjection(type) || type == Thoughts::ReviewCardFeedback::entityType() || type == Thoughts::DocumentFeedback::entityType()
+        || type == Thoughts::ReadingOverlays::entityType();
 }
 
 static bool isKeptTombstone(const QString &type, const QJsonObject &payload)
@@ -3912,6 +3972,9 @@ QJsonObject FedoraRepository::effectiveProjections(bool includeSourceJournals, b
             projections.insert(key, Thoughts::ReviewCardFeedback::merge(projections.value(key).toObject(), payload.toObject()));
         } else if (type == Thoughts::DocumentFeedback::entityType()) {
             projections.insert(key, Thoughts::DocumentFeedback::merge(projections.value(key).toObject(), payload.toObject()));
+        } else if (type == Thoughts::ReadingOverlays::entityType()) {
+            // The user's Delete Mark or Delete Overlay, unless the agent wrote a later revision.
+            projections.insert(key, Thoughts::ReadingOverlays::merge(projections.value(key).toObject(), payload.toObject()));
         } else if (payload.toObject().value(QStringLiteral("deleted")).toBool() && !isCommentProjection(type)) {
             projections.remove(key);
         } else {
@@ -4109,6 +4172,21 @@ bool FedoraRepository::enqueueAgentConversation(const QJsonObject &record, QStri
     return true;
 }
 
+bool FedoraRepository::enqueueReadingOverlay(const QJsonObject &record, QString *error)
+{
+    QString outboxDetails;
+    if (!ensureOutboxReady(&outboxDetails)) {
+        if (error) *error = outboxDetails.isEmpty() ? QStringLiteral("The local sync queue is not available.") : outboxDetails;
+        return false;
+    }
+    if (!Thoughts::ReadingOverlays::enqueue(*m_outbox, record, error)) {
+        return false;
+    }
+    schedulePendingChangesRefresh();
+    emitEffectiveProjections();
+    return true;
+}
+
 bool FedoraRepository::enqueueDocumentFeedback(const QJsonObject &record, QString *error)
 {
     QString outboxDetails;
@@ -4122,6 +4200,59 @@ bool FedoraRepository::enqueueDocumentFeedback(const QJsonObject &record, QStrin
     schedulePendingChangesRefresh();
     emitEffectiveProjections();
     return true;
+}
+
+QString FedoraRepository::feedbackSnapshotPath(const QString &sha256) const
+{
+    return validSha256(sha256) ? QDir(m_stateRoot).filePath(QStringLiteral("feedback-snapshots/") + sha256) : QString();
+}
+
+QString FedoraRepository::keepFeedbackSnapshot(const QByteArray &bytes, QString *error)
+{
+    const QString sha256 = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    const QString path = feedbackSnapshotPath(sha256);
+    if (bytes.isEmpty()) {
+        if (error) *error = QStringLiteral("The picture is empty.");
+        return {};
+    }
+    // Kept once: the same picture is the same object.
+    if (!feedbackSnapshot(sha256).isEmpty()) return sha256;
+    QSaveFile file(path);
+    if (!QDir().mkpath(QFileInfo(path).absolutePath()) || !file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+        if (error) *error = QStringLiteral("The picture could not be saved on this computer.");
+        return {};
+    }
+    return sha256;
+}
+
+QByteArray FedoraRepository::feedbackSnapshot(const QString &sha256) const
+{
+    QFile file(feedbackSnapshotPath(sha256));
+    // A picture of a page, far below the server's object limit.
+    if (sha256.isEmpty() || !file.open(QIODevice::ReadOnly) || file.size() > 256 * 1024 * 1024) return {};
+    const QByteArray bytes = file.readAll();
+    return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()) == sha256 ? bytes : QByteArray();
+}
+
+void FedoraRepository::fetchFeedbackSnapshot(const QString &sha256, QObject *context, std::function<void(bool found)> done)
+{
+    if (!feedbackSnapshot(sha256).isEmpty()) {
+        done(true);
+        return;
+    }
+    if (!validSha256(sha256) || !ensureClient()) {
+        done(false);
+        return;
+    }
+    // Without a Sync plan: the plain object download, which every authenticated client may use.
+    auto *reply = m_client->downloadObject(sha256.toLatin1());
+    connect(context, &QObject::destroyed, reply, &QNetworkReply::abort);
+    connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
+    connect(reply, &QNetworkReply::finished, context, [this, reply, sha256, done] {
+        const QByteArray bytes = reply->error() == QNetworkReply::NoError ? reply->readAll() : QByteArray();
+        // Kept only as the object it names.
+        done(!bytes.isEmpty() && keepFeedbackSnapshot(bytes) == sha256);
+    });
 }
 
 bool FedoraRepository::enqueueReviewCardFeedback(const QJsonObject &record, QString *error)
@@ -5861,6 +5992,35 @@ bool FedoraRepository::captureCommentRecords(const QString &docsRoot, const QStr
     return true;
 }
 
+void FedoraRepository::reloadServerConnection()
+{
+    if (m_syncCoordinator.running()) {
+        // A Sync talks to one server from its start to its end.
+        m_serverConnectionReloadPending = true;
+        return;
+    }
+    m_serverConnectionReloadPending = false;
+    m_cachedToken.clear();
+    m_cachedSourcePublisherToken.clear();
+    m_tokenWithheld.clear();
+    m_sourcePublisherTokenWithheld.clear();
+    if (m_client) {
+        // Requests still under way (a held build poll, say) end on the client that sent them,
+        // into their own handlers; the next request goes with the new token.
+        m_retiredClients.push_back(std::move(m_client));
+    }
+    m_serverCapabilitiesFresh = false;
+    m_traceCapabilityKnown = false;
+    // At once, for work that follows on without asking for a client first; none while this
+    // computer has no token (signed out).
+    ensureClient();
+}
+
+bool FedoraRepository::serverConnectionReloadPending() const
+{
+    return m_serverConnectionReloadPending;
+}
+
 QByteArray FedoraRepository::bearerToken()
 {
     if (!m_cachedToken.isEmpty()) {
@@ -6030,6 +6190,7 @@ void FedoraRepository::exportProjectRevision(FedoraRepository *repository, const
             if (!output->open(QIODevice::WriteOnly)) { poll->deleteLater(); completed(false, output->errorString()); return; }
             auto hash = std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
             auto written = std::make_shared<qint64>(0);
+            if (!repository->ensureClient()) { poll->deleteLater(); completed(false, QStringLiteral("This computer is not connected to the server.")); return; }
             auto *download = repository->m_client->downloadObject(digest.toLatin1());
             connect(poll, &QObject::destroyed, download, &QNetworkReply::abort);
             const auto drain = [download, output, hash, written, size] {
@@ -6047,11 +6208,18 @@ void FedoraRepository::exportProjectRevision(FedoraRepository *repository, const
             });
         });
     };
-    connect(poll, &QTimer::timeout, poll, [=] { if (!*busy) accept(repository->m_client->projectExport(requestId)); });
+    // This computer may sign out while the export runs.
+    const auto connected = [poll, repository, completed] {
+        if (repository->ensureClient()) return true;
+        poll->deleteLater();
+        completed(false, QStringLiteral("This computer is not connected to the server."));
+        return false;
+    };
+    connect(poll, &QTimer::timeout, poll, [=] { if (!*busy && connected()) accept(repository->m_client->projectExport(requestId)); });
     progress(QStringLiteral("Requesting project export…"));
     QJsonObject request {{QStringLiteral("request_id"), requestId}, {QStringLiteral("project_id"), id}, {QStringLiteral("reading_revision"), revision}};
     if (!documentIds.isEmpty()) request.insert(QStringLiteral("document_ids"), documentIds);
-    accept(repository->m_client->requestProjectExport(request));
+    if (connected()) accept(repository->m_client->requestProjectExport(request));
 }
 
 bool FedoraRepository::ensureClient()
@@ -6501,7 +6669,10 @@ void FedoraRepository::forgetServerSupport()
     m_documentFeedbackKindsSupport = -1;
     m_documentFeedbackDrawingSupport = -1;
     m_documentFeedbackTextSupport = -1;
+    m_documentFeedbackHtmlDrawingSupport = -1;
+    m_documentFeedbackPicturesSupport = -1;
     m_agentConversationsSupport = -1;
+    m_readingOverlaysSupport = -1;
     m_reviewTagScaleSupport = -1;
     m_reviewTagSectionSupport = -1;
     m_reviewTagPhaseSupport = -1;
@@ -6514,6 +6685,8 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
     m_clientReviewCardMoveReady = false;
     forgetServerSupport();
     m_uploadedReviewSourceObjects.clear();
+    m_uploadedFeedbackSnapshots.clear();
+    m_missingFeedbackSnapshots.clear();
     if (m_syncCoordinator.running() || (!target.isEmpty() && !safePdfFilename(target))) {
         return;
     }
@@ -7257,10 +7430,15 @@ bool FedoraRepository::applyManualServerState(const QJsonObject &serverState)
     }
     const QJsonObject manifestIdentity = sourceManifestFileIdentity(m_sourceManifestPath, false, &trackerError);
     const bool checkedManifestMatches = sameSourceManifestFileMetadata(authoringFrontier.metadata.value(QStringLiteral("materialized_source_manifest")).toObject(), manifestIdentity);
-    const qint64 materialized = checkedManifestMatches ? authoringFrontier.metadata.value(QStringLiteral("materialized_source_frontier")).toInteger(-1) : -1;
+    // A folder a Project gained on another device is installed by the installer (it installs
+    // into every connected folder), but nothing else would make this Sync run it: the
+    // folders missing here are part of what it last checked (18 Nov: the math Project's folder).
+    const QJsonArray missingFolders = QJsonArray::fromStringList(Thoughts::ProjectConfiguration::missingConnectedFolders(m_docsRoot));
+    const bool sameMissingFolders = authoringFrontier.metadata.value(QStringLiteral("materialized_missing_folders")).toArray() == missingFolders;
+    const qint64 materialized = checkedManifestMatches && sameMissingFolders ? authoringFrontier.metadata.value(QStringLiteral("materialized_source_frontier")).toInteger(-1) : -1;
     const bool sourceInventoryReady = sourceInventoryCoversLibrary(m_docsRoot, m_sourceManifestPath, m_syncCoordinator.isDocument() ? m_syncCoordinator.target : QString())
         && (checkedManifestMatches || sourceManifestPathIsProjectScoped(m_sourceManifestPath, &trackerError));
-    if (sourceInventoryReady && m_syncCoordinator.authoringCheckedSourceFrontier < sourceFrontier && materialized < sourceFrontier) {
+    if (sourceInventoryReady && (m_syncCoordinator.authoringCheckedSourceFrontier < sourceFrontier || !sameMissingFolders) && materialized < sourceFrontier) {
         startManualAuthoringReconciliation(sourceFrontier);
         return true;
     }
@@ -7661,6 +7839,9 @@ void FedoraRepository::startManualAuthoringReconciliation(qint64 through)
             }
             frontier.metadata.insert(QStringLiteral("materialized_source_manifest"), manifest);
             frontier.metadata.insert(QStringLiteral("materialized_source_frontier"), checked);
+            // As this installation leaves them: one it installed is here now.
+            frontier.metadata.insert(QStringLiteral("materialized_missing_folders"),
+                                     QJsonArray::fromStringList(Thoughts::ProjectConfiguration::missingConnectedFolders(m_docsRoot)));
             if (!error.isEmpty() || !store->setFrontier(frontier, &error)) {
                 failManualSync(QStringLiteral("The editable-source checkpoint could not be saved."), error);
                 return;
@@ -9168,9 +9349,11 @@ QList<QJsonObject> FedoraRepository::documentOperations(const QString &target, c
             (type == QLatin1String("voice_capture") && targetCaptures.contains(entityId))
             || (type == Thoughts::PdfLinkOverrides::entityType() && !targetDocumentId.isEmpty()
                 && payload.value(QStringLiteral("source_document_id")).toString() == targetDocumentId)
-            // Document feedback belongs to its anchor's document.
+            // Document feedback belongs to its anchor's document, a reading overlay to its document.
             || (type == Thoughts::DocumentFeedback::entityType() && !targetDocumentId.isEmpty()
-                && Thoughts::DocumentFeedback::documentIdOf(payload) == targetDocumentId);
+                && Thoughts::DocumentFeedback::documentIdOf(payload) == targetDocumentId)
+            || (type == Thoughts::ReadingOverlays::entityType() && !targetDocumentId.isEmpty()
+                && Thoughts::ReadingOverlays::documentIdOf(payload) == targetDocumentId);
         if (belongs && outboxKind.isEmpty()) {
             scoped.append(operation);
         }
@@ -9243,9 +9426,12 @@ bool FedoraRepository::applyDocumentSnapshot(const QJsonObject &snapshot)
              // The snapshot holds every current link override of the document.
              (type == Thoughts::PdfLinkOverrides::entityType() && !targetDocumentId.isEmpty()
               && payload.value(QStringLiteral("source_document_id")).toString() == targetDocumentId) ||
-             // ... and every current document feedback of the document (anchor.pdf.document_id).
+             // ... and every current document feedback of the document (anchor.pdf.document_id) ...
              (type == Thoughts::DocumentFeedback::entityType() && !targetDocumentId.isEmpty()
-              && Thoughts::DocumentFeedback::documentIdOf(payload) == targetDocumentId));
+              && Thoughts::DocumentFeedback::documentIdOf(payload) == targetDocumentId) ||
+             // ... and every current reading overlay of the document (document.document_id).
+             (type == Thoughts::ReadingOverlays::entityType() && !targetDocumentId.isEmpty()
+              && Thoughts::ReadingOverlays::documentIdOf(payload) == targetDocumentId));
         if (belongs && !isKeptTombstone(type, payload)) {
             iterator = projections.erase(iterator);
         } else {
@@ -9602,6 +9788,10 @@ void FedoraRepository::processNextManualLibraryMutation()
 
 void FedoraRepository::recoverManualDeviceSequence()
 {
+    if (!ensureClient()) {
+        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."));
+        return;
+    }
     ++m_deviceSequenceRecoveryAttempts;
     m_uploading = true;
     emitSyncProgress(QStringLiteral("reconciling_device_sequence"), 0, 0, QStringLiteral("Reconciling the local sync sequence"));
@@ -9641,7 +9831,7 @@ bool FedoraRepository::retainAcknowledgedProjections(const QJsonArray &operation
         if ((!isCommentProjection(type) && type != QLatin1String("review_event") && type != QLatin1String("review_card")
              && type != QLatin1String("review_tag_groups") && type != Thoughts::PdfLinkOverrides::entityType()
              && type != Thoughts::ReviewCardFeedback::entityType() && type != Thoughts::DocumentFeedback::entityType()
-             && type != Thoughts::AgentConversations::entityType())
+             && type != Thoughts::ReadingOverlays::entityType() && type != Thoughts::AgentConversations::entityType())
             || !safeComponent(collection) || !safeComponent(entityId) || !operation.value(QStringLiteral("payload")).isObject()) {
             continue;
         }
@@ -9660,11 +9850,13 @@ bool FedoraRepository::retainAcknowledgedProjections(const QJsonArray &operation
         if (type == QLatin1String("review_card") && projections.contains(key)
             && projections.value(key).toObject().value(QStringLiteral("revision")).toInteger()
                 > payload.value(QStringLiteral("revision")).toInteger()) continue;
-        // Accepted feedback (tombstones included) goes through the server's merge rules.
-        if (type == Thoughts::ReviewCardFeedback::entityType() || type == Thoughts::DocumentFeedback::entityType()) {
+        // Accepted feedback and overlay edits (tombstones included) go through the server's merge rules.
+        if (type == Thoughts::ReviewCardFeedback::entityType() || type == Thoughts::DocumentFeedback::entityType()
+            || type == Thoughts::ReadingOverlays::entityType()) {
             const QJsonValue merged = type == Thoughts::DocumentFeedback::entityType()
                 ? Thoughts::DocumentFeedback::merge(projections.value(key).toObject(), payload)
-                : Thoughts::ReviewCardFeedback::merge(projections.value(key).toObject(), payload);
+                : type == Thoughts::ReadingOverlays::entityType() ? Thoughts::ReadingOverlays::merge(projections.value(key).toObject(), payload)
+                                                                   : Thoughts::ReviewCardFeedback::merge(projections.value(key).toObject(), payload);
             if (projections.value(key) != merged) {
                 projections.insert(key, merged);
                 changed = true;
@@ -9750,9 +9942,21 @@ bool FedoraRepository::holdUnsupportedOperations(QList<QJsonObject> &operations)
             if (!Thoughts::DocumentFeedback::kindOf(payload).isEmpty()) support = std::min(support, m_documentFeedbackKindsSupport);
             if (Thoughts::DocumentFeedback::isDrawing(payload)) support = std::min(support, m_documentFeedbackDrawingSupport);
             if (Thoughts::DocumentFeedback::isTextBox(payload)) support = std::min(support, m_documentFeedbackTextSupport);
+            if (Thoughts::DocumentFeedback::isAttachmentDrawing(payload)) {
+                support = std::min(support, m_documentFeedbackHtmlDrawingSupport);
+                // Its snapshot is neither on the server nor here: it waits, and the rest goes.
+                if (m_missingFeedbackSnapshots.contains(Thoughts::DocumentFeedback::snapshotSha256(payload))) support = 0;
+            }
+            // Pictures on a comment (§12): the same, for each picture.
+            if (Thoughts::DocumentFeedback::hasPictures(payload)) {
+                support = std::min(support, m_documentFeedbackPicturesSupport);
+                const QStringList pictures = Thoughts::DocumentFeedback::pictureSha256s(payload);
+                if (std::any_of(pictures.cbegin(), pictures.cend(), [this](const QString &sha256) { return m_missingFeedbackSnapshots.contains(sha256); })) support = 0;
+            }
             return support;
         }
         if (type == Thoughts::AgentConversations::entityType()) return m_agentConversationsSupport;
+        if (type == Thoughts::ReadingOverlays::entityType()) return m_readingOverlaysSupport;
         return 1;
     };
     if (std::all_of(operations.cbegin(), operations.cend(), [&](const QJsonObject &operation) { return support(operation) == 1; })) return false;
@@ -9776,7 +9980,10 @@ bool FedoraRepository::holdUnsupportedOperations(QList<QJsonObject> &operations)
         m_documentFeedbackKindsSupport = capabilities.contains(QJsonValue(Thoughts::DocumentFeedback::kindsCapability())) ? 1 : 0;
         m_documentFeedbackDrawingSupport = capabilities.contains(QJsonValue(Thoughts::DocumentFeedback::drawingCapability())) ? 1 : 0;
         m_documentFeedbackTextSupport = capabilities.contains(QJsonValue(Thoughts::DocumentFeedback::textCapability())) ? 1 : 0;
+        m_documentFeedbackHtmlDrawingSupport = capabilities.contains(QJsonValue(Thoughts::DocumentFeedback::htmlDrawingCapability())) ? 1 : 0;
+        m_documentFeedbackPicturesSupport = capabilities.contains(QJsonValue(Thoughts::DocumentFeedback::picturesCapability())) ? 1 : 0;
         m_agentConversationsSupport = capabilities.contains(QJsonValue(Thoughts::AgentConversations::capability())) ? 1 : 0;
+        m_readingOverlaysSupport = capabilities.contains(QJsonValue(Thoughts::ReadingOverlays::capability())) ? 1 : 0;
         m_reviewTagScaleSupport = capabilities.contains(QJsonValue(QStringLiteral("review_tag_scales_v1"))) ? 1 : 0;
         m_reviewTagSectionSupport = capabilities.contains(QJsonValue(QStringLiteral("review_tag_sections_v1"))) ? 1 : 0;
         m_reviewTagPhaseSupport = capabilities.contains(QJsonValue(QStringLiteral("review_tag_phases_v1"))) ? 1 : 0;
@@ -9897,6 +10104,54 @@ void FedoraRepository::uploadNextManualBatch(const QList<QJsonObject> &operation
             return;
         }
     }
+    // A drawing in an HTML attachment is drawn on a snapshot of the page, and a comment may carry
+    // pictures (§12): objects the server keeps with the record, uploaded first, so the record never
+    // reaches the server before its pictures.
+    for (const auto &op : std::as_const(ordinaryOperations)) {
+        if (op.value(QStringLiteral("entity_type")).toString() != Thoughts::DocumentFeedback::entityType()) continue;
+        const QJsonObject payload = op.value(QStringLiteral("payload")).toObject();
+        QList<QJsonObject> objects;
+        if (Thoughts::DocumentFeedback::isAttachmentDrawing(payload)) objects.append(Thoughts::DocumentFeedback::snapshotOf(payload));
+        for (const QJsonValue &picture : Thoughts::DocumentFeedback::picturesOf(payload)) objects.append(picture.toObject());
+        const auto next = std::find_if(objects.cbegin(), objects.cend(), [this](const QJsonObject &object) {
+            const QString hash = object.value(QStringLiteral("object_sha256")).toString();
+            return validSha256(hash) && !m_uploadedFeedbackSnapshots.contains(hash);
+        });
+        if (next == objects.cend()) continue;
+        const QString hash = next->value(QStringLiteral("object_sha256")).toString();
+        const QByteArray mediaType = next->value(QStringLiteral("media_type")).toString().toLatin1();
+        m_uploading = true;
+        auto *head = m_client->objectMetadata(hash.toLatin1());
+        connect(head, &QNetworkReply::finished, this, [this, head, operations, hash, mediaType] {
+            const bool present = head->error() == QNetworkReply::NoError;
+            const int status = head->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            head->deleteLater();
+            if (present) { m_uploading = false; m_uploadedFeedbackSnapshots.insert(hash); uploadNextManualBatch(operations); return; }
+            if (status != 404) { m_uploading = false; failManualSync(QStringLiteral("Could not check a feedback picture on the server. Its feedback remains queued.")); return; }
+            const QByteArray bytes = feedbackSnapshot(hash);
+            if (bytes.isEmpty()) {
+                // Not on this computer any more either: its feedback waits for a later Sync.
+                m_uploading = false;
+                m_missingFeedbackSnapshots.insert(hash);
+                scheduleManualSyncAdvance();
+                return;
+            }
+            const QString item = QStringLiteral("feedback-snapshot:") + hash;
+            if (!planManualUpload(item, bytes.size())) { m_uploading = false; failManualSync(QStringLiteral("Invalid feedback picture transfer accounting.")); return; }
+            auto *upload = m_client->uploadObject(bytes, mediaType);
+            connect(upload, &QNetworkReply::uploadProgress, this, [this, item, size = bytes.size()](qint64 sent, qint64) { accountManualUploadProgress(item, qMin(sent, qint64(size))); });
+            connect(upload, &QNetworkReply::finished, this, [this, upload, operations, hash, item, size = bytes.size()] {
+                m_uploading = false;
+                const bool ok = upload->error() == QNetworkReply::NoError;
+                upload->deleteLater();
+                accountManualUploadProgress(item, ok ? size : 0, ok, !ok);
+                if (!ok) { failManualSync(QStringLiteral("A feedback picture could not be uploaded; its feedback remains queued.")); return; }
+                m_uploadedFeedbackSnapshots.insert(hash);
+                uploadNextManualBatch(operations);
+            });
+        });
+        return;
+    }
     ordinaryOperations = Thoughts::SyncClient::normalizedOperationsForUpload(ordinaryOperations);
     QJsonArray operationValues;
     for (const QJsonObject &operation : std::as_const(ordinaryOperations)) {
@@ -9969,12 +10224,14 @@ void FedoraRepository::uploadNextManualBatch(const QList<QJsonObject> &operation
         QJsonArray acceptedOperations;
         for (const QJsonObject &operation : ordinaryOperations) {
             const QString operationId = operation.value(QStringLiteral("operation_id")).toString();
-            // A superseded card, tag layout, link override, answer or document feedback or agent conversation lost to a newer one; keep the server's.
+            // A superseded card, tag layout, link override, answer or document feedback, reading overlay or agent conversation lost to a newer one;
+            // keep the server's.
             const QString entityType = operation.value(QStringLiteral("entity_type")).toString();
             if (disposition.acknowledged.contains(operationId) && !disposition.refused.contains(operationId)
                 && !((entityType == QLatin1String("review_card") || entityType == QLatin1String("review_tag_groups")
                       || entityType == Thoughts::PdfLinkOverrides::entityType() || entityType == Thoughts::ReviewCardFeedback::entityType()
-                      || entityType == Thoughts::DocumentFeedback::entityType() || entityType == Thoughts::AgentConversations::entityType())
+                      || entityType == Thoughts::DocumentFeedback::entityType() || entityType == Thoughts::ReadingOverlays::entityType()
+                      || entityType == Thoughts::AgentConversations::entityType())
                      && disposition.superseded.contains(operationId))) {
                 acceptedOperations.append(operation);
             }
@@ -12012,6 +12269,9 @@ int FedoraRepository::collectObsoleteLibraryGenerations(const QString &docsRoot,
         protectedDirectories.insert(QDir::cleanPath(QFileInfo(pending).absoluteFilePath()));
     }
 
+    // A reader tab still shows an earlier version from these (heldLibraryGenerations).
+    const QSet<QString> held = heldLibraryGenerations();
+
     static const QRegularExpression stageName(QStringLiteral("^\\.thoughts-library-stage-([0-9a-f]{64})$"));
     int removed = 0;
     const QDir root(docsRoot);
@@ -12021,7 +12281,8 @@ int FedoraRepository::collectObsoleteLibraryGenerations(const QString &docsRoot,
         const QString directory = QDir::cleanPath(info.absoluteFilePath());
         // A recent directory may belong to a Sync that has not recorded its
         // pending generation yet.
-        if (!nameMatch.hasMatch() || protectedDirectories.contains(directory) || (minimumAgeSeconds > 0 && info.lastModified().toUTC() > newestRemovable)) {
+        if (!nameMatch.hasMatch() || protectedDirectories.contains(directory) || held.contains(generationKey(directory))
+            || (minimumAgeSeconds > 0 && info.lastModified().toUTC() > newestRemovable)) {
             continue;
         }
         QFile manifestFile(QDir(directory).filePath(QStringLiteral(".thoughts-generation.json")));
@@ -13367,6 +13628,10 @@ void FedoraRepository::downloadTargetedPublicationPdf()
         return;
     }
 
+    if (!ensureClient()) {
+        failTargetedBuildActivation(QStringLiteral("The server is not configured or its credentials are unavailable."), target);
+        return;
+    }
     m_targetPdfDownloading = true;
     const QString requestedPlanId = m_targetReaderPlan.value(QStringLiteral("plan_id")).toString();
     QNetworkReply *reply = m_client->downloadObject(transferDigest, requestedPlanId.toLatin1());

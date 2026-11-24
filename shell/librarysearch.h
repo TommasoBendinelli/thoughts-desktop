@@ -21,6 +21,7 @@ struct LibrarySearchPdf {
     QString project;
     QString identity;
     QString libraryTitle = {}; // the Library's own name (project, document or display name), if any
+    bool sourced = false; // built from a source (LaTeX, Markdown): ranked before imported PDFs
 };
 
 // A comment, note or review card, re-indexed in full on every update.

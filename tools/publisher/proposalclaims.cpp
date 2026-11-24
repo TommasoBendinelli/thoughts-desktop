@@ -263,6 +263,53 @@ void expireProposalClaims(SourcePublisher &publisher, const Json &result)
     publisher.state.remove(pendingKey);
 }
 
+std::optional<Json> applyProposalClaims(SourcePublisher &publisher, const QString &path, const QByteArray &content)
+{
+    QString error;
+    const QList<QJsonObject> claims = ProposalDecisions::claimsForConflictResolution(proposalClaimDatabase(publisher), path, QString::fromUtf8(content), &error);
+    if (!error.isEmpty()) {
+        publisher.report(QStringLiteral("Proposal decisions for %1 are unavailable and wait for the next Sync: %2").arg(path, error));
+        return std::nullopt;
+    }
+    if (claims.isEmpty()) {
+        return std::nullopt;
+    }
+    const std::optional<bool> capable = serverReadsClaims(publisher.api);
+    if (!capable || !*capable) {
+        // A later upload of the file carries them; the server then matches them late.
+        return std::nullopt;
+    }
+    Json result = Json::array();
+    for (const QJsonObject &claim : claims) {
+        result.append(toJson(claim));
+    }
+    publisher.report(QStringLiteral("Recording %1 proposal decision(s) with the source change %2.").arg(claims.size()).arg(path));
+    return result;
+}
+
+void expireApplyProposalClaims(SourcePublisher &publisher, const Json &mutation, const Json &result)
+{
+    QStringList ids;
+    for (const Json &claim : Py::iterate(Py::get(mutation, QStringLiteral("proposal_decisions"), Json::array()))) {
+        const Json id = Py::get(claim, QStringLiteral("decision_id"));
+        if (id.isString()) ids.append(id.toString());
+    }
+    if (ids.isEmpty() || Py::get(result, QStringLiteral("outcome")) == Json(QStringLiteral("conflict"))) {
+        return;
+    }
+    qint64 matched = 0, other = 0;
+    for (const Json &answer : Py::iterate(Py::get(result, QStringLiteral("proposal_decisions"), Json::array()))) {
+        const Json outcome = Py::get(answer, QStringLiteral("outcome"));
+        (outcome == Json(QStringLiteral("matched")) || outcome == Json(QStringLiteral("matched_late")) ? matched : other) += 1;
+    }
+    QString error;
+    if (!ProposalDecisions::forgetClaims(proposalClaimDatabase(publisher), ids, &error)) {
+        publisher.report(QStringLiteral("Answered proposal decisions could not be removed: ") + error);
+    } else if (matched || other) {
+        publisher.report(QStringLiteral("The server recorded %1 proposal decision(s); %2 needed no change.").arg(matched).arg(other));
+    }
+}
+
 std::optional<QByteArray> withClaimedDecisions(const SourcePublisher &publisher, const QString &path, const QByteArray &text)
 {
     QString error;

@@ -41,6 +41,8 @@ struct AgentProposalSidebarEntry
     bool liveSource = false;
     bool localSourcePresent = false;
     QString resolutionError;
+    // Its place in the text (sortAgentProposalRowsInReadingOrder): the list is in this order.
+    QList<int> readingOrder;
 };
 
 struct SourceCommentSidebarEntry
@@ -74,6 +76,9 @@ struct ReviewCardSidebarEntry
     // drawn only there; on another version it is listed (the Retired filter) but not placed.
     bool retired = false;
     QString pdfSha256;
+    // Placed on the newest version of the PDF, which is ready while the tab keeps an earlier one
+    // on screen: listed, not drawn; choosing it shows that version.
+    bool onNewestVersion = false;
     bool operator==(const ReviewCardSidebarEntry &) const = default;
 };
 
@@ -118,9 +123,12 @@ public:
            // Whether the row is document feedback, whatever its type: a comment-kind feedback lists
            // with the comments (ItemTypeRole Comment) but opens, edits and deletes as feedback.
            DocumentFeedbackRole,
-           // A review card's "sidebar_schedule" as a map: its review_kind, review_kind_source and
-           // projects_kind give the Cards list menu's kind entries (review-card-kinds.md §5).
-           ReviewCardKindRole };
+           // A review card's "sidebar_schedule" as a map (its state, review_kind, review_kind_source and
+           // projects_kind, review-card-kinds.md §5).
+           ReviewCardKindRole,
+           // A review card placed on the newest version of the PDF while the tab keeps an earlier
+           // one on screen (ReviewCardSidebarEntry::onNewestVersion).
+           ReviewCardOnNewestVersionRole };
     // Notes are not annotations: they never appear in the Annotations list (value 2 stays unused).
     enum ItemType { Comment = 1, Feedback = 2, AgentProposal = 4, ReviewCard = 8 };
 

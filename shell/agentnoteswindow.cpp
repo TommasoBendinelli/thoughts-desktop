@@ -14,6 +14,8 @@
 #include <QContextMenuEvent>
 #include <QDesktopServices>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -28,6 +30,8 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QAction>
+#include <QSettings>
 #include <QShortcut>
 #include <QStyle>
 #include <QSplitter>
@@ -225,10 +229,24 @@ void AgentNoteImageView::paintEvent(QPaintEvent *)
         m_scaled.setDevicePixelRatio(ratio);
     }
     painter.drawPixmap(0, 0, m_scaled);
+    if (m_drawing && !m_drawing->isEmpty() && m_drawing->imageWidth() == m_image.width() && m_drawing->imageHeight() == m_image.height()) {
+        // The reply's highlights stay on the note after drawing in place (AgentNotesView::setDrawTool).
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.scale(width() / qreal(m_image.width()), height() / qreal(m_image.height()));
+        m_drawing->paint(&painter);
+        painter.restore();
+    }
     QColor frame = palette().color(QPalette::WindowText);
     frame.setAlphaF(0.12);
     painter.setPen(frame);
     painter.drawRect(rect().adjusted(0, 0, -1, -1));
+}
+
+void AgentNoteImageView::setDrawing(const AgentNotes::AnnotationDocument *drawing)
+{
+    m_drawing = drawing;
+    update();
 }
 
 void AgentNoteImageView::setClickable(bool clickable)
@@ -269,7 +287,8 @@ void AgentNoteImageView::mouseMoveEvent(QMouseEvent *event)
         updateCursor(link);
         if (link >= 0) {
             const AgentNotes::NoteLink &target = m_links.at(link);
-            const QString where = target.href.startsWith(QLatin1String("thoughts-pdf-link:"))
+            // A Library PDF's place or a reading overlay (thoughts://open/document?…&overlay=…): here.
+            const QString where = target.href.startsWith(QLatin1String("thoughts-pdf-link:")) || target.href.startsWith(QLatin1String("thoughts://"))
                 ? i18n("Open in Thoughts") : target.href;
             QToolTip::showText(event->globalPosition().toPoint(), target.label.isEmpty() ? where : i18n("%1 — %2", target.label, where), this);
         } else {
@@ -394,6 +413,24 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         m_sendPage = new QPushButton(i18n("Send Page to Agent…"), bar);
         auto *barLayout = new QHBoxLayout(bar);
         barLayout->setContentsMargins(12, 8, 12, 8);
+        // The notes list beside the open note, hidden or shown as the reader's sidebar (⌘B).
+        m_toggleList = new QAction(QIcon::fromTheme(QStringLiteral("sidebar-expand-left"), QIcon::fromTheme(QStringLiteral("view-sidetree"))), i18n("Show Sidebar"), this);
+        m_toggleList->setObjectName(QStringLiteral("agentNotesToggleList"));
+        m_toggleList->setCheckable(true);
+        QList<QKeySequence> listShortcuts{QKeySequence(Qt::CTRL | Qt::Key_B)};
+#ifdef Q_OS_MACOS
+        listShortcuts.append(QKeySequence(Qt::META | Qt::Key_B));
+#endif
+        m_toggleList->setShortcuts(listShortcuts);
+        // This window's own: a reader window open beside it keeps ⌘B for its sidebar.
+        m_toggleList->setShortcutContext(Qt::WindowShortcut);
+        addAction(m_toggleList);
+        auto *toggleListButton = new QToolButton(bar);
+        toggleListButton->setObjectName(QStringLiteral("agentNotesToggleListButton"));
+        toggleListButton->setAutoRaise(true);
+        toggleListButton->setDefaultAction(m_toggleList);
+        barLayout->addWidget(toggleListButton);
+        barLayout->addSpacing(4);
         barLayout->addWidget(new QLabel(i18n("Show:"), bar));
         barLayout->addWidget(m_filterBox);
         barLayout->addSpacing(8);
@@ -508,6 +545,20 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         paneLayout->addWidget(answerLine);
         m_scroll->setParent(m_notePane);
         paneLayout->addWidget(m_scroll, 1);
+        // The reply under the note, always in view: no scrolling to the end to answer.
+        m_replyDock = new QWidget(m_notePane);
+        m_replyDock->setObjectName(QStringLiteral("agentNoteReplyDock"));
+        auto *dockLayout = new QVBoxLayout(m_replyDock);
+        dockLayout->setContentsMargins(24, 0, 24, 12);
+        dockLayout->setSpacing(10);
+        auto *rule = new QFrame(m_replyDock);
+        rule->setFrameShape(QFrame::HLine);
+        rule->setFrameShadow(QFrame::Plain);
+        rule->setForegroundRole(QPalette::Mid);
+        dockLayout->addWidget(rule);
+        m_replyBox->setParent(m_replyDock);
+        dockLayout->addWidget(m_replyBox);
+        paneLayout->addWidget(m_replyDock);
         m_detailStack->addWidget(m_placeholder);
         m_detailStack->addWidget(m_notePane);
         splitter->addWidget(m_list);
@@ -517,6 +568,9 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         splitter->setSizes({360, 760});
         outer->addWidget(splitter, 1);
         connect(m_list, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *current) { currentChanged(current); });
+        // Shown or hidden as last time.
+        setListShown(QSettings().value(QStringLiteral("AgentNotes/ListShown"), true).toBool(), false);
+        connect(m_toggleList, &QAction::toggled, this, [this](bool shown) { setListShown(shown, true); });
     }
 
     connect(m_refresh, &QAbstractButton::clicked, this, [this] {
@@ -566,7 +620,9 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
     };
     if (m_center) {
         connect(m_center, &AgentNotes::Center::draftChanged, this, [this](const QString &noteId) {
-            if (noteId == m_shownNoteId) updateReplyBox();
+            if (noteId != m_shownNoteId) return;
+            updateReplyBox();
+            syncDrawing();
         });
         connect(m_center, &AgentNotes::Center::notesChanged, this, &AgentNotesView::rebuildList);
         connect(m_center, &AgentNotes::Center::listeningChanged, this, [this](const QString &noteId) {
@@ -684,13 +740,22 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
         m_sourcesBox->setItemData(m_sourcesBox->count() - 1, AgentNotes::ReplySources::description(value), Qt::ToolTipRole);
     }
     m_sourcesBox->setAccessibleName(i18n("What the agent may use to answer"));
-    auto *sourcesLabel = new QLabel(i18nc("what the agent may use to answer a reply", "Sources:"), m_replyBox);
-    sourcesLabel->setBuddy(m_sourcesBox);
+    m_sourcesLabel = new QLabel(i18nc("what the agent may use to answer a reply", "Sources:"), m_replyBox);
+    m_sourcesLabel->setBuddy(m_sourcesBox);
+    // In the choice's place when the reply continues the conversation that sent the note: that
+    // chat has the note and its sources open already, so there is nothing to choose.
+    m_continuesConversation = new QLabel(m_replyBox);
+    m_continuesConversation->setObjectName(QStringLiteral("agentNoteReplyContinues"));
+    m_continuesConversation->setWordWrap(true);
+    m_continuesConversation->setToolTip(i18n("The agent conversation that sent this note answers your reply, with what it already has open."));
+    setSecondary(m_continuesConversation);
+    m_continuesConversation->hide();
     if (sidebar) {
         auto *sourcesRow = new QHBoxLayout;
-        sourcesRow->addWidget(sourcesLabel);
+        sourcesRow->addWidget(m_sourcesLabel);
         sourcesRow->addWidget(m_sourcesBox, 1);
         replyButtons->addLayout(sourcesRow);
+        replyButtons->addWidget(m_continuesConversation);
         auto *row = new QHBoxLayout;
         row->addWidget(m_drawButton);
         row->addStretch(1);
@@ -700,8 +765,9 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     } else {
         replyButtons->addWidget(m_drawButton);
         replyButtons->addWidget(m_replyStatus, 1);
-        replyButtons->addWidget(sourcesLabel);
+        replyButtons->addWidget(m_sourcesLabel);
         replyButtons->addWidget(m_sourcesBox);
+        replyButtons->addWidget(m_continuesConversation);
         replyButtons->addWidget(m_sendReply);
     }
     replyLayout->addLayout(replyButtons);
@@ -718,15 +784,62 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     m_repliesLayout->setContentsMargins(0, 0, 0, 0);
     m_repliesLayout->setSpacing(10);
 
+    // Highlight, Pen, Erase and Undo at the top of the note: drawing happens on the note itself
+    // (24 Nov 2026: Draw on the Picture… was at the end of the note and opened a window).
+    m_drawTools = new QWidget(m_detail);
+    m_drawTools->setObjectName(QStringLiteral("agentNoteDrawTools"));
+    auto *tools = new QHBoxLayout(m_drawTools);
+    tools->setContentsMargins(0, 0, 0, 0);
+    tools->setSpacing(4);
+    const auto tool = [this, tools](QToolButton *&button, const QString &name, const QString &icon, const QString &text, const QString &tip, int which) {
+        button = new QToolButton(m_drawTools);
+        button->setObjectName(name);
+        button->setIcon(QIcon::fromTheme(icon));
+        button->setText(text);
+        button->setToolTip(tip);
+        button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        button->setAutoRaise(true);
+        if (which >= 0) {
+            button->setCheckable(true);
+            // A second click on the chosen tool goes back to reading the note.
+            connect(button, &QToolButton::clicked, this, [this, which](bool checked) { setDrawTool(checked ? which : int(AgentNoteCanvas::Tool::None)); });
+        }
+        tools->addWidget(button);
+    };
+    tool(m_highlightTool, QStringLiteral("agentNoteInlineHighlight"), QStringLiteral("draw-highlight"), i18n("Highlight"),
+         i18n("Highlight on the note; it goes with your reply"), int(AgentNoteCanvas::Tool::Highlighter));
+    tool(m_penTool, QStringLiteral("agentNoteInlinePen"), QStringLiteral("draw-freehand"), i18n("Pen"), i18n("Draw on the note; it goes with your reply"),
+         int(AgentNoteCanvas::Tool::Pen));
+    tool(m_eraseTool, QStringLiteral("agentNoteInlineErase"), QStringLiteral("draw-eraser"), i18n("Erase"), i18n("Remove marks you made"),
+         int(AgentNoteCanvas::Tool::Eraser));
+    tool(m_undoTool, QStringLiteral("agentNoteInlineUndo"), QStringLiteral("edit-undo"), i18n("Undo"), i18n("Undo the last mark"), -1);
+    connect(m_undoTool, &QToolButton::clicked, this, [this] {
+        auto draft = m_center ? m_center->existingDraft(m_shownNoteId) : nullptr;
+        if (!draft || !draft->drawing.canUndo()) return;
+        draft->drawing.undo();
+        if (m_canvas) m_canvas->update();
+        m_center->draftDrawingChanged(m_shownNoteId);
+    });
+    tools->addStretch(1);
+    m_canvas = new AgentNoteCanvas(m_detail);
+    m_canvas->setObjectName(QStringLiteral("agentNoteCanvas"));
+    m_canvas->hide();
+    connect(m_canvas, &AgentNoteCanvas::documentChanged, this, [this] {
+        if (m_center && !m_shownNoteId.isEmpty()) m_center->draftDrawingChanged(m_shownNoteId);
+    });
+
     detailLayout->addWidget(m_title);
     detailLayout->addWidget(m_meta);
     detailLayout->addLayout(links);
+    detailLayout->addWidget(m_drawTools);
     detailLayout->addWidget(m_question);
     detailLayout->addWidget(m_message);
     detailLayout->addSpacing(4);
     detailLayout->addWidget(m_image);
+    detailLayout->addWidget(m_canvas);
     detailLayout->addSpacing(4);
-    detailLayout->addWidget(m_replyBox);
+    // The Split layout keeps the reply under the note, always in view (see the constructor).
+    if (sidebar) detailLayout->addWidget(m_replyBox);
     detailLayout->addSpacing(sidebar ? 8 : 12);
     detailLayout->addWidget(m_repliesHeader);
     detailLayout->addWidget(m_replies);
@@ -802,7 +915,8 @@ QString AgentNotesView::currentNoteId() const
 
 QString AgentNotesView::shownNoteId() const
 {
-    if (m_layout == Layout::Split) return currentNoteId();
+    // Split: the note selected, or a mark note shown with nothing selected.
+    if (m_layout == Layout::Split) return m_unlistedShown ? m_shownNoteId : currentNoteId();
     return m_pages->currentWidget() == m_notePage ? m_shownNoteId : QString();
 }
 
@@ -872,6 +986,7 @@ void AgentNotesView::fitImages()
     const int bar = qMax(m_scroll->style()->pixelMetric(QStyle::PM_ScrollBarExtent, nullptr, scrollBar), scrollBar->sizeHint().width());
     const int available = m_scroll->width() - 2 * m_scroll->frameWidth() - bar - margins.left() - margins.right();
     m_image->fitWidth(available);
+    if (m_canvas) m_canvas->fitWidth(qMin(available, AgentNoteImageView::MaxWidth));
     for (AgentNoteImageView *view : m_replies->findChildren<AgentNoteImageView *>()) view->fitWidth(available);
 }
 
@@ -895,7 +1010,8 @@ void AgentNotesView::updateStatus()
     if (m_layout == Layout::Sidebar) {
         setWindowTitle(unread > 0 ? i18np("Agent Notes (1 unread)", "Agent Notes (%1 unread)", unread) : i18n("Agent Notes"));
     }
-    if (m_list->count() == 0) {
+    // An empty list says so where the note goes, unless a note no list holds is shown there.
+    if (m_list->count() == 0 && !m_unlistedShown) {
         if (!m_center->hasListed()) {
             showPlaceholder(m_center->lastError().isEmpty() ? i18n("Loading agent notes…") : m_center->lastError());
         } else if (!m_filter.isEmpty()) {
@@ -922,7 +1038,7 @@ void AgentNotesView::rebuildList()
 {
     if (!m_center) return;
     const bool sidebar = m_layout == Layout::Sidebar;
-    const QString keep = !m_requestedNoteId.isEmpty() ? m_requestedNoteId : currentNoteId();
+    const QString keep = !m_requestedNoteId.isEmpty() ? m_requestedNoteId : m_unlistedShown ? m_shownNoteId : currentNoteId();
     const QDateTime now = QDateTime::currentDateTimeUtc();
     const QList<Note> notes = m_center->notes();
     {
@@ -970,6 +1086,23 @@ void AgentNotesView::rebuildList()
         updateStatus();
         return;
     }
+    // A note no list holds (a mark note, which the Center fetched by its id): shown by itself, the
+    // list beside it with nothing selected, until the user picks a note there.
+    if (const auto unlisted = select || keep.isEmpty() ? std::nullopt : m_center->note(keep); unlisted && unlisted->isMarkNote()) {
+        m_requestedNoteId.clear();
+        {
+            const QSignalBlocker blocker(m_list);
+            m_list->setCurrentItem(nullptr);
+            m_list->clearSelection();
+        }
+        const bool sameNote = m_unlistedShown && unlisted->id == m_shownNoteId;
+        m_unlistedShown = true;
+        showDetail(*unlisted, sameNote);
+        markSeenSoon(*unlisted);
+        updateStatus();
+        return;
+    }
+    m_unlistedShown = false;
     if (!select && m_list->count() > 0) select = m_list->item(0);
     if (select) {
         const QSignalBlocker blocker(m_list);
@@ -995,6 +1128,8 @@ void AgentNotesView::currentChanged(QListWidgetItem *current)
         if (m_list->count() == 0) updateStatus();
         return;
     }
+    // A note picked in the list takes the place of a mark note shown by itself.
+    m_unlistedShown = false;
     const auto note = m_center->note(current->data(NoteIdRole).toString());
     if (!note) return;
     showDetail(*note, note->id == m_shownNoteId);
@@ -1081,6 +1216,10 @@ void AgentNotesView::showDetail(const Note &note, bool sameNote)
     rebuildReplies(note);
     // The user's own pages are answered by the agent with a note of its own; agent notes get a reply box.
     m_replyBox->setVisible(!note.isPhonePage());
+    if (m_replyDock) m_replyDock->setVisible(!note.isPhonePage());
+    m_drawTools->setVisible(!note.isPhonePage());
+    if (!sameNote) setDrawTool(int(AgentNoteCanvas::Tool::None));
+    syncDrawing();
     if (m_center && !note.isPhonePage()) {
         // Who listens for a reply: asked when the note is shown, then every minute while it is
         // (a view out of sight asks when it comes back, see showEvent).
@@ -1109,8 +1248,41 @@ QString AgentNotesView::answerNoteId() const
     return note && !note->isPhonePage() ? id : QString();
 }
 
+void AgentNotesView::setListShown(bool shown, bool remember)
+{
+    if (!m_toggleList) return;
+    {
+        const QSignalBlocker blocker(m_toggleList);
+        m_toggleList->setChecked(shown);
+    }
+    const QString key = QKeySequence(Qt::CTRL | Qt::Key_B).toString(QKeySequence::NativeText);
+    m_toggleList->setText(shown ? i18n("Hide Sidebar") : i18n("Show Sidebar"));
+    m_toggleList->setToolTip(shown ? i18n("Hide Sidebar (%1)", key) : i18n("Show Sidebar (%1)", key));
+    // The list keeps the note chosen while it is hidden; focus in it moves to the note.
+    if (!shown && m_list->hasFocus()) m_scroll->setFocus();
+    m_list->setVisible(shown);
+    if (remember) QSettings().setValue(QStringLiteral("AgentNotes/ListShown"), shown);
+}
+
+bool AgentNotesView::listShown() const
+{
+    return !m_toggleList || m_toggleList->isChecked();
+}
+
+void AgentNotesView::updateSourcesChoice()
+{
+    const QString id = answerNoteId();
+    const auto note = id.isEmpty() ? std::nullopt : m_center->note(id);
+    const auto continued = note ? AgentNotes::continuedConversation(*note, m_center->answer(id)) : std::nullopt;
+    m_sourcesLabel->setVisible(!continued);
+    m_sourcesBox->setVisible(!continued);
+    m_continuesConversation->setVisible(continued.has_value());
+    if (continued) m_continuesConversation->setText(continued->text());
+}
+
 void AgentNotesView::updateAnswerLine()
 {
+    if (m_sourcesBox) updateSourcesChoice();
     if (!m_answerLine) return;
     const QString id = answerNoteId();
     const auto line = id.isEmpty() ? std::nullopt : AgentNotes::answerLine(m_center->answer(id), m_center->canChangeAnswerer(), m_center->serverReachable());
@@ -1271,6 +1443,49 @@ void AgentNotesView::showAnswerFailure(const QString &noteId, const QString &tex
     m_answerFailure->setText(text);
     m_answerFailureTimer->start();
     updateAnswerLine();
+}
+
+void AgentNotesView::setDrawTool(int which)
+{
+    const auto tool = AgentNoteCanvas::Tool(which);
+    const QImage image = m_image->image();
+    const bool drawing = m_center && !m_shownNoteId.isEmpty() && tool != AgentNoteCanvas::Tool::None && !image.isNull();
+    for (const auto &[button, value] : {std::pair {m_highlightTool, AgentNoteCanvas::Tool::Highlighter}, std::pair {m_penTool, AgentNoteCanvas::Tool::Pen},
+                                        std::pair {m_eraseTool, AgentNoteCanvas::Tool::Eraser}}) {
+        const QSignalBlocker blocker(button);
+        button->setChecked(drawing && value == tool);
+    }
+    if (drawing) {
+        auto draft = m_center->draft(m_shownNoteId);
+        // The drawing is in the picture's pixels, as in Draw on the Picture…; one of another size starts again.
+        if (draft->drawing.isNull() || draft->drawing.imageWidth() != image.width() || draft->drawing.imageHeight() != image.height()) {
+            draft->drawing = AgentNotes::AnnotationDocument(image.width(), image.height());
+        }
+        m_drawnDraft = draft;
+        m_canvas->setImage(image);
+        m_canvas->setDocument(&draft->drawing);
+        m_canvas->setTool(tool);
+        m_canvas->fitWidth(m_image->width());
+        m_image->hide();
+        m_canvas->show();
+    } else {
+        m_canvas->setDocument(nullptr);
+        m_canvas->hide();
+        m_image->show();
+    }
+    syncDrawing();
+}
+
+void AgentNotesView::syncDrawing()
+{
+    auto draft = m_center && !m_shownNoteId.isEmpty() ? m_center->existingDraft(m_shownNoteId) : nullptr;
+    const bool drawingNow = m_canvas && m_canvas->isVisible();
+    // A sent reply has no draft any more: its marks leave the note.
+    if (!draft && drawingNow) setDrawTool(int(AgentNoteCanvas::Tool::None));
+    m_drawnDraft = draft;
+    m_image->setDrawing(draft && !draft->drawing.isNull() ? &draft->drawing : nullptr);
+    if (m_undoTool) m_undoTool->setEnabled(draft && draft->drawing.canUndo() && !draft->sending);
+    if (m_canvas && drawingNow) m_canvas->update();
 }
 
 void AgentNotesView::updateReplyBox()
@@ -1614,6 +1829,145 @@ void AgentNotesWindow::showNote(const QString &noteId)
     if (windowState().testFlag(Qt::WindowMinimized)) setWindowState(windowState() & ~Qt::WindowMinimized);
     raise();
     activateWindow();
+}
+
+// ---------------------------------------------------------------- Send to Agent's sessions
+
+namespace
+{
+const QString SessionsKey = QStringLiteral("AgentNotes/SendToSessions");
+const QString LastSessionKey = QStringLiteral("AgentNotes/SendToSession");
+const QString LastSessionLabelKey = QStringLiteral("AgentNotes/SendToSessionLabel");
+}
+
+AgentSessionList::AgentSessionList(AgentNotes::Center *center, QObject *parent)
+    : QObject(parent)
+    , m_center(center)
+{
+    // The list as last fetched, at once.
+    m_sessions = AgentNotes::recipientsFromJson(QJsonDocument::fromJson(QSettings().value(SessionsKey).toByteArray()).array());
+}
+
+AgentSessionList *AgentSessionList::instance()
+{
+    static QPointer<AgentSessionList> list;
+    if (!list) list = new AgentSessionList(AgentNotes::Center::instance(), AgentNotes::Center::instance());
+    return list;
+}
+
+void AgentSessionList::setProposals(const QList<AgentNotes::ProposalAuthorship> &proposals)
+{
+    m_proposals = proposals;
+    Q_EMIT changed();
+}
+
+void AgentSessionList::refresh()
+{
+    // Who wrote which proposals, read again in the background (the menu's order).
+    if (m_loadProposals) m_loadProposals();
+    if (m_refreshing || !m_center) return;
+    m_refreshing = true;
+    QPointer<AgentSessionList> guard(this);
+    m_center->client()->wakers(this, [guard](const std::optional<QJsonObject> &answer, const QString &error) {
+        if (!guard) return;
+        guard->m_refreshing = false;
+        if (answer) {
+            guard->m_sessions = AgentNotes::recipients(*answer);
+            guard->m_error.clear();
+            guard->m_answered = true;
+            QSettings().setValue(SessionsKey, QJsonDocument(AgentNotes::recipientsJson(guard->m_sessions)).toJson(QJsonDocument::Compact));
+        } else {
+            guard->m_error = error;
+        }
+        Q_EMIT guard->changed();
+    });
+}
+
+QString AgentSessionList::lastSession() const
+{
+    return QSettings().value(LastSessionKey).toString();
+}
+
+QString AgentSessionList::lastSessionLabel() const
+{
+    const auto known = session(lastSession());
+    return known ? known->label() : QSettings().value(LastSessionLabelKey).toString();
+}
+
+void AgentSessionList::setLastSession(const AgentNotes::Recipient &session)
+{
+    QSettings settings;
+    settings.setValue(LastSessionKey, session.sessionId);
+    settings.setValue(LastSessionLabelKey, session.label());
+}
+
+std::optional<AgentNotes::Recipient> AgentSessionList::session(const QString &sessionId) const
+{
+    for (const AgentNotes::Recipient &known : m_sessions) {
+        if (!sessionId.isEmpty() && known.sessionId == sessionId) return known;
+    }
+    return std::nullopt;
+}
+
+void AgentSessionList::populate(QMenu *menu, std::function<void(const AgentNotes::Recipient &)> send, bool refreshNow, DocumentProvider document)
+{
+    if (!menu) return;
+    fill(menu, send, document);
+    if (!menu->property("thoughtsSessionsFollowed").toBool()) {
+        menu->setProperty("thoughtsSessionsFollowed", true);
+        // What a refresh brings, while the menu is open; the newest list each time it opens.
+        connect(this, &AgentSessionList::changed, menu, [this, menu, send, document] {
+            if (menu->isVisible()) fill(menu, send, document);
+        });
+        connect(menu, &QMenu::aboutToShow, this, [this, menu, send, document] {
+            fill(menu, send, document);
+            refresh();
+        });
+    }
+    if (refreshNow) refresh();
+}
+
+void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNotes::Recipient &)> &send, const DocumentProvider &document)
+{
+    menu->clear();
+    // The More Sessions of an earlier fill goes with its entry.
+    for (QMenu *more : menu->findChildren<QMenu *>(QStringLiteral("sendToAgentMore"), Qt::FindDirectChildrenOnly)) more->deleteLater();
+    if (m_sessions.isEmpty()) {
+        // Asked for now (or about to be), or why there are none.
+        const QString why = m_refreshing || (m_error.isEmpty() && !m_answered) ? i18n("Listing the sessions…")
+            : !m_error.isEmpty()                                            ? i18n("No sessions: %1", m_error)
+                                                                            : i18n("No session can be woken now");
+        QAction *none = menu->addAction(why);
+        none->setObjectName(QStringLiteral("sendToAgentNone"));
+        none->setEnabled(false);
+        return;
+    }
+    const QString last = lastSession();
+    const QHash<QString, AgentNotes::ProposalCounts> counts = AgentNotes::proposalCounts(m_proposals, document ? document() : AgentNotes::DocumentSources{});
+    const AgentNotes::SessionMenu order = AgentNotes::sessionMenu(m_sessions, counts, last);
+    const auto add = [&](QMenu *into, const AgentNotes::Recipient &session) {
+        const QString count = AgentNotes::countLabel(counts.value(session.sessionId.toLower()));
+        QAction *action = into->addAction(count.isEmpty() ? session.choiceText() : session.choiceText() + QLatin1Char(' ') + count);
+        action->setObjectName(QStringLiteral("sendToAgentSession"));
+        action->setData(session.sessionId);
+        // One session gets each send, so no tick marks the last one (20 November): its tip says it.
+        QString tip = i18n("Send the page on screen and what Copy for agent copies to %1", session.label());
+        if (session.sessionId == last) tip += QLatin1Char('\n') + i18n("Sent to last: Send to Last Agent (%1) sends here.", QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A).toString(QKeySequence::NativeText));
+        if (!session.live) tip += QLatin1Char('\n') + i18n("Its machine is offline: it is woken when the machine is back, or another agent answers.");
+        else if (session.state == QLatin1String("busy")) tip += QLatin1Char('\n') + i18n("Working now: it reads the page when it is done.");
+        else if (session.state == QLatin1String("closed")) tip += QLatin1Char('\n') + i18n("Not running: it is started again to read the page.");
+        action->setToolTip(tip);
+        connect(action, &QAction::triggered, menu, [send, session] {
+            if (send) send(session);
+        });
+    };
+    for (const AgentNotes::Recipient &session : order.shown) add(menu, session);
+    if (order.more.isEmpty()) return;
+    if (!order.shown.isEmpty()) menu->addSeparator();
+    auto *more = new QMenu(i18n("More Sessions"), menu);
+    more->setObjectName(QStringLiteral("sendToAgentMore"));
+    menu->addMenu(more);
+    for (const AgentNotes::Recipient &session : order.more) add(more, session);
 }
 
 }

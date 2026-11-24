@@ -25,6 +25,16 @@
     <key>NSHighResolutionCapable</key>
     <true/>
 
+    <!-- Live HTML pages (thoughts-server protocol/html-live-pages.md) load an address the user
+         agreed to, plain http on a named host included (a dashboard on another machine); App
+         Transport Security would refuse that in a web view. This allows it in web views only:
+         embedded pages stay sealed off by their CSP, and Thoughts' own connections are unchanged. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+    </dict>
+
     <key>CFBundleIconFile</key>
     <string>${MACOSX_BUNDLE_ICON_FILE}</string>
 

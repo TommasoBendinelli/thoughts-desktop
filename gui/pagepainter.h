@@ -11,6 +11,8 @@
 #include <QImage>
 #include <QPen>
 
+#include <functional>
+
 #include "core/annotations.h"
 #include "core/area.h" // for NormalizedPoint
 
@@ -31,6 +33,26 @@ public:
     // list of flags passed to the painting function. by OR-ing those flags
     // you can decide whether or not to permit drawing of a certain feature.
     enum PagePainterFlags { Accessibility = 1, EnhanceLinks = 2, EnhanceImages = 4, Highlights = 8, TextSelection = 16, Annotations = 32, HideComments = 64 };
+
+    /**
+     * What a view paints on a page right over its image, under the highlights, the text selection
+     * and the annotations (Thoughts: agents' reading overlays, drawn under the user's own markup).
+     * @p map gives a normalized rectangle of the page in @p painter coordinates; @p painter is
+     * clipped to the area being painted. Only the paintings of a view that set it get it: the view
+     * sets it around its own calls (Underlay::Scope) and nothing else paints meanwhile.
+     */
+    using Underlay = std::function<void(QPainter *painter, const Okular::Page *page, const std::function<QRectF(const QRectF &normalized)> &map)>;
+    class Q_DECL_EXPORT UnderlayScope
+    {
+    public:
+        explicit UnderlayScope(Underlay underlay);
+        ~UnderlayScope();
+        UnderlayScope(const UnderlayScope &) = delete;
+        UnderlayScope &operator=(const UnderlayScope &) = delete;
+
+    private:
+        Underlay m_previous;
+    };
 
     /**
      * Draw @p page on @p destPainter.

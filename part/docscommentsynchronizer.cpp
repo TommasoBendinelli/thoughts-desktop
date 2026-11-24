@@ -8,6 +8,7 @@
 
 #include "docscommentsynchronizer.h"
 #include "verifiedartifactcache.h"
+#include "fileidentitycache.h"
 #include "commenttexvisibility.h"
 #include "sourcenavigationvisibility.h"
 #include "sourceowner.h"
@@ -27,6 +28,7 @@
 #include <QLockFile>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QCache>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -762,6 +764,40 @@ bool reconcileJsonl(const QString &path, QList<QJsonObject> *records, QString *e
         *conflictCount = losing.size();
     }
     return true;
+}
+
+// reconcileJsonl() of a file without sync conflicts, kept while the file is
+// unchanged: such a file is only read (a merge of duplicate records writes it,
+// which changes it, so that result is not kept). The Library reads every
+// sidecar and the shared review_resolutions.jsonl once per document and load.
+struct ReconciledJsonl {
+    bool ok = false;
+    QList<QJsonObject> records;
+    QString error;
+    qint64 bytes = 0;
+};
+
+bool reconcileJsonlKept(const QString &path, QList<QJsonObject> *records, QString *error)
+{
+    const QFileInfo canonicalInfo(path);
+    if (!syncConflictFiles(canonicalInfo, canonicalInfo.completeBaseName() + QStringLiteral(".sync-conflict-*.jsonl")).isEmpty()) {
+        return reconcileJsonl(path, records, error);
+    }
+    static Thoughts::FileIdentityCache<ReconciledJsonl> cache(96 * 1024 * 1024);
+    const ReconciledJsonl result = cache.value(
+        path,
+        [](const QString &file) {
+            ReconciledJsonl reconciled;
+            reconciled.bytes = QFileInfo(file).size();
+            reconciled.ok = reconcileJsonl(file, &reconciled.records, &reconciled.error);
+            return reconciled;
+        },
+        [](const ReconciledJsonl &reconciled) { return qsizetype(reconciled.bytes) * Thoughts::ParsedJsonHeapFactor; });
+    *records = result.records;
+    if (!result.ok && error) {
+        *error = result.error;
+    }
+    return result.ok;
 }
 
 QJsonObject metadataFrom(const QJsonObject &comment)
@@ -2395,7 +2431,9 @@ int remapSourceNavigationLine(const QStringList &snapshotLines, const QStringLis
         : remapSnapshotLineFromSelectedText(visibleSnapshot, visibleCurrent, oldLine, selectedText);
 }
 
-int remapAnchorPassage(const QStringList &snapshotLines, const QStringList &currentLines, int mappedLine, const QString &selection)
+// @p snapshotOldLine: the snapshot's line found for the selection, also when it cannot be mapped.
+int remapAnchorPassage(const QStringList &snapshotLines, const QStringList &currentLines, int mappedLine, const QString &selection,
+                       int *snapshotOldLine = nullptr)
 {
     const QStringList before = sourceNavigationLines(snapshotLines);
     const QStringList after = sourceNavigationLines(currentLines);
@@ -2412,6 +2450,7 @@ int remapAnchorPassage(const QStringList &snapshotLines, const QStringList &curr
         if (matches != 1) return 0;
     }
     if (oldLine < 1 || oldLine > before.size()) return 0;
+    if (snapshotOldLine) *snapshotOldLine = oldLine;
     if (before == after) return oldLine;
     const QString target = normalizedSourceLine(before.at(oldLine - 1));
     if (target.isEmpty()) return 0;
@@ -6203,7 +6242,7 @@ PublishedSourceArtifactResolution resolvePublishedSourceArtifact(
     }
     const QStringList snapshotLines = publishedSourceLines(snapshot);
     const int line = request.requireExactPassage
-        ? remapAnchorPassage(snapshotLines, currentLines, mapped->line, request.selectedText)
+        ? remapAnchorPassage(snapshotLines, currentLines, mapped->line, request.selectedText, &attempt.result.snapshotLine)
         : remapSourceNavigationLine(snapshotLines, currentLines, mapped->line, request.selectedText);
     if (line < 1) {
         attempt.result.problem = DocsCommentSynchronizer::SourceResolutionResult::Problem::AmbiguousLocation;
@@ -6648,9 +6687,46 @@ QList<QJsonObject> DocsCommentSynchronizer::visibleSidecarComments(const QString
     const QString commentsRoot = QDir(docsRoot).filePath(QStringLiteral("comments"));
     const QString sidecarPath = QDir(commentsRoot).filePath(pdfStem + QStringLiteral("_comments.jsonl"));
     const QString resolutionPath = QDir(commentsRoot).filePath(QStringLiteral("review_resolutions.jsonl"));
+    // The visible records follow from the two files alone: kept while both
+    // are unchanged (a missing one has no identity and stays missing).
+    struct Visible {
+        QString identities;
+        QList<QJsonObject> visible;
+        QSet<QString> suppressed;
+        QByteArray fingerprint;
+    };
+    static QMutex visibleMutex;
+    static QCache<QString, Visible> visibleCache(4096);
+    // Sync conflict copies are merged into the file (reconcileJsonl()), which
+    // writes it: never answered from memory.
+    const auto identities = [&] {
+        QString key;
+        for (const QString &path : {sidecarPath, resolutionPath}) {
+            const QFileInfo info(path);
+            if (!syncConflictFiles(info, info.completeBaseName() + QStringLiteral(".sync-conflict-*.jsonl")).isEmpty()) return QString();
+            const QString identity = Thoughts::artifactFileIdentity(path);
+            if (identity.isEmpty() && QFileInfo::exists(path)) return QString();
+            key += (identity.isEmpty() ? QStringLiteral("missing:") + path : identity) + QLatin1Char('\n');
+        }
+        return key;
+    };
+    const QString identitiesBefore = identities();
+    if (!identitiesBefore.isEmpty()) {
+        QMutexLocker lock(&visibleMutex);
+        if (const Visible *kept = visibleCache.object(sidecarPath); kept && kept->identities == identitiesBefore) {
+            Thoughts::fileReadCounts().hits += 2;
+            if (suppressedIds) {
+                *suppressedIds = kept->suppressed;
+            }
+            if (fingerprint) {
+                *fingerprint = kept->fingerprint;
+            }
+            return kept->visible;
+        }
+    }
     QList<QJsonObject> records;
     QList<QJsonObject> resolutions;
-    if (!reconcileJsonl(sidecarPath, &records, error) || !reconcileJsonl(resolutionPath, &resolutions, error)) {
+    if (!reconcileJsonlKept(sidecarPath, &records, error) || !reconcileJsonlKept(resolutionPath, &resolutions, error)) {
         return {};
     }
     QSet<QString> suppressed;
@@ -6677,7 +6753,9 @@ QList<QJsonObject> DocsCommentSynchronizer::visibleSidecarComments(const QString
     if (suppressedIds) {
         *suppressedIds = suppressed;
     }
-    if (fingerprint) {
+    const bool keep = !identitiesBefore.isEmpty() && identities() == identitiesBefore;
+    if (fingerprint || keep) {
+        QByteArray computed;
         QJsonArray encodedVisible;
         for (const QJsonObject &record : std::as_const(visible)) {
             encodedVisible.append(record);
@@ -6688,12 +6766,19 @@ QList<QJsonObject> DocsCommentSynchronizer::visibleSidecarComments(const QString
         for (const QString &id : std::as_const(encodedSuppressed)) {
             encodedSuppressedIds.append(id);
         }
-        *fingerprint = QCryptographicHash::hash(
+        computed = QCryptographicHash::hash(
             compactJson(QJsonObject {
                 {QStringLiteral("visible"), encodedVisible},
                 {QStringLiteral("suppressed_ids"), encodedSuppressedIds},
             }),
             QCryptographicHash::Sha256);
+        if (fingerprint) {
+            *fingerprint = computed;
+        }
+        if (keep) {
+            QMutexLocker lock(&visibleMutex);
+            visibleCache.insert(sidecarPath, new Visible {identitiesBefore, visible, suppressed, computed});
+        }
     }
     return visible;
 }

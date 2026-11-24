@@ -32,9 +32,8 @@ public:
     int filesChecked = 0;
 
     explicit LibrarySourceInventory(const QString &root) : m_root(QDir(root).absolutePath()) {
-        QFile file(cachePath());
-        if (!file.open(QIODevice::ReadOnly)) return;
-        const auto saved = QJsonDocument::fromJson(file.readAll()).object();
+        // Read again only when it changed (fileidentitycache.h).
+        const auto saved = cachedJsonFile(cachePath()).object();
         if (saved.value(QStringLiteral("version")).toInt() == 1 && saved.value(QStringLiteral("root")).toString() == m_root)
             m_entries = saved.value(QStringLiteral("folders")).toObject();
     }
@@ -132,9 +131,7 @@ public:
         }
         const auto bytes = QJsonDocument(QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("root"), m_root},
             {QStringLiteral("folders"), m_entries}}).toJson(QJsonDocument::Compact);
-        QFile previous(cachePath());
-        if (previous.open(QIODevice::ReadOnly) && previous.readAll() == bytes) return;
-        previous.close();
+        if (const auto previous = cachedFileBytes(cachePath()); previous && *previous == bytes) return;
         QDir().mkpath(QFileInfo(cachePath()).absolutePath());
         QSaveFile file(cachePath());
         if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) file.commit();

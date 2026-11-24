@@ -11,7 +11,8 @@
 // A docs folder's interactive HTML pages, kept in step with Fedora's page list
 // (thoughts-server protocol/html-pages.md, capability html_pages_v1).
 //
-// A page is docs-<folder>/tex/support/html/<name>.html. Its bytes are an
+// A page is <folder>/tex/support/html/<name>.html, the folder a docs-* folder or a
+// Project's default folder (.thoughts/projects/<hex>/default). Its bytes are an
 // object; the folder's list is the HTML attachment manifest, which only
 // Fedora writes (POST /v1/html-pages). Each Sync compares the local files, the
 // folder's pages on Fedora and the version both last agreed on (kept in
@@ -38,9 +39,9 @@ struct HtmlPageSync {
     bool reportable() const { return changed() || !conflicts.isEmpty() || !errors.isEmpty(); }
 };
 
-// docs-<folder>/tex/support/html/<name>.html with a portable file name.
+// <folder>/tex/support/html/<name>.html with a portable file name.
 bool isHtmlPagePath(const QString &path);
-// The connected docs-* folders among the owners of `paths` (managed source paths).
+// The source folders (docs-* and default folders) among the owners of `paths` (managed source paths).
 QStringList htmlPageFolders(const QStringList &paths);
 // The folder's pages its HTML attachment manifest lists on this computer.
 QStringList listedHtmlPages(const Py::Path &docsRoot, const QString &folder);

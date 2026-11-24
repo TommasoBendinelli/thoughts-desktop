@@ -2,6 +2,7 @@
 // Page links (shell/thoughtspagelink.h): the parse the phone also makes
 // (ThoughtsCitationLinks.kt parseThoughtsCitationLink), the page and note a link
 // opens with, and the Library PDF it names.
+#include "../part/pdfplacelink.h"
 #include "../shell/thoughtspagelink.h"
 
 #include <QCryptographicHash>
@@ -45,6 +46,17 @@ private Q_SLOTS:
     void rejectsInvalidLinks();
     void opensTheTargetPageWithThePhonesNotes();
     void findsTheLibraryPdfOfTheDocument();
+    void readsTheServersDocumentPagesLeniently();
+    void otherAddressesStayWebLinks_data();
+    void otherAddressesStayWebLinks();
+    void knowsTheOriginsOfItsServer();
+    void parsesPdfPlaceLinks();
+    void malformedPlacesKeepThePage_data();
+    void malformedPlacesKeepThePage();
+    void refusesOtherPdfLinks_data();
+    void refusesOtherPdfLinks();
+    void convertsPdfPointsToThePageAsShown();
+    void parsesReadingOverlayLinks();
 };
 
 void ThoughtsPageLinkTest::parsesValidLinks()
@@ -210,6 +222,275 @@ void ThoughtsPageLinkTest::findsTheLibraryPdfOfTheDocument()
     // No Library index: nothing is synchronized.
     QVERIFY(QFile::remove(QDir(currentPdfs).filePath(QStringLiteral(".thoughts-library-index.json"))));
     QVERIFY(Thoughts::pageLinkDocumentPath(root.path(), Document).isEmpty());
+}
+
+// 2026-11-19: an agent linked a note with the server's "Open in Thoughts" page
+// (https://<server>/open/document/<id>?page=1&first=1&version=<sha256>), which the Mac handed to
+// the browser. A page of this computer's server under /open/document/<id> is the page link it
+// stands for, read leniently: agents wrote some with only ?page=N.
+void ThoughtsPageLinkTest::readsTheServersDocumentPagesLeniently()
+{
+    const QStringList origins{QStringLiteral("https://thoughts.example.org")};
+    const QString page = QStringLiteral("https://thoughts.example.org/open/document/") + Document;
+
+    auto link = Thoughts::serverPageLink(QUrl(page + QLatin1Char('?') + validQuery()), origins);
+    QVERIFY(link);
+    QCOMPARE(link->documentId, Document);
+    QCOMPARE(link->page, 3);
+    QCOMPARE(link->first, 10);
+    QCOMPARE(link->version, Version);
+    QCOMPARE(link->targetPage(), 12);
+    QVERIFY(Thoughts::isServerDocumentPageUrl(QUrl(page), origins));
+
+    // Missing first: 1. Missing version: the current one (no version). Missing page: 1.
+    link = Thoughts::serverPageLink(QUrl(page + QStringLiteral("?page=5")), origins);
+    QVERIFY(link);
+    QCOMPARE(link->page, 5);
+    QCOMPARE(link->first, 1);
+    QVERIFY(link->version.isEmpty());
+    QCOMPARE(link->targetPage(), 5);
+    link = Thoughts::serverPageLink(QUrl(page), origins);
+    QVERIFY(link);
+    QCOMPARE(link->targetPage(), 1);
+    QVERIFY(link->version.isEmpty());
+    link = Thoughts::serverPageLink(QUrl(page + QStringLiteral("?first=4&version=") + Version), origins);
+    QVERIFY(link);
+    QCOMPARE(link->targetPage(), 4);
+    QCOMPARE(link->version, Version);
+
+    // Unreadable values count as missing; other parameters and a fragment do not matter.
+    link = Thoughts::serverPageLink(QUrl(page + QStringLiteral("?page=0&first=x&version=nope&utm=1#top")), origins);
+    QVERIFY(link);
+    QCOMPARE(link->targetPage(), 1);
+    QVERIFY(link->version.isEmpty());
+    link = Thoughts::serverPageLink(QUrl(page + QStringLiteral("?page=2&page=9&version=") + QString(64, QLatin1Char('A'))), origins);
+    QVERIFY(link);
+    QCOMPARE(link->page, 2);
+    QCOMPARE(link->version, Version);
+
+    // The host's case, the default port and an upper-case id or a trailing slash are the same page.
+    link = Thoughts::serverPageLink(QUrl(QStringLiteral("https://Thoughts.Example.ORG:443/open/document/") + Document.toUpper() + QStringLiteral("/?page=7")), origins);
+    QVERIFY(link);
+    QCOMPARE(link->documentId, Document);
+    QCOMPARE(link->targetPage(), 7);
+}
+
+void ThoughtsPageLinkTest::otherAddressesStayWebLinks_data()
+{
+    QTest::addColumn<QString>("value");
+    QTest::addColumn<bool>("documentPage");
+    const QString query = QLatin1Char('?') + validQuery();
+    QTest::newRow("other host") << QStringLiteral("https://other.example.org/open/document/") + Document + query << false;
+    QTest::newRow("subdomain") << QStringLiteral("https://www.thoughts.example.org/open/document/") + Document + query << false;
+    QTest::newRow("http") << QStringLiteral("http://thoughts.example.org/open/document/") + Document + query << false;
+    QTest::newRow("other port") << QStringLiteral("https://thoughts.example.org:8443/open/document/") + Document + query << false;
+    QTest::newRow("user info") << QStringLiteral("https://me@thoughts.example.org/open/document/") + Document + query << false;
+    QTest::newRow("web app") << QStringLiteral("https://thoughts.example.org/app/") << false;
+    QTest::newRow("web app document") << QStringLiteral("https://thoughts.example.org/app/document/") + Document + query << false;
+    QTest::newRow("server root") << QStringLiteral("https://thoughts.example.org/") << false;
+    QTest::newRow("other path") << QStringLiteral("https://thoughts.example.org/open/documents/") + Document + query << false;
+    QTest::newRow("prefixed path") << QStringLiteral("https://thoughts.example.org/x/open/document/") + Document + query << false;
+    QTest::newRow("thoughts scheme") << link(validQuery()) << false;
+    // A document page without a document: not opened here, but still the server's page.
+    QTest::newRow("no document") << QStringLiteral("https://thoughts.example.org/open/document/") + query << true;
+    QTest::newRow("not an id") << QStringLiteral("https://thoughts.example.org/open/document/item-response-theory") + query << true;
+    QTest::newRow("extra segment") << QStringLiteral("https://thoughts.example.org/open/document/") + Document + QStringLiteral("/page") + query << true;
+}
+
+void ThoughtsPageLinkTest::otherAddressesStayWebLinks()
+{
+    QFETCH(QString, value);
+    QFETCH(bool, documentPage);
+    const QStringList origins{QStringLiteral("https://thoughts.example.org")};
+    QVERIFY2(!Thoughts::serverPageLink(QUrl(value), origins), qPrintable(value));
+    QCOMPARE(Thoughts::isServerDocumentPageUrl(QUrl(value), origins), documentPage);
+    // Without a server, nothing is the server's.
+    QVERIFY(!Thoughts::isServerDocumentPageUrl(QUrl(value), {}));
+}
+
+void ThoughtsPageLinkTest::knowsTheOriginsOfItsServer()
+{
+    QCOMPARE(Thoughts::ownServerOrigins(QStringLiteral("https://thoughts.example.org/")), QStringList{QStringLiteral("https://thoughts.example.org")});
+    QCOMPARE(Thoughts::ownServerOrigins(QStringLiteral("https://Thoughts.Example.org:8443")), QStringList{QStringLiteral("https://thoughts.example.org:8443")});
+    // The public server and its earlier private address are one server: each knows the other's pages.
+    // A build without an earlier address (THOUGHTS_LEGACY_SERVER_URL empty) has only the public one.
+    const bool legacy = !Thoughts::ServerAddress::legacyUrl().isEmpty();
+    QStringList owner{Thoughts::ServerAddress::origin(Thoughts::ServerAddress::defaultUrl())};
+    if (legacy) owner.append(Thoughts::ServerAddress::origin(Thoughts::ServerAddress::legacyUrl()));
+    if (legacy) QCOMPARE(Thoughts::ownServerOrigins(Thoughts::ServerAddress::legacyUrl()), owner);
+    QCOMPARE(Thoughts::ownServerOrigins(Thoughts::ServerAddress::defaultUrl()), owner);
+    QVERIFY(Thoughts::serverPageLink(QUrl(Thoughts::ServerAddress::defaultUrl() + QStringLiteral("/open/document/") + Document),
+                                     Thoughts::ownServerOrigins(legacy ? Thoughts::ServerAddress::legacyUrl() : Thoughts::ServerAddress::defaultUrl())));
+    // An address Thoughts refuses (the tests' own http server, nothing) has no pages.
+    QVERIFY(Thoughts::ownServerOrigins(QStringLiteral("http://127.0.0.1:9")).isEmpty());
+    QVERIFY(Thoughts::ownServerOrigins(QString()).isEmpty());
+    // The configured server: THOUGHTS_SERVER_URL in tests.
+    const QByteArray saved = qgetenv("THOUGHTS_SERVER_URL");
+    qputenv("THOUGHTS_SERVER_URL", "https://thoughts.example.org");
+    QCOMPARE(Thoughts::ownServerOrigins(), QStringList{QStringLiteral("https://thoughts.example.org")});
+    if (saved.isEmpty()) qunsetenv("THOUGHTS_SERVER_URL");
+    else qputenv("THOUGHTS_SERVER_URL", saved);
+}
+
+// Agent note links to a place in a PDF (server protocol/agent-notes.md, "Links to a place in a
+// PDF"): the page as before, and optionally a point and the passage, in PDF points.
+void ThoughtsPageLinkTest::parsesPdfPlaceLinks()
+{
+    const auto place = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:web_article.pdf?page=1&x=72.000&y=1387.437&rect=72,1370.5,523.25,1399"));
+    QVERIFY(place);
+    QCOMPARE(place->filename, QStringLiteral("web_article.pdf"));
+    QCOMPARE(place->page, 1);
+    QVERIFY(place->point);
+    QCOMPARE(*place->point, QPointF(72.0, 1387.437));
+    QVERIFY(place->rect);
+    QCOMPARE(*place->rect, QRectF(QPointF(72.0, 1370.5), QPointF(523.25, 1399.0)));
+
+    // The page alone, as notes linked it so far.
+    const auto page = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:notes.pdf?page=0"));
+    QVERIFY(page);
+    QCOMPARE(page->filename, QStringLiteral("notes.pdf"));
+    QCOMPARE(page->page, 0);
+    QVERIFY(!page->point && !page->rect);
+
+    // The corners in any order make the same passage; a rect alone is the place too.
+    const auto swapped = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:notes.pdf?page=2&rect=300,410,60,380"));
+    QVERIFY(swapped && swapped->rect && !swapped->point);
+    QCOMPARE(*swapped->rect, QRectF(QPointF(60, 380), QPointF(300, 410)));
+    // y without x: the left edge. Encoded commas (as a URL may carry them) and unknown parameters.
+    const auto encoded = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:notes.pdf?page=4&y=500&zoom=2&rect=10%2C20%2C30%2C40"));
+    QVERIFY(encoded && encoded->point && encoded->rect);
+    QCOMPARE(*encoded->point, QPointF(0, 500));
+    QCOMPARE(*encoded->rect, QRectF(QPointF(10, 20), QPointF(30, 40)));
+    // The first of repeated parameters counts.
+    const auto repeated = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:notes.pdf?page=4&y=500&y=10"));
+    QVERIFY(repeated && repeated->point);
+    QCOMPARE(repeated->point->y(), 500.0);
+    // What QUrl gives back for the link of a PDF reads the same.
+    const QString fromUrl = QUrl(QStringLiteral("thoughts-pdf-link:notes.pdf?page=3&x=72&y=400.5&rect=60,380,300,410")).toString();
+    const auto read = Thoughts::parsePdfPlaceLink(fromUrl);
+    QVERIFY2(read && read->point && read->rect, qPrintable(fromUrl));
+    QCOMPARE(read->page, 3);
+}
+
+void ThoughtsPageLinkTest::malformedPlacesKeepThePage_data()
+{
+    QTest::addColumn<QString>("query");
+    QTest::addColumn<bool>("point");
+    QTest::addColumn<bool>("rect");
+    QTest::newRow("y not a number") << QStringLiteral("&x=72&y=abc") << false << false;
+    QTest::newRow("y nan") << QStringLiteral("&x=72&y=nan") << false << false;
+    QTest::newRow("y infinite") << QStringLiteral("&y=inf") << false << false;
+    QTest::newRow("y exponent") << QStringLiteral("&y=1e400") << false << false;
+    QTest::newRow("y empty") << QStringLiteral("&y=") << false << false;
+    QTest::newRow("x alone") << QStringLiteral("&x=72") << false << false;
+    QTest::newRow("x malformed") << QStringLiteral("&x=7,2&y=400") << true << false;
+    QTest::newRow("rect three numbers") << QStringLiteral("&y=400&rect=1,2,3") << true << false;
+    QTest::newRow("rect five numbers") << QStringLiteral("&rect=1,2,3,4,5") << false << false;
+    QTest::newRow("rect no width") << QStringLiteral("&rect=10,20,10,40") << false << false;
+    QTest::newRow("rect no height") << QStringLiteral("&rect=10,20,30,20") << false << false;
+    QTest::newRow("rect word") << QStringLiteral("&rect=a,b,c,d") << false << false;
+    QTest::newRow("bare ampersands") << QStringLiteral("&&") << false << false;
+    QTest::newRow("no value") << QStringLiteral("&rect") << false << false;
+}
+
+void ThoughtsPageLinkTest::malformedPlacesKeepThePage()
+{
+    QFETCH(QString, query);
+    QFETCH(bool, point);
+    QFETCH(bool, rect);
+    const auto place = Thoughts::parsePdfPlaceLink(QStringLiteral("thoughts-pdf-link:notes.pdf?page=7") + query);
+    QVERIFY(place);
+    QCOMPARE(place->page, 7);
+    QCOMPARE(bool(place->point), point);
+    QCOMPARE(bool(place->rect), rect);
+}
+
+void ThoughtsPageLinkTest::refusesOtherPdfLinks_data()
+{
+    QTest::addColumn<QString>("href");
+    QTest::newRow("no page") << QStringLiteral("thoughts-pdf-link:notes.pdf");
+    QTest::newRow("page not first") << QStringLiteral("thoughts-pdf-link:notes.pdf?x=1&page=1");
+    QTest::newRow("negative page") << QStringLiteral("thoughts-pdf-link:notes.pdf?page=-1");
+    QTest::newRow("folder") << QStringLiteral("thoughts-pdf-link:docs/notes.pdf?page=1");
+    QTest::newRow("parent") << QStringLiteral("thoughts-pdf-link:../notes.pdf?page=1");
+    QTest::newRow("not a pdf") << QStringLiteral("thoughts-pdf-link:notes.txt?page=1");
+    QTest::newRow("fragment") << QStringLiteral("thoughts-pdf-link:notes.pdf?page=1#quote=x");
+    QTest::newRow("other scheme") << QStringLiteral("https://example.org/notes.pdf?page=1");
+}
+
+void ThoughtsPageLinkTest::refusesOtherPdfLinks()
+{
+    QFETCH(QString, href);
+    QVERIFY(!Thoughts::parsePdfPlaceLink(href));
+}
+
+// PDF points from the bottom left of the crop box, in the PDF's own user space, to the page as
+// the reader shows it (top left origin, normalized), turned by its /Rotate and the reader.
+void ThoughtsPageLinkTest::convertsPdfPointsToThePageAsShown()
+{
+    const QSizeF crop(500, 2000); // a tall page
+    const auto near = [](const QPointF &actual, const QPointF &expected) {
+        return std::abs(actual.x() - expected.x()) < 1e-9 && std::abs(actual.y() - expected.y()) < 1e-9;
+    };
+    // The origin flip: y counts from the bottom.
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(50, 1500), crop, 0), QPointF(0.1, 0.25)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(0, 2000), crop, 0), QPointF(0, 0)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(500, 0), crop, 0), QPointF(1, 1)));
+    // Outside the crop box: its edge.
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(-20, 2400), crop, 0), QPointF(0, 0)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(900, -5), crop, 0), QPointF(1, 1)));
+    // Turned clockwise: the page's top left goes to the top right, and so on.
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(50, 1500), crop, 1), QPointF(0.75, 0.1)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(50, 1500), crop, 2), QPointF(0.9, 0.75)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(50, 1500), crop, 3), QPointF(0.25, 0.9)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(50, 1500), crop, 5), QPointF(0.75, 0.1)));
+    QVERIFY(near(Thoughts::normalizedPdfPoint(QPointF(0, 2000), crop, 1), QPointF(1, 0)));
+    // A passage: its lower edge in PDF points is its bottom on the page.
+    const QRectF passage(QPointF(50, 1400), QPointF(250, 1500));
+    const QRectF shown = Thoughts::normalizedPdfRect(passage, crop, 0);
+    QVERIFY(near(shown.topLeft(), QPointF(0.1, 0.25)));
+    QVERIFY(near(shown.bottomRight(), QPointF(0.5, 0.3)));
+    const QRectF turned = Thoughts::normalizedPdfRect(passage, crop, 1);
+    QVERIFY(near(turned.topLeft(), QPointF(0.7, 0.1)));
+    QVERIFY(near(turned.bottomRight(), QPointF(0.75, 0.5)));
+    const QRectF upsideDown = Thoughts::normalizedPdfRect(passage, crop, 2);
+    QVERIFY(near(upsideDown.topLeft(), QPointF(0.5, 0.7)));
+    QVERIFY(near(upsideDown.bottomRight(), QPointF(0.9, 0.75)));
+    // No crop box: nothing to place.
+    QCOMPARE(Thoughts::normalizedPdfPoint(QPointF(1, 1), QSizeF(), 0), QPointF());
+}
+
+void ThoughtsPageLinkTest::parsesReadingOverlayLinks()
+{
+    // add_reading_overlay's open_url (reading-overlays.md §3.1): thoughts://open/document?document_id=…&overlay=….
+    const QString overlay = QStringLiteral("5b0c1f6e-2a47-4d1e-9c3b-7e8f2a6d4c10");
+    const auto parsed = Thoughts::parseOverlayLink(QUrl(QStringLiteral("thoughts://open/document?document_id=%1&overlay=%2").arg(Document, overlay)));
+    QVERIFY(parsed);
+    QCOMPARE(parsed->documentId, Document);
+    QCOMPARE(parsed->overlayId, overlay);
+    // Either order, upper-case ids, other parameters ignored.
+    const auto reordered = Thoughts::parseOverlayLink(QUrl(QStringLiteral("thoughts://open/document?overlay=%1&page=3&document_id=%2").arg(overlay.toUpper(), Document.toUpper())));
+    QVERIFY(reordered);
+    QCOMPARE(reordered->documentId, Document);
+    QCOMPARE(reordered->overlayId, overlay);
+    // The page link's form with an overlay.
+    const auto pageForm = Thoughts::parseOverlayLink(QUrl(link(validQuery() + QStringLiteral("&overlay=") + overlay)));
+    QVERIFY(pageForm);
+    QCOMPARE(pageForm->documentId, Document);
+    QCOMPARE(pageForm->overlayId, overlay);
+    // It is no page link: those take exactly page, first and version.
+    QVERIFY(!Thoughts::parsePageLink(QUrl(QStringLiteral("thoughts://open/document?document_id=%1&overlay=%2").arg(Document, overlay))));
+    QVERIFY(Thoughts::isPageLinkUrl(QUrl(QStringLiteral("thoughts://open/document?document_id=%1&overlay=%2").arg(Document, overlay))));
+    // Not an overlay link.
+    for (const QString &value : {link(validQuery()), QStringLiteral("thoughts://open/document?document_id=%1").arg(Document),
+                                 QStringLiteral("thoughts://open/document?document_id=%1&overlay=m1").arg(Document),
+                                 QStringLiteral("thoughts://open/document?document_id=not-a-uuid&overlay=%1").arg(overlay),
+                                 QStringLiteral("thoughts://open/document?overlay=%1").arg(overlay),
+                                 QStringLiteral("thoughts://open/document?document_id=%1&overlay=%2&overlay=%2").arg(Document, overlay),
+                                 QStringLiteral("thoughts://open/card?document_id=%1&overlay=%2").arg(Document, overlay),
+                                 QStringLiteral("thoughts://elsewhere/document?document_id=%1&overlay=%2").arg(Document, overlay),
+                                 QStringLiteral("https://open/document?document_id=%1&overlay=%2").arg(Document, overlay)})
+        QVERIFY2(!Thoughts::parseOverlayLink(QUrl(value)), qPrintable(value));
 }
 
 QTEST_GUILESS_MAIN(ThoughtsPageLinkTest)

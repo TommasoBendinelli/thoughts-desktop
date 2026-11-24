@@ -12,6 +12,7 @@
 #include <optional>
 
 class QAbstractButton;
+class QAction;
 class QComboBox;
 class QDialog;
 class QLabel;
@@ -57,6 +58,8 @@ public:
     // clicked(), and the pointer and a tooltip show where it goes.
     void setLinks(const QList<AgentNotes::NoteLink> &links);
     QList<AgentNotes::NoteLink> links() const { return m_links; }
+    // The reply's drawing over the picture (null: none). Kept alive by the caller.
+    void setDrawing(const AgentNotes::AnnotationDocument *drawing);
     // The link under @p position (widget pixels), or -1.
     int linkAt(const QPointF &position) const;
 
@@ -84,6 +87,7 @@ private:
     bool m_clickable = false;
     QPixmap m_scaled;
     QList<AgentNotes::NoteLink> m_links;
+    const AgentNotes::AnnotationDocument *m_drawing = nullptr;
     int m_hoveredLink = -1;
 };
 
@@ -155,6 +159,8 @@ public:
     AgentNotes::Filter filter() const { return m_filter; }
     // The notes listed now, after the filter.
     int listedCount() const;
+    // The window's notes list is shown (Hide Sidebar, ⌘B); always for the sidebar's own list.
+    bool listShown() const;
 
     // The phone's tools: draw on the note's picture (and reply), send a page, delete a note.
     void openComposer(const QString &noteId);
@@ -189,11 +195,19 @@ private:
     bool readsNow() const;
     void openLarge();
     void updateReplyBox();
+    // Highlight, Pen and Erase at the top of a note: draw on the note in place (None: read it). The
+    // drawing is the reply's, as Draw on the Picture… makes it, and stays shown over the note.
+    void setDrawTool(int tool);
+    void syncDrawing();
     QWidget *createAnswerLine(QWidget *parent);
     // The line above the note shown: whether an agent listens for a reply, which one, and
     // "Change" (AgentNotes::answerLine). No line for a page the user sent, nor while the server
     // has not said or cannot tell.
     void updateAnswerLine();
+    // The Sources choice, or in its place the conversation the reply continues.
+    void updateSourcesChoice();
+    // The window's notes list beside the open note (Split), hidden or shown; @p remember saves it.
+    void setListShown(bool shown, bool remember);
     // The agent's note on screen whose line is kept up to date; empty when there is none.
     QString answerNoteId() const;
     // The list "Change" opens: Automatic and the agents that could answer now, the current
@@ -227,6 +241,8 @@ private:
 
     QLabel *m_status = nullptr;
     QAbstractButton *m_markAllRead = nullptr;
+    // Hide Sidebar / Show Sidebar (⌘B) in the window: its notes list.
+    QAction *m_toggleList = nullptr;
     QAbstractButton *m_refresh = nullptr;
     QAbstractButton *m_sendPage = nullptr;
     QListWidget *m_list = nullptr;
@@ -249,6 +265,16 @@ private:
     QLabel *m_message = nullptr;
     AgentNoteImageView *m_image = nullptr;
     QWidget *m_replyBox = nullptr;
+    // Split layout: the reply box under the note, always in view.
+    QWidget *m_replyDock = nullptr;
+    QWidget *m_drawTools = nullptr;
+    QToolButton *m_highlightTool = nullptr;
+    QToolButton *m_penTool = nullptr;
+    QToolButton *m_eraseTool = nullptr;
+    QToolButton *m_undoTool = nullptr;
+    class AgentNoteCanvas *m_canvas = nullptr;
+    // The draft drawn on in place or shown over the note: kept alive while it is.
+    std::shared_ptr<AgentNotes::Center::Draft> m_drawnDraft;
     // Split: the line that says who listens, over the note (m_scroll).
     QWidget *m_notePane = nullptr;
     QWidget *m_answerLine = nullptr;
@@ -267,6 +293,8 @@ private:
     QPushButton *m_sendReply = nullptr;
     // What the agent may use when it answers (AgentNotes::ReplySources), sent with every reply.
     QComboBox *m_sourcesBox = nullptr;
+    QLabel *m_sourcesLabel = nullptr;
+    QLabel *m_continuesConversation = nullptr;
     QLabel *m_repliesHeader = nullptr;
     QWidget *m_replies = nullptr;
     QVBoxLayout *m_repliesLayout = nullptr;
@@ -277,6 +305,9 @@ private:
     QString m_shownCardId;
     QUrl m_shownConversation;
     QString m_requestedNoteId;
+    // Split: the note shown is one the list does not hold (a reading overlay mark's note, opened
+    // from its mark), shown with nothing selected in the list until the user picks a note there.
+    bool m_unlistedShown = false;
 };
 
 // File › Agent Notes: its own window, the list beside the note.
@@ -289,6 +320,65 @@ public:
 
     // Selects the note (once the list holds it) and brings the window forward.
     void showNote(const QString &noteId);
+};
+
+// Send to Agent's sessions (a tab's menu, File › Send to Agent): the sessions reply wakers can wake
+// (AgentNotes::recipients), as last fetched, kept in the app's settings so a menu lists them at
+// once, and fetched again in the background whenever a menu shows them. Also the session the user
+// sent to last.
+class AgentSessionList : public QObject
+{
+    Q_OBJECT
+public:
+    explicit AgentSessionList(AgentNotes::Center *center, QObject *parent = nullptr);
+    // The app's, on AgentNotes::Center::instance().
+    static AgentSessionList *instance();
+
+    QList<AgentNotes::Recipient> sessions() const { return m_sessions; }
+    bool isRefreshing() const { return m_refreshing; }
+    // Why the last refresh did not bring the list (empty when it did).
+    QString error() const { return m_error; }
+    // Asks the server again (GET /v1/agent-notes/wakers) unless a request is on its way; changed()
+    // follows the answer. A failure keeps the sessions known.
+    void refresh();
+
+    // The session sent to last ("" before any), with its label as it was then.
+    QString lastSession() const;
+    QString lastSessionLabel() const;
+    void setLastSession(const AgentNotes::Recipient &session);
+    std::optional<AgentNotes::Recipient> session(const QString &sessionId) const;
+
+    // The proposals the sessions wrote (pending and decided, every version), for the order: the
+    // sessions with the most on the document first (AgentNotes::sessionMenu). Set by the loader,
+    // which refresh() calls to read them again in the background.
+    QList<AgentNotes::ProposalAuthorship> proposals() const { return m_proposals; }
+    void setProposals(const QList<AgentNotes::ProposalAuthorship> &proposals);
+    void setProposalLoader(std::function<void()> load) { m_loadProposals = std::move(load); }
+
+    // @p menu lists the sessions as AgentNotes::sessionMenu orders them for @p document's (asked for
+    // each time the menu is filled): at most MenuSessions, each with its proposals ("— 12 here",
+    // "— 40 in all"), the one sent to last checked; the rest under More Sessions. A click calls
+    // @p send. Without any, one disabled entry says why (listing, none to wake, or the failure).
+    // Each time it opens it asks again in the background (and now too, with @p refreshNow) and
+    // lists what comes while it is open.
+    using DocumentProvider = std::function<AgentNotes::DocumentSources()>;
+    void populate(QMenu *menu, std::function<void(const AgentNotes::Recipient &)> send, bool refreshNow = true, DocumentProvider document = {});
+
+Q_SIGNALS:
+    void changed();
+
+private:
+    // @p menu's entries as the list is now.
+    void fill(QMenu *menu, const std::function<void(const AgentNotes::Recipient &)> &send, const DocumentProvider &document);
+
+    QPointer<AgentNotes::Center> m_center;
+    QList<AgentNotes::Recipient> m_sessions;
+    bool m_refreshing = false;
+    // The server answered this run (an empty list then means none can be woken).
+    bool m_answered = false;
+    QString m_error;
+    QList<AgentNotes::ProposalAuthorship> m_proposals;
+    std::function<void()> m_loadProposals;
 };
 
 }

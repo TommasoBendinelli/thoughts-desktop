@@ -220,3 +220,37 @@ bool Thoughts::handleHtmlAttachmentLink(const QObject *document, const QUrl &lin
     handler(link);
     return true;
 }
+
+namespace
+{
+struct WebLinkHandler {
+    QPointer<QObject> receiver;
+    std::function<bool(const QUrl &)> handler;
+};
+QHash<const QObject *, WebLinkHandler> &webLinkHandlers()
+{
+    static QHash<const QObject *, WebLinkHandler> handlers;
+    return handlers;
+}
+}
+
+void Thoughts::setWebLinkHandler(const QObject *document, QObject *receiver, std::function<bool(const QUrl &)> handler)
+{
+    if (!document) return;
+    if (!receiver || !handler) {
+        webLinkHandlers().remove(document);
+        return;
+    }
+    webLinkHandlers().insert(document, {receiver, std::move(handler)});
+    // Forget the entry with either side (a later document may reuse the address).
+    QObject::connect(document, &QObject::destroyed, receiver, [document] { webLinkHandlers().remove(document); });
+    QObject::connect(receiver, &QObject::destroyed, [document] { webLinkHandlers().remove(document); });
+}
+
+bool Thoughts::handleWebLink(const QObject *document, const QUrl &link)
+{
+    const auto found = webLinkHandlers().constFind(document);
+    if (found == webLinkHandlers().constEnd() || !found->receiver || !found->handler) return false;
+    const auto handler = found->handler;
+    return handler(link);
+}

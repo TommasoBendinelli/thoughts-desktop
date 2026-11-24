@@ -10,6 +10,7 @@
 #include "../part/htmlreader.h"
 #include "../part/htmlattachmentreader.h"
 #include "../core/htmlattachment.h"
+#include "../core/htmllivepage.h"
 #include "../part/annotationmodel.h"
 #include "../part/documentfeedback.h"
 #include "../part/documentfeedbackoverlay.h"
@@ -21,6 +22,7 @@
 #include "../part/reviewfeedbackoverlay.h"
 #include "../part/side_reviews.h"
 #include "../part/sidebar.h"
+#include "../part/snapshotdrawingdialog.h"
 #include "../part/thoughtsplatform.h"
 #include "../settings.h"
 
@@ -35,17 +37,22 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include <QFutureWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QInputDialog>
+#include <QLabel>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
+#include <QPushButton>
 #include <QScopeGuard>
 #include <QScreen>
 #include <QShortcut>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QTest>
+#include <cstdio>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeView>
@@ -57,6 +64,9 @@ namespace
 const QString CardId = QStringLiteral("4150ddf3-7842-4511-b735-05f9ec89972f");
 const QString AttachmentPath = QStringLiteral("docs-ideas/tex/support/html/explainer.html");
 const QString DocumentId = QStringLiteral("c1870925-b9d7-45f5-b112-ba599f2b5af4");
+const QUrl LiveAddress(QStringLiteral("http://localhost:18770/"));
+// A live page's stub (thoughts-server protocol/html-live-pages.md §1), as the attachment's bytes.
+const QByteArray LiveStub = Thoughts::LivePage::stubHtml(LiveAddress, QStringLiteral("Training curves"));
 
 QString sha(const QByteArray &bytes)
 {
@@ -98,19 +108,25 @@ private Q_SLOTS:
     void webViewReviewSelectionAndCards();
     void attachmentShownInPlaceOfTheDocument();
     void attachmentTabShowsThePageAlone();
+    void attachmentFollowsItsNewestVersion();
     void attachmentForwardsReviewKeys();
     void attachmentCardFromASelection();
     void attachmentFeedbackFromASelection();
+    void snapshotDrawingDialogTakesStrokes();
+    void attachmentDrawingOnASnapshot();
     void attachmentCardReviewWithoutPageShowsStoredAnswer();
     void webViewAttachmentCardsAndReview();
     void webViewAttachmentFeedback();
+    void livePageAsksThenLoadsWithoutTheBridge();
+    void liveSnapshotAndGoLiveAgain();
+    void livePageTextFeedback();
 
 private:
     // A Library PDF (copy of data/file1.pdf) whose generation lists `state` for its edition.
     QString addLibraryPdf(const QString &stem, const QString &kind, const QJsonObject &htmlFields);
     void shot(Part &part, const QString &name, QWidget *popup = nullptr, Thoughts::HtmlDocumentView *view = nullptr);
-    // The attachment fixture in the PDF's source bundle (as Sync installs it) -> its target.
-    Thoughts::HtmlAttachmentTarget addAttachment(const QString &pdfPath);
+    // The attachment fixture (or @p html) in the PDF's source bundle (as Sync installs it) -> its target.
+    Thoughts::HtmlAttachmentTarget addAttachment(const QString &pdfPath, const QByteArray &page = {});
     QJsonObject attachmentCard(const QJsonObject &fields, const QString &question) const;
     QJsonValue callAttachment(Part &part, const QString &name, const QJsonArray &args = {});
     QJsonValue callViewer(Part &part, const QString &name, const QJsonArray &args = {});
@@ -245,13 +261,13 @@ QJsonValue HtmlViewTest::callViewer(Part &part, const QString &name, const QJson
     return value;
 }
 
-Thoughts::HtmlAttachmentTarget HtmlViewTest::addAttachment(const QString &pdfPath)
+Thoughts::HtmlAttachmentTarget HtmlViewTest::addAttachment(const QString &pdfPath, const QByteArray &page)
 {
     // <docs>/.runtime/target/source-bundle: the Library's bundle next to current_pdfs/.
     const QDir root(QFileInfo(pdfPath).absolutePath() + QStringLiteral("/../.runtime/target/source-bundle"));
     QDir().mkpath(root.filePath(QStringLiteral("objects")));
     QDir().mkpath(root.filePath(QStringLiteral("documents")));
-    const QByteArray html = readFile(QStringLiteral(KDESRCDIR "data/html-attachment/explainer.html"));
+    const QByteArray html = page.isEmpty() ? readFile(QStringLiteral(KDESRCDIR "data/html-attachment/explainer.html")) : page;
     const QByteArray pdf = readFile(pdfPath);
     auto write = [](const QString &path, const QByteArray &bytes) {
         QFile file(path);
@@ -551,6 +567,64 @@ void HtmlViewTest::attachmentLinksOpenOnlyOnTheReadersClick()
 #endif
 }
 
+void HtmlViewTest::attachmentFollowsItsNewestVersion()
+{
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("offscreen only: the newest version replaces the page (the web view restores the place)");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("ideas"), QStringLiteral("source_linked"), {});
+    const auto first = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The first version.</p>"));
+    QVERIFY(first.isValid());
+    Part page(nullptr, {});
+    QVERIFY(page.openHtmlAttachmentTab(QUrl::fromLocalFile(path), {{QStringLiteral("path"), AttachmentPath}}));
+    const auto sha256 = [&page] { return page.htmlAttachmentState().value(QStringLiteral("sha256")).toString(); };
+    const auto url = [&page] { return page.htmlAttachmentState().value(QStringLiteral("url")).toString(); };
+    QCOMPARE(sha256(), first.sha256);
+    const QString firstUrl = url();
+    QVERIFY(page.m_attachmentWatchedFiles.size() >= 1);
+    QTest::qWait(1000); // The file system's notifications start (FSEvents on macOS).
+
+    // Sync brings a newer version: the PDF's bundle pointer is rewritten, and the tab shows it.
+    const auto second = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The second version, with the judge.</p>"));
+    QVERIFY(second.isValid() && second.sha256 != first.sha256);
+    QTRY_COMPARE_WITH_TIMEOUT(sha256(), second.sha256, 10000);
+    QVERIFY(url() != firstUrl);
+    QCOMPARE(page.m_attachmentView->notice(), QStringLiteral("This page was updated to its newest version."));
+    QVERIFY(page.isHtmlAttachmentTab());
+    QCOMPARE(page.m_documentStack->currentWidget(), page.m_attachmentView);
+
+    // Replaced by a rename (written beside it first), as an atomic save does.
+    const QString pointer = page.m_attachmentWatchedFiles.constLast();
+    QVERIFY(QFileInfo::exists(pointer));
+    const auto third = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The third version.</p>"));
+    QVERIFY(third.isValid());
+    const QByteArray thirdPointer = readFile(pointer);
+    QVERIFY(addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The second version, with the judge.</p>")).isValid());
+    QTRY_COMPARE_WITH_TIMEOUT(sha256(), second.sha256, 10000);
+    QTest::qWait(1200);
+    {
+        QFile beside(pointer + QStringLiteral(".part"));
+        QVERIFY(beside.open(QIODevice::WriteOnly));
+        QCOMPARE(beside.write(thirdPointer), thirdPointer.size());
+    }
+    QCOMPARE(std::rename(QFile::encodeName(pointer + QStringLiteral(".part")).constData(), QFile::encodeName(pointer).constData()), 0);
+    QTRY_COMPARE_WITH_TIMEOUT(sha256(), third.sha256, 10000);
+
+    // While one of its cards is reviewed the page stays; it follows once the review moves on.
+    page.m_attachmentReviewShown = true;
+    const auto fourth = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The fourth version.</p>"));
+    QVERIFY(fourth.isValid());
+    QTRY_VERIFY_WITH_TIMEOUT(page.m_attachmentFollowPending, 10000);
+    QCOMPARE(sha256(), third.sha256);
+    page.clearReviewMask();
+    QTRY_COMPARE_WITH_TIMEOUT(sha256(), fourth.sha256, 10000);
+    QVERIFY(!page.m_attachmentFollowPending);
+
+    // Closed: nothing is watched any more.
+    page.closeHtmlAttachment();
+    QVERIFY(page.m_attachmentWatchedFiles.isEmpty());
+}
+
 void HtmlViewTest::attachmentCardFromASelection()
 {
     if (Thoughts::HtmlDocumentView::webViewAvailable()) {
@@ -847,6 +921,328 @@ void HtmlViewTest::webViewAttachmentFeedback()
     QTRY_COMPARE_WITH_TIMEOUT(callAttachment(part, QStringLiteral("getPageState")).toObject().value(QStringLiteral("hash")).toString(), QStringLiteral("#simulator"), 5000);
     QTRY_VERIFY_WITH_TIMEOUT(placed(), 5000);
     shot(part, QStringLiteral("f3-attachment-row-clicked.png"), nullptr, part.m_attachmentView);
+    part.closeHtmlAttachment();
+}
+
+namespace
+{
+// A press, moves and a release of the left button on @p widget at @p points, as the mouse draws.
+void drag(QWidget *widget, const QList<QPointF> &points)
+{
+    const auto send = [widget](QEvent::Type type, const QPointF &at, Qt::MouseButton button, Qt::MouseButtons buttons) {
+        QMouseEvent event(type, at, widget->mapToGlobal(at), button, buttons, Qt::NoModifier);
+        QApplication::sendEvent(widget, &event);
+    };
+    send(QEvent::MouseButtonPress, points.constFirst(), Qt::LeftButton, Qt::LeftButton);
+    for (qsizetype index = 1; index < points.size(); ++index) send(QEvent::MouseMove, points.at(index), Qt::NoButton, Qt::LeftButton);
+    send(QEvent::MouseButtonRelease, points.constLast(), Qt::LeftButton, Qt::NoButton);
+}
+
+// The row of @p id in @p view, in any group.
+QModelIndex rowOf(const QAbstractItemView *view, const QString &id, const QModelIndex &parent = {})
+{
+    for (int row = 0; row < view->model()->rowCount(parent); ++row) {
+        const QModelIndex index = view->model()->index(row, 0, parent);
+        if (index.data(AnnotationModel::ItemIdRole).toString() == id) return index;
+        if (const QModelIndex found = rowOf(view, id, index); found.isValid()) return found;
+    }
+    return {};
+}
+
+// @p x, @p y of the picture (0..1) in the dialog's canvas.
+QPointF onPicture(const Thoughts::SnapshotDrawingDialog *dialog, double x, double y)
+{
+    const QRectF picture = dialog->pictureRect();
+    return QPointF(picture.left() + x * picture.width(), picture.top() + y * picture.height());
+}
+
+template<typename Button = QPushButton> Button *dialogButton(const QWidget *dialog, const QString &name)
+{
+    return dialog->findChild<Button *>(name);
+}
+}
+
+void HtmlViewTest::snapshotDrawingDialogTakesStrokes()
+{
+    // Draw on This Page takes a picture (the WKWebView snapshot in the app) and gives strokes
+    // normalized to it; it writes nothing itself.
+    QImage picture(800, 500, QImage::Format_RGB32);
+    picture.fill(Qt::white);
+    picture.setDevicePixelRatio(2.0);
+    Thoughts::SnapshotDrawingDialog dialog(picture, {}, false, QStringLiteral("#2e7d32"), false);
+    QCOMPARE(dialog.windowTitle(), QStringLiteral("Draw on This Page"));
+    dialog.show();
+    QTRY_VERIFY(!dialog.pictureRect().isEmpty());
+    // As large as the page was on screen (its logical size), never larger.
+    QVERIFY(dialog.pictureRect().width() <= 400.0 + 0.5);
+    QCOMPARE(qRound(dialog.pictureRect().width() * 250.0 / dialog.pictureRect().height()), 400);
+    QSignalSpy saves(&dialog, &Thoughts::SnapshotDrawingDialog::saveRequested);
+    QSignalSpy chosen(&dialog, &Thoughts::SnapshotDrawingDialog::pencilChosen);
+    auto *save = dialogButton(&dialog, QStringLiteral("snapshotDrawingSave"));
+    QVERIFY(save);
+    QVERIFY(!save->isEnabled());
+    QVERIFY(!dialogButton(&dialog, QStringLiteral("snapshotDrawingDelete")));
+    QCOMPARE(dialog.colour(), QStringLiteral("#2e7d32"));
+    QVERIFY(dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotColour_green"))->isChecked());
+
+    // A stroke: its points on the picture, 0..1 from its top left, in the pencil's colour; one
+    // beyond the picture's edge stays on it.
+    drag(dialog.canvas(), {onPicture(&dialog, 0.2, 0.3), onPicture(&dialog, 0.4, 0.35), onPicture(&dialog, 1.3, 0.5)});
+    QCOMPARE(dialog.strokes().size(), 1);
+    const auto first = dialog.strokes().constFirst();
+    QCOMPARE(first.colour, QStringLiteral("#2e7d32"));
+    QCOMPARE(first.points.size(), 3);
+    QVERIFY(std::abs(first.points.at(0).x() - 0.2) < 0.01 && std::abs(first.points.at(0).y() - 0.3) < 0.01);
+    QVERIFY(std::abs(first.points.at(1).x() - 0.4) < 0.01 && std::abs(first.points.at(1).y() - 0.35) < 0.01);
+    QCOMPARE(first.points.at(2).x(), 1.0);
+    QVERIFY(save->isEnabled());
+    // Outside the picture nothing starts.
+    drag(dialog.canvas(), {QPointF(1.0, 1.0), QPointF(2.0, 2.0)});
+    QCOMPARE(dialog.strokes().size(), 1);
+
+    // Another colour, chosen here, is the pencil's everywhere.
+    dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotColour_red"))->click();
+    QCOMPARE(chosen.size(), 1);
+    QCOMPARE(chosen.constFirst().at(0).toString(), QStringLiteral("#d32f2f"));
+    drag(dialog.canvas(), {onPicture(&dialog, 0.7, 0.7)});
+    QCOMPARE(dialog.strokes().size(), 2);
+    QCOMPARE(dialog.strokes().at(1).colour, QStringLiteral("#d32f2f"));
+    QCOMPARE(dialog.strokes().at(1).points.size(), 1); // A dot.
+
+    // The eraser takes whole strokes; Undo puts back what one drag took, then the strokes one by one.
+    dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotEraser"))->click();
+    QVERIFY(dialog.erasing());
+    drag(dialog.canvas(), {onPicture(&dialog, 0.3, 0.2), onPicture(&dialog, 0.3, 0.45)});
+    QCOMPARE(dialog.strokes().size(), 1);
+    QCOMPARE(dialog.strokes().constFirst().colour, QStringLiteral("#d32f2f"));
+    dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotUndo"))->click();
+    QCOMPARE(dialog.strokes().size(), 2);
+    dialog.undo();
+    QCOMPARE(dialog.strokes().size(), 1);
+    // Clear, and Undo of Clear.
+    dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotClear"))->click();
+    QVERIFY(dialog.strokes().isEmpty());
+    QVERIFY(!save->isEnabled());
+    dialog.undo();
+    QCOMPARE(dialog.strokes().size(), 1);
+
+    // Save hands over the strokes; the owner closes the dialog once they are written.
+    save->click();
+    QCOMPARE(saves.size(), 1);
+    QCOMPARE(saves.constFirst().at(0).value<QList<Thoughts::DocumentFeedback::Stroke>>().size(), 1);
+    QVERIFY(dialog.isVisible());
+
+    // A drawing holds at most 200 strokes.
+    dialogButton<QToolButton>(&dialog, QStringLiteral("snapshotColour_blue"))->click();
+    QVERIFY(dialog.colour().isEmpty());
+    for (int index = dialog.strokes().size(); index < Thoughts::DocumentFeedback::maximumStrokes; ++index) drag(dialog.canvas(), {onPicture(&dialog, 0.5, 0.5)});
+    QCOMPARE(dialog.strokes().size(), Thoughts::DocumentFeedback::maximumStrokes);
+    QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("snapshotDrawingFull"))->isHidden());
+    drag(dialog.canvas(), {onPicture(&dialog, 0.5, 0.5)});
+    QCOMPARE(dialog.strokes().size(), Thoughts::DocumentFeedback::maximumStrokes);
+    QVERIFY(!dialog.findChild<QLabel *>(QStringLiteral("snapshotDrawingFull"))->isHidden());
+
+    // A drawing made before opens with its strokes, Save only once they change, and Delete.
+    const QList<Thoughts::DocumentFeedback::Stroke> kept{{{QPointF(0.1, 0.1), QPointF(0.2, 0.2)}, QString()}};
+    Thoughts::SnapshotDrawingDialog existing(picture, kept, true, QString(), false);
+    existing.show();
+    QTRY_VERIFY(!existing.pictureRect().isEmpty());
+    QSignalSpy deletes(&existing, &Thoughts::SnapshotDrawingDialog::deleteRequested);
+    QCOMPARE(existing.strokes().size(), 1);
+    QVERIFY(!existing.changed());
+    QVERIFY(!dialogButton(&existing, QStringLiteral("snapshotDrawingSave"))->isEnabled());
+    drag(existing.canvas(), {onPicture(&existing, 0.8, 0.2), onPicture(&existing, 0.9, 0.3)});
+    QVERIFY(existing.changed());
+    QVERIFY(dialogButton(&existing, QStringLiteral("snapshotDrawingSave"))->isEnabled());
+    dialogButton(&existing, QStringLiteral("snapshotDrawingDelete"))->click();
+    QCOMPARE(deletes.size(), 1);
+}
+
+void HtmlViewTest::attachmentDrawingOnASnapshot()
+{
+    // The pencil on an HTML page did nothing (18 November): it draws on a snapshot of the page, kept
+    // as document feedback of the page (document-feedback.md 10.1), and the PDF's other tools are
+    // greyed out there.
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("drives the viewer messages by hand: offscreen only (the WKWebView snapshot itself runs in the app)");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("ideas"), QStringLiteral("source_linked"), {});
+    const auto target = addAttachment(path);
+    QVERIFY(target.isValid());
+    Part part(nullptr, {});
+    part.openDocument(path);
+    QVERIFY(part.m_document->isOpened());
+    const QSignalBlocker quietRepository(part.m_fedoraRepository);
+    // The document's own feedback is read once the first frame is up and again once its Library
+    // identity is verified (openFile): both before this test's own.
+    QTRY_VERIFY_WITH_TIMEOUT(!part.m_docsPdfIdentityWatcher || part.m_docsPdfIdentityWatcher->isFinished(), 20000);
+    QTest::qWait(50);
+    auto *overlay = part.m_pageView->documentFeedback();
+    overlay->clear();
+    QList<QJsonObject> written;
+    overlay->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    const QString pdfSha = sha(readFile(path));
+    overlay->setDocument(DocumentId, pdfSha);
+    overlay->setReviewVersion({{QStringLiteral("pdf_sha256"), pdfSha}, {QStringLiteral("source_built"), false}});
+    Okular::Settings::setPencilColor(QString());
+    Okular::Settings::setPencilEraser(false);
+
+    QAction *pencil = part.actionCollection()->action(QStringLiteral("mouse_draw"));
+    QAction *textBox = part.actionCollection()->action(QStringLiteral("mouse_text_box"));
+    QAction *textSelect = part.actionCollection()->action(QStringLiteral("mouse_textselect"));
+    QAction *areaSelect = part.actionCollection()->action(QStringLiteral("mouse_select"));
+    QAction *zoom = part.actionCollection()->action(QStringLiteral("mouse_zoom"));
+    QVERIFY(pencil && textBox && textSelect && areaSelect && zoom);
+    const QList<QAction *> pdfOnly{textBox, textSelect, areaSelect, zoom};
+    // On the PDF every tool works, with its own tip.
+    for (QAction *tool : pdfOnly) QVERIFY2(tool->isEnabled(), qPrintable(tool->objectName()));
+    QCOMPARE(textBox->toolTip(), QStringLiteral("Text box"));
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Pencil"));
+    textSelect->trigger();
+    QVERIFY(textSelect->isChecked());
+
+    // On the page: the PDF's tools are greyed out, the pencil is not.
+    QString error;
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    QCOMPARE(part.m_pageView->shownInstead(), PageView::ShownInstead::HtmlPage);
+    for (QAction *tool : pdfOnly) {
+        QVERIFY2(!tool->isEnabled(), qPrintable(tool->objectName()));
+        QCOMPARE(tool->toolTip(), QStringLiteral("Works on PDF pages"));
+    }
+    QVERIFY(pencil->isEnabled());
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Draw on This Page"));
+    // A reload of the PDF (updateActionState) keeps them so.
+    part.m_pageView->updateActionState(true, false);
+    QVERIFY(!textBox->isEnabled());
+    QVERIFY(pencil->isEnabled());
+    // The pencil takes a picture of the page instead of the PDF's tool: here, offscreen, there is
+    // no page to take, and the PDF keeps its tool.
+    pencil->trigger();
+    QVERIFY(!pencil->isChecked());
+    QVERIFY(textSelect->isChecked());
+    QVERIFY(!part.widget()->findChild<Thoughts::SnapshotDrawingDialog *>());
+
+    // The picture the app would take: the page as the user saw it.
+    QImage picture(800, 500, QImage::Format_RGB32);
+    picture.fill(QColor(QStringLiteral("#fafafa")));
+    picture.setDevicePixelRatio(2.0);
+    part.chooseSidebarDisplay(nullptr);
+    part.openNewAttachmentDrawing(picture, target, {{QStringLiteral("hash"), QStringLiteral("#simulator")}});
+    QPointer<Thoughts::SnapshotDrawingDialog> dialog = part.widget()->findChild<Thoughts::SnapshotDrawingDialog *>(QStringLiteral("snapshotDrawingDialog"));
+    QVERIFY(dialog);
+    QVERIFY(dialog->isVisible());
+    QTRY_VERIFY(!dialog->pictureRect().isEmpty());
+    QVERIFY(written.isEmpty());
+    drag(dialog->canvas(), {onPicture(dialog, 0.25, 0.4), onPicture(dialog, 0.5, 0.45), onPicture(dialog, 0.75, 0.6)});
+    // Cancel keeps nothing.
+    QCOMPARE(dialog->strokes().size(), 1);
+    dialogButton(dialog, QStringLiteral("snapshotDrawingSave"))->click();
+    // Annotations opens on its row, as for other new feedback.
+    QVERIFY(part.m_showLeftPanel->isChecked());
+    QCOMPARE(part.m_sidebar->currentItem(), part.m_reviewsWidget.data());
+    QCOMPARE(part.m_reviewsWidget->findChild<QTreeView *>()->currentIndex().data(AnnotationModel::ItemIdRole).toString(), written.value(0).value(QStringLiteral("feedback_id")).toString());
+    QTRY_VERIFY(!dialog);
+
+    // Saved: the picture is kept on this computer, and the record names it, the page and its state.
+    QCOMPARE(written.size(), 1);
+    const QJsonObject drawn = written.constLast();
+    const QString id = drawn.value(QStringLiteral("feedback_id")).toString();
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(drawn).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(drawn)));
+    QVERIFY(Thoughts::DocumentFeedback::isAttachmentDrawing(drawn));
+    const QJsonObject anchor = drawn.value(QStringLiteral("anchor")).toObject();
+    QCOMPARE(anchor.value(QStringLiteral("html_attachment")).toObject(), QJsonObject({{QStringLiteral("path"), AttachmentPath}, {QStringLiteral("sha256"), target.sha256}}));
+    QCOMPARE(anchor.value(QStringLiteral("page_state")).toObject().value(QStringLiteral("hash")).toString(), QStringLiteral("#simulator"));
+    QCOMPARE(anchor.value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString(), QStringLiteral("Drawing"));
+    QCOMPARE(anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("document_id")).toString(), DocumentId);
+    QCOMPARE(anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("pdf_sha256")).toString(), pdfSha);
+    QVERIFY(anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("regions")).toArray().isEmpty());
+    const QJsonObject snapshot = Thoughts::DocumentFeedback::snapshotOf(drawn);
+    QCOMPARE(snapshot.value(QStringLiteral("media_type")).toString(), QStringLiteral("image/png"));
+    QCOMPARE(snapshot.value(QStringLiteral("width")).toInt(), 800);
+    QCOMPARE(snapshot.value(QStringLiteral("height")).toInt(), 500);
+    const QByteArray kept = part.m_fedoraRepository->feedbackSnapshot(Thoughts::DocumentFeedback::snapshotSha256(drawn));
+    QVERIFY(!kept.isEmpty());
+    QCOMPARE(QImage::fromData(kept).size(), QSize(800, 500));
+    const auto strokes = Thoughts::DocumentFeedback::strokesOf(drawn);
+    QCOMPARE(strokes.size(), 1);
+    QVERIFY(std::abs(strokes.constFirst().points.constFirst().x() - 0.25) < 0.01 && std::abs(strokes.constFirst().points.constFirst().y() - 0.4) < 0.01);
+    QCOMPARE(drawn.value(QStringLiteral("review_version")).toObject().value(QStringLiteral("pdf_sha256")).toString(), pdfSha);
+
+    // Never on the live page, never on the PDF.
+    QVERIFY(part.m_attachmentReader->pageFeedback().isEmpty());
+    QVERIFY(overlay->rectsOf(id).isEmpty());
+    QImage page(300, 400, QImage::Format_RGB32);
+    page.fill(Qt::white);
+    QPainter painter(&page);
+    overlay->paint(&painter, {1, 2}, [](int, const QRectF &rect) { return QRectF(rect.x() * 300.0, rect.y() * 400.0, rect.width() * 300.0, rect.height() * 400.0); }, false);
+    painter.end();
+    QImage blank(300, 400, QImage::Format_RGB32);
+    blank.fill(Qt::white);
+    QCOMPARE(page, blank);
+
+    // In the Feedback list of the document, as other feedback of the page: "Drawing", in the page.
+    QVERIFY(part.m_showLeftPanel->isChecked());
+    auto *rows = part.m_reviewsWidget->findChild<QTreeView *>();
+    QVERIFY(rows);
+    const QModelIndex row = rowOf(rows, id);
+    QVERIFY(row.isValid());
+    QCOMPARE(row.data(AnnotationModel::ItemTypeRole).toInt(), int(AnnotationModel::Feedback));
+    QCOMPARE(row.data(Qt::DisplayRole).toString(), QStringLiteral("Drawing"));
+    QCOMPARE(row.data(AnnotationModel::ReviewCardPagesLabelRole).toString(), QStringLiteral("HTML"));
+    QCOMPARE(row.data(AnnotationModel::ReviewCardStatusRole).toString(), QStringLiteral("explainer"));
+
+    // Its row opens its snapshot with its strokes, not the page; more strokes are the next revision.
+    part.hideHtmlAttachment();
+    QVERIFY(!part.htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    QCOMPARE(part.m_pageView->shownInstead(), PageView::ShownInstead::Nothing);
+    Q_EMIT rows->clicked(rowOf(rows, id));
+    QVERIFY(!part.htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    dialog = part.widget()->findChild<Thoughts::SnapshotDrawingDialog *>(QStringLiteral("snapshotDrawingDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(!dialog->pictureRect().isEmpty());
+    QCOMPARE(dialog->strokes().size(), 1);
+    QVERIFY(dialogButton(dialog, QStringLiteral("snapshotDrawingDelete")));
+    QVERIFY(!dialogButton(dialog, QStringLiteral("snapshotDrawingSave"))->isEnabled());
+    drag(dialog->canvas(), {onPicture(dialog, 0.1, 0.9), onPicture(dialog, 0.2, 0.8)});
+    dialogButton(dialog, QStringLiteral("snapshotDrawingSave"))->click();
+    QTRY_VERIFY(!dialog);
+    QCOMPARE(written.size(), 2);
+    const QJsonObject grown = written.constLast();
+    QCOMPARE(grown.value(QStringLiteral("feedback_id")).toString(), id);
+    QCOMPARE(grown.value(QStringLiteral("revision")).toInt(), 2);
+    QCOMPARE(grown.value(QStringLiteral("anchor")), drawn.value(QStringLiteral("anchor")));
+    QCOMPARE(Thoughts::DocumentFeedback::snapshotOf(grown), snapshot);
+    QCOMPARE(Thoughts::DocumentFeedback::strokesOf(grown).size(), 2);
+    QVERIFY(Thoughts::DocumentFeedback::validationError(grown).isEmpty());
+
+    // Delete, as other feedback: the tombstone, with Undo.
+    part.showFeedback(id, true);
+    dialog = part.widget()->findChild<Thoughts::SnapshotDrawingDialog *>(QStringLiteral("snapshotDrawingDialog"));
+    QVERIFY(dialog);
+    QCOMPARE(dialog->strokes().size(), 2);
+    dialogButton(dialog, QStringLiteral("snapshotDrawingDelete"))->click();
+    QTRY_VERIFY(!dialog);
+    QCOMPARE(written.size(), 3);
+    QVERIFY(written.constLast().value(QStringLiteral("deleted")).toBool());
+    QVERIFY(overlay->shownRecords().isEmpty());
+
+    // Back on the PDF the tools work again; the HTML edition keeps no drawings either.
+    for (QAction *tool : pdfOnly) QVERIFY2(tool->isEnabled(), qPrintable(tool->objectName()));
+    QCOMPARE(textBox->toolTip(), QStringLiteral("Text box"));
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Pencil"));
+    part.m_pageView->setShownInstead(PageView::ShownInstead::HtmlEdition);
+    QVERIFY(!pencil->isEnabled());
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Works on PDF pages"));
+    part.m_pageView->setShownInstead(PageView::ShownInstead::Nothing);
+    QVERIFY(pencil->isEnabled());
+    // On the PDF the pencil is the PDF's pencil again.
+    pencil->trigger();
+    QVERIFY(pencil->isChecked());
+    QVERIFY(!part.widget()->findChild<Thoughts::SnapshotDrawingDialog *>());
+    textSelect->trigger();
     part.closeHtmlAttachment();
 }
 
@@ -1503,6 +1899,522 @@ void HtmlViewTest::webViewReviewSelectionAndCards()
     // Back to the PDF.
     part.setDocumentView(QStringLiteral("pdf"));
     QCOMPARE(part.m_documentStack->currentWidget(), part.m_pageView.data());
+}
+
+void HtmlViewTest::livePageAsksThenLoadsWithoutTheBridge()
+{
+    // A live page (19 November: pages are embedded or live): its stub names an
+    // address, which the reader loads instead, after asking once for its origin, in a view with
+    // none of the page bridge.
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("drives the live page's load by hand: offscreen only (the WKWebView itself runs in the app)");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("runs"), QStringLiteral("source_linked"), {});
+    const auto target = addAttachment(path, LiveStub);
+    QVERIFY(target.isValid());
+    QCOMPARE(Thoughts::LivePage::stubAddressOfFile(target.file), LiveAddress);
+    Thoughts::LivePage::forgetOrigins();
+    Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    OpenedLinks opened;
+    for (const char *scheme : {"https", "http", "mailto"}) QDesktopServices::setUrlHandler(QString::fromLatin1(scheme), &opened, "open");
+    const auto restore = qScopeGuard([this] {
+        Part::setHtmlAttachmentsWithoutWebViewForTesting(false);
+        Thoughts::LivePage::forgetOrigins();
+        for (const char *scheme : {"https", "http", "mailto"}) QDesktopServices::unsetUrlHandler(QString::fromLatin1(scheme));
+        QDir(m_docs + QStringLiteral("/docs-ideas")).removeRecursively();
+    });
+    Part part(nullptr, {});
+    part.openDocument(path);
+    QVERIFY(part.m_document->isOpened());
+    const auto button = [&part](const char *name) { return part.m_attachmentView->findChild<QToolButton *>(QString::fromLatin1(name)); };
+
+    // First the question, in the page's place: nothing is loaded before Open.
+    QString error;
+    QVERIFY2(part.showHtmlAttachment(target, false, &error), qPrintable(error));
+    QVariantMap state = part.htmlAttachmentState();
+    QVERIFY(state.value(QStringLiteral("shown")).toBool());
+    QVERIFY(state.value(QStringLiteral("live")).toBool());
+    QCOMPARE(state.value(QStringLiteral("live_url")).toString(), LiveAddress.toString());
+    QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("consent"));
+    QCOMPARE(state.value(QStringLiteral("title")).toString(), QStringLiteral("Training curves"));
+    QCOMPARE(state.value(QStringLiteral("message")).toString(), QStringLiteral("This page loads http://localhost:18770 from the network. Open it?"));
+    QCOMPARE(state.value(QStringLiteral("message_action")).toString(), QStringLiteral("Open"));
+    QCOMPARE(part.m_attachmentView->messageCancelText(), QStringLiteral("Cancel"));
+    QVERIFY(!part.m_attachmentView->isLive());
+    // Its bar, and what needs an embedded page.
+    QCOMPARE(state.value(QStringLiteral("live_bar")).toString(), QStringLiteral("Live · http://localhost:18770/"));
+    QVERIFY(button("thoughtsHtmlLiveReload") && !button("thoughtsHtmlLiveReload")->isHidden());
+    QVERIFY(!state.value(QStringLiteral("snapshot_enabled")).toBool());
+    QVERIFY(!state.value(QStringLiteral("new_card_enabled")).toBool());
+    QCOMPARE(state.value(QStringLiteral("new_card_tip")).toString(), QStringLiteral("Works on embedded pages"));
+    QVERIFY(part.m_attachmentReader->pageFeedback().isEmpty());
+    // The PDF's tools are greyed out as on any page; the pencil draws on a snapshot of it.
+    QCOMPARE(part.m_pageView->shownInstead(), PageView::ShownInstead::HtmlPage);
+    QAction *pencil = part.actionCollection()->action(QStringLiteral("mouse_draw"));
+    QAction *textSelect = part.actionCollection()->action(QStringLiteral("mouse_textselect"));
+    QVERIFY(pencil && textSelect);
+    QVERIFY(pencil->isEnabled());
+    QCOMPARE(pencil->toolTip(), QStringLiteral("Draw on This Page"));
+    QVERIFY(!textSelect->isEnabled());
+    // A card made in the page is reviewed with its stored answer: no viewer masks a live page.
+    const QJsonObject card = attachmentCard(Thoughts::HtmlAttachmentReader::newCardFields({{QStringLiteral("text_quote"), QJsonObject{{QStringLiteral("exact"), QStringLiteral("0.12")}}}}, target),
+                                            QStringLiteral("Loss?"));
+    QVERIFY(part.m_attachmentReader->presentReview(card, false));
+    QCOMPARE(part.m_attachmentReader->reviewState(), QStringLiteral("not_found"));
+    part.m_attachmentReader->clearReview();
+
+    // Open: remembered for the origin, then loaded (offscreen there is no web view, so it is not
+    // reached), and said plainly with Retry.
+    button("thoughtsHtmlViewMessageAction")->click();
+    QVERIFY(Thoughts::LivePage::originAllowed(QStringLiteral("http://localhost:18770")));
+    QVERIFY(part.m_attachmentView->isLive());
+    QCOMPARE(part.m_attachmentView->liveUrl(), LiveAddress);
+    QCOMPARE(part.m_attachmentView->transportKind(), QStringLiteral("live"));
+    state = part.htmlAttachmentState();
+    QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    QCOMPARE(state.value(QStringLiteral("message")).toString(), QStringLiteral("This live page is at http://localhost:18770/, which this device cannot reach."));
+    QCOMPARE(state.value(QStringLiteral("message_action")).toString(), QStringLiteral("Retry"));
+    QVERIFY(!state.value(QStringLiteral("snapshot_enabled")).toBool());
+    QCOMPARE(state.value(QStringLiteral("snapshot_tip")).toString(), QStringLiteral("Works once the page is shown."));
+
+    // Loaded, as WebKit reports it: Take Snapshot where the page's folder is on this computer.
+    Q_EMIT part.m_attachmentView->liveLoaded(LiveAddress);
+    state = part.htmlAttachmentState();
+    QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("loaded"));
+    QVERIFY(!state.value(QStringLiteral("snapshot_enabled")).toBool());
+    QCOMPARE(state.value(QStringLiteral("snapshot_tip")).toString(), QStringLiteral("This page's folder is not on this computer."));
+    QVERIFY(QDir().mkpath(m_docs + QStringLiteral("/docs-ideas")));
+    part.updateLivePageBar();
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("snapshot_enabled")).toBool());
+    QVERIFY(button("thoughtsHtmlLiveTakeSnapshot")->isEnabled());
+    // Still no cards or feedback, and no viewer is ever asked for anything.
+    QVERIFY(!part.htmlAttachmentState().value(QStringLiteral("new_card_enabled")).toBool());
+    QVERIFY(!part.m_attachmentReader->isReady());
+    QVERIFY(!part.m_attachmentView->isAttachment());
+
+    // Reload: the address again (unreached here again).
+    button("thoughtsHtmlLiveReload")->click();
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    // Retry likewise.
+    button("thoughtsHtmlViewMessageAction")->click();
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+
+    // Open in Browser: the page's address, not its stub.
+    button("thoughtsHtmlOpenInBrowser")->click();
+    QCOMPARE(opened.urls, QList<QUrl>{LiveAddress});
+#ifdef Q_OS_MACOS
+    // A link to another origin: the browser on the reader's click only.
+    Q_EMIT part.m_attachmentView->externalLinkRequested(QUrl(QStringLiteral("https://thoughts.example.org/run/7")), true);
+    Q_EMIT part.m_attachmentView->externalLinkRequested(QUrl(QStringLiteral("https://collector.example.org/x?shown=loss")), false);
+    QCOMPARE(opened.urls, QList<QUrl>({LiveAddress, QUrl(QStringLiteral("https://thoughts.example.org/run/7"))}));
+#endif
+
+    // The same page again: kept as it is.
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    // Closed: the live view and its storage are gone.
+    part.closeHtmlAttachment();
+    QVERIFY(!part.m_attachmentView->isLive());
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("live_bar")).toString().isEmpty());
+
+    // Cancel at the question: the document again, nothing loaded or remembered.
+    Thoughts::LivePage::forgetOrigins();
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("consent"));
+    button("thoughtsHtmlViewMessageCancel")->click();
+    QVERIFY(!part.htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    QVERIFY(!part.m_attachmentView->isLive());
+    QVERIFY(!Thoughts::LivePage::originAllowed(QStringLiteral("http://localhost:18770")));
+    // Asked again next time.
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("consent"));
+    part.closeHtmlAttachment();
+
+    // An embedded page shows no live bar.
+    const QString other = addLibraryPdf(QStringLiteral("runs-embedded"), QStringLiteral("source_linked"), {});
+    const auto embedded = addAttachment(other);
+    Part plain(nullptr, {});
+    plain.openDocument(other);
+    QVERIFY(plain.showHtmlAttachment(embedded, false, &error));
+    QVERIFY(!plain.htmlAttachmentState().value(QStringLiteral("live")).toBool());
+    QVERIFY(plain.htmlAttachmentState().value(QStringLiteral("live_bar")).toString().isEmpty());
+    QVERIFY(plain.htmlAttachmentState().value(QStringLiteral("snapshot_of")).toString().isEmpty());
+    QVERIFY(plain.m_attachmentView->isAttachment());
+}
+
+void HtmlViewTest::liveSnapshotAndGoLiveAgain()
+{
+    // Take Snapshot: what the live page shows now becomes the page itself (an embedded page, the
+    // same link), and Go Live Again writes its stub back.
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("drives the live page's load by hand: offscreen only (the serializer runs in the app's WKWebView)");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("runs-snapshot"), QStringLiteral("source_linked"), {});
+    const auto target = addAttachment(path, LiveStub);
+    QVERIFY(target.isValid());
+    Thoughts::LivePage::forgetWrites();
+    Thoughts::LivePage::allowOrigin(Thoughts::LivePage::origin(LiveAddress));
+    Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    const QString library = m_docs + QLatin1Char('/') + AttachmentPath;
+    const auto restore = qScopeGuard([this] {
+        Part::setHtmlAttachmentsWithoutWebViewForTesting(false);
+        Part::setLivePageAnswerForTesting(-1);
+        Thoughts::LivePage::forgetOrigins();
+        Thoughts::LivePage::forgetWrites();
+        QDir(m_docs + QStringLiteral("/docs-ideas")).removeRecursively();
+    });
+    Part part(nullptr, {});
+    part.openDocument(path);
+    QVERIFY(part.m_document->isOpened());
+    QSignalSpy syncs(&part, &Part::globalSyncRequested);
+    QString error;
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    // The origin was agreed to before: no question.
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    Q_EMIT part.m_attachmentView->liveLoaded(LiveAddress);
+    // As the page's serializer answers (part/html-live/snapshot.js).
+    const QString serialized = QString::fromUtf8(
+        QJsonDocument(QJsonObject{{QStringLiteral("html"), QStringLiteral("<html><head><title>TensorBoard</title><style>p{color:#333}</style></head><body><p>loss 0.12</p>"
+                                                                          "<img src=\"data:image/png;base64,iVBORw0KGgo=\" style=\"width:300px;height:150px\"></body></html>")},
+                                  {QStringLiteral("title"), QStringLiteral("TensorBoard")},
+                                  {QStringLiteral("canvases"), 1}})
+            .toJson());
+
+    // The page's folder is not here: nothing to save it in.
+    Part::setLivePageAnswerForTesting(1);
+    QVERIFY(!part.saveLiveSnapshot(serialized, &error));
+    QVERIFY2(error.contains(QStringLiteral("docs-ideas")), qPrintable(error));
+    QVERIFY(QDir().mkpath(m_docs + QStringLiteral("/docs-ideas")));
+    // Cancel at "Replace the live page with this snapshot?": the live page stays.
+    Part::setLivePageAnswerForTesting(0);
+    QVERIFY(!part.saveLiveSnapshot(serialized, &error));
+    QVERIFY(error.isEmpty());
+    QVERIFY(!QFileInfo::exists(library));
+    QCOMPARE(syncs.count(), 0);
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("live")).toBool());
+    // Replace: written as the page's file, sent by Sync, shown embedded at once.
+    Part::setLivePageAnswerForTesting(1);
+    QVERIFY2(part.saveLiveSnapshot(serialized, &error), qPrintable(error));
+    const QByteArray snapshot = readFile(library);
+    QCOMPARE(Thoughts::LivePage::snapshotSource(snapshot), LiveAddress);
+    QVERIFY(!Thoughts::LivePage::stubAddress(snapshot).isValid());
+    QVERIFY(QString::fromUtf8(snapshot).contains(QStringLiteral(">Snapshot of <a href=\"http://localhost:18770/\"")));
+    QVERIFY(snapshot.contains("<p>loss 0.12</p>"));
+    QCOMPARE(Thoughts::LivePage::title(snapshot), QStringLiteral("Training curves"));
+    QCOMPARE(syncs.count(), 1);
+    QVariantMap state = part.htmlAttachmentState();
+    QVERIFY(state.value(QStringLiteral("shown")).toBool());
+    QVERIFY(!state.value(QStringLiteral("live")).toBool());
+    QCOMPARE(state.value(QStringLiteral("path")).toString(), AttachmentPath);
+    QCOMPARE(state.value(QStringLiteral("sha256")).toString(), sha(snapshot));
+    QCOMPARE(state.value(QStringLiteral("snapshot_of")).toString(), LiveAddress.toString());
+    QCOMPARE(state.value(QStringLiteral("title")).toString(), QStringLiteral("Training curves"));
+    QVERIFY(state.value(QStringLiteral("live_bar")).toString().isEmpty());
+    QVERIFY(state.value(QStringLiteral("url")).toString().startsWith(QStringLiteral("http://127.0.0.1:"))); // sealed off again
+    QVERIFY(part.m_attachmentView->isAttachment());
+    QVERIFY(!part.m_attachmentView->isLive());
+    QVERIFY(state.value(QStringLiteral("new_card_tip")).toString() != QStringLiteral("Works on embedded pages"));
+    // The PDF's bundle still has the stub until it rebuilds; this computer shows what it wrote.
+    QCOMPARE(Thoughts::resolveHtmlAttachment(AttachmentPath, path, &error).sha256, sha(LiveStub));
+    QCOMPARE(part.resolveHtmlPage(AttachmentPath, &error).sha256, sha(snapshot));
+    QCOMPARE(part.attachmentVersion(AttachmentPath), sha(snapshot));
+    // Go Live Again is for snapshots only; Take Snapshot only for live pages.
+    part.takeLiveSnapshot();
+    QCOMPARE(syncs.count(), 1);
+
+    // Go Live Again: the stub with the snapshot's address and the page's name, live again.
+    QVERIFY(part.goLiveAgain());
+    const QByteArray stub = readFile(library);
+    QCOMPARE(Thoughts::LivePage::stubAddress(stub), LiveAddress);
+    QCOMPARE(Thoughts::LivePage::title(stub), QStringLiteral("Training curves"));
+    QCOMPARE(syncs.count(), 2);
+    state = part.htmlAttachmentState();
+    QVERIFY(state.value(QStringLiteral("live")).toBool());
+    QCOMPARE(state.value(QStringLiteral("live_url")).toString(), LiveAddress.toString());
+    QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    QVERIFY(state.value(QStringLiteral("snapshot_of")).toString().isEmpty());
+    QVERIFY(!part.goLiveAgain());
+}
+
+void HtmlViewTest::livePageTextFeedback()
+{
+    // Text feedback on a live page (23 November: right-clicking a selection of a live page showed
+    // only the web view's menu; html-live-pages.md §2.1): the reader reads the selection with its
+    // own script in the page's isolated script world and shows its own menu; the record is
+    // feedback in the page (document-feedback.md §8) on the live stub, with one picture of what
+    // was shown (§12) where the server keeps pictures. The page still gets no bridge.
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("drives the live page's selection by hand: offscreen only (the WKWebView's menu and script world run in the app)");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("runs-feedback"), QStringLiteral("source_linked"), {});
+    const auto target = addAttachment(path, LiveStub);
+    QVERIFY(target.isValid());
+    QCOMPARE(target.sha256, sha(LiveStub));
+    Thoughts::LivePage::forgetWrites();
+    Thoughts::LivePage::allowOrigin(Thoughts::LivePage::origin(LiveAddress));
+    Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    const QString capabilities = QStringLiteral("thoughts-server/capabilities");
+    const auto restore = qScopeGuard([capabilities] {
+        Part::setHtmlAttachmentsWithoutWebViewForTesting(false);
+        Part::setLivePagePictureForTesting(QImage());
+        Thoughts::LivePage::forgetOrigins();
+        QSettings().remove(capabilities);
+    });
+    Part part(nullptr, {});
+    part.openDocument(path);
+    QVERIFY(part.m_document->isOpened());
+    const QSignalBlocker quietRepository(part.m_fedoraRepository);
+    auto *overlay = part.m_pageView->documentFeedback();
+    overlay->clear();
+    QList<QJsonObject> written;
+    overlay->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    QSettings().remove(capabilities);
+    QString error;
+    QVERIFY(part.showHtmlAttachment(target, false, &error));
+    Q_EMIT part.m_attachmentView->liveLoaded(LiveAddress);
+    // A load refreshes the document's feedback: start again from none for the checks below.
+    overlay->clear();
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("loaded"));
+    // Still no viewer and no cards (the selection's menu is the reader's own).
+    QVERIFY(!part.m_attachmentView->isAttachment());
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("new_card_tip")).toString(), QStringLiteral("Works on embedded pages"));
+
+    // The isolated script's answer (part/html-live/selection.js), as a viewer selection.
+    QCOMPARE(Thoughts::HtmlAttachmentReader::liveSelectionArguments(),
+             QJsonObject({{QStringLiteral("context"), Thoughts::ReviewCardFeedback::contextLength}, {QStringLiteral("longest"), Thoughts::ReviewCardFeedback::maximumQuote}}));
+    const QString quoted = QStringLiteral("loss after epoch 7 is 0.12");
+    const auto answer = [](const QJsonObject &fields) { return QString::fromUtf8(QJsonDocument(fields).toJson(QJsonDocument::Compact)); };
+    const QJsonObject selection = Thoughts::HtmlAttachmentReader::liveSelection(
+        answer({{QStringLiteral("exact"), QString(QStringLiteral("  ") + quoted + QStringLiteral(" "))},
+                {QStringLiteral("prefix"), QString(QString(40, QLatin1Char('p')) + QStringLiteral("Training "))},
+                {QStringLiteral("suffix"), QString(QStringLiteral(" and falling") + QString(40, QLatin1Char('s')))},
+                {QStringLiteral("hash"), QStringLiteral("#curves")}}));
+    QCOMPARE(selection.value(QStringLiteral("text_quote")).toObject().value(QStringLiteral("exact")).toString(), quoted);
+    QCOMPARE(selection.value(QStringLiteral("page_state")).toObject().value(QStringLiteral("hash")).toString(), QStringLiteral("#curves"));
+    // Nothing (readable) selected, no answer, a page state that is no location.hash.
+    QVERIFY(Thoughts::HtmlAttachmentReader::liveSelection(answer({{QStringLiteral("exact"), QStringLiteral("  ")}, {QStringLiteral("hash"), QStringLiteral("#x")}})).isEmpty());
+    QVERIFY(Thoughts::HtmlAttachmentReader::liveSelection(QStringLiteral("the page was closed")).isEmpty());
+    QCOMPARE(Thoughts::HtmlAttachmentReader::liveSelection(answer({{QStringLiteral("exact"), QStringLiteral("loss")}, {QStringLiteral("hash"), QStringLiteral("curves")}}))
+                 .value(QStringLiteral("page_state")).toObject().value(QStringLiteral("hash")).toString(),
+             QString());
+    // Offscreen there is no web view to read it from: nothing, and the page is not asked.
+    QJsonObject read{{QStringLiteral("unset"), true}};
+    part.m_attachmentReader->readLiveSelection([&read](const QJsonObject &result) { read = result; });
+    QVERIFY(read.isEmpty());
+
+    const auto actions = [&part](const QJsonObject &chosen) {
+        QMenu menu;
+        part.addLiveSelectionMenuActions(&menu, chosen);
+        QStringList names;
+        for (const QAction *action : menu.actions()) names.append(action->isSeparator() ? QStringLiteral("|") : action->objectName());
+        return names;
+    };
+    const auto trigger = [&part](const QJsonObject &chosen, const QString &name) {
+        QMenu menu;
+        part.addLiveSelectionMenuActions(&menu, chosen);
+        for (QAction *action : menu.actions()) {
+            if (action->objectName() == name) action->trigger();
+        }
+    };
+
+    // Feedback needs a Library document, as on the PDF: Copy alone (the web view's own).
+    QCOMPARE(actions(selection), QStringList{QStringLiteral("attachmentCopy")});
+    const QString pdfSha = sha(readFile(path));
+    overlay->setDocument(DocumentId, pdfSha);
+    overlay->setReviewVersion({{QStringLiteral("pdf_sha256"), pdfSha}, {QStringLiteral("source_built"), false}});
+    const QStringList feedbackActions{QStringLiteral("attachmentFeedbackLike"), QStringLiteral("attachmentFeedbackDislike"), QStringLiteral("attachmentFeedbackQuestion"),
+                                      QStringLiteral("attachmentFeedbackComment"), QStringLiteral("|"), QStringLiteral("attachmentCopy")};
+    QCOMPARE(actions(selection), feedbackActions);
+    // The web view's own menu (one menu, 23 Nov 2026) asks whether to offer feedback, then gives the
+    // item chosen; the selection is read then. Offscreen nothing can be read: the reader is told.
+    QVERIFY(part.liveSelectionFeedbackOffered());
+    const qsizetype before = written.size();
+    part.chooseLiveSelection(QStringLiteral("like"));
+    QCOMPARE(written.size(), before);
+    QCOMPARE(part.m_attachmentView->notice(), QStringLiteral("The selected text could not be read. Select it again."));
+    part.m_attachmentView->setNotice(QString(), QString());
+    // No review cards on a live page, also where the server keeps them.
+    part.m_attachmentCardsSupported = true;
+    QCOMPARE(actions(selection), feedbackActions);
+    // A selection the script cannot read (a form field, a frame): Copy alone.
+    QCOMPARE(actions(QJsonObject()), QStringList{QStringLiteral("attachmentCopy")});
+
+    // Like, where the server has no document_feedback_pictures_v1: the record goes without one.
+    QImage shown(3000, 1500, QImage::Format_ARGB32_Premultiplied);
+    shown.fill(Qt::transparent);
+    {
+        QPainter painter(&shown);
+        painter.fillRect(QRect(1000, 500, 1000, 500), QColor(20, 90, 200));
+    }
+    Part::setLivePagePictureForTesting(shown);
+    trigger(selection, QStringLiteral("attachmentFeedbackLike"));
+    QCOMPARE(written.size(), 1);
+    const QJsonObject liked = written.constLast();
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(liked).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(liked)));
+    QCOMPARE(liked.value(QStringLiteral("view")).toString(), QStringLiteral("html_attachment"));
+    QCOMPARE(liked.value(QStringLiteral("polarity")).toString(), Thoughts::ReviewCardFeedback::positive());
+    QVERIFY(!liked.contains(QStringLiteral("kind")));
+    QVERIFY(!liked.contains(QStringLiteral("pictures")));
+    const QJsonObject anchor = liked.value(QStringLiteral("anchor")).toObject();
+    // The page's path and the page as stored: the live stub.
+    QCOMPARE(anchor.value(QStringLiteral("html_attachment")).toObject(), QJsonObject({{QStringLiteral("path"), AttachmentPath}, {QStringLiteral("sha256"), sha(LiveStub)}}));
+    QCOMPARE(anchor.value(QStringLiteral("page_state")).toObject(), QJsonObject({{QStringLiteral("hash"), QStringLiteral("#curves")}}));
+    const QJsonObject pdf = anchor.value(QStringLiteral("pdf")).toObject();
+    QCOMPARE(pdf.value(QStringLiteral("document_id")).toString(), DocumentId);
+    QCOMPARE(pdf.value(QStringLiteral("pdf_sha256")).toString(), pdfSha);
+    QVERIFY(pdf.value(QStringLiteral("regions")).toArray().isEmpty());
+    const QJsonObject quote = anchor.value(QStringLiteral("quote")).toObject();
+    QCOMPARE(quote.value(QStringLiteral("exact")).toString(), quoted);
+    QCOMPARE(quote.value(QStringLiteral("prefix")).toString().size(), Thoughts::ReviewCardFeedback::contextLength);
+    QVERIFY(quote.value(QStringLiteral("prefix")).toString().endsWith(QStringLiteral("pTraining ")));
+    QCOMPARE(quote.value(QStringLiteral("suffix")).toString().size(), Thoughts::ReviewCardFeedback::contextLength);
+    QVERIFY(quote.value(QStringLiteral("suffix")).toString().startsWith(QStringLiteral(" and falling")));
+    // Listed as any page's feedback (on this version of the page), never drawn on the PDF.
+    QCOMPARE(part.m_attachmentReader->pageFeedback().size(), 1);
+    QVERIFY(overlay->rectsOf(liked.value(QStringLiteral("feedback_id")).toString()).isEmpty());
+    QVERIFY(Thoughts::DocumentFeedback::shownOn(liked, pdfSha, part.attachmentVersion(AttachmentPath)));
+    // Given on this load of the live page (its address and when it loaded): a Reload makes it from
+    // an earlier version, as feedback on an earlier PDF (html-live-pages.md §2.1, checked below).
+    const QJsonObject liveLoad = anchor.value(QStringLiteral("live")).toObject();
+    QCOMPARE(liveLoad.value(QStringLiteral("address")).toString(), LiveAddress.toString());
+    QVERIFY(!liveLoad.value(QStringLiteral("loaded_at")).toString().isEmpty());
+    // Its row brings the live page back (the quote is not looked for in it).
+    part.hideHtmlAttachment();
+    QVERIFY(!part.htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    part.showFeedback(liked.value(QStringLiteral("feedback_id")).toString(), false);
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("shown")).toBool());
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("live")).toBool());
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("loaded"));
+
+    // Dislike with document_feedback_pictures_v1: one picture of what was shown, opaque JPEG at
+    // most 2048 pixels, kept on this computer first (Sync uploads it before the record).
+    QSettings().setValue(capabilities, QStringList{QStringLiteral("document_feedback_v1"), Thoughts::DocumentFeedback::picturesCapability()});
+    trigger(selection, QStringLiteral("attachmentFeedbackDislike"));
+    QCOMPARE(written.size(), 2);
+    const QJsonObject disliked = written.constLast();
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(disliked).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(disliked)));
+    QCOMPARE(disliked.value(QStringLiteral("polarity")).toString(), Thoughts::ReviewCardFeedback::negative());
+    QCOMPARE(disliked.value(QStringLiteral("anchor")).toObject(), anchor);
+    const QJsonArray pictures = Thoughts::DocumentFeedback::picturesOf(disliked);
+    QCOMPARE(pictures.size(), 1);
+    const QJsonObject picture = pictures.first().toObject();
+    QCOMPARE(picture.value(QStringLiteral("media_type")).toString(), QStringLiteral("image/jpeg"));
+    QCOMPARE(picture.value(QStringLiteral("width")).toInt(), Thoughts::DocumentFeedback::maximumPictureSide);
+    QCOMPARE(picture.value(QStringLiteral("height")).toInt(), Thoughts::DocumentFeedback::maximumPictureSide / 2);
+    const QByteArray kept = part.m_fedoraRepository->feedbackSnapshot(picture.value(QStringLiteral("object_sha256")).toString());
+    QVERIFY(!kept.isEmpty());
+    QImage keptImage;
+    QVERIFY(keptImage.loadFromData(kept, "JPEG"));
+    QCOMPARE(keptImage.size(), QSize(2048, 1024));
+    // What was transparent is the page's white, not black.
+    QVERIFY(qGray(keptImage.pixel(50, 50)) > 240);
+    QVERIFY(qBlue(keptImage.pixel(1024, 512)) > 150 && qRed(keptImage.pixel(1024, 512)) < 80);
+
+    // No picture at hand (the web view gave none): the feedback is kept without it.
+    Part::setLivePagePictureForTesting(QImage());
+    trigger(selection, QStringLiteral("attachmentFeedbackLike"));
+    QCOMPARE(written.size(), 3);
+    QVERIFY(!written.constLast().contains(QStringLiteral("pictures")));
+    Part::setLivePagePictureForTesting(shown);
+
+    // Comment…: the picture is in the editor, to keep or remove. It is not something the user
+    // wrote: closed with nothing written, nothing is saved.
+    trigger(selection, QStringLiteral("attachmentFeedbackComment"));
+    QCOMPARE(written.size(), 3);
+    QPointer<Thoughts::ReviewFeedbackEditor> editor = part.widget()->findChild<Thoughts::ReviewFeedbackEditor *>(QStringLiteral("reviewFeedbackEditor"));
+    QVERIFY(editor);
+    QVERIFY(editor->isNew());
+    QCOMPARE(editor->pictures(), pictures);
+    editor->close();
+    QCOMPARE(written.size(), 3);
+    delete editor.data();
+    trigger(selection, QStringLiteral("attachmentFeedbackComment"));
+    editor = part.widget()->findChild<Thoughts::ReviewFeedbackEditor *>(QStringLiteral("reviewFeedbackEditor"));
+    QVERIFY(editor);
+    QCOMPARE(editor->pictures(), pictures);
+    Q_EMIT editor->saveRequested(Thoughts::ReviewCardFeedback::positive(), QStringLiteral(" Why does it fall? "));
+    QCOMPARE(written.size(), 4);
+    const QJsonObject commented = written.constLast();
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(commented).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(commented)));
+    QCOMPARE(commented.value(QStringLiteral("comment")).toString(), QStringLiteral("Why does it fall?"));
+    QCOMPARE(Thoughts::DocumentFeedback::kindOf(commented), Thoughts::DocumentFeedback::other());
+    QCOMPARE(commented.value(QStringLiteral("anchor")).toObject(), anchor);
+    QCOMPARE(Thoughts::DocumentFeedback::picturesOf(commented), pictures);
+    QCOMPARE(part.m_attachmentReader->pageFeedback().size(), 4);
+
+    // None during a review of one of the page's cards.
+    const QJsonObject card = attachmentCard(Thoughts::HtmlAttachmentReader::newCardFields(selection, target), QStringLiteral("Loss at epoch 7?"));
+    QVERIFY(part.m_attachmentReader->presentReview(card, false));
+    QCOMPARE(actions(selection), QStringList{QStringLiteral("attachmentCopy")});
+    part.giveLiveFeedback(Thoughts::ReviewCardFeedback::positive(), false, QString(), selection);
+    QCOMPARE(written.size(), 4);
+    part.m_attachmentReader->clearReview();
+    // Nor once another page is shown (the menu was for this one).
+    part.closeHtmlAttachment();
+    part.saveLiveFeedback(Thoughts::ReviewCardFeedback::positive(), selection, false, QString(), shown);
+    QCOMPARE(written.size(), 4);
+    part.giveLiveFeedback(Thoughts::ReviewCardFeedback::positive(), false, QString(), selection);
+    QCOMPARE(written.size(), 4);
+
+    // An embedded page as before: the viewer's selection, and no picture of the page.
+    const QString other = addLibraryPdf(QStringLiteral("runs-feedback-embedded"), QStringLiteral("source_linked"), {});
+    const auto embedded = addAttachment(other);
+    QVERIFY(embedded.isValid());
+    Part plain(nullptr, {});
+    plain.openDocument(other);
+    const QSignalBlocker quietPlainRepository(plain.m_fedoraRepository);
+    auto *plainOverlay = plain.m_pageView->documentFeedback();
+    plainOverlay->clear();
+    plainOverlay->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    const QString otherSha = sha(readFile(other));
+    plainOverlay->setDocument(DocumentId, otherSha);
+    plainOverlay->setReviewVersion({{QStringLiteral("pdf_sha256"), otherSha}, {QStringLiteral("source_built"), false}});
+    QVERIFY(plain.showHtmlAttachment(embedded, false, &error));
+    QVERIFY(plain.m_attachmentView->isAttachment());
+    const QJsonObject viewerSelection{{QStringLiteral("type"), QStringLiteral("selection")},
+                                      {QStringLiteral("text"), QStringLiteral("Every simulated agent pays the toll")},
+                                      {QStringLiteral("text_quote"), QJsonObject{{QStringLiteral("exact"), QStringLiteral("Every simulated agent pays the toll")}}},
+                                      {QStringLiteral("page_state"), QJsonObject{{QStringLiteral("hash"), QStringLiteral("#simulator")}}}};
+    Q_EMIT plain.m_attachmentView->viewerMessage(viewerSelection);
+    {
+        QMenu menu;
+        plain.addAttachmentMenuActions(&menu, {{QStringLiteral("selection"), viewerSelection}, {QStringLiteral("items"), QJsonArray()}});
+        for (QAction *action : menu.actions()) {
+            if (action->objectName() == QLatin1String("attachmentFeedbackLike")) action->trigger();
+        }
+    }
+    QCOMPARE(written.size(), 5);
+    const QJsonObject embeddedLike = written.constLast();
+    QCOMPARE(embeddedLike.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject().value(QStringLiteral("sha256")).toString(), embedded.sha256);
+    QVERIFY(!embeddedLike.contains(QStringLiteral("pictures")));
+    plain.closeHtmlAttachment();
+
+    // Reload: a new load of the live page. Its likes, dislikes and questions are from an earlier
+    // version now (listed behind "N from earlier versions"); a comment of kind other follows its
+    // text until resolved, as on the PDF.
+    if (!part.htmlAttachmentState().value(QStringLiteral("shown")).toBool()) QVERIFY(part.showHtmlAttachment(target, false, &error));
+    QVERIFY(part.htmlAttachmentState().value(QStringLiteral("live")).toBool());
+    const QString loadedVersion = part.attachmentVersion(AttachmentPath);
+    QVERIFY(Thoughts::DocumentFeedback::shownOn(liked, pdfSha, loadedVersion));
+    QTest::qWait(5); // a later millisecond
+    Q_EMIT part.m_attachmentView->liveLoaded(LiveAddress);
+    const QString reloadedVersion = part.attachmentVersion(AttachmentPath);
+    QVERIFY(reloadedVersion != loadedVersion);
+    QVERIFY(reloadedVersion.startsWith(sha(LiveStub)));
+    QVERIFY(!Thoughts::DocumentFeedback::shownOn(liked, pdfSha, reloadedVersion));
+    QVERIFY(!Thoughts::DocumentFeedback::shownOn(disliked, pdfSha, reloadedVersion));
+    QJsonObject note = liked;
+    note.insert(QStringLiteral("polarity"), Thoughts::ReviewCardFeedback::neutral());
+    note.insert(QStringLiteral("kind"), Thoughts::DocumentFeedback::other());
+    QVERIFY(Thoughts::DocumentFeedback::shownOn(note, pdfSha, reloadedVersion));
+    // An embedded page has no load: its version is the page itself.
+    QCOMPARE(Thoughts::DocumentFeedback::attachmentVersionOf(embedded.sha256), embedded.sha256);
 }
 }
 

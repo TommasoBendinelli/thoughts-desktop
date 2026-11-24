@@ -7,9 +7,11 @@
 #include <QJsonValue>
 #include <QUuid>
 #include <QRegularExpression>
+#include <QSet>
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace Thoughts::DocumentFeedback
 {
@@ -46,6 +48,16 @@ QString drawingCapability()
 QString textCapability()
 {
     return QStringLiteral("document_feedback_text_v1");
+}
+
+QString htmlDrawingCapability()
+{
+    return QStringLiteral("document_feedback_html_drawing_v1");
+}
+
+QString picturesCapability()
+{
+    return QStringLiteral("document_feedback_pictures_v1");
 }
 
 QString attachmentView()
@@ -90,6 +102,8 @@ bool isPageMark(const QJsonObject &record)
 
 QRectF pageMarkBounds(const QJsonObject &record)
 {
+    // Its strokes are on its snapshot, not on a page of the PDF.
+    if (isAttachmentFeedback(record)) return {};
     return isTextBox(record) ? textBoxRect(record) : strokeBounds(record);
 }
 
@@ -230,7 +244,8 @@ QRectF strokeBounds(const QJsonObject &record)
     return QRectF(QPointF(left, top), QPointF(right, bottom)).adjusted(-0.005, -0.005, 0.005, 0.005).intersected(QRectF(0.0, 0.0, 1.0, 1.0));
 }
 
-static QJsonObject drawingJson(const QList<Stroke> &strokes)
+// @p strokes in @p drawing (its snapshot and fields another client added stay).
+static QJsonObject drawingJson(QJsonObject drawing, const QList<Stroke> &strokes)
 {
     // A tenth of a pixel on a page a thousand pixels wide, and a smaller record.
     const auto rounded = [](double value) { return std::round(value * 10000.0) / 10000.0; };
@@ -242,11 +257,108 @@ static QJsonObject drawingJson(const QList<Stroke> &strokes)
         if (!stroke.colour.isEmpty()) json.insert(QStringLiteral("color"), stroke.colour);
         result.append(json);
     }
-    return QJsonObject{{QStringLiteral("strokes"), result}};
+    drawing.insert(QStringLiteral("strokes"), result);
+    return drawing;
+}
+
+bool isAttachmentDrawing(const QJsonObject &record)
+{
+    return isDrawing(record) && isAttachmentFeedback(record);
+}
+
+QJsonObject snapshotOf(const QJsonObject &record)
+{
+    return record.value(drawing()).toObject().value(QStringLiteral("snapshot")).toObject();
+}
+
+QString snapshotSha256(const QJsonObject &record)
+{
+    return snapshotOf(record).value(QStringLiteral("object_sha256")).toString();
+}
+
+QJsonObject snapshotJson(const QString &objectSha256, const QString &mediaType, int width, int height)
+{
+    return {{QStringLiteral("object_sha256"), objectSha256.toLower()}, {QStringLiteral("media_type"), mediaType}, {QStringLiteral("width"), width}, {QStringLiteral("height"), height}};
+}
+
+// The server's rules for drawing.snapshot (§10.1): an object, a picture type and its size in pixels.
+static bool validSnapshot(const QJsonValue &value)
+{
+    if (!value.isObject()) return false;
+    const QJsonObject snapshot = value.toObject();
+    static const QRegularExpression sha256(QStringLiteral("^[0-9a-f]{64}$"));
+    const QString mediaType = snapshot.value(QStringLiteral("media_type")).toString();
+    const auto side = [&snapshot](const QString &key) {
+        const QJsonValue size = snapshot.value(key);
+        // Whole numbers only, as the server's strict integers.
+        return size.isDouble() && size.toDouble() == std::floor(size.toDouble()) && size.toDouble() >= 1.0 && size.toDouble() <= maximumSnapshotSide;
+    };
+    return sha256.match(snapshot.value(QStringLiteral("object_sha256")).toString()).hasMatch()
+        && (mediaType == QLatin1String("image/png") || mediaType == QLatin1String("image/jpeg")) && side(QStringLiteral("width")) && side(QStringLiteral("height"));
+}
+
+QJsonArray picturesOf(const QJsonObject &record)
+{
+    if (isDrawing(record)) return {};
+    QJsonArray pictures;
+    for (const QJsonValue &picture : record.value(QStringLiteral("pictures")).toArray()) {
+        if (validSnapshot(picture)) pictures.append(picture);
+    }
+    return pictures;
+}
+
+QStringList pictureSha256s(const QJsonObject &record)
+{
+    QStringList digests;
+    for (const QJsonValue &picture : picturesOf(record)) digests.append(picture.toObject().value(QStringLiteral("object_sha256")).toString());
+    return digests;
+}
+
+bool hasPictures(const QJsonObject &record)
+{
+    return !picturesOf(record).isEmpty();
+}
+
+QJsonObject withPictures(const QJsonObject &record, const QJsonArray &pictures)
+{
+    QJsonObject result = record;
+    if (pictures.isEmpty()) result.remove(QStringLiteral("pictures"));
+    else result.insert(QStringLiteral("pictures"), pictures);
+    return result;
+}
+
+QString agentPicturesNote(const QJsonObject &record)
+{
+    const qsizetype count = picturesOf(record).size();
+    if (count == 0) return {};
+    return count == 1 ? QStringLiteral(" [1 picture: the Thoughts document_feedback tool shows it]")
+                      : QStringLiteral(" [%1 pictures: the Thoughts document_feedback tool shows them]").arg(count);
+}
+
+// The server's rules for pictures (§12): at most maximumPictures, each a valid object, none twice,
+// none on a drawing.
+static bool validPictures(const QJsonObject &record)
+{
+    if (!record.contains(QStringLiteral("pictures"))) return true;
+    const QJsonValue value = record.value(QStringLiteral("pictures"));
+    if (!value.isArray()) return false;
+    const QJsonArray pictures = value.toArray();
+    if (pictures.size() > maximumPictures || (isDrawing(record) && !pictures.isEmpty())) return false;
+    QSet<QString> seen;
+    for (const QJsonValue &picture : pictures) {
+        if (!validSnapshot(picture)) return false;
+        const QString digest = picture.toObject().value(QStringLiteral("object_sha256")).toString();
+        if (seen.contains(digest)) return false;
+        seen.insert(digest);
+    }
+    return true;
 }
 
 static bool validDrawing(const QJsonObject &record)
 {
+    // Made on a snapshot in an HTML attachment, never on the PDF.
+    const QJsonValue snapshot = record.value(drawing()).toObject().value(QStringLiteral("snapshot"));
+    if (isAttachmentFeedback(record) ? !validSnapshot(snapshot) : !snapshot.isUndefined()) return false;
     const QJsonArray strokes = record.value(drawing()).toObject().value(QStringLiteral("strokes")).toArray();
     if (strokes.isEmpty() || strokes.size() > maximumStrokes) return false;
     for (const QJsonValue &stroke : strokes) {
@@ -289,8 +401,16 @@ bool shownOn(const QJsonObject &record, const QString &displayedPdfSha256, const
     if (kindOf(record) == other()) return !isResolved(record);
     if (canResolve(record) && isResolved(record)) return false;
     const QJsonObject anchor = record.value(QStringLiteral("anchor")).toObject();
-    if (isAttachmentFeedback(record)) return anchor.value(QStringLiteral("html_attachment")).toObject().value(QStringLiteral("sha256")).toString() == attachmentSha256;
+    if (isAttachmentFeedback(record))
+        return attachmentVersionOf(anchor.value(QStringLiteral("html_attachment")).toObject().value(QStringLiteral("sha256")).toString(),
+                                   anchor.value(QStringLiteral("live")).toObject().value(QStringLiteral("loaded_at")).toString())
+            == attachmentSha256;
     return anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("pdf_sha256")).toString().compare(displayedPdfSha256, Qt::CaseInsensitive) == 0;
+}
+
+QString attachmentVersionOf(const QString &pageSha256, const QString &liveLoadedAt)
+{
+    return liveLoadedAt.isEmpty() ? pageSha256 : pageSha256 + QStringLiteral("#load=") + liveLoadedAt;
 }
 
 QJsonObject attachmentAnchor(const QJsonObject &placement, const QString &documentId, const QString &pdfSha256)
@@ -309,6 +429,8 @@ QJsonObject attachmentAnchor(const QJsonObject &placement, const QString &docume
                                                     documentId, pdfSha256, QJsonArray());
     anchor.insert(QStringLiteral("html_attachment"), placement.value(QStringLiteral("html_attachment")));
     anchor.insert(QStringLiteral("page_state"), placement.value(QStringLiteral("page_state")));
+    // A live page's load (html-live-pages.md §2.1): {address, loaded_at}.
+    if (placement.value(QStringLiteral("live")).isObject()) anchor.insert(QStringLiteral("live"), placement.value(QStringLiteral("live")));
     return anchor;
 }
 
@@ -330,7 +452,19 @@ QJsonObject createDrawing(int page, const QList<Stroke> &strokes, const QString 
     const QJsonObject anchor = ReviewCardFeedback::anchor(QStringLiteral("Drawing"), QString(), QString(), documentId, pdfSha256,
                                                           ReviewCardFeedback::regionsJson({{page, QRectF(0.0, 0.0, 1.0, 1.0)}}));
     QJsonObject record = withKind(create(ReviewCardFeedback::neutral(), QString(), anchor, originId, now), drawing());
-    record.insert(drawing(), drawingJson(strokes));
+    record.insert(drawing(), drawingJson({}, strokes));
+    return record;
+}
+
+QJsonObject createAttachmentDrawing(const QJsonObject &placement, const QJsonObject &snapshot, const QList<Stroke> &strokes, const QString &documentId,
+                                    const QString &pdfSha256, const QString &originId, const QDateTime &now)
+{
+    // The anchor of feedback in the page (§8), with the quote a drawing has: nothing searches for it.
+    QJsonObject drawn = placement;
+    drawn.insert(QStringLiteral("text_quote"), QJsonObject{{QStringLiteral("exact"), QStringLiteral("Drawing")}, {QStringLiteral("prefix"), QString()}, {QStringLiteral("suffix"), QString()}});
+    QJsonObject record = withKind(create(ReviewCardFeedback::neutral(), QString(), attachmentAnchor(drawn, documentId, pdfSha256), originId, now), drawing());
+    record.insert(QStringLiteral("view"), attachmentView());
+    record.insert(drawing(), drawingJson({{QStringLiteral("snapshot"), snapshot}}, strokes));
     return record;
 }
 
@@ -359,7 +493,7 @@ QJsonObject edit(const QJsonObject &record, const QString &polarity, const QStri
 QJsonObject withStrokes(const QJsonObject &record, const QList<Stroke> &strokes, const QString &originId, const QDateTime &now)
 {
     QJsonObject next = edit(record, record.value(QStringLiteral("polarity")).toString(), record.value(QStringLiteral("comment")).toString(), originId, now);
-    next.insert(drawing(), drawingJson(strokes));
+    next.insert(drawing(), drawingJson(record.value(drawing()).toObject(), strokes));
     return next;
 }
 
@@ -415,9 +549,11 @@ QString validationError(const QJsonObject &record)
     if ((record.contains(QStringLiteral("kind")) && kind != question() && kind != other() && kind != drawing() && kind != textBox())
         || kind.isEmpty() == (record.value(QStringLiteral("polarity")).toString() == ReviewCardFeedback::neutral())) return invalid(QStringLiteral("kind"));
     if (record.contains(drawing()) != isDrawing(record) || (isDrawing(record) && !validDrawing(record))) return invalid(QStringLiteral("drawing"));
-    if (record.contains(textBoxField()) != isTextBox(record) || (isTextBox(record) && !validTextBox(record))) return invalid(QStringLiteral("text box"));
+    // A text box is typed on a page of the PDF; the server refuses one in an HTML attachment.
+    if (record.contains(textBoxField()) != isTextBox(record) || (isTextBox(record) && (attachment || !validTextBox(record)))) return invalid(QStringLiteral("text box"));
     if (record.contains(QStringLiteral("resolved_at"))
         && (!canResolve(record) || !QDateTime::fromString(record.value(QStringLiteral("resolved_at")).toString(), Qt::ISODateWithMs).isValid())) return invalid(QStringLiteral("resolution"));
+    if (!validPictures(record)) return invalid(QStringLiteral("pictures"));
     return ReviewCardFeedback::fieldValidationError(record, false, QStringLiteral("document feedback"));
 }
 
@@ -553,12 +689,93 @@ Placement place(const QJsonObject &record, const QString &displayedPdfSha256, in
         if (pages.isEmpty() || pages == searched || !pageText) continue;
         searched = pages;
         const ReviewCardFeedback::AnswerText text = pageText(pages);
-        const auto resolution = ReviewCardFeedback::resolve(record, text.text, QString());
+        auto resolution = ReviewCardFeedback::resolve(record, text.text, QString());
+        // A passage that runs on across a page break: its quote leaves out the page number and the
+        // running head between the pages, so the search does too.
+        ReviewCardFeedback::AnswerText bare;
+        if (resolution.state != QLatin1String("relocated") && pages.size() > 1) {
+            bare = withoutPageFurniture(text);
+            if (bare.text.size() < text.text.size()) resolution = ReviewCardFeedback::resolve(record, bare.text, QString());
+        }
         if (resolution.state != QLatin1String("relocated")) continue;
-        const auto rects = ReviewCardFeedback::rangeRects(text, resolution.start, resolution.end);
+        const auto rects = ReviewCardFeedback::rangeRects(bare.text.isEmpty() ? text : bare, resolution.start, resolution.end);
         if (!rects.isEmpty()) return {QStringLiteral("relocated"), rects};
     }
     return {QStringLiteral("orphaned"), {}};
+}
+
+ReviewCardFeedback::AnswerText withoutPageFurniture(const ReviewCardFeedback::AnswerText &text)
+{
+    // The text lines of each page (glyph boxes merged as ReviewCardFeedback::lineRects merges them),
+    // with the glyphs of each.
+    struct Line {
+        int page = 0;
+        QRectF box;
+        QList<int> glyphs;
+    };
+    QList<Line> lines;
+    QList<int> pages;
+    for (int index = 0; index < text.glyphs.size(); ++index) {
+        const ReviewCardFeedback::Glyph &glyph = text.glyphs.at(index);
+        if (glyph.text.trimmed().isEmpty() || !glyph.box.isValid()) continue;
+        if (!pages.contains(glyph.page)) pages.append(glyph.page);
+        if (!lines.isEmpty()) {
+            Line &line = lines.last();
+            const double centre = glyph.box.center().y();
+            if (line.page == glyph.page && centre >= line.box.top() && centre <= line.box.bottom()
+                && glyph.box.left() >= line.box.left() - line.box.height()) {
+                line.box = line.box.united(glyph.box);
+                line.glyphs.append(index);
+                continue;
+            }
+        }
+        lines.append({glyph.page, glyph.box, {index}});
+    }
+    // Page furniture, as the server's reading overlays leave it out of a passage across a page break:
+    // a line in the band at the foot (head) of the page, set apart from the line above (below) it by
+    // more than furnitureGap of its own height. Only between pages: the foot of each page but the
+    // last, the head of each but the first.
+    QSet<int> furniture;
+    for (int position = 0; position < pages.size(); ++position) {
+        QList<int> kept;
+        for (int index = 0; index < lines.size(); ++index) {
+            if (lines.at(index).page == pages.at(position)) kept.append(index);
+        }
+        const auto drop = [&](bool foot) {
+            while (kept.size() > 1) {
+                int candidate = kept.constFirst();
+                for (const int index : std::as_const(kept)) {
+                    const QRectF &box = lines.at(index).box;
+                    if (foot ? box.top() > lines.at(candidate).box.top() : box.top() < lines.at(candidate).box.top()) candidate = index;
+                }
+                const QRectF &box = lines.at(candidate).box;
+                // The nearest edge of the rest of the page's text above (below) it.
+                std::optional<double> nearest;
+                for (const int index : std::as_const(kept)) {
+                    const QRectF &other = lines.at(index).box;
+                    if (foot && other.top() < box.top()) nearest = std::max(nearest.value_or(other.bottom()), other.bottom());
+                    if (!foot && other.top() > box.top()) nearest = std::min(nearest.value_or(other.top()), other.top());
+                }
+                if (!nearest) return;
+                const bool inBand = foot ? box.top() >= 1.0 - furnitureBand : box.bottom() <= furnitureBand;
+                const double gap = foot ? box.top() - *nearest : *nearest - box.bottom();
+                if (!inBand || gap <= furnitureGap * box.height()) return;
+                for (const int glyph : lines.at(candidate).glyphs) furniture.insert(glyph);
+                kept.removeOne(candidate);
+            }
+        };
+        if (position + 1 < pages.size()) drop(true);
+        if (position > 0) drop(false);
+    }
+    if (furniture.isEmpty()) return text;
+    ReviewCardFeedback::AnswerText bare;
+    bare.glyphs = text.glyphs;
+    for (int i = 0; i < text.text.size() && i < text.source.size(); ++i) {
+        if (furniture.contains(text.source.at(i))) continue;
+        bare.text.append(text.text.at(i));
+        bare.source.append(text.source.at(i));
+    }
+    return bare;
 }
 
 QPair<QString, QString> context(const ReviewCardFeedback::AnswerText &text, const std::function<bool(int, const QPointF &)> &selected)

@@ -1,0 +1,13 @@
+\documentclass{article}
+\usepackage{hyperref}
+% A link to a figure: hyperref's target (figure.1) is its caption, below the figure.
+\begin{document}
+\section{Text}
+See Figure~\ref{fig:box}.
+\newpage
+\begin{figure}[t]
+\centering
+\rule{0.6\linewidth}{0.4\textheight}
+\caption{A tall figure above its caption.}\label{fig:box}
+\end{figure}
+\end{document}

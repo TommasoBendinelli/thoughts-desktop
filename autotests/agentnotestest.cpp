@@ -11,6 +11,7 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QComboBox>
+#include <tuple>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QLocale>
@@ -19,6 +20,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QStackedWidget>
 #include <QStandardPaths>
@@ -209,6 +211,10 @@ public:
 
     QJsonArray notes;  // newest first
     QJsonArray olderNotes;  // listed only for their document (?document_id=)
+    QJsonArray markNotes;  // in no list: GET /v1/agent-notes/{id} only (reading overlay mark notes)
+    // GET /v1/agent-notes/wakers; off: 404, as a server before agent_note_wakers_v1.
+    QJsonObject wakers{{QStringLiteral("wakers"), QJsonArray()}};
+    bool wakersSupported = true;
     QHash<QString, QByteArray> files;  // path -> body
     QStringList requests;  // "GET /v1/agent-notes?limit=20"
     QList<QJsonObject> bodies;  // of the POSTs, in order
@@ -234,6 +240,21 @@ public:
     QStringList capabilities;
     // This computer's device account, so pages it sends are its own on every system.
     QString device = Thoughts::Platform::desktopDeviceAccount();
+    // GET /v1/agent-notes/changes: its cursor; a request with that cursor as `after` is held until
+    // change() (as the server waits). Off: 404, as a server before agent_note_changes_v1.
+    bool changesSupported = true;
+    QString changesCursor = QStringLiteral("1.0");
+    int waitingChanges() const { return int(m_waiting.size()); }
+    void change(const QString &cursor)
+    {
+        changesCursor = cursor;
+        const QByteArray body = QJsonDocument(QJsonObject{{QStringLiteral("cursor"), cursor}, {QStringLiteral("changed"), true}}).toJson(QJsonDocument::Compact);
+        for (QTcpSocket *socket : std::exchange(m_waiting, {})) {
+            if (!socket) continue;
+            socket->write("HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+            socket->disconnectFromHost();
+        }
+    }
 
     QJsonObject *noteRecordOf(const QString &id)
     {
@@ -254,6 +275,7 @@ public:
 private:
     QJsonObject m_scratch;
     int m_scratchIndex = -1;
+    QList<QPointer<QTcpSocket>> m_waiting;
     qint64 m_replySequence = 100;
 
     void answer(QTcpSocket *socket, const QByteArray &request, const QByteArray &requestBody)
@@ -269,6 +291,14 @@ private:
         if (!request.contains(QByteArray(QByteArray("Authorization: Bearer ") + token))) {
             code = 401;
             body = R"({"detail":"invalid token"})";
+        } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/agent-notes/changes") && changesSupported) {
+            const QString after = QUrlQuery(target).queryItemValue(QStringLiteral("after"));
+            if (!after.isEmpty() && after == changesCursor) {
+                m_waiting.append(socket);  // answered by change()
+                return;
+            }
+            code = 200;
+            body = QJsonDocument(QJsonObject{{QStringLiteral("cursor"), changesCursor}, {QStringLiteral("changed"), !after.isEmpty()}}).toJson(QJsonDocument::Compact);
         } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/agent-notes")) {
             code = listStatus;
             const int limit = QUrlQuery(target).queryItemValue(QStringLiteral("limit")).toInt();
@@ -296,6 +326,23 @@ private:
                 extraHeaders = QByteArray("ETag: ") + version + QByteArray("\r\n");
             }
             listBytes += body.size();
+        } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/agent-notes/wakers")) {
+            if (wakersSupported) {
+                code = 200;
+                body = QJsonDocument(wakers).toJson(QJsonDocument::Compact);
+            }
+        } else if (method == QLatin1String("GET") && target.path().startsWith(QLatin1String("/v1/agent-notes/")) && target.path().count(QLatin1Char('/')) == 3
+                   && !files.contains(target.path())) {
+            // One note by its id, listed or not.
+            const QString id = target.path().section(QLatin1Char('/'), -1);
+            body = R"({"detail":"note not found","error_code":"agent_note_not_found"})";
+            for (const QJsonArray *source : {&notes, &markNotes}) {
+                for (const QJsonValue &value : *source) {
+                    if (value.toObject().value(QStringLiteral("note_id")).toString() != id) continue;
+                    code = 200;
+                    body = QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact);
+                }
+            }
         } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/health")) {
             code = 200;
             body = QJsonDocument(QJsonObject{{QStringLiteral("status"), QStringLiteral("ok")}, {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)}})
@@ -463,6 +510,7 @@ private Q_SLOTS:
     void readStatePersists();
     void unreadRule();
     void clientListsWithTheDeviceToken();
+    void aNewNoteShowsAtOnceWhileTheServerOffersChanges();
     void clientReportsFailures();
     void clientCachesPicturesBySha();
     void clientStaysOfflineInTestMode();
@@ -483,9 +531,21 @@ private Q_SLOTS:
     void drawingMatchesThePhone();
     void textReplySendsThePictureAsItIs();
     void replyCarriesWhatTheAgentMayUse();
+    void continuedConversationIsTheSendersOwn();
+    void notesListHidesLikeTheReadersSidebar();
+    void replyToTheSendingConversationSaysSoInsteadOfSources();
     void noteLinksOpenWhenClicked();
     void drawnReplySendsTheComposite();
+    void highlightOnTheNoteItself();
     void pageGoesToTheAgent();
+    void markNotesAreNeverListed();
+    void markNoteOpensByItsId();
+    void askedPageNamesItsSession();
+    void sendToAgentRecipients();
+    void sendToAgentSessionMenu();
+    void sendToAgentRanking();
+    void sendToAgentRankedMenu();
+    void copyForAgentMessageGoesAsItIs();
     void deleteAsksFirst();
     void filtersFollowTheLibrary();
     void viewShowsOneProjectWithItsOlderNotes();
@@ -634,6 +694,32 @@ void AgentNotesTest::clientListsWithTheDeviceToken()
     QCOMPARE(result->notes.size(), 5);
     QCOMPARE(result->notes.first().sequence, 30);
     QCOMPARE(server.requests, QStringList{QStringLiteral("GET /v1/agent-notes?limit=5")});
+}
+
+void AgentNotesTest::aNewNoteShowsAtOnceWhileTheServerOffersChanges()
+{
+    FakeServer server;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, now.addSecs(-120), QStringLiteral("First")));
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    QSignalSpy attention(&center, &Center::noteNeedsAttention);
+    center.start(0);
+    // The first list, then a request that waits for the next change.
+    QVERIFY(waitFor([&] { return center.hasListed() && center.isLive() && server.waitingChanges() == 1; }));
+    QVERIFY(server.requests.contains(QStringLiteral("GET /v1/agent-notes/changes")));
+    QVERIFY(server.requests.contains(QStringLiteral("GET /v1/agent-notes/changes?after=1.0&wait=%1").arg(Center::ChangesWaitSeconds)));
+    // A note arrives: the list is asked for at once, not at the next timed poll (15 s to 2 min away).
+    server.notes.prepend(noteRecord(QStringLiteral("n2"), 2, QDateTime::currentDateTimeUtc(), QStringLiteral("Second")));
+    server.change(QStringLiteral("2.0"));
+    QVERIFY(waitFor([&] { return center.note(QStringLiteral("n2")).has_value(); }, 3000));
+    QVERIFY(waitFor([&] { return server.waitingChanges() == 1; }));
+    QVERIFY(server.requests.contains(QStringLiteral("GET /v1/agent-notes/changes?after=2.0&wait=%1").arg(Center::ChangesWaitSeconds)));
+    // Nobody opened it: announced once its grace period is over, with no list asked for meanwhile.
+    QCOMPARE(attention.count(), 0);
+    QVERIFY(waitFor([&] { return attention.count() == 1; }, (Center::GracePeriodSeconds + 3) * 1000));
+    QCOMPARE(attention.first().first().value<Note>().id, QStringLiteral("n2"));
 }
 
 void AgentNotesTest::clientReportsFailures()
@@ -1739,6 +1825,202 @@ void AgentNotesTest::replyCarriesWhatTheAgentMayUse()
     QCOMPARE(later.replySources(), AgentNotes::ReplySources::defaultValue());
 }
 
+// 19 Nov 2026: asking what the agent may use ("All documents + Mental Model") is wrong when
+// the reply goes back to the chat that sent the note, which has it all open. Who answers
+// decides: the note's own conversation (listening, woken, chosen, or not known yet) continues;
+// a topic owner, the reply agent, another conversation or nobody start a new one.
+void AgentNotesTest::continuedConversationIsTheSendersOwn()
+{
+    QJsonObject record = noteRecord(QStringLiteral("n1"), 1, QDateTime::currentDateTimeUtc(), QStringLiteral("Question"));
+    record.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("agent"), QStringLiteral("mcp")}, {QStringLiteral("conversation_agent"), QStringLiteral("claude")},
+                                                        {QStringLiteral("conversation_id"), ConversationA}});
+    const Note fromConversation = note(record);
+    const Note connector = note(noteRecord(QStringLiteral("n2"), 2, QDateTime::currentDateTimeUtc(), QStringLiteral("Plain")));
+    QJsonObject page = noteRecord(QStringLiteral("p1"), 3, QDateTime::currentDateTimeUtc(), QStringLiteral("Page"));
+    page.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("kind"), QStringLiteral("phone_page")}, {QStringLiteral("conversation_id"), ConversationA}});
+    QJsonObject linked = noteRecord(QStringLiteral("n3"), 4, QDateTime::currentDateTimeUtc(), QStringLiteral("Chat"));
+    linked.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("conversation_agent"), QStringLiteral("claude")}, {QStringLiteral("conversation_url"), QStringLiteral("https://claude.ai/chat/abc")}});
+
+    // Before the server says who listens: the note's own conversation, if it has one.
+    QVERIFY(continuedConversation(fromConversation, std::nullopt));
+    QVERIFY(continuedConversation(note(linked), std::nullopt));
+    QVERIFY(continuedConversation(fromConversation, ListeningAnswer{}));
+    QVERIFY(!continuedConversation(connector, std::nullopt));
+    QVERIFY(!continuedConversation(note(page), std::nullopt));
+    QCOMPARE(continuedConversation(fromConversation, std::nullopt)->text(), QStringLiteral("Your reply goes back to the agent's conversation."));
+
+    const auto answerOf = [](const QJsonObject &json) { return std::optional<ListeningAnswer>(ListeningAnswer::fromJson(json)); };
+    const QJsonObject ownSender = agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationA);
+    const QJsonObject otherSender = agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationB);
+    // Its agent listens.
+    QVERIFY(continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("listeners"), QJsonArray{ownSender}}})));
+    // A reply waker wakes its session: named by its title.
+    const auto woken = continuedConversation(
+        fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")},
+                                    {QStringLiteral("wake"), wakeRecord(QStringLiteral("will_be_woken"), QStringLiteral("sender"), QStringLiteral("mac"), QStringLiteral("Example session"))}}));
+    QVERIFY(woken);
+    QCOMPARE(woken->title, QStringLiteral("Example session"));
+    QCOMPARE(woken->text(), QStringLiteral("Your reply goes back to the agent's conversation “Example session”."));
+    // ... also while its machine is offline (it answers when back).
+    QVERIFY(continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                              {QStringLiteral("wake"), wakeRecord(QStringLiteral("waker_offline"), QStringLiteral("sender"), QStringLiteral("mac"), {})}})));
+    // Chosen by the user, and live.
+    QVERIFY(continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("answer_by"), ownSender}})));
+
+    // Someone else answers: a new conversation, the choice stays.
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("listeners"), QJsonArray{topicAgentRecord()}}})));
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("listeners"), QJsonArray{replyAgentRecord()}}})));
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("listening")}, {QStringLiteral("answer_by"), otherSender}})));
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                               {QStringLiteral("wake"), wakeRecord(QStringLiteral("will_be_woken"), QStringLiteral("responder"), QStringLiteral("example-server"), QStringLiteral("Agent Study"))}})));
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                               {QStringLiteral("wake"), wakeRecord(QStringLiteral("will_be_woken"), QStringLiteral("owner"), QStringLiteral("mac"), QStringLiteral("Topic session"))}})));
+    // Nobody listens, or the agent chosen does not: the reply agent may take it.
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")}})));
+    QVERIFY(!continuedConversation(fromConversation, answerOf({{QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                               {QStringLiteral("answer_by"), agentRecord(QStringLiteral("sender"), QStringLiteral("example-laptop"), ConversationA, {}, {}, false)}})));
+}
+
+// 19 Nov: ⌘B in the reader and in Agent Notes, and a button in the Agent Notes window for it.
+// The window's notes list (beside the open note) hides and shows with ⌘B (on macOS Control-B
+// too) and with the reader's sidebar icon over it, which says which it does; the choice is kept
+// for the next window. The reader's sidebar of notes has no such toggle (the reader's own ⌘B
+// hides that sidebar).
+void AgentNotesTest::notesListHidesLikeTheReadersSidebar()
+{
+    QSettings().remove(QStringLiteral("AgentNotes/ListShown"));
+    const auto restore = qScopeGuard([] { QSettings().remove(QStringLiteral("AgentNotes/ListShown")); });
+    FakeServer server;
+    const QByteArray picture = png(QSize(120, 300), QColor(30, 90, 200));
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, QDateTime::currentDateTimeUtc().addSecs(-60), QStringLiteral("Question"), picture));
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.resize(1200, 900);
+    window.show();
+    window.activateWindow();
+    QVERIFY(QTest::qWaitForWindowActive(&window));
+    QVERIFY(waitFor([&] { return center.hasListed() && window.currentNoteId() == QLatin1String("n1"); }));
+    auto *list = window.findChild<QListWidget *>(QStringLiteral("agentNotesList"));
+    auto *button = window.findChild<QToolButton *>(QStringLiteral("agentNotesToggleListButton"));
+    QVERIFY(list && button);
+    QVERIFY(list->isVisible() && button->isVisible() && button->isChecked());
+    QVERIFY(window.listShown());
+    const QString key = QKeySequence(Qt::CTRL | Qt::Key_B).toString(QKeySequence::NativeText);
+    QCOMPARE(button->toolTip(), QStringLiteral("Hide Sidebar (%1)").arg(key));
+
+    // ⌘B with the focus in the list: hidden, the note stays, and so does the choice.
+    list->setFocus();
+    QTest::keyClick(list, Qt::Key_B, Qt::ControlModifier);
+    QVERIFY(waitFor([&] { return !list->isVisible(); }));
+    QVERIFY(!button->isChecked() && !window.listShown());
+    QCOMPARE(button->toolTip(), QStringLiteral("Show Sidebar (%1)").arg(key));
+    QCOMPARE(window.currentNoteId(), QStringLiteral("n1"));
+    QCOMPARE(QSettings().value(QStringLiteral("AgentNotes/ListShown")).toBool(), false);
+    // The button: shown again.
+    button->click();
+    QVERIFY(list->isVisible() && button->isChecked());
+    QCOMPARE(QSettings().value(QStringLiteral("AgentNotes/ListShown")).toBool(), true);
+#ifdef Q_OS_MACOS
+    QTest::keyClick(&window, Qt::Key_B, Qt::MetaModifier);
+#else
+    QTest::keyClick(&window, Qt::Key_B, Qt::ControlModifier);
+#endif
+    QVERIFY(waitFor([&] { return !list->isVisible(); }));
+    // The next window starts as this one was left.
+    AgentNotesWindow later(&center, {}, {}, {});
+    QVERIFY(later.findChild<QListWidget *>(QStringLiteral("agentNotesList"))->isHidden());
+    QVERIFY(!later.findChild<QToolButton *>(QStringLiteral("agentNotesToggleListButton"))->isChecked());
+    // The reader's sidebar of notes has none.
+    AgentNotesView sidebar(AgentNotesView::Layout::Sidebar, &center, {}, {}, {});
+    QVERIFY(!sidebar.findChild<QToolButton *>(QStringLiteral("agentNotesToggleListButton")));
+    QVERIFY(sidebar.listShown());
+}
+
+// The reply box of a note from an agent's conversation: in the window and in the reader's
+// sidebar, a line saying where the reply goes instead of the Sources choice, and the reply carries
+// the default sources whatever was chosen for new conversations. When nobody listens any more,
+// the choice is back.
+void AgentNotesTest::replyToTheSendingConversationSaysSoInsteadOfSources()
+{
+    QSettings().setValue(QStringLiteral("AgentNotes/ReplySources"), QStringLiteral("linked_pdf"));
+    const auto restore = qScopeGuard([] { QSettings().remove(QStringLiteral("AgentNotes/ReplySources")); });
+    FakeServer server;
+    const QByteArray picture = png(QSize(120, 300), QColor(30, 90, 200));
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    QJsonObject record = noteRecord(QStringLiteral("n1"), 1, now.addSecs(-120), QStringLiteral("From a chat"), picture);
+    record.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("agent"), QStringLiteral("mcp")}, {QStringLiteral("conversation_agent"), QStringLiteral("claude")},
+                                                        {QStringLiteral("conversation_id"), ConversationA}});
+    server.notes.append(record);
+    server.notes.append(noteRecord(QStringLiteral("n2"), 2, now.addSecs(-60), QStringLiteral("From the connector"), picture));
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    server.files.insert(QStringLiteral("/v1/agent-notes/n2/image"), picture);
+    server.answers.insert(QStringLiteral("n1"), QJsonObject{{QStringLiteral("note_id"), QStringLiteral("n1")}, {QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                            {QStringLiteral("listeners"), QJsonArray()},
+                                                            {QStringLiteral("wake"), wakeRecord(QStringLiteral("will_be_woken"), QStringLiteral("sender"), QStringLiteral("mac"),
+                                                                                                QStringLiteral("Example session"))}});
+    server.listening.insert(QStringLiteral("n2"), QStringLiteral("not_listening"));
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.resize(1200, 900);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    AgentNotesView sidebar(AgentNotesView::Layout::Sidebar, &center, {}, {}, {});
+    sidebar.resize(300, 800);
+    sidebar.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&sidebar));
+    QVERIFY(waitFor([&] { return center.hasListed(); }));
+    window.selectNote(QStringLiteral("n1"));
+    sidebar.selectNote(QStringLiteral("n1"));
+    QVERIFY(waitFor([&] { return center.answer(QStringLiteral("n1")).has_value(); }));
+    const QString statement = QStringLiteral("Your reply goes back to the agent's conversation “Example session”.");
+    for (QWidget *view : {static_cast<QWidget *>(&window), static_cast<QWidget *>(&sidebar)}) {
+        auto *sources = view->findChild<QComboBox *>(QStringLiteral("agentNoteReplySources"));
+        auto *continues = view->findChild<QLabel *>(QStringLiteral("agentNoteReplyContinues"));
+        QVERIFY(sources && continues);
+        QVERIFY2(waitFor([&] { return continues->isVisible() && continues->text() == statement; }), qPrintable(continues->text()));
+        QVERIFY(!sources->isVisible());
+    }
+    // The label "Sources:" goes with the choice.
+    for (QLabel *label : window.findChildren<QLabel *>()) {
+        if (label->text() == QStringLiteral("Sources:")) QVERIFY(!label->isVisible());
+    }
+
+    // The reply goes with the default sources, not the choice kept for new conversations.
+    auto *field = window.findChild<QPlainTextEdit *>(QStringLiteral("agentNoteReplyField"));
+    auto *send = window.findChild<QPushButton *>(QStringLiteral("agentNoteSend"));
+    field->setFocus();
+    QTest::keyClicks(field, QStringLiteral("Go on"));
+    send->click();
+    QVERIFY(waitFor([&] { return field->toPlainText().isEmpty(); }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("sources")).toString(), QStringLiteral("library_and_mental_model"));
+    QCOMPARE(center.replySources(), QStringLiteral("linked_pdf"));
+
+    // A note of no conversation: the choice, as before, and the reply carries it.
+    window.selectNote(QStringLiteral("n2"));
+    auto *sources = window.findChild<QComboBox *>(QStringLiteral("agentNoteReplySources"));
+    auto *continues = window.findChild<QLabel *>(QStringLiteral("agentNoteReplyContinues"));
+    QVERIFY(waitFor([&] { return sources->isVisible() && !continues->isVisible(); }));
+    QCOMPARE(sources->currentData().toString(), QStringLiteral("linked_pdf"));
+    QTest::keyClicks(field, QStringLiteral("New question"));
+    send->click();
+    QVERIFY(waitFor([&] { return field->toPlainText().isEmpty(); }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("sources")).toString(), QStringLiteral("linked_pdf"));
+
+    // Nobody would answer in the conversation any more: the choice is back for the first note too.
+    server.answers.insert(QStringLiteral("n1"), QJsonObject{{QStringLiteral("note_id"), QStringLiteral("n1")}, {QStringLiteral("state"), QStringLiteral("not_listening")},
+                                                            {QStringLiteral("listeners"), QJsonArray()}});
+    window.selectNote(QStringLiteral("n1"));
+    center.checkListeningIfOlder(QStringLiteral("n1"), 0);
+    QVERIFY(waitFor([&] { return sources->isVisible() && !continues->isVisible(); }));
+    auto *sidebarSources = sidebar.findChild<QComboBox *>(QStringLiteral("agentNoteReplySources"));
+    QVERIFY(waitFor([&] { return sidebarSources->isVisible(); }));
+}
+
 void AgentNotesTest::textReplySendsThePictureAsItIs()
 {
     FakeServer server;
@@ -1798,6 +2080,64 @@ void AgentNotesTest::textReplySendsThePictureAsItIs()
 
 // Draw on the Picture: the phone's tools on the picture large; Send posts the drawing on the
 // picture (PNG), its stroke document and the comment typed under the note.
+// 24 Nov 2026: highlighting meant scrolling to the end of the note for Draw on the Picture…, which opened a
+// window. Highlight sits at the top of the note and draws on the note itself; the marks stay shown over the
+// note and go with the reply, whose box stays in view under the note.
+void AgentNotesTest::highlightOnTheNoteItself()
+{
+    FakeServer server;
+    const QByteArray picture = png(QSize(400, 600), Qt::white);
+    server.notes.append(noteRecord(QStringLiteral("n1"), 1, QDateTime::currentDateTimeUtc(), QStringLiteral("Read this"), picture));
+    server.files.insert(QStringLiteral("/v1/agent-notes/n1/image"), picture);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    AgentNotesView view(AgentNotesView::Layout::Split, &center, {}, {}, {});
+    view.resize(1000, 700);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    QVERIFY(waitFor([&] { return center.hasListed(); }));
+    view.selectNote(QStringLiteral("n1"));
+    auto *image = view.findChild<AgentNoteImageView *>();
+    QVERIFY(waitFor([&] { return !image->image().isNull(); }));
+    // The reply box is under the note, out of its scroll area: always in view.
+    auto *scroll = view.findChild<QScrollArea *>(QStringLiteral("agentNoteScroll"));
+    auto *replyBox = view.findChild<QWidget *>(QStringLiteral("agentNoteReplyBox"));
+    QVERIFY(replyBox && !scroll->widget()->isAncestorOf(replyBox) && replyBox->isVisible());
+
+    auto *highlight = view.findChild<QToolButton *>(QStringLiteral("agentNoteInlineHighlight"));
+    QVERIFY(highlight && highlight->isVisible());
+    highlight->click();
+    auto *canvas = view.findChild<AgentNoteCanvas *>(QStringLiteral("agentNoteCanvas"));
+    QVERIFY(highlight->isChecked() && canvas->isVisible() && !image->isVisible());
+    QVERIFY(waitFor([&] { return canvas->width() > 100; }));
+    const qreal toCanvas = canvas->width() / 400.0;
+    drag(canvas, {QPointF(50, 300) * toCanvas, QPointF(200, 300) * toCanvas, QPointF(350, 300) * toCanvas});
+    auto draft = center.existingDraft(QStringLiteral("n1"));
+    QVERIFY(draft);
+    QCOMPARE(draft->drawing.strokes().size(), 1);
+    // Back to reading: the mark stays over the note, Undo can take it back, the reply knows of it.
+    highlight->click();
+    QVERIFY(!highlight->isChecked() && !canvas->isVisible() && image->isVisible());
+    auto *undo = view.findChild<QToolButton *>(QStringLiteral("agentNoteInlineUndo"));
+    QVERIFY(undo->isEnabled());
+    QVERIFY(waitFor([&] { return view.findChild<QPushButton *>(QStringLiteral("agentNoteDraw"))->text().contains(QStringLiteral("Edit")); }));
+    QImage shown(image->size(), QImage::Format_ARGB32);
+    image->render(&shown);
+    QVERIFY2(shown.pixelColor(image->width() / 2, int(image->height() * 0.5)) != QColor(Qt::white), "the highlight is drawn over the note");
+
+    view.findChild<QPlainTextEdit *>(QStringLiteral("agentNoteReplyField"))->setPlainText(QStringLiteral("this part"));
+    view.findChild<QPushButton *>(QStringLiteral("agentNoteSend"))->click();
+    QVERIFY(waitFor([&] { return center.note(QStringLiteral("n1"))->replies.size() == 1; }));
+    const QJsonObject body = server.bodies.last();
+    QCOMPARE(body.value(QStringLiteral("message")).toString(), QStringLiteral("this part"));
+    const QJsonArray strokes = body.value(QStringLiteral("strokes")).toObject().value(QStringLiteral("strokes")).toArray();
+    QCOMPARE(strokes.size(), 1);
+    QCOMPARE(strokes.first().toObject().value(QStringLiteral("tool")).toString(), QStringLiteral("highlighter"));
+    // Sent: its marks leave the note.
+    QVERIFY(waitFor([&] { return !undo->isEnabled(); }));
+}
+
 void AgentNotesTest::drawnReplySendsTheComposite()
 {
     FakeServer server;
@@ -1947,6 +2287,504 @@ void AgentNotesTest::pageGoesToTheAgent()
     QCOMPARE(center.unreadCount(), 0);
     sidebar.selectNote(page.id);
     QVERIFY(!sidebar.findChild<QWidget *>(QStringLiteral("agentNoteReplyBox"))->isVisible());
+}
+
+// Ask About This on a reading overlay's mark (reading-overlays.md §4): a page like Send Page's
+// whose origin also names the overlay's conversation and the mark (agent-notes.md, "Pages sent to
+// one session"); what every page has is never replaced.
+void AgentNotesTest::askedPageNamesItsSession()
+{
+    FakeServer server;
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    Center::Page page;
+    page.title = QStringLiteral("About “Reverse KL” (p. 3)");
+    page.message = QStringLiteral("Question about a mark of your reading overlay …");
+    page.documentId = QStringLiteral("doc-7");
+    page.documentFilename = QStringLiteral("agents_vs_network.pdf");
+    page.documentName = QStringLiteral("AgentsVsNetwork");
+    page.page = 3;
+    page.pages = 12;
+    page.image = QImage(400, 600, QImage::Format_RGB32);
+    page.image.fill(Qt::white);
+    const QJsonObject mark{{QStringLiteral("overlay_id"), QStringLiteral("5b0c1f6e-2a47-4d1e-9c3b-7e8f2a6d4c10")},
+                           {QStringLiteral("mark_id"), QStringLiteral("m1")},
+                           {QStringLiteral("kind"), QStringLiteral("skip")}};
+    page.origin = QJsonObject{{QStringLiteral("conversation_id"), ConversationA}, {QStringLiteral("reading_overlay"), mark},
+                              {QStringLiteral("kind"), QStringLiteral("other")}, {QStringLiteral("page"), 99}};
+    bool sent = false;
+    center.sendPage(page, [&sent](bool ok, const QString &) { sent = ok; });
+    QVERIFY(waitFor([&] { return sent; }));
+    const QJsonObject body = server.bodies.last();
+    QCOMPARE(body.value(QStringLiteral("title")).toString(), page.title);
+    QCOMPARE(body.value(QStringLiteral("message")).toString(), page.message);
+    QCOMPARE(body.value(QStringLiteral("document_id")).toString(), QStringLiteral("doc-7"));
+    QCOMPARE(body.value(QStringLiteral("document_filename")).toString(), QStringLiteral("agents_vs_network.pdf"));
+    QCOMPARE(body.value(QStringLiteral("origin")).toObject(),
+             (QJsonObject{{QStringLiteral("kind"), QStringLiteral("phone_page")}, {QStringLiteral("device"), QStringLiteral("mac")},
+                          {QStringLiteral("page"), 3}, {QStringLiteral("pages"), 12}, {QStringLiteral("document_name"), QStringLiteral("AgentsVsNetwork")},
+                          {QStringLiteral("stroke_count"), 0}, {QStringLiteral("conversation_id"), ConversationA}, {QStringLiteral("reading_overlay"), mark}}));
+}
+
+// A reading overlay mark's note (origin.kind "overlay_mark", reading-overlays.md "Mark notes") is
+// opened from its mark, never from the list: a server before reading_overlay_mark_notes_v1 lists
+// it, and the list here leaves it out all the same (no unread count, no notification).
+void AgentNotesTest::markNotesAreNeverListed()
+{
+    FakeServer server;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    QJsonObject mark = noteRecord(QStringLiteral("4b1f2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"), 3, now, QStringLiteral("What to read · Read carefully: “The loss”…"));
+    mark.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("kind"), QStringLiteral("overlay_mark")}, {QStringLiteral("agent"), QStringLiteral("claude")}});
+    server.notes = QJsonArray{mark, noteRecord(QStringLiteral("n2"), 2, now.addSecs(-60), QStringLiteral("Listed"))};
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    AgentNotesView sidebar(AgentNotesView::Layout::Sidebar, &center, {}, {}, {});
+    center.refresh();
+    QVERIFY(waitFor([&] { return center.hasListed() && !center.isRefreshing(); }));
+    QCOMPARE(center.notes().size(), 1);
+    QCOMPARE(center.notes().first().id, QStringLiteral("n2"));
+    QVERIFY(!center.note(QStringLiteral("4b1f2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d")));
+    QCOMPARE(center.unreadCount(), 1);
+    QVERIFY(waitFor([&] { return list(sidebar)->count() == 1; }));
+    QCOMPARE(list(sidebar)->item(0)->text(), QStringLiteral("Listed"));
+    // A document's notes (merged into the list) leave it out too.
+    center.merge({note(mark)});
+    QCOMPARE(center.notes().size(), 1);
+    QVERIFY(note(mark).isMarkNote());
+    QVERIFY(!note(server.notes.at(1).toObject()).isMarkNote());
+}
+
+// A mark note is fetched by its id (GET /v1/agent-notes/{id}) and kept apart from the list: the
+// Agent Notes window shows it with nothing selected in its list, also while the list is empty and
+// when it is asked for again; picking a note in the list shows that one. A deleted or unknown note
+// is not kept.
+void AgentNotesTest::markNoteOpensByItsId()
+{
+    FakeServer server;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QString markId = QStringLiteral("4b1f2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d");
+    QImage picture(400, 900, QImage::Format_RGB32);
+    picture.fill(Qt::white);
+    QByteArray png;
+    {
+        QBuffer buffer(&png);
+        buffer.open(QIODevice::WriteOnly);
+        picture.save(&buffer, "PNG");
+    }
+    QJsonObject mark = noteRecord(markId, 7, now, QStringLiteral("What to read · Read carefully: “The loss”…"), png);
+    mark.insert(QStringLiteral("origin"), QJsonObject{{QStringLiteral("kind"), QStringLiteral("overlay_mark")}, {QStringLiteral("agent"), QStringLiteral("claude")},
+                                                      {QStringLiteral("conversation_id"), ConversationA}});
+    mark.insert(QStringLiteral("document_id"), QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848"));
+    server.markNotes = QJsonArray{mark};
+    server.files.insert(QStringLiteral("/v1/agent-notes/%1/image").arg(markId), png);
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    center.refresh();
+    QVERIFY(waitFor([&] { return center.hasListed() && !center.isRefreshing(); }));
+    QVERIFY(center.notes().isEmpty());
+
+    std::optional<Note> fetched;
+    bool answered = false;
+    center.fetchNote(markId, [&](const std::optional<Note> &note, const QString &) {
+        fetched = note;
+        answered = true;
+    });
+    QVERIFY(waitFor([&] { return answered; }));
+    QVERIFY(fetched && fetched->isMarkNote());
+    QVERIFY(server.requests.contains(QStringLiteral("GET /v1/agent-notes/%1").arg(markId)));
+    // Kept apart: found by its id, never listed, never unread.
+    QVERIFY(center.note(markId));
+    QVERIFY(center.notes().isEmpty());
+    QCOMPARE(center.unreadCount(), 0);
+
+    AgentNotesWindow window(&center, {}, {}, {});
+    window.showNote(markId);
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCOMPARE(window.shownNoteId(), markId);
+    QVERIFY(window.currentNoteId().isEmpty());
+    QCOMPARE(window.findChild<QLabel *>(QStringLiteral("agentNoteTitle"))->text(), mark.value(QStringLiteral("title")).toString());
+    QVERIFY(!window.findChild<QLabel *>(QStringLiteral("agentNotesPlaceholder"))->isVisible());
+    auto *image = window.findChild<AgentNoteImageView *>(QStringLiteral("agentNoteImage"));
+    QVERIFY(waitFor([&] { return !image->image().isNull(); }));
+    QCOMPARE(image->image().size(), picture.size());
+    QCOMPARE(list(window)->count(), 0);
+
+    // The list fills; the mark note stays shown, nothing selected, and is not among them.
+    server.notes = QJsonArray{noteRecord(QStringLiteral("n1"), 5, now.addSecs(-60), QStringLiteral("Listed"))};
+    center.refresh();
+    QVERIFY(waitFor([&] { return list(window)->count() == 1 && !center.isRefreshing(); }));
+    QCOMPARE(window.shownNoteId(), markId);
+    QVERIFY(window.currentNoteId().isEmpty());
+    QCOMPARE(window.findChild<QLabel *>(QStringLiteral("agentNoteTitle"))->text(), mark.value(QStringLiteral("title")).toString());
+    // Picked in the list: that note.
+    list(window)->setCurrentRow(0);
+    QCOMPARE(window.shownNoteId(), QStringLiteral("n1"));
+    QCOMPARE(window.findChild<QLabel *>(QStringLiteral("agentNoteTitle"))->text(), QStringLiteral("Listed"));
+    // Asked for again (its mark clicked again): shown again.
+    window.showNote(markId);
+    QCOMPARE(window.shownNoteId(), markId);
+    QVERIFY(window.currentNoteId().isEmpty());
+
+    // Unknown, or deleted since: not kept, and the window goes back to the list.
+    answered = false;
+    QString error;
+    center.fetchNote(QStringLiteral("0c1d2e3f-4a5b-4c6d-8e7f-8091a2b3c4d5"), [&](const std::optional<Note> &note, const QString &why) {
+        fetched = note;
+        error = why;
+        answered = true;
+    });
+    QVERIFY(waitFor([&] { return answered; }));
+    QVERIFY(!fetched);
+    QVERIFY(!error.isEmpty());
+    mark.insert(QStringLiteral("deleted"), true);
+    server.markNotes = QJsonArray{mark};
+    answered = false;
+    center.fetchNote(markId, [&](const std::optional<Note> &note, const QString &) {
+        fetched = note;
+        answered = true;
+    });
+    QVERIFY(waitFor([&] { return answered; }));
+    QVERIFY(!fetched);
+    QVERIFY(!center.note(markId));
+    QVERIFY(waitFor([&] { return window.shownNoteId() == QStringLiteral("n1"); }));
+}
+
+// A menu's entries as text: "---" for a separator, "<title> > [<entries>]" for a submenu, " [off]"
+// for a disabled entry and " [x]" for a checked one.
+QStringList menuEntries(QMenu &menu)
+{
+    QStringList texts;
+    for (QAction *action : menu.actions()) {
+        if (action->isSeparator()) {
+            texts.append(QStringLiteral("---"));
+        } else if (action->menu()) {
+            texts.append(action->text() + QStringLiteral(" > [") + menuEntries(*action->menu()).join(QStringLiteral(", ")) + QLatin1Char(']'));
+        } else {
+            texts.append(action->text() + (action->isEnabled() ? QString() : QStringLiteral(" [off]")) + (action->isChecked() ? QStringLiteral(" [x]") : QString()));
+        }
+    }
+    return texts;
+}
+
+// A wakers answer (GET /v1/agent-notes/wakers) of two machines, as the "To:" of Send to Agent lists it.
+QJsonObject testWakers()
+{
+    const auto session = [](const QString &id, const QString &title, const QString &state, const QString &lastActive, std::optional<bool> wakeable = std::nullopt) {
+        QJsonObject record{{QStringLiteral("session_id"), id}, {QStringLiteral("title"), title}, {QStringLiteral("state"), state}, {QStringLiteral("kind"), QStringLiteral("claude")}};
+        if (!lastActive.isEmpty()) record.insert(QStringLiteral("last_active_at"), lastActive);
+        if (wakeable) record.insert(QStringLiteral("wakeable"), *wakeable);
+        return record;
+    };
+    // Listed offline machine first on purpose: the live one's sessions come first all the same.
+    return QJsonObject{{QStringLiteral("wakers"),
+                        QJsonArray{QJsonObject{{QStringLiteral("machine"), QStringLiteral("macbook")}, {QStringLiteral("live"), false},
+                                               {QStringLiteral("sessions"), QJsonArray{session(QStringLiteral("s6"), QStringLiteral("Laptop session"), QStringLiteral("idle"), QStringLiteral("2026-11-20T12:00:00Z"))}}},
+                                   QJsonObject{{QStringLiteral("machine"), QStringLiteral("example-server")}, {QStringLiteral("live"), true},
+                                               {QStringLiteral("sessions"),
+                                                QJsonArray{session(QStringLiteral("s2"), QStringLiteral("Old work"), QStringLiteral("closed"), QStringLiteral("2026-11-20T11:00:00Z")),
+                                                           session(QStringLiteral("s3"), QStringLiteral("Busy one"), QStringLiteral("busy"), QStringLiteral("2026-11-20T09:00:00Z")),
+                                                           session(QStringLiteral("s4"), QStringLiteral("Cannot wake"), QStringLiteral("idle"), QStringLiteral("2026-11-20T13:00:00Z"), false),
+                                                           session(QStringLiteral("0f9e8d7c-6b5a-4938-a271-605f4e3d2c1b"), QString(), QStringLiteral("idle"), QString()),
+                                                           session(QStringLiteral("s1"), QStringLiteral("Thought Editor"), QStringLiteral("idle"), QStringLiteral("2026-11-20T10:00:00Z"))}}}}},
+                       {QStringLiteral("checked_at"), QStringLiteral("2026-11-20T13:30:00Z")}};
+}
+
+// Send to Agent's "To:": the sessions reply wakers can wake, those of live machines first, open
+// ones before closed ones, the most recently active first; one that cannot be woken left out. Each
+// reads "<title> · <machine>", with what it is doing when it is not simply waiting. The message is
+// the request, a blank line, then Copy for Agent's text.
+void AgentNotesTest::sendToAgentRecipients()
+{
+    const QList<Recipient> sessions = recipients(testWakers());
+    QStringList ids;
+    QStringList choices;
+    for (const Recipient &session : sessions) {
+        ids.append(session.sessionId);
+        choices.append(session.choiceText());
+    }
+    QCOMPARE(ids, (QStringList{QStringLiteral("s1"), QStringLiteral("s3"), QStringLiteral("0f9e8d7c-6b5a-4938-a271-605f4e3d2c1b"), QStringLiteral("s2"), QStringLiteral("s6")}));
+    QCOMPARE(choices, (QStringList{QStringLiteral("Thought Editor · example-server"), QStringLiteral("Busy one · example-server · busy"), QStringLiteral("Session 0f9e8d7c · example-server"),
+                                   QStringLiteral("Old work · example-server · closed"), QStringLiteral("Laptop session · macbook · offline")}));
+    QCOMPARE(sessions.first().label(), QStringLiteral("Thought Editor · example-server"));
+    // A session two machines name is listed once, where it ranks best.
+    QJsonObject twice = testWakers();
+    QJsonArray machines = twice.value(QStringLiteral("wakers")).toArray();
+    QJsonObject laptop = machines.at(0).toObject();
+    QJsonArray laptopSessions = laptop.value(QStringLiteral("sessions")).toArray();
+    laptopSessions.append(QJsonObject{{QStringLiteral("session_id"), QStringLiteral("s1")}, {QStringLiteral("title"), QStringLiteral("Thought Editor")}, {QStringLiteral("state"), QStringLiteral("idle")}});
+    laptop.insert(QStringLiteral("sessions"), laptopSessions);
+    machines.replace(0, laptop);
+    twice.insert(QStringLiteral("wakers"), machines);
+    QCOMPARE(recipients(twice).size(), 5);
+    QCOMPARE(recipients(twice).first().machine, QStringLiteral("example-server"));
+    QVERIFY(recipients(QJsonObject()).isEmpty());
+
+    // Kept between runs as they were.
+    const QList<Recipient> kept = recipientsFromJson(recipientsJson(sessions));
+    QCOMPARE(kept.size(), sessions.size());
+    for (int index = 0; index < kept.size(); ++index) {
+        QCOMPARE(kept.at(index).sessionId, sessions.at(index).sessionId);
+        QCOMPARE(kept.at(index).choiceText(), sessions.at(index).choiceText());
+        QCOMPARE(kept.at(index).lastActive, sessions.at(index).lastActive);
+    }
+}
+
+// Send to Agent's menus: the sessions as last fetched (kept in the app's settings, so a menu lists
+// them at once), fetched again in the background; what comes while the menu is open shows in it.
+// The session sent to last says so in its tip; a click hands its session over. With nothing to list, one
+// disabled entry says why.
+void AgentNotesTest::sendToAgentSessionMenu()
+{
+    FakeServer server;
+    server.wakers = testWakers();
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    const auto forget = [] {
+        QSettings settings;
+        for (const QString &key : {QStringLiteral("AgentNotes/SendToSessions"), QStringLiteral("AgentNotes/SendToSession"), QStringLiteral("AgentNotes/SendToSessionLabel")})
+            settings.remove(key);
+    };
+    forget();  // nothing kept from an earlier run
+    const auto restore = qScopeGuard(forget);
+    const auto entries = [](QMenu &menu) { return menuEntries(menu); };
+    {
+        // Nothing fetched yet: listing, then the sessions, also into the open menu.
+        AgentSessionList sessions(&center);
+        QMenu menu;
+        std::optional<Recipient> clicked;
+        sessions.populate(&menu, [&clicked](const Recipient &session) { clicked = session; });
+        QCOMPARE(entries(menu), QStringList{QStringLiteral("Listing the sessions… [off]")});
+        QVERIFY(sessions.isRefreshing());
+        menu.popup(QPoint(10, 10));
+        QVERIFY(waitFor([&] { return menu.actions().size() == 6; }));
+        // No proposals anywhere: the wakers' order; the untitled session (nobody named it) under More.
+        QCOMPARE(entries(menu), (QStringList{QStringLiteral("Thought Editor · example-server"), QStringLiteral("Busy one · example-server · busy"), QStringLiteral("Old work · example-server · closed"),
+                                             QStringLiteral("Laptop session · macbook · offline"), QStringLiteral("---"),
+                                             QStringLiteral("More Sessions > [Session 0f9e8d7c · example-server]")}));
+        menu.close();
+        // A click hands its session over; the one sent to last says so next time.
+        menu.actions().at(1)->trigger();
+        QVERIFY(clicked);
+        QCOMPARE(clicked->sessionId, QStringLiteral("s3"));
+        sessions.setLastSession(*clicked);
+        QCOMPARE(sessions.lastSession(), QStringLiteral("s3"));
+        QCOMPARE(sessions.lastSessionLabel(), QStringLiteral("Busy one · example-server"));
+        sessions.populate(&menu, [](const Recipient &) {});
+        // No tick (one session gets each send): its tip says it was sent to last.
+        QCOMPARE(entries(menu).at(1), QStringLiteral("Busy one · example-server · busy"));
+        QVERIFY(menu.actions().at(1)->toolTip().contains(QStringLiteral("Sent to last")));
+        QVERIFY(!menu.actions().at(0)->toolTip().contains(QStringLiteral("Sent to last")));
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+    }
+    {
+        // The next run: the list as last fetched at once, also when the server cannot list it now.
+        server.wakersSupported = false;
+        AgentSessionList sessions(&center);
+        QMenu menu;
+        sessions.populate(&menu, [](const Recipient &) {});
+        QCOMPARE(menu.actions().size(), 6);
+        QCOMPARE(menu.actions().at(0)->text(), QStringLiteral("Thought Editor · example-server"));
+        QVERIFY(menu.actions().at(1)->toolTip().contains(QStringLiteral("Sent to last")));
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        QVERIFY(!sessions.error().isEmpty());
+        sessions.populate(&menu, [](const Recipient &) {});
+        QCOMPARE(menu.actions().size(), 6);
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+    }
+    {
+        // Nothing kept and nothing to be had: why.
+        QSettings().remove(QStringLiteral("AgentNotes/SendToSessions"));
+        AgentSessionList sessions(&center);
+        QMenu menu;
+        sessions.populate(&menu, [](const Recipient &) {});
+        menu.popup(QPoint(10, 10));
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        QVERIFY(waitFor([&] { return menu.actions().size() == 1 && menu.actions().first()->text().startsWith(QStringLiteral("No sessions: ")); }));
+        QVERIFY(!menu.actions().first()->isEnabled());
+        menu.close();
+        // A server that lists none: none can be woken.
+        server.wakersSupported = true;
+        server.wakers = QJsonObject{{QStringLiteral("wakers"), QJsonArray()}};
+        sessions.populate(&menu, [](const Recipient &) {});
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        sessions.populate(&menu, [](const Recipient &) {});
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        QCOMPARE(entries(menu), QStringList{QStringLiteral("No session can be woken now [off]")});
+    }
+}
+
+// Send to Agent's order: the sessions that wrote the most proposals on the document first, then
+// the most in the whole Library, then the wakers' order; six shown, the session sent to last always
+// among them; sessions nobody named (agent-3f, …) only with proposals on the document; the rest under
+// More Sessions in the wakers' order. A proposal is on a document in its source, or for LaTeX in a
+// file below its source's folder that is no other document's source.
+void AgentNotesTest::sendToAgentRanking()
+{
+    const DocumentSources paper{QStringLiteral("docs-paper/overleaf/tex/source/main.tex"), {QStringLiteral("docs-paper/overleaf/tex/source/appendix-paper.tex")}};
+    QVERIFY(belongsTo(QStringLiteral("docs-paper/overleaf/tex/source/main.tex"), paper));
+    QVERIFY(belongsTo(QStringLiteral("docs-paper/overleaf/tex/source/sections/intro.tex"), paper));
+    QVERIFY(!belongsTo(QStringLiteral("docs-paper/overleaf/tex/source/appendix-paper.tex"), paper));
+    QVERIFY(!belongsTo(QStringLiteral("docs-paper/overleaf/tex/main.tex"), paper));
+    QVERIFY(!belongsTo(QStringLiteral("docs-other/overleaf/tex/source/main.tex"), paper));
+    const DocumentSources note{QStringLiteral("docs-notes/kl.md"), {}};
+    QVERIFY(belongsTo(QStringLiteral("docs-notes/kl.md"), note));
+    QVERIFY(!belongsTo(QStringLiteral("docs-notes/other.md"), note));
+    QVERIFY(!belongsTo(QStringLiteral("docs-notes/kl.md"), DocumentSources{}));
+
+    const auto session = [](const QString &id, const QString &title) { return Recipient{id, title, QStringLiteral("example-server"), QStringLiteral("idle"), true, {}}; };
+    // The wakers' order.
+    const QList<Recipient> sessions{session(QStringLiteral("a"), QStringLiteral("Alpha")), session(QStringLiteral("b"), QStringLiteral("Beta")),
+                                    session(QStringLiteral("c"), QStringLiteral("agent-3f")), session(QStringLiteral("d"), QStringLiteral("Delta")),
+                                    session(QStringLiteral("e"), QStringLiteral("Echo")), session(QStringLiteral("f"), QStringLiteral("Foxtrot")),
+                                    session(QStringLiteral("g"), QStringLiteral("Golf")), session(QStringLiteral("h"), QStringLiteral("agent-9a")),
+                                    session(QStringLiteral("i"), QStringLiteral("India"))};
+    QList<ProposalAuthorship> proposals;
+    const auto wrote = [&proposals](const QString &conversation, const QString &source, int count) {
+        for (int index = 0; index < count; ++index) proposals.append({conversation, source});
+    };
+    wrote(QStringLiteral("d"), QStringLiteral("docs-paper/overleaf/tex/source/main.tex"), 2);
+    wrote(QStringLiteral("d"), QStringLiteral("docs-other/main.tex"), 1);
+    wrote(QStringLiteral("g"), QStringLiteral("docs-paper/overleaf/tex/source/sections/intro.tex"), 12);
+    wrote(QStringLiteral("i"), QStringLiteral("docs-other/main.tex"), 40);
+    wrote(QStringLiteral("b"), QStringLiteral("docs-other/main.tex"), 3);
+    wrote(QStringLiteral("h"), QStringLiteral("docs-paper/overleaf/tex/source/main.tex"), 1);
+    wrote(QStringLiteral("c"), QStringLiteral("docs-other/main.tex"), 50);
+    wrote(QStringLiteral("unknown"), QStringLiteral("docs-paper/overleaf/tex/source/main.tex"), 5);
+    const QHash<QString, ProposalCounts> counts = proposalCounts(proposals, paper);
+    QCOMPARE(counts.value(QStringLiteral("g")).here, 12);
+    QCOMPARE(counts.value(QStringLiteral("d")).here, 2);
+    QCOMPARE(counts.value(QStringLiteral("d")).all, 3);
+    QCOMPARE(counts.value(QStringLiteral("i")).here, 0);
+    QCOMPARE(counts.value(QStringLiteral("i")).all, 40);
+    QCOMPARE(countLabel(counts.value(QStringLiteral("g"))), QStringLiteral("— 12 here"));
+    QCOMPARE(countLabel(counts.value(QStringLiteral("i"))), QStringLiteral("— 40 in all"));
+    QCOMPARE(countLabel(counts.value(QStringLiteral("a"))), QString());
+    QVERIFY(isAutoNamed(session(QStringLiteral("c"), QStringLiteral("agent-3f"))));
+    QVERIFY(isAutoNamed(session(QStringLiteral("x"), QString())));
+    QVERIFY(!isAutoNamed(session(QStringLiteral("a"), QStringLiteral("Alpha"))));
+
+    const auto ids = [](const QList<Recipient> &list) {
+        QStringList result;
+        for (const Recipient &item : list) result.append(item.sessionId);
+        return result;
+    };
+    // Proposals here first (g 12, d 2, h 1), then in all (i 40, b 3), then the wakers' order (a, e,
+    // f); the session nobody named with none here (c) under More whatever its count.
+    SessionMenu menu = sessionMenu(sessions, counts, QString());
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("g"), QStringLiteral("d"), QStringLiteral("h"), QStringLiteral("i"), QStringLiteral("b"), QStringLiteral("a")}));
+    QCOMPARE(ids(menu.more), (QStringList{QStringLiteral("c"), QStringLiteral("e"), QStringLiteral("f")}));
+    // The session sent to last, ranked lower: the sixth.
+    menu = sessionMenu(sessions, counts, QStringLiteral("f"));
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("g"), QStringLiteral("d"), QStringLiteral("h"), QStringLiteral("i"), QStringLiteral("b"), QStringLiteral("f")}));
+    QCOMPARE(ids(menu.more), (QStringList{QStringLiteral("a"), QStringLiteral("c"), QStringLiteral("e")}));
+    // Already among them: as ranked.
+    menu = sessionMenu(sessions, counts, QStringLiteral("d"));
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("g"), QStringLiteral("d"), QStringLiteral("h"), QStringLiteral("i"), QStringLiteral("b"), QStringLiteral("a")}));
+    // No proposals at all: the wakers' order, six, sessions nobody named under More.
+    menu = sessionMenu(sessions, {}, QString());
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("d"), QStringLiteral("e"), QStringLiteral("f"), QStringLiteral("g")}));
+    QCOMPARE(ids(menu.more), (QStringList{QStringLiteral("c"), QStringLiteral("h"), QStringLiteral("i")}));
+    // A document without proposals: by those in all.
+    menu = sessionMenu(sessions, proposalCounts(proposals, note), QString());
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("i"), QStringLiteral("g"), QStringLiteral("b"), QStringLiteral("d"), QStringLiteral("a"), QStringLiteral("e")}));
+    QVERIFY(ids(menu.more).contains(QStringLiteral("c")) && ids(menu.more).contains(QStringLiteral("h")));
+    // Few sessions: all shown, nothing under More.
+    menu = sessionMenu(sessions.mid(0, 2), counts, QString());
+    QCOMPARE(ids(menu.shown), (QStringList{QStringLiteral("b"), QStringLiteral("a")}));
+    QVERIFY(menu.more.isEmpty());
+}
+
+// The menu itself: the sessions in that order with their counts, More Sessions below; the counts
+// that arrive while it is open order it again.
+void AgentNotesTest::sendToAgentRankedMenu()
+{
+    FakeServer server;
+    QJsonArray sessionsJson;
+    for (const auto &[id, title, state] : std::initializer_list<std::tuple<QString, QString, QString>>{
+             {QStringLiteral("a"), QStringLiteral("Thought Editor"), QStringLiteral("idle")}, {QStringLiteral("b"), QStringLiteral("Agent Study"), QStringLiteral("busy")},
+             {QStringLiteral("c"), QStringLiteral("agent-3f"), QStringLiteral("idle")}, {QStringLiteral("d"), QStringLiteral("Paper revision"), QStringLiteral("idle")},
+             {QStringLiteral("e"), QStringLiteral("Mental Model"), QStringLiteral("closed")}, {QStringLiteral("f"), QStringLiteral("Glasses watcher"), QStringLiteral("idle")},
+             {QStringLiteral("g"), QStringLiteral("Data sweep"), QStringLiteral("idle")}, {QStringLiteral("h"), QStringLiteral("Overlays"), QStringLiteral("idle")}})
+        sessionsJson.append(QJsonObject{{QStringLiteral("session_id"), id}, {QStringLiteral("title"), title}, {QStringLiteral("state"), state}});
+    server.wakers = QJsonObject{{QStringLiteral("wakers"), QJsonArray{QJsonObject{{QStringLiteral("machine"), QStringLiteral("example-server")}, {QStringLiteral("live"), true},
+                                                                                  {QStringLiteral("sessions"), sessionsJson}}}}};
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    const auto forget = [] {
+        QSettings settings;
+        for (const QString &key : {QStringLiteral("AgentNotes/SendToSessions"), QStringLiteral("AgentNotes/SendToSession"), QStringLiteral("AgentNotes/SendToSessionLabel")})
+            settings.remove(key);
+    };
+    forget();
+    const auto restore = qScopeGuard(forget);
+    AgentSessionList sessions(&center);
+    int loads = 0;
+    sessions.setProposalLoader([&loads] { ++loads; });
+    const DocumentSources paper{QStringLiteral("docs-paper/main.tex"), {}};
+    QMenu menu;
+    sessions.populate(&menu, [](const Recipient &) {}, true, [paper] { return paper; });
+    QCOMPARE(loads, 1);
+    menu.popup(QPoint(10, 10));
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing() && menu.actions().size() == 8; }));
+    // No counts yet: the wakers' order (open sessions before closed ones), six; the session nobody named
+    // under More.
+    QCOMPARE(menuEntries(menu), (QStringList{QStringLiteral("Thought Editor · example-server"), QStringLiteral("Agent Study · example-server · busy"), QStringLiteral("Paper revision · example-server"),
+                                             QStringLiteral("Glasses watcher · example-server"), QStringLiteral("Data sweep · example-server"), QStringLiteral("Overlays · example-server"),
+                                             QStringLiteral("---"), QStringLiteral("More Sessions > [agent-3f · example-server, Mental Model · example-server · closed]")}));
+    // The counts arrive while it is open: in their order now.
+    QList<ProposalAuthorship> proposals;
+    for (int index = 0; index < 12; ++index) proposals.append({QStringLiteral("d"), QStringLiteral("docs-paper/main.tex")});
+    for (int index = 0; index < 40; ++index) proposals.append({QStringLiteral("h"), QStringLiteral("docs-other/main.tex")});
+    proposals.append({QStringLiteral("c"), QStringLiteral("docs-paper/main.tex")});
+    sessions.setProposals(proposals);
+    QCOMPARE(menuEntries(menu), (QStringList{QStringLiteral("Paper revision · example-server — 12 here"), QStringLiteral("agent-3f · example-server — 1 here"), QStringLiteral("Overlays · example-server — 40 in all"),
+                                             QStringLiteral("Thought Editor · example-server"), QStringLiteral("Agent Study · example-server · busy"), QStringLiteral("Glasses watcher · example-server"),
+                                             QStringLiteral("---"), QStringLiteral("More Sessions > [Data sweep · example-server, Mental Model · example-server · closed]")}));
+    const QString screenshots = qEnvironmentVariable("THOUGHTS_TEST_SCREENSHOTS");
+    if (!screenshots.isEmpty()) QVERIFY(menu.grab().save(screenshots + QStringLiteral("/send-to-agent-ranked.png")));
+    menu.close();
+    // Each opening reads the proposals again.
+    const int before = loads;
+    QVERIFY(QMetaObject::invokeMethod(&menu, "aboutToShow"));
+    QCOMPARE(loads, before + 1);
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+}
+
+// Send to Agent's page carries exactly what Copy for agent copies: a verbatim message goes as it is,
+// to the last character; other pages' messages are trimmed as before.
+void AgentNotesTest::copyForAgentMessageGoesAsItIs()
+{
+    FakeServer server;
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    Center::Page page;
+    page.title = QStringLiteral("Copy for agent: AgentsVsNetwork · page 3");
+    page.message = QStringLiteral("Thoughts document: \"AgentsVsNetwork\"\n  Selection: \"x\"\n");
+    page.verbatim = true;
+    page.page = 3;
+    page.pages = 12;
+    page.documentName = QStringLiteral("AgentsVsNetwork");
+    page.image = QImage(200, 300, QImage::Format_RGB32);
+    page.image.fill(Qt::white);
+    page.origin = QJsonObject{{QStringLiteral("conversation_id"), QStringLiteral("s1")}, {QStringLiteral("copy_for_agent"), true}};
+    bool sent = false;
+    center.sendPage(page, [&sent](bool ok, const QString &) { sent = ok; });
+    QVERIFY(waitFor([&] { return sent; }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("message")).toString(), page.message);
+    QCOMPARE(server.bodies.last().value(QStringLiteral("origin")).toObject().value(QStringLiteral("copy_for_agent")), QJsonValue(true));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("origin")).toObject().value(QStringLiteral("conversation_id")).toString(), QStringLiteral("s1"));
+    page.verbatim = false;
+    page.noteId.clear();
+    sent = false;
+    center.sendPage(page, [&sent](bool ok, const QString &) { sent = ok; });
+    QVERIFY(waitFor([&] { return sent; }));
+    QCOMPARE(server.bodies.last().value(QStringLiteral("message")).toString(), page.message.trimmed());
 }
 
 // Delete Note…: asks first, then deletes it for every device.

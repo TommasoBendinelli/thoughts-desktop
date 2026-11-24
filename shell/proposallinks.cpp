@@ -5,6 +5,7 @@
 // same Project configuration code the source publisher freezes with
 // (tools/publisher), so a link the tools accept is a link the build resolves.
 #include "proposallinks.h"
+#include "thoughtspagelinkurl.h"
 
 #include "../part/sourceowner.h"
 #include "../tools/publisher/buildinputs.h"
@@ -46,6 +47,13 @@ bool pdfIdentifier(const QString &value)
     return pattern.match(value).hasMatch();
 }
 
+// doc_links.PDF_LINK_ANCHOR_PATTERN: anchors may also carry ':' and '*' (section*.10, cite.doe:2020).
+bool pdfAnchor(const QString &value)
+{
+    static const QRegularExpression pattern(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9_.:*-]*$"));
+    return pattern.match(value).hasMatch();
+}
+
 bool sourceLabel(const QString &value)
 {
     // SOURCE_LABEL_PATTERN
@@ -71,6 +79,7 @@ struct LibraryPdf {
     QString path;              // relative to the docs root
     QString filename;
     bool included = false;
+    QString documentId;        // its Library document
 };
 
 // One source document of some Project.
@@ -79,16 +88,18 @@ struct LibrarySource {
     QString folder;   // owner
     QString source;   // relative to the folder
     bool included = false;
+    QString documentId; // the Library document built from it
 };
 
 class Checker
 {
 public:
-    Checker(const QString &root, const QString &owner, const QString &sourceRelative, const QString &updatedSource)
+    Checker(const QString &root, const QString &owner, const QString &sourceRelative, const QString &updatedSource, const QStringList &serverOrigins = {})
         : m_root(root)
         , m_owner(owner)
         , m_sourceRelative(sourceRelative)
         , m_updatedSource(updatedSource)
+        , m_serverOrigins(serverOrigins)
     {
         const QString suffix = QFileInfo(sourceRelative).suffix().toLower();
         m_markdown = suffix == QLatin1String("md") || suffix == QLatin1String("markdown");
@@ -107,11 +118,15 @@ public:
         const QString text = link.arguments.at(2);
         if (link.name == QLatin1String("PdfLink")) return pdfLink(target, anchor, text);
         if (link.name == QLatin1String("CrossPdfLink")) return crossPdfLink(target, anchor, text);
-        if (link.name == QLatin1String("SourceLink")) return sourceLink(link.name, m_owner + QLatin1Char('/') + target, QStringLiteral("source-label:") + anchor, anchor, text, false);
-        return sourceLink(link.name, target, QStringLiteral("source-label:") + anchor, anchor, text, true);
+        // doc_links._source_link_payload: the label document-start opens the target's start, as
+        // for \PdfLink; any other label is a Source label the target defines.
+        const QString label = anchor == documentStart ? documentStart : sourceLabelPrefix + anchor;
+        if (link.name == QLatin1String("SourceLink")) return sourceLink(link.name, m_owner + QLatin1Char('/') + target, label, anchor, text, false);
+        return sourceLink(link.name, target, label, anchor, text, true);
     }
 
     std::optional<ProposalLinkIssue> markdownLink(const QString &target, bool image, const QString &text) const;
+    std::optional<ProposalLinkIssue> serverPageLink(const QString &address, const QString &text) const;
 
 private:
     // A link as this document's language writes it: the LaTeX command, or in
@@ -175,10 +190,11 @@ private:
                 if (folder.isEmpty() || relative.isEmpty()) continue;
                 const QString format = document.value(QStringLiteral("format")).toString();
                 const bool included = document.value(QStringLiteral("included")).toBool();
+                const QString documentId = document.value(QStringLiteral("document_id")).toString();
                 if (format == QLatin1String("pdf")) {
-                    m_pdfs.append({name, path.str(), paths, folder + QLatin1Char('/') + relative, relative.section(QLatin1Char('/'), -1), included});
+                    m_pdfs.append({name, path.str(), paths, folder + QLatin1Char('/') + relative, relative.section(QLatin1Char('/'), -1), included, documentId});
                 } else if (format == QLatin1String("latex") || format == QLatin1String("markdown")) {
-                    m_sources.append({name, folder, relative, included});
+                    m_sources.append({name, folder, relative, included, documentId});
                 }
             }
         }
@@ -244,7 +260,33 @@ private:
         return anchors;
     }
 
-    // pdf_link_target: document-start, or exactly one doc-anchor: annotation.
+    // The page count and named destinations of a PDF (doc_links.pdf_anchor_index), or -1 pages when unreadable.
+    int pdfPageCount(const QString &path) const
+    {
+        if (const auto cached = m_pageCounts.constFind(path); cached != m_pageCounts.cend()) return *cached;
+        const std::unique_ptr<Poppler::Document> document = Poppler::Document::load(path);
+        const int pages = document && !document->isLocked() ? document->numPages() : -1;
+        m_pageCounts.insert(path, pages);
+        return pages;
+    }
+
+    bool pdfHasDestination(const QString &path, const QString &name) const
+    {
+        const QString key = path + QChar(0) + name;
+        if (const auto cached = m_destinations.constFind(key); cached != m_destinations.cend()) return *cached;
+        const std::unique_ptr<Poppler::Document> document = Poppler::Document::load(path);
+        bool found = false;
+        if (document && !document->isLocked()) {
+            const std::unique_ptr<Poppler::LinkDestination> destination = document->linkDestination(name);
+            found = destination && destination->pageNumber() >= 1 && destination->pageNumber() <= document->numPages();
+        }
+        m_destinations.insert(key, found);
+        return found;
+    }
+
+    // pdf_link_target (doc_links.resolve_pdf_anchor): document-start; exactly one doc-anchor:
+    // annotation (it wins over a destination of the same name); page.N of the file's pages;
+    // a named destination of the PDF (equation.1, figure.caption.3, subsection.2.1, ...).
     std::optional<QString> anchorProblem(const QString &absolutePdf, const QString &anchor) const
     {
         if (anchor == documentStart) return std::nullopt;
@@ -254,10 +296,18 @@ private:
         if (count == 1) return std::nullopt;
         const QString filename = QFileInfo(absolutePdf).fileName();
         if (count > 1) return QStringLiteral("The anchor %1 occurs %2 times in %3; a PDF link needs a unique doc-anchor: annotation.").arg(anchor).arg(count).arg(filename);
+        static const QRegularExpression page(QStringLiteral("^page\\.([1-9][0-9]{0,6})$"));
+        if (const QRegularExpressionMatch match = page.match(anchor); match.hasMatch()) {
+            const int pages = pdfPageCount(absolutePdf);
+            if (pages < 0 || match.captured(1).toInt() <= pages) return std::nullopt;
+            return QStringLiteral("%1 has %2 page(s); use page.1 to page.%2.").arg(filename).arg(pages);
+        }
+        if (pdfHasDestination(absolutePdf, anchor)) return std::nullopt;
         QStringList known = anchors->keys();
         std::sort(known.begin(), known.end());
-        return QStringLiteral("%1 has no doc-anchor:%2 annotation; use document-start%3.")
-            .arg(filename, anchor, known.isEmpty() ? QStringLiteral(" (it has no doc-anchor: annotations)") : QStringLiteral(" or one of its anchors: ") + known.mid(0, 10).join(QStringLiteral(", ")));
+        return QStringLiteral("%1 has no doc-anchor:%2 annotation, page or named destination %2; use document-start, page.N%3, or a name the "
+                              "pdf_anchors tool lists (equation.1, figure.caption.3, subsection.2.1, ...).")
+            .arg(filename, anchor, known.isEmpty() ? QString() : QStringLiteral(", one of its doc-anchors (") + known.mid(0, 10).join(QStringLiteral(", ")) + QLatin1Char(')'));
     }
 
     QString absolute(const QString &relative) const { return QDir(m_root).filePath(relative); }
@@ -358,13 +408,13 @@ private:
             // A path or filename, e.g. docs-Other/paper or paper.pdf.
             const QString bare = stem(key.section(QLatin1Char('/'), -1));
             QString suggestion;
-            const QString where = pdfIdentifier(bare) ? pdfElsewhere(bare, pdfIdentifier(anchor) ? anchor : documentStart, text, &suggestion) : QString();
+            const QString where = pdfIdentifier(bare) ? pdfElsewhere(bare, pdfAnchor(anchor) ? anchor : documentStart, text, &suggestion) : QString();
             return issue(QStringLiteral("invalid_pdf_key"),
                          QStringLiteral("%1 does not name a PDF: \\PdfLink takes a Library PDF by its filename without .pdf (letters, digits, dots, underscores, hyphens), with no folder.%2").arg(link, where),
                          suggestion);
         }
-        if (!pdfIdentifier(anchor))
-            return issue(QStringLiteral("invalid_anchor"), QStringLiteral("%1 has an invalid anchor; use document-start or the name of a doc-anchor: annotation (letters, digits, dots, underscores, hyphens).").arg(link));
+        if (!pdfAnchor(anchor))
+            return issue(QStringLiteral("invalid_anchor"), QStringLiteral("%1 has an invalid anchor; use document-start, page.N, a named destination of the PDF or the name of a doc-anchor: annotation (letters, digits, dots, colons, asterisks, underscores, hyphens).").arg(link));
         return libraryPdfLink(link, key, anchor, text, QString(), form(QStringLiteral("PdfLink"), key, documentStart, text));
     }
 
@@ -376,15 +426,15 @@ private:
         if (parts.size() != 2 || !SourceOwner::isConnectedFolder(parts.first()) || !pdfIdentifier(parts.last())) {
             const QString bare = stem(selector.section(QLatin1Char('/'), -1));
             QString suggestion;
-            const QString where = pdfIdentifier(bare) ? pdfElsewhere(bare, pdfIdentifier(anchor) ? anchor : documentStart, text, &suggestion) : QString();
+            const QString where = pdfIdentifier(bare) ? pdfElsewhere(bare, pdfAnchor(anchor) ? anchor : documentStart, text, &suggestion) : QString();
             return issue(QStringLiteral("invalid_cross_target"),
                          QStringLiteral("%1 does not name a PDF: \\CrossPdfLink takes docs-<folder>/<pdfKey>, a docs-* folder and the PDF filename without .pdf; "
                                         "\\PdfLink{pdfKey}{anchor}{text} is simpler and finds the PDF in any Project.%2")
                              .arg(link, where),
                          suggestion);
         }
-        if (!pdfIdentifier(anchor))
-            return issue(QStringLiteral("invalid_anchor"), QStringLiteral("%1 has an invalid anchor; use document-start or the name of a doc-anchor: annotation.").arg(link));
+        if (!pdfAnchor(anchor))
+            return issue(QStringLiteral("invalid_anchor"), QStringLiteral("%1 has an invalid anchor; use document-start, page.N, a named destination of the PDF or the name of a doc-anchor: annotation.").arg(link));
         // The folder only says where to look first; the PDF is found by its name.
         return libraryPdfLink(link, parts.last(), anchor, text, parts.first(), form(QStringLiteral("CrossPdfLink"), selector, documentStart, text));
     }
@@ -570,7 +620,7 @@ private:
                                        .arg(label, *target));
         const QString suggestion = owner == m_owner ? command(QStringLiteral("SourceLink"), relative, label, text)
                                                     : command(QStringLiteral("CrossSourceLink"), *target, label, text);
-        if (labelDefined(owner, label)) return issue(QStringLiteral("retired_link"), QStringLiteral("%1; use %2.").arg(retired, suggestion), suggestion);
+        if (label == documentStart || labelDefined(owner, label)) return issue(QStringLiteral("retired_link"), QStringLiteral("%1; use %2.").arg(retired, suggestion), suggestion);
         const QString texLabel = hasTexLabel(*target, label) ? QStringLiteral(" (it has only \\label{%1})").arg(label) : QString();
         return issue(QStringLiteral("retired_link"),
                      QStringLiteral("%1; use %2 and mark the target with \\SourceLabel{%3} in %4%5: the Source label must exist before the link resolves.")
@@ -578,15 +628,38 @@ private:
                      suggestion);
     }
 
+    // The Source labels a source document defines (the text this request writes for its own).
+    QStringList definedLabels(const QString &path) const
+    {
+        QString content = m_updatedSource;
+        if (path != m_sourceRelative) {
+            QFile file(absolute(path));
+            if (file.size() > 20 * 1024 * 1024 || !file.open(QIODevice::ReadOnly)) return {};
+            content = QString::fromUtf8(file.readAll());
+        }
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        static const QRegularExpression tex(QStringLiteral("\\\\SourceLabel\\s*\\{\\s*([A-Za-z0-9][A-Za-z0-9_.:-]*)\\s*\\}"));
+        static const QRegularExpression markdown(QStringLiteral("\\{\\s*#source-label:([A-Za-z0-9][A-Za-z0-9_.:-]*)(?=[\\s}])"));
+        QStringList labels;
+        for (auto it = (suffix == QLatin1String("tex") ? tex : markdown).globalMatch(content); it.hasNext();) {
+            const QString label = it.next().captured(1);
+            if (!labels.contains(label)) labels.append(label);
+        }
+        return labels;
+    }
+
     QString m_root;
     QString m_owner;
     QString m_sourceRelative;
     QString m_updatedSource;
+    QStringList m_serverOrigins;
     bool m_markdown = false;
     mutable bool m_catalogLoaded = false;
     mutable QList<LibraryPdf> m_pdfs;
     mutable QList<LibrarySource> m_sources;
     mutable QHash<QString, std::optional<QHash<QString, int>>> m_anchors;
+    mutable QHash<QString, int> m_pageCounts;
+    mutable QHash<QString, bool> m_destinations;
 };
 
 // A relative Markdown link. A link to another document means a LaTeX link
@@ -667,6 +740,88 @@ std::optional<ProposalLinkIssue> Checker::markdownLink(const QString &target, bo
     return std::nullopt;
 }
 
+// A link to the Thoughts server's "Open in Thoughts" page of a Library document
+// (\href{https://<server>/open/document/<id>?page=N...}{text}, or the Markdown link to it, on
+// the server this computer uses: Thoughts::isServerDocumentPageUrl). The build keeps it a web
+// link, which opens a browser instead of the document; a Thoughts link opens the document in the
+// app and on the phone, and the build checks it. The suggestion is the Thoughts link to the same
+// document: \PdfLink{<pdfKey>}{page.N}{text} for an imported PDF (N the page the server page
+// opens), for a note the \SourceLink or \CrossSourceLink of its source at document-start (in
+// Markdown its relative path without a fragment): its start, since a page of a note has no
+// link. A place in the note needs a Source label there, which the message says to propose.
+std::optional<ProposalLinkIssue> Checker::serverPageLink(const QString &address, const QString &text) const
+{
+    const QUrl url(address, QUrl::TolerantMode);
+    if (!Thoughts::isServerDocumentPageUrl(url, m_serverOrigins)) return std::nullopt;
+    const QString reason = QStringLiteral("server_page_link");
+    const QString written = m_markdown ? QStringLiteral("[%1](%2)").arg(text, address) : QStringLiteral("\\href{%1}{%2}").arg(address, text);
+    const QString general = m_markdown
+        ? QStringLiteral("%1 links the Thoughts server's \"Open in Thoughts\" page, which opens in a browser instead of Thoughts. A link to a Library "
+                         "document must be a Thoughts link: an imported PDF by its bare Library filename ([text](pdfKey.pdf#page.N)), a note by its "
+                         "relative path ([text](other.md) in this folder, [text](../../docs-<folder>/path.tex) in another, with "
+                         "#source-label:name for a place in it).")
+              .arg(written)
+        : QStringLiteral("%1 links the Thoughts server's \"Open in Thoughts\" page, which opens in a browser instead of Thoughts. A link to a Library "
+                         "document must be a Thoughts link: an imported PDF is linked with \\PdfLink{pdfKey}{page.N}{text} (pdfKey is its Library "
+                         "filename without .pdf), a note with \\SourceLink{path}{label}{text} in this folder or "
+                         "\\CrossSourceLink{docs-<folder>/path}{label}{text}, where label is document-start for its start or a \\SourceLabel{label} "
+                         "the note defines.")
+              .arg(written);
+    const auto link = Thoughts::serverPageLink(url, m_serverOrigins);
+    if (!link) return issue(reason, general + QStringLiteral(" This address names no document."));
+    loadCatalog();
+    for (const LibraryPdf &pdf : m_pdfs) {
+        if (pdf.documentId != link->documentId) continue;
+        if (!pdf.included)
+            return issue(reason, general + QStringLiteral(" It is the PDF %1 of Project %2, which is not selected for building there, so no link can reach it.")
+                                               .arg(pdf.filename, pdf.project));
+        QString anchor = QStringLiteral("page.%1").arg(link->targetPage());
+        QString note;
+        if (const auto problem = anchorProblem(absolute(pdf.path), anchor)) {
+            anchor = documentStart;
+            note = QStringLiteral(" (%1 The link opens its start.)").arg(*problem);
+        }
+        const QString suggestion = form(QStringLiteral("PdfLink"), stem(pdf.filename), anchor, text);
+        return issue(reason, general + QStringLiteral(" It is the PDF %1 of Project %2: use %3.%4").arg(pdf.filename, pdf.project, suggestion, note), suggestion);
+    }
+    for (const LibrarySource &source : m_sources) {
+        if (source.documentId != link->documentId) continue;
+        const QString path = source.folder + QLatin1Char('/') + source.source;
+        if (!source.included)
+            return issue(reason, general + QStringLiteral(" It is the note %1 of Project %2, which is not selected for building there, so no link can reach it.")
+                                               .arg(path, source.project));
+        const bool here = source.folder == m_owner;
+        const QString name = here ? QStringLiteral("SourceLink") : QStringLiteral("CrossSourceLink");
+        const QString target = here ? source.source : path;
+        const QString labelForm = source.source.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive) ? QStringLiteral("\\SourceLabel{name}")
+                                                                                                      : QStringLiteral("{#source-label:name} on a heading");
+        const QString suggestion = form(name, target, documentStart, text);
+        QString message = general + QStringLiteral(" It is the note %1 of Project %2: use %3 for its start. For a specific place in it, the note needs a Source "
+                                                   "label there (%4; propose it if the note has none) and the link %5.")
+                                        .arg(path, source.project, suggestion, labelForm,
+                                             m_markdown ? QStringLiteral("adds #source-label:name") : QStringLiteral("names that label instead of document-start"));
+        if (const QStringList labels = definedLabels(path); !labels.isEmpty())
+            message += QStringLiteral(" Its Source labels: %1.").arg(labels.mid(0, 10).join(QStringLiteral(", ")));
+        return issue(reason, message, suggestion);
+    }
+    return issue(reason, general + QStringLiteral(" No Project of this Library has the document %1; link its Library PDF or source instead.").arg(link->documentId));
+}
+
+// The address an \href names, as hyperref reads it: TeX's escaped specials are the characters.
+QString hrefAddress(const QString &argument)
+{
+    static const QRegularExpression escaped(QStringLiteral("\\\\([#%&_~$])"));
+    return QString(argument).replace(escaped, QStringLiteral("\\1")).trimmed();
+}
+
+// The link text of a Markdown link as written ([text](target)).
+QString markdownLinkText(const QString &link)
+{
+    static const QRegularExpression label(QStringLiteral("^!?\\[(.*)\\][(:]"), QRegularExpression::DotMatchesEverythingOption | QRegularExpression::InvertedGreedinessOption);
+    const auto match = label.match(link);
+    return match.hasMatch() ? match.captured(1) : QString();
+}
+
 struct MarkdownLink {
     QString target;
     bool image = false;
@@ -701,7 +856,8 @@ QList<ProposalLinkIssue> htmlPageLinkIssues(const QString &root, const QString &
     static const QRegularExpression link(QStringLiteral("thoughts-html:([^\\s{}()<>\\[\\]\"'\\\\]+)"));
     QSet<QString> before;
     for (auto it = link.globalMatch(original); it.hasNext();) before.insert(QUrl::fromPercentEncoding(it.next().captured(1).toUtf8()));
-    const bool connected = owner.startsWith(QLatin1String("docs-"));
+    // A docs-* folder and a Project's default folder both have pages (thoughts-server protocol/html-pages.md 1).
+    const bool connected = SourceOwner::isOwner(owner);
     const QStringList listed = connected ? Publisher::listedHtmlPages(Py::Path(root), owner) : QStringList();
     const auto exists = [&](const QString &path) {
         return Publisher::isHtmlSourcePath(path, owner)
@@ -723,8 +879,8 @@ QList<ProposalLinkIssue> htmlPageLinkIssues(const QString &root, const QString &
         if (connected && own != target && exists(own)) issue.suggestion = QStringLiteral("thoughts-html:") + own;
         if (!connected) {
             issue.reason = QStringLiteral("html_page_other_folder");
-            issue.message = QStringLiteral("%1: only notes in a docs-* folder can link HTML pages, and only pages of their own folder.").arg(issue.text);
-        } else if (target.section(QLatin1Char('/'), 0, 0) != owner) {
+            issue.message = QStringLiteral("%1: only notes of a Project's source folder can link HTML pages, and only pages of their own folder.").arg(issue.text);
+        } else if (SourceOwner::of(target) != owner) {
             issue.reason = QStringLiteral("html_page_other_folder");
             issue.message = QStringLiteral("%1 names a page of another folder; a note's PDF carries only the pages of its own folder (%2). "
                                            "Put the page in %2/tex/support/html/ first.").arg(issue.text, owner);
@@ -759,7 +915,7 @@ QList<Thoughts::ProposalLinkIssue> Thoughts::introducedLinkIssues(const QString 
     } catch (const Py::Exception &) {
         return {};
     }
-    const Checker checker(root, owner, relative, updatedSource);
+    const Checker checker(root, owner, relative, updatedSource, Thoughts::ownServerOrigins());
     QList<ProposalLinkIssue> issues = htmlPageLinkIssues(root, owner, original, replacement);
     const QString suffix = QFileInfo(sourcePath).suffix().toLower();
     if (suffix == QLatin1String("md") || suffix == QLatin1String("markdown")) {
@@ -774,6 +930,18 @@ QList<Thoughts::ProposalLinkIssue> Thoughts::introducedLinkIssues(const QString 
                 issues.append(*problem);
             }
         }
+        // Web links to the Thoughts server's own document pages.
+        QSet<QString> existingWeb;
+        for (const auto &span : Publisher::MarkdownLinks::linkSpans(original)) existingWeb.insert(span.href);
+        for (const auto &span : Publisher::MarkdownLinks::linkSpans(replacement)) {
+            if (span.image || existingWeb.contains(span.href)) continue;
+            if (auto problem = checker.serverPageLink(span.href, markdownLinkText(span.text))) {
+                problem->command = QStringLiteral("markdown_link");
+                problem->text = span.text;
+                problem->line = span.line;
+                issues.append(*problem);
+            }
+        }
         return issues;
     }
     // The link's target and anchor identify it; its visible text may change.
@@ -783,6 +951,22 @@ QList<Thoughts::ProposalLinkIssue> Thoughts::introducedLinkIssues(const QString 
     for (const auto &link : Publisher::activeLinkCommands(replacement)) {
         if (link.arguments.size() >= 2 && existing.contains(identity(link))) continue;
         if (auto problem = checker.check(link)) {
+            problem->command = link.name;
+            problem->text = link.text;
+            problem->line = link.line;
+            issues.append(*problem);
+        }
+    }
+    // \href to the Thoughts server's own document pages, by the address alone.
+    const QStringList href{QStringLiteral("href")};
+    QSet<QString> existingAddresses;
+    for (const auto &link : Publisher::activeCommands(original, href, 2))
+        if (!link.arguments.isEmpty()) existingAddresses.insert(hrefAddress(link.arguments.first()));
+    for (const auto &link : Publisher::activeCommands(replacement, href, 2)) {
+        if (link.arguments.isEmpty()) continue;
+        const QString address = hrefAddress(link.arguments.first());
+        if (existingAddresses.contains(address)) continue;
+        if (auto problem = checker.serverPageLink(address, link.arguments.value(1))) {
             problem->command = link.name;
             problem->text = link.text;
             problem->line = link.line;

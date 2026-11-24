@@ -419,12 +419,18 @@ Json reconcile(SourcePublisher &publisher, qint64 through)
         candidates.append({path, destination, identity, remote, decision.action});
     }
 
-    // Files another device added to an installed folder.
+    // Files another device added to an installed folder, or to a folder a Project of this
+    // Library connects that is not on this computer yet: the manifest lists only the folders
+    // found here, so a folder added on the server never arrived (18 Nov: a Project's folder made on
+    // the server, with a note moved into it).
     const QStringList managedList = publisher.paths();
     const QSet<QString> managed(managedList.cbegin(), managedList.cend());
     QSet<QString> installedOwners;
     for (const Json &project : Py::iterate(Py::get(Py::loadsText(Py::readText(publisher.manifestPath)), QStringLiteral("projects"), Json::array()))) {
         installedOwners.insert(Py::hashKey(Py::get(project, QStringLiteral("project"))));
+    }
+    for (const QString &owner : sourceOwners(root)) {
+        installedOwners.insert(Py::hashKey(Json(owner)));
     }
     QList<QPair<Json, Json>> headItems = heads.items();
     std::stable_sort(headItems.begin(), headItems.end(), [](const QPair<Json, Json> &left, const QPair<Json, Json> &right) {

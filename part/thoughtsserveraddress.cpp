@@ -13,6 +13,8 @@
 #include <QJsonObject>
 #include <QUrl>
 
+#include <atomic>
+
 namespace Thoughts::ServerAddress
 {
 
@@ -360,6 +362,21 @@ QByteArray storedToken(const QString &account, const QString &address, QString *
         }
     }
     return allowed ? token : QByteArray();
+}
+
+namespace
+{
+std::atomic<quint64> s_connectionGeneration {0};
+}
+
+quint64 connectionGeneration()
+{
+    return s_connectionGeneration.load();
+}
+
+void connectionChanged()
+{
+    ++s_connectionGeneration;
 }
 
 QString tokenWithheldMessage(const QString &account, const QString &issuedFor, const QString &address)

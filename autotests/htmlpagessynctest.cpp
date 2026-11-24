@@ -158,10 +158,10 @@ class HtmlPagesSyncTest : public QObject
         QFile input(file(relative));
         return input.open(QIODevice::ReadOnly) ? input.readAll() : QByteArray();
     }
-    HtmlPageSync sync(FakePages &fedora)
+    HtmlPageSync sync(FakePages &fedora, const QString &which = folder)
     {
         SourceApi api(fedora.url(), QStringLiteral("token"));
-        return syncHtmlPages(api, Thoughts::Py::Path(m_root), Thoughts::Py::Path(m_root + QStringLiteral("/state/source-state.json")), {folder},
+        return syncHtmlPages(api, Thoughts::Py::Path(m_root), Thoughts::Py::Path(m_root + QStringLiteral("/state/source-state.json")), {which},
                              QStringLiteral("20261109T120000Z"));
     }
 
@@ -180,9 +180,34 @@ private Q_SLOTS:
         QVERIFY(!isHtmlPagePath(QStringLiteral("docs-concepts/tex/support/html/sub/a.html")));
         QVERIFY(!isHtmlPagePath(QStringLiteral("docs-concepts/tex/support/html/.a.html")));
         QVERIFY(!isHtmlPagePath(QStringLiteral(".thoughts/projects/x/default/tex/support/html/a.html")));
+        const QString project = QStringLiteral(".thoughts/projects/") + QString(64, QLatin1Char('a')) + QStringLiteral("/default");
+        QVERIFY(isHtmlPagePath(project + QStringLiteral("/tex/support/html/a.html")));
+        QVERIFY(!isHtmlPagePath(project + QStringLiteral("/tex/support/html/sub/a.html")));
+        QVERIFY(!isHtmlPagePath(project + QStringLiteral("/a.html")));
         QCOMPARE(htmlPageFolders({QStringLiteral("docs-b/tex/a.tex"), QStringLiteral("docs-a/x.md"), QStringLiteral(".thoughts/projects/p/default/a.md"),
-                                  QStringLiteral("docs-a/y.md")}),
-                 QStringList({QStringLiteral("docs-a"), QStringLiteral("docs-b")}));
+                                  project + QStringLiteral("/note.tex"), QStringLiteral("docs-a/y.md")}),
+                 QStringList({project, QStringLiteral("docs-a"), QStringLiteral("docs-b")}));
+    }
+
+    // 24 Nov 2026: a Project's default folder has pages too (a prompts page beside its note).
+    void aDefaultFolderPageIsInstalledAndSent()
+    {
+        const QString project = QStringLiteral(".thoughts/projects/") + QString(64, QLatin1Char('c')) + QStringLiteral("/default");
+        const QString fromFedora = project + QStringLiteral("/tex/support/html/prompts.html");
+        const QString made = project + QStringLiteral("/tex/support/html/local.html");
+        write(project + QStringLiteral("/notes.tex"), "\\documentclass{article}");
+        write(made, "<!doctype html><p>made here");
+        FakePages fedora;
+        fedora.put(fromFedora, "<!doctype html><p>prompts");
+        fedora.put(page, "<!doctype html><p>another folder");
+        const HtmlPageSync report = sync(fedora, project);
+        QVERIFY2(report.errors.isEmpty(), qPrintable(report.errors.join(QLatin1Char('\n'))));
+        QCOMPARE(report.installed, QStringList{fromFedora});
+        QCOMPARE(read(fromFedora), QByteArray("<!doctype html><p>prompts"));
+        QCOMPARE(report.uploaded, QStringList{made});
+        QCOMPARE(fedora.changes.size(), 1);
+        QCOMPARE(read(page), QByteArray()); // another folder's page stays where it is
+        QCOMPARE(listedHtmlPages(Thoughts::Py::Path(m_root), project), QStringList());
     }
 
     void aServerWithoutPagesIsLeftAlone()

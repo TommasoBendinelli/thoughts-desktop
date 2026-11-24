@@ -494,11 +494,17 @@ void Fetcher::setServer(const QUrl &baseUrl, const QByteArray &token)
     m_baseUrl = baseUrl;
     m_token = token;
     m_serverSet = true;
+    m_serverGiven = true;
 }
 
 bool Fetcher::ensureServer(QString *error)
 {
+    if (m_serverSet && !m_serverGiven && m_serverGeneration != ServerAddress::connectionGeneration()) {
+        // Signed in or out since: read the address and the token again.
+        m_serverSet = false;
+    }
     if (!m_serverSet) {
+        m_serverGeneration = ServerAddress::connectionGeneration();
         const QString address = ServerAddress::configured();
         m_token = qgetenv("THOUGHTS_TOKEN").trimmed();
         if (m_token.isEmpty()) {

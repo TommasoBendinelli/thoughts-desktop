@@ -28,6 +28,7 @@
 #include <QUuid>
 
 #include <algorithm>
+#include <numeric>
 
 namespace Thoughts::AgentNotes
 {
@@ -412,6 +413,11 @@ bool Note::isPhonePage() const
     return origin.value(QLatin1String("kind")).toString() == QLatin1String("phone_page");
 }
 
+bool Note::isMarkNote() const
+{
+    return origin.value(QLatin1String("kind")).toString() == QLatin1String("overlay_mark");
+}
+
 QString Note::senderLabel() const
 {
     if (isPhonePage()) return senderDeviceId == Platform::desktopDeviceAccount() ? i18n("You, from this computer") : i18n("You, from the phone");
@@ -430,6 +436,188 @@ QUrl Note::conversationUrl() const
 {
     const QUrl url(origin.value(QLatin1String("conversation_url")).toString(), QUrl::StrictMode);
     return url.isValid() && url.scheme() == QLatin1String("https") && !url.host().isEmpty() ? url : QUrl();
+}
+
+QString ContinuedConversation::text() const
+{
+    return title.isEmpty() ? i18n("Your reply goes back to the agent's conversation.")
+                           : i18nc("@info a conversation's title", "Your reply goes back to the agent's conversation “%1”.", title);
+}
+
+QString Recipient::label() const
+{
+    const QString name = title.trimmed().isEmpty() ? i18nc("@item a Claude session without a title", "Session %1", sessionId.left(8)) : title.simplified();
+    return machine.isEmpty() ? name : i18nc("@item session title · machine", "%1 · %2", name, machine);
+}
+
+QString Recipient::choiceText() const
+{
+    if (!live) return i18nc("@item session · its machine is offline", "%1 · offline", label());
+    if (state == QLatin1String("busy")) return i18nc("@item session · working now", "%1 · busy", label());
+    if (state == QLatin1String("closed")) return i18nc("@item session · not running", "%1 · closed", label());
+    return label();
+}
+
+QList<Recipient> recipients(const QJsonObject &wakersAnswer)
+{
+    QList<Recipient> result;
+    QSet<QString> seen;
+    for (const QJsonValue &waker : wakersAnswer.value(QLatin1String("wakers")).toArray()) {
+        const QJsonObject record = waker.toObject();
+        const QString machine = record.value(QLatin1String("machine")).toString();
+        const bool live = record.value(QLatin1String("live")).toBool();
+        for (const QJsonValue &value : record.value(QLatin1String("sessions")).toArray()) {
+            const QJsonObject session = value.toObject();
+            const QString id = session.value(QLatin1String("session_id")).toString().trimmed();
+            if (id.isEmpty() || (session.contains(QLatin1String("wakeable")) && !session.value(QLatin1String("wakeable")).toBool())) continue;
+            Recipient recipient{id, session.value(QLatin1String("title")).toString(), machine, session.value(QLatin1String("state")).toString(), live,
+                                parseTime(session.value(QLatin1String("last_active_at")))};
+            result.append(recipient);
+        }
+    }
+    // Live wakers first, open sessions before closed ones, then the most recent; a session listed
+    // twice (by two machines) keeps its first place.
+    std::stable_sort(result.begin(), result.end(), [](const Recipient &a, const Recipient &b) {
+        if (a.live != b.live) return a.live;
+        const bool aOpen = a.state != QLatin1String("closed");
+        const bool bOpen = b.state != QLatin1String("closed");
+        if (aOpen != bOpen) return aOpen;
+        return a.lastActive.isValid() && (!b.lastActive.isValid() || a.lastActive > b.lastActive);
+    });
+    result.erase(std::remove_if(result.begin(), result.end(), [&seen](const Recipient &recipient) {
+                     if (seen.contains(recipient.sessionId)) return true;
+                     seen.insert(recipient.sessionId);
+                     return false;
+                 }),
+                 result.end());
+    return result;
+}
+
+QJsonArray recipientsJson(const QList<Recipient> &sessions)
+{
+    QJsonArray json;
+    for (const Recipient &session : sessions) {
+        QJsonObject record{{QStringLiteral("session_id"), session.sessionId}, {QStringLiteral("title"), session.title}, {QStringLiteral("machine"), session.machine},
+                           {QStringLiteral("state"), session.state}, {QStringLiteral("live"), session.live}};
+        if (session.lastActive.isValid()) record.insert(QStringLiteral("last_active_at"), session.lastActive.toUTC().toString(Qt::ISODateWithMs));
+        json.append(record);
+    }
+    return json;
+}
+
+QList<Recipient> recipientsFromJson(const QJsonArray &json)
+{
+    QList<Recipient> sessions;
+    for (const QJsonValue &value : json) {
+        const QJsonObject record = value.toObject();
+        const QString id = record.value(QLatin1String("session_id")).toString();
+        if (id.isEmpty()) continue;
+        sessions.append({id, record.value(QLatin1String("title")).toString(), record.value(QLatin1String("machine")).toString(),
+                         record.value(QLatin1String("state")).toString(), record.value(QLatin1String("live")).toBool(),
+                         parseTime(record.value(QLatin1String("last_active_at")))});
+    }
+    return sessions;
+}
+
+bool belongsTo(const QString &sourceFile, const DocumentSources &document)
+{
+    if (document.source.isEmpty() || sourceFile.isEmpty()) return false;
+    if (sourceFile == document.source) return true;
+    if (!document.source.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive) || document.otherDocuments.contains(sourceFile)) return false;
+    const QString folder = document.source.section(QLatin1Char('/'), 0, -2);
+    return !folder.isEmpty() && sourceFile.startsWith(folder + QLatin1Char('/'));
+}
+
+QHash<QString, ProposalCounts> proposalCounts(const QList<ProposalAuthorship> &proposals, const DocumentSources &document)
+{
+    QHash<QString, ProposalCounts> counts;
+    for (const ProposalAuthorship &proposal : proposals) {
+        if (proposal.conversationId.isEmpty()) continue;
+        ProposalCounts &count = counts[proposal.conversationId.toLower()];
+        ++count.all;
+        if (belongsTo(proposal.sourceFile, document)) ++count.here;
+    }
+    return counts;
+}
+
+QString countLabel(const ProposalCounts &counts)
+{
+    if (counts.here > 0) return i18nc("@item proposals a session made on this document", "— %1 here", counts.here);
+    if (counts.all > 0) return i18nc("@item proposals a session made in the whole Library", "— %1 in all", counts.all);
+    return QString();
+}
+
+bool isAutoNamed(const Recipient &session)
+{
+    static const QRegularExpression automatic(QStringLiteral("^[a-z]+[-_ ][0-9a-f]{1,12}$"));
+    const QString title = session.title.trimmed();
+    return title.isEmpty() || title == session.sessionId || automatic.match(title).hasMatch();
+}
+
+SessionMenu sessionMenu(const QList<Recipient> &sessions, const QHash<QString, ProposalCounts> &counts, const QString &lastSession)
+{
+    const auto countsOf = [&counts](const Recipient &session) { return counts.value(session.sessionId.toLower()); };
+    QList<int> order(sessions.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        const ProposalCounts first = countsOf(sessions.at(a));
+        const ProposalCounts second = countsOf(sessions.at(b));
+        if (first.here != second.here) return first.here > second.here;
+        return first.all > second.all;
+    });
+    SessionMenu menu;
+    QSet<int> shown;
+    for (const int index : std::as_const(order)) {
+        if (shown.size() >= MenuSessions) break;
+        const Recipient &session = sessions.at(index);
+        if (isAutoNamed(session) && countsOf(session).here == 0) continue;
+        shown.insert(index);
+        menu.shown.append(session);
+    }
+    // The session sent to last is always there, in the last place when it ranks lower.
+    for (int index = 0; index < sessions.size(); ++index) {
+        if (lastSession.isEmpty() || sessions.at(index).sessionId != lastSession || shown.contains(index)) continue;
+        if (menu.shown.size() >= MenuSessions) {
+            const QString dropped = menu.shown.takeLast().sessionId;
+            for (int other = 0; other < sessions.size(); ++other) {
+                if (sessions.at(other).sessionId == dropped) shown.remove(other);
+            }
+        }
+        shown.insert(index);
+        menu.shown.append(sessions.at(index));
+    }
+    for (int index = 0; index < sessions.size(); ++index) {
+        if (!shown.contains(index)) menu.more.append(sessions.at(index));
+    }
+    return menu;
+}
+
+std::optional<ContinuedConversation> continuedConversation(const Note &note, const std::optional<ListeningAnswer> &answer)
+{
+    if (note.isPhonePage()) return std::nullopt;
+    const QString conversationId = note.origin.value(QLatin1String("conversation_id")).toString().trimmed();
+    if (conversationId.isEmpty() && !note.conversationUrl().isValid()) return std::nullopt;
+    ContinuedConversation conversation;
+    if (!answer) return conversation;
+    // The sender's agent of this very conversation (a sender of no conversation is device-wide).
+    const auto ownSender = [&conversationId](const Agent &agent) {
+        return agent.role == SenderRole && (agent.conversationId.isEmpty() || conversationId.isEmpty() || agent.conversationId == conversationId);
+    };
+    const std::optional<Agent> &named = answer->answerBy ? answer->answerBy : answer->coverer;
+    const bool ownWake = answer->wake && answer->wake->role == SenderRole;
+    if (ownWake) conversation.title = answer->wake->title;
+    if (namesTheListener(answer->state, named, answer->wake)) {
+        if (named && !ownSender(*named)) return std::nullopt;
+        return conversation;
+    }
+    // A reply waker wakes the session that answers: the note's own, or another.
+    if (answer->wake) {
+        if (!ownWake || (answer->answerBy && !ownSender(*answer->answerBy))) return std::nullopt;
+        return conversation;
+    }
+    // Nobody listens, or the agent chosen does not: the Thoughts reply agent may answer it afresh.
+    if (answer->state != Listening::Unknown || answer->answerBy) return std::nullopt;
+    return conversation;
 }
 
 std::optional<QList<Note>> parseNotes(const QByteArray &json, QString *error)
@@ -763,6 +951,39 @@ void Client::remove(const QString &path, QObject *context, std::function<void(co
     finishWrite(m_network->deleteResource(request(path, 30000)), context, std::move(done));
 }
 
+void Client::changes(const QString &after, int waitSeconds, QObject *context, std::function<void(const ChangesResult &)> done)
+{
+    QPointer<QObject> guard(context);
+    QString error;
+    if (!ensureServer(&error)) {
+        QTimer::singleShot(0, this, [guard, done = std::move(done)] {
+            if (guard) done({Failure::NotConnected, {}, false});
+        });
+        return;
+    }
+    const int wait = qBound(0, waitSeconds, 30);
+    QUrlQuery query;
+    if (!after.isEmpty()) {
+        query.addQueryItem(QStringLiteral("after"), after);
+        query.addQueryItem(QStringLiteral("wait"), QString::number(wait));
+    }
+    const QString pathAndQuery = QStringLiteral("/v1/agent-notes/changes") + (query.isEmpty() ? QString() : QStringLiteral("?") + query.toString(QUrl::FullyEncoded));
+    QNetworkReply *reply = get(pathAndQuery, (wait + 15) * 1000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, done = std::move(done)] {
+        reply->deleteLater();
+        ChangesResult result;
+        result.failure = failureOf(reply);
+        if (result.failure == Failure::Unauthorized) m_link.tokenRefused();
+        if (result.failure == Failure::None) {
+            const QJsonObject json = QJsonDocument::fromJson(reply->readAll()).object();
+            result.cursor = json.value(QLatin1String("cursor")).toString();
+            result.changed = json.value(QLatin1String("changed")).toBool();
+            if (result.cursor.isEmpty()) result.failure = Failure::Failed;
+        }
+        if (guard) done(result);
+    });
+}
+
 void Client::finishWrite(QNetworkReply *reply, QObject *context, std::function<void(const WriteResult &)> done)
 {
     QPointer<QObject> guard(context);
@@ -844,6 +1065,69 @@ void Client::capabilities(QObject *context, std::function<void(bool, const QStri
         const QByteArray body = reply->readAll();
         const bool ok = failureOf(reply) == Failure::None && QJsonDocument::fromJson(body).object().value(QLatin1String("capabilities")).isArray();
         done(ok, ok ? serverCapabilities(body) : QStringList());
+    });
+}
+
+void Client::wakers(QObject *context, std::function<void(const std::optional<QJsonObject> &, const QString &)> done)
+{
+    QPointer<QObject> guard(context);
+    QString error;
+    if (!ensureServer(&error)) {
+        QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
+            if (guard) done(std::nullopt, error);
+        });
+        return;
+    }
+    QNetworkReply *reply = get(QStringLiteral("/v1/agent-notes/wakers"), 15000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, done = std::move(done)] {
+        reply->deleteLater();
+        const Failure failure = failureOf(reply);
+        if (failure == Failure::Unauthorized) m_link.tokenRefused();
+        if (!guard) return;
+        if (failure != Failure::None) {
+            done(std::nullopt, failure == Failure::Unsupported ? i18n("The server does not list the sessions it can wake.") : describe(failure, reply));
+            return;
+        }
+        const QJsonDocument answer = QJsonDocument::fromJson(reply->readAll());
+        if (!answer.isObject() || !answer.object().value(QLatin1String("wakers")).isArray()) {
+            done(std::nullopt, i18n("The Thoughts server sent an unreadable list of sessions."));
+            return;
+        }
+        done(answer.object(), {});
+    });
+}
+
+void Client::note(const QString &noteId, QObject *context, std::function<void(const std::optional<Note> &, Failure, const QString &)> done)
+{
+    QPointer<QObject> guard(context);
+    QString error;
+    if (!ensureServer(&error)) {
+        QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
+            if (guard) done(std::nullopt, Failure::NotConnected, error);
+        });
+        return;
+    }
+    QNetworkReply *reply = get(QStringLiteral("/v1/agent-notes/%1").arg(QString::fromLatin1(QUrl::toPercentEncoding(noteId))), 30000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, noteId, done = std::move(done)] {
+        reply->deleteLater();
+        const Failure failure = failureOf(reply);
+        if (failure == Failure::Unauthorized) m_link.tokenRefused();
+        if (!guard) return;
+        if (failure != Failure::None) {
+            done(std::nullopt, failure, failure == Failure::Unsupported ? i18n("The note is not on the server.") : describe(failure, reply));
+            return;
+        }
+        const auto note = Note::fromJson(QJsonDocument::fromJson(reply->readAll()).object());
+        if (!note || note->id != noteId) {
+            done(std::nullopt, Failure::Failed, i18n("The Thoughts server sent an unreadable agent note."));
+            return;
+        }
+        if (note->deleted) {
+            // As one the server no longer has.
+            done(std::nullopt, Failure::Unsupported, i18n("This note was deleted."));
+            return;
+        }
+        done(note, Failure::None, {});
     });
 }
 
@@ -940,10 +1224,16 @@ Center::Center(Client *client, QString statePath, Clock clock, QObject *parent)
     , m_state(std::move(statePath))
     , m_clock(clock ? std::move(clock) : Clock([] { return QDateTime::currentDateTimeUtc(); }))
     , m_timer(new QTimer(this))
+    , m_changesTimer(new QTimer(this))
+    , m_decideTimer(new QTimer(this))
 {
     qRegisterMetaType<Thoughts::AgentNotes::Note>();
     m_timer->setSingleShot(true);
     connect(m_timer, &QTimer::timeout, this, &Center::poll);
+    m_changesTimer->setSingleShot(true);
+    connect(m_changesTimer, &QTimer::timeout, this, &Center::waitForChanges);
+    m_decideTimer->setSingleShot(true);
+    connect(m_decideTimer, &QTimer::timeout, this, &Center::decideNotifications);
 }
 
 Center::~Center() = default;
@@ -953,7 +1243,50 @@ std::optional<Note> Center::note(const QString &noteId) const
     for (const Note &note : m_notes) {
         if (note.id == noteId) return note;
     }
+    const auto unlisted = m_unlisted.constFind(noteId);
+    if (unlisted != m_unlisted.cend()) return *unlisted;
     return std::nullopt;
+}
+
+Note *Center::knownNote(const QString &noteId)
+{
+    for (Note &note : m_notes) {
+        if (note.id == noteId) return &note;
+    }
+    const auto unlisted = m_unlisted.find(noteId);
+    return unlisted != m_unlisted.end() ? &*unlisted : nullptr;
+}
+
+void Center::fetchNote(const QString &noteId, std::function<void(const std::optional<Note> &, const QString &)> done)
+{
+    if (noteId.isEmpty()) {
+        if (done) done(std::nullopt, i18n("No note was named."));
+        return;
+    }
+    m_client->note(noteId, this, [this, noteId, done = std::move(done)](const std::optional<Note> &fetched, Client::Failure failure, const QString &error) {
+        if (!fetched) {
+            // Gone from the server: gone here too, when it was kept apart.
+            if (failure == Client::Failure::Unsupported) {
+                if (m_unlisted.remove(noteId) > 0) Q_EMIT notesChanged();
+            }
+            if (done) done(std::nullopt, error);
+            return;
+        }
+        if (Note *known = knownNote(noteId); known && m_unlisted.contains(noteId)) {
+            const bool changed = signatureOf({*known}) != signatureOf({*fetched});
+            *known = *fetched;
+            if (changed) Q_EMIT notesChanged();
+        } else if (known) {
+            replaceNote(*fetched);
+        } else if (fetched->isMarkNote()) {
+            // Never listed: kept apart.
+            m_unlisted.insert(noteId, *fetched);
+            Q_EMIT notesChanged();
+        } else {
+            merge({*fetched});
+        }
+        if (done) done(fetched, {});
+    });
 }
 
 int Center::unreadCount() const
@@ -992,6 +1325,52 @@ void Center::start(int firstDelayMs)
     if (m_started) return;
     m_started = true;
     schedule(firstDelayMs);
+    m_changesTimer->start(qMax(0, firstDelayMs));
+}
+
+void Center::waitForChanges()
+{
+    if (!m_started || m_changesInFlight) return;
+    m_changesInFlight = true;
+    m_client->changes(m_changesCursor, m_changesCursor.isEmpty() ? 0 : ChangesWaitSeconds, this,
+                      [this](const Client::ChangesResult &result) { changesFinished(result); });
+}
+
+void Center::changesFinished(const Client::ChangesResult &result)
+{
+    m_changesInFlight = false;
+    if (result.failure != Client::Failure::None) {
+        if (std::exchange(m_live, false)) {
+            DeveloperLog::record(QStringLiteral("agent_notes.live.stopped"), {{QStringLiteral("failure"), int(result.failure)}});
+        }
+        // A server without it, or no server yet: asked again in a while (it may be updated). A
+        // dropped connection: again soon, then less often (2 s up to a minute).
+        int delay = 2000;
+        if (result.failure == Client::Failure::Unsupported || result.failure == Client::Failure::NotConnected
+            || result.failure == Client::Failure::Unauthorized) {
+            delay = 30 * 60 * 1000;
+        } else {
+            for (int step = 0; step < m_changesFailures && delay < 60 * 1000; ++step) delay *= 2;
+            delay = qMin(delay, 60 * 1000);
+        }
+        ++m_changesFailures;
+        // Starts over from the server's cursor then, and asks for the list once (changes may have been missed).
+        m_changesCursor.clear();
+        m_changesRestart = true;
+        m_changesTimer->start(delay);
+        return;
+    }
+    m_changesFailures = 0;
+    if (!std::exchange(m_live, true)) DeveloperLog::record(QStringLiteral("agent_notes.live.started"), {});
+    const bool restarted = m_changesCursor.isEmpty() && std::exchange(m_changesRestart, false);
+    m_changesCursor = result.cursor;
+    // A note or a reply was added (or, starting over after a failure, may have been): the list now, as Refresh asks it.
+    if (result.changed || (restarted && m_listed)) {
+        m_unchangedPolls = 0;
+        if (m_inFlight) m_refreshAgain = true;
+        else poll();
+    }
+    m_changesTimer->start(0);
 }
 
 void Center::setWatching(const QObject *viewer, bool watching)
@@ -1055,6 +1434,8 @@ void Center::refresh()
     m_unchangedPolls = 0;
     m_timer->stop();
     poll();
+    // The notes no list brings (mark notes opened here): their replies, as the list brings others'.
+    for (const QString &noteId : m_unlisted.keys()) fetchNote(noteId);
 }
 
 void Center::requestOpen(const QString &noteId)
@@ -1093,6 +1474,12 @@ void Center::replaceNote(const Note &updated)
         emitUnreadIfChanged();
         return;
     }
+    // A note kept apart from the list (a mark note): its receipt, a reply.
+    const auto unlisted = m_unlisted.find(updated.id);
+    if (unlisted == m_unlisted.end()) return;
+    const bool changed = signatureOf({*unlisted}) != signatureOf({updated});
+    *unlisted = updated;
+    if (changed) Q_EMIT notesChanged();
 }
 
 std::shared_ptr<Center::Draft> Center::draft(const QString &noteId)
@@ -1208,7 +1595,9 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
     // Without a drawing: an empty stroke document at the picture's size, as the phone sends.
     const AnnotationDocument strokes = !current->drawing.isNull() ? current->drawing : AnnotationDocument(size.width(), size.height());
     const QString message = current->message.trimmed();
-    const QString sources = replySources();
+    // A reply that continues the conversation that sent the note asks nothing about sources
+    // (the view says where it goes instead): it carries the default, what agents used before.
+    const QString sources = continuedConversation(*target, answer(noteId)) ? ReplySources::defaultValue() : replySources();
     QCryptographicHash hash(QCryptographicHash::Sha256);
     hash.addData(image);
     hash.addData(strokes.toJson());
@@ -1241,14 +1630,11 @@ void Center::postReply(const QString &noteId, const QByteArray &image, const QSt
         }
         // The reply belongs to the note now; the next list shows it.
         if (const auto reply = Reply::fromJson(result.json)) {
-            for (Note &existing : m_notes) {
-                if (existing.id != noteId) continue;
-                if (std::none_of(existing.replies.cbegin(), existing.replies.cend(), [&](const Reply &known) { return known.id == reply->id; })) {
-                    existing.replies.append(*reply);
-                    m_signature = signatureOf(m_notes);
-                    Q_EMIT notesChanged();
-                }
-                break;
+            Note *existing = knownNote(noteId);
+            if (existing && std::none_of(existing->replies.cbegin(), existing->replies.cend(), [&](const Reply &known) { return known.id == reply->id; })) {
+                existing->replies.append(*reply);
+                m_signature = signatureOf(m_notes);
+                Q_EMIT notesChanged();
             }
         }
         finishReply(noteId, true, {});
@@ -1396,12 +1782,17 @@ void Center::sendPage(const Page &page, std::function<void(bool, const QString &
     if (page.page > 0) origin.insert(QStringLiteral("page"), page.page);
     if (page.pages > 0) origin.insert(QStringLiteral("pages"), page.pages);
     if (!page.documentName.isEmpty()) origin.insert(QStringLiteral("document_name"), page.documentName);
+    // What this page adds (Ask About This: the overlay's conversation and mark); never in place of
+    // the fields above.
+    for (auto it = page.origin.constBegin(); it != page.origin.constEnd(); ++it) {
+        if (!origin.contains(it.key())) origin.insert(it.key(), it.value());
+    }
     QJsonObject body{{QStringLiteral("note_id"), page.noteId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : page.noteId},
                      {QStringLiteral("title"), page.title.trimmed().left(200)},
                      {QStringLiteral("origin"), origin},
                      {QStringLiteral("image"),
                       QJsonObject{{QStringLiteral("media_type"), QStringLiteral("image/png")}, {QStringLiteral("data_base64"), QString::fromLatin1(png.toBase64())}}}};
-    const QString message = page.message.trimmed();
+    const QString message = page.verbatim ? page.message : page.message.trimmed();
     if (!message.isEmpty()) body.insert(QStringLiteral("message"), message);
     if (!page.documentId.isEmpty()) body.insert(QStringLiteral("document_id"), page.documentId);
     if (!page.documentFilename.isEmpty()) body.insert(QStringLiteral("document_filename"), page.documentFilename);
@@ -1430,7 +1821,8 @@ void Center::deleteNote(const QString &noteId, std::function<void(bool, const QS
             m_answers.remove(noteId);
             m_answeredAt.remove(noteId);
             m_choices.remove(noteId);
-            if (m_notes.size() != before) {
+            const bool unlisted = m_unlisted.remove(noteId) > 0;
+            if (m_notes.size() != before || unlisted) {
                 m_signature = signatureOf(m_notes);
                 Q_EMIT notesChanged();
                 emitUnreadIfChanged();
@@ -1512,7 +1904,9 @@ bool Center::apply(const QList<Note> &fetched)
         for (const Note &note : fetched) lowest = qMin(lowest, note.sequence);
         // The answer is the newest notes: everything from its lowest sequence up is what the
         // server has now (a note missing there was deleted); older notes stay as they were.
-        merged = fetched;
+        // Mark notes are never listed, also when a server before reading_overlay_mark_notes_v1
+        // lists them.
+        std::copy_if(fetched.cbegin(), fetched.cend(), std::back_inserter(merged), [](const Note &note) { return !note.isMarkNote(); });
         for (const Note &note : std::as_const(m_notes)) {
             if (note.sequence < lowest) merged.append(note);
         }
@@ -1538,6 +1932,7 @@ void Center::merge(const QList<Note> &fetched)
 {
     bool changed = false;
     for (const Note &note : fetched) {
+        if (note.isMarkNote()) continue;  // never listed (apply())
         auto existing = std::find_if(m_notes.begin(), m_notes.end(), [&](const Note &known) { return known.id == note.id; });
         if (existing == m_notes.end()) {
             m_notes.append(note);
@@ -1590,7 +1985,12 @@ void Center::decideNotifications()
             m_state.markDecided(note.id);
             continue;
         }
-        if (age < GracePeriodSeconds) continue;
+        if (age < GracePeriodSeconds) {
+            // Decided again when its grace period is over, whether or not the list is asked for by then.
+            const qint64 remainingMs = (GracePeriodSeconds - age) * 1000 + 500;
+            if (!m_decideTimer->isActive() || m_decideTimer->remainingTime() > remainingMs) m_decideTimer->start(int(remainingMs));
+            continue;
+        }
         m_state.markDecided(note.id);
         attention.append(note);
     }

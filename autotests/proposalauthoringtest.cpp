@@ -14,6 +14,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTest>
 #include <algorithm>
@@ -662,6 +663,22 @@ private Q_SLOTS:
         QCOMPARE(result["links"].toArray().first().toObject()["reason"].toString(), "pdf_not_in_library");
         QCOMPARE(result["links"].toArray().first().toObject()["suggestion"].toString(), "\\PdfLink{paper_abc}{document-start}{Chu}");
         QVERIFY2(result["message"].toString().contains("Project Benchmark"), qPrintable(result["message"].toString()));
+        // A PDF's own named destinations and its pages are anchors too (the server's
+        // pdf_link_named_destinations_v1): no hand-made doc-anchor: needed.
+        QFile named(QStringLiteral(KDESRCDIR "data/kjsfunctionstest.pdf"));
+        QVERIFY(named.open(QIODevice::ReadOnly));
+        writeProject(root, "test:named", "Named", "docs-named-222222", {}, {{"named_dest.pdf", named.readAll()}});
+        for (const QString &link : {QStringLiteral("\\PdfLink{named_dest}{Navigation1}{x}"), QStringLiteral("\\PdfLink{named_dest}{page.1}{x}")}) {
+            const auto accepted = create(root, grpo, 2, 3, "See " + link + ".\n");
+            QVERIFY2(accepted["accepted"].toBool(), qPrintable(link + ": " + QJsonDocument(accepted).toJson()));
+            put(grpo, before);
+        }
+        result = create(root, grpo, 2, 3, "See \\PdfLink{named_dest}{page.2}{x}.\n");
+        QCOMPARE(result["links"].toArray().first().toObject()["reason"].toString(), "anchor_not_found");
+        QVERIFY2(result["message"].toString().contains("page.1 to page.1"), qPrintable(result["message"].toString()));
+        result = create(root, grpo, 2, 3, "See \\PdfLink{named_dest}{equation.9}{x}.\n");
+        QCOMPARE(result["links"].toArray().first().toObject()["reason"].toString(), "anchor_not_found");
+        QVERIFY2(result["message"].toString().contains("pdf_anchors"), qPrintable(result["message"].toString()));
         // Another Project's PDF that this Library does not hold: a named anchor is left to the build.
         const QString paper = root + "/.thoughts/projects/" + projectHash("test:benchmark") + "/documents/paper_abc.pdf";
         QVERIFY(QFile::remove(paper));
@@ -736,6 +753,14 @@ private Q_SLOTS:
                  "\\CrossSourceLink{docs-followup/tex/source/main.tex}{known}{x}");
         QCOMPARE(create(root, grpo, 2, 3, "\\CrossSourceLink{docs-concepts/tex/source/other.tex}{known}{x}\n")["links"].toArray().first().toObject()["suggestion"].toString(),
                  "\\SourceLink{tex/source/other.tex}{known}{x}");
+        // 2026-11-19 (thoughts-server db43c52): the label document-start opens the note's start, as
+        // for \PdfLink, in a note with Source labels or none; the target must still be a selected note.
+        QVERIFY(accepted("\\SourceLink{tex/source/other.tex}{document-start}{x}\n"));
+        QVERIFY(accepted("\\CrossSourceLink{docs-followup/tex/source/main.tex}{document-start}{x}\n"));
+        QCOMPARE(create(root, grpo, 2, 3, "\\CrossSourceLink{docs-followup/tex/source/gone.tex}{document-start}{x}\n")["links"].toArray().first().toObject()["reason"].toString(),
+                 "source_not_selected");
+        QCOMPARE(create(root, grpo, 2, 3, "\\CrossSourceLink{docs-concepts/tex/source/other.tex}{document-start}{x}\n")["links"].toArray().first().toObject()["suggestion"].toString(),
+                 "\\SourceLink{tex/source/other.tex}{document-start}{x}");
         // A label the same proposal adds counts.
         QVERIFY(create(root, grpo, 2, 3, "\\SourceLabel{fresh}\\SourceLink{tex/source/grpo.tex}{fresh}{x}\n")["accepted"].toBool());
         put(grpo, before);
@@ -818,6 +843,8 @@ private Q_SLOTS:
         QCOMPARE(result["error_code"].toString(), "invalid_link");
         QCOMPARE(result["links"].toArray().size(), 1);
         QCOMPARE(result["links"].toArray().first().toObject()["suggestion"].toString(), "\\CrossSourceLink{docs-followup/tex/source/main.tex}{document-start}{main}");
+        // document-start is the note's start: no Source label to add for it.
+        QVERIFY2(!result["message"].toString().contains("\\SourceLabel{document-start}"), qPrintable(result["message"].toString()));
         QCOMPARE(get(other), revised);
         QVERIFY(proposed != revised);
     }
@@ -900,6 +927,142 @@ private Q_SLOTS:
         const QByteArray broken = "Intro.\n\\href{thoughts-html:docs-concepts/tex/support/html/gone.html}{gone}\nEnd.\n";
         put(grpo, broken);
         QVERIFY(create(root, grpo, 3, 4, "Changed.\n")["accepted"].toBool());
+    }
+    // 2026-11-24: a note of a Project's default folder links a page of that folder.
+    void defaultFolderNotesLinkTheirOwnPages() {
+        QTemporaryDir directory;
+        const QString root = QFileInfo(directory.path()).canonicalFilePath();
+        writeLinkLibrary(root);
+        QJsonObject project = Thoughts::ProjectConfiguration::empty(root, "project-pages", "Project Pages");
+        const QString folder = Thoughts::ProjectConfiguration::defaultFolderPath(project);
+        QVERIFY(Thoughts::SourceOwner::isDefaultFolder(folder));
+        QVERIFY(Thoughts::ProjectConfiguration::save(Thoughts::ProjectConfiguration::path(root, "project-pages"), project).isEmpty());
+        const QString note = root + "/" + folder + "/notes.tex";
+        put(note, "\\documentclass{article}\n\\begin{document}\nPrompts.\n\\end{document}\n");
+        const QString page = folder + "/tex/support/html/prompts.html";
+        auto result = create(root, note, 3, 4, "See \\href{thoughts-html:" + page + "}{the prompts}.\n");
+        QCOMPARE(result["error_code"].toString(), "invalid_link");
+        QCOMPARE(result["links"].toArray().first().toObject()["reason"].toString(), "html_page_not_found");
+        // A page the folder's list names (Fedora added it; Sync has not installed it yet).
+        QVERIFY(QDir(root).mkpath(folder + "/tex/support"));
+        put(root + "/" + folder + "/tex/support/thoughts_html_attachments.txt",
+            "{\"attachments\": [{\"bytes\": 3, \"kind\": \"html_attachment\", \"object\": \"" + QByteArray(64, 'a') + "\", \"path\": \"" + page.toUtf8()
+                + "\", \"sha256\": \"" + QByteArray(64, 'a') + "\"}], \"schema_version\": 1}\n");
+        // A docs folder's page is another folder's.
+        QVERIFY(QDir(root).mkpath("docs-concepts/tex/support/html"));
+        put(root + "/docs-concepts/tex/support/html/curve.html", "<!doctype html><p>curve");
+        result = create(root, note, 3, 4, "\\href{thoughts-html:docs-concepts/tex/support/html/curve.html}{x}\n");
+        QCOMPARE(result["links"].toArray().first().toObject()["reason"].toString(), "html_page_other_folder");
+        result = create(root, note, 3, 4, "See \\href{thoughts-html:" + page + "}{the prompts}.\n");
+        QVERIFY2(result["accepted"].toBool(), qPrintable(QJsonDocument(result).toJson()));
+    }
+    // 2026-11-19: an agent replaced a Thoughts link with the server's "Open in Thoughts" page
+    // (\href{https://<server>/open/document/<id>?page=1&first=1&version=<sha256>}{...}), which opens a
+    // browser. A new link to a document page of this computer's server is refused (server_page_link)
+    // with the Thoughts link to the same document: \PdfLink{<pdfKey>}{page.N}{text} for an imported
+    // PDF, the \SourceLink / \CrossSourceLink of a note's source at its start (document-start; in
+    // Markdown its relative path without a fragment).
+    void serverPageLinksAreRefusedWithTheThoughtsLink() {
+        const QByteArray savedServer = qgetenv("THOUGHTS_SERVER_URL");
+        qputenv("THOUGHTS_SERVER_URL", "https://thoughts.example.org");
+        const auto restore = qScopeGuard([&savedServer] {
+            if (savedServer.isEmpty()) qunsetenv("THOUGHTS_SERVER_URL");
+            else qputenv("THOUGHTS_SERVER_URL", savedServer);
+        });
+        QTemporaryDir directory;
+        const QString root = QFileInfo(directory.path()).canonicalFilePath();
+        writeLinkLibrary(root);
+        // The Library document of a Project's source or imported PDF, as its configuration names it.
+        const auto documentId = [&root](const QString &project, const QString &path) {
+            QFile file(root + "/.thoughts/projects/" + projectHash(project) + "/documents/thoughts-project.json");
+            if (!file.open(QIODevice::ReadOnly)) return QString();
+            for (const auto &value : QJsonDocument::fromJson(file.readAll()).object()["documents"].toArray())
+                if (value.toObject()["source"].toObject()["path"].toString() == path) return value.toObject()["document_id"].toString();
+            return QString();
+        };
+        const QString paper = documentId("test:followup", "paper_abc.pdf");
+        const QString main = documentId("test:followup", "tex/source/main.tex");
+        const QString other = documentId("test:concepts", "tex/source/other.tex");
+        const QString unselected = documentId("test:concepts", "unselected.pdf");
+        QVERIFY(!paper.isEmpty() && !main.isEmpty() && !other.isEmpty() && !unselected.isEmpty());
+        const QString server = "https://thoughts.example.org/open/document/";
+        const QString grpo = root + "/docs-concepts/tex/source/grpo.tex";
+        const QString notes = root + "/docs-concepts/markdown/notes.md";
+        const QByteArray before = get(grpo);
+        const auto refusal = [&](const QString &path, const QString &replacement) {
+            const auto result = create(root, path, 2, 3, replacement);
+            if (result["error_code"].toString() != "invalid_link") qWarning("%s", QJsonDocument(result).toJson().constData());
+            return result["links"].toArray().first().toObject();
+        };
+
+        // An imported PDF: \PdfLink at the page the server page opens.
+        auto result = create(root, grpo, 2, 3, "See the \\href{" + server + paper + "?page=1&first=1&version=" + QString(64, 'a') + "}{Chu paper}.\n");
+        QCOMPARE(result["error_code"].toString(), "invalid_link");
+        QCOMPARE(get(grpo), before);
+        auto link = result["links"].toArray().first().toObject();
+        QCOMPARE(link["reason"].toString(), "server_page_link");
+        QCOMPARE(link["command"].toString(), "href");
+        QCOMPARE(link["line"].toInt(), 1);
+        QCOMPARE(link["suggestion"].toString(), "\\PdfLink{paper_abc}{page.1}{Chu paper}");
+        for (const QString &part : {QStringLiteral("Thoughts link"), QStringLiteral("\\PdfLink{pdfKey}"), QStringLiteral("paper_abc.pdf of Project Benchmark-followup")})
+            QVERIFY2(result["message"].toString().contains(part), qPrintable(result["message"].toString()));
+        // Only ?page=N, as agents wrote them; a page past the PDF's end links its start.
+        QCOMPARE(refusal(grpo, "\\href{" + server + paper + "?page=1}{Chu}\n")["suggestion"].toString(), "\\PdfLink{paper_abc}{page.1}{Chu}");
+        link = refusal(grpo, "\\href{" + server + paper + "?page=5}{Chu}\n");
+        QCOMPARE(link["suggestion"].toString(), "\\PdfLink{paper_abc}{document-start}{Chu}");
+        QVERIFY2(link["message"].toString().contains("page.1 to page.1"), qPrintable(link["message"].toString()));
+        // The suggestion is accepted.
+        QVERIFY(create(root, grpo, 2, 3, "See the \\PdfLink{paper_abc}{page.1}{Chu paper}.\n")["accepted"].toBool());
+        put(grpo, before);
+
+        // A note of another folder: \CrossSourceLink at document-start (thoughts-server db43c52), its
+        // start, with the hint that a place in it needs a Source label there.
+        link = refusal(grpo, "The \\href{" + server + main + "?page=5}{main note} says so.\n");
+        QCOMPARE(link["reason"].toString(), "server_page_link");
+        QCOMPARE(link["suggestion"].toString(), "\\CrossSourceLink{docs-followup/tex/source/main.tex}{document-start}{main note}");
+        QVERIFY2(link["message"].toString().contains("needs a Source label there (\\SourceLabel{name}; propose it"), qPrintable(link["message"].toString()));
+        QVERIFY(create(root, grpo, 2, 3, "The \\CrossSourceLink{docs-followup/tex/source/main.tex}{document-start}{main note} says so.\n")["accepted"].toBool());
+        put(grpo, before);
+        // A note of this folder: \SourceLink, and the Source labels it has are named.
+        link = refusal(grpo, "\\href{" + server + other + "}{other note}\n");
+        QCOMPARE(link["suggestion"].toString(), "\\SourceLink{tex/source/other.tex}{document-start}{other note}");
+        QVERIFY2(link["message"].toString().contains("Its Source labels: known."), qPrintable(link["message"].toString()));
+        QVERIFY(create(root, grpo, 2, 3, "\\SourceLink{tex/source/other.tex}{document-start}{other note}\n")["accepted"].toBool());
+        put(grpo, before);
+
+        // In Markdown: the bare PDF filename at the page, a note's relative path for its start.
+        link = refusal(notes, "See [Chu](" + server + paper + "?page=1&first=1).\n");
+        QCOMPARE(link["reason"].toString(), "server_page_link");
+        QCOMPARE(link["command"].toString(), "markdown_link");
+        QCOMPARE(link["suggestion"].toString(), "[Chu](paper_abc.pdf#page.1)");
+        link = refusal(notes, "See [the main note](" + server + main + "?page=2).\n");
+        QCOMPARE(link["suggestion"].toString(), "[the main note](../../docs-followup/tex/source/main.tex)");
+        QVERIFY2(link["message"].toString().contains("#source-label:name"), qPrintable(link["message"].toString()));
+        QVERIFY(create(root, notes, 2, 3, "See [the main note](../../docs-followup/tex/source/main.tex).\n")["accepted"].toBool());
+
+        // Without a link to give: a PDF no build reaches, a document the Library does not have,
+        // an address that names none.
+        link = refusal(grpo, "\\href{" + server + unselected + "?page=1}{x}\n");
+        QVERIFY(!link.contains("suggestion"));
+        QVERIFY2(link["message"].toString().contains("not selected for building"), qPrintable(link["message"].toString()));
+        link = refusal(grpo, "\\href{" + server + "0b1c2d3e-4f50-4a61-8b72-93a4b5c6d7e8?page=1}{x}\n");
+        QCOMPARE(link["reason"].toString(), "server_page_link");
+        QVERIFY(!link.contains("suggestion"));
+        QVERIFY2(link["message"].toString().contains("No Project of this Library has the document"), qPrintable(link["message"].toString()));
+        QCOMPARE(refusal(grpo, "\\href{" + server + "item-response-theory}{x}\n")["reason"].toString(), "server_page_link");
+        QCOMPARE(get(grpo), before);
+
+        // Other servers and the server's other pages are web links like any other.
+        for (const QString &web : QStringList{"https://other.example.org/open/document/" + paper + "?page=1", "https://thoughts.example.org/app/"}) {
+            result = create(root, grpo, 2, 3, "\\href{" + web + "}{x}\n");
+            QVERIFY2(result["accepted"].toBool(), qPrintable(web + ": " + QJsonDocument(result).toJson()));
+            put(grpo, before);
+        }
+        // A link the replaced text already has is not this proposal's, whatever its text now says.
+        const QByteArray linked = "Intro.\nSee \\href{" + (server + paper + "?page=1").toUtf8() + "}{Chu}.\nEnd.\n";
+        put(grpo, linked);
+        result = create(root, grpo, 2, 3, "Read \\href{" + server + paper + "?page=1}{the Chu paper} first.\n");
+        QVERIFY2(result["accepted"].toBool(), qPrintable(QJsonDocument(result).toJson()));
     }
     void markdownLinksMustResolve() {
         QTemporaryDir directory;

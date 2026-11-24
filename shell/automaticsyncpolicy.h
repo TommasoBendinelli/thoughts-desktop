@@ -41,6 +41,9 @@ namespace Thoughts
 //    wait ten minutes for its PDF. Each ended build is announced once, so this
 //    cannot become a loop.
 //  - A Sync the user starts, or one a command asks for, is never held back.
+//  - A change made on this computer starts an automatic Sync of its own once the
+//    user has paused (localchangesync.h). It is held back as the one for
+//    proposal decisions is.
 class AutomaticSyncPolicy
 {
 public:

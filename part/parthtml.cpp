@@ -290,6 +290,8 @@ void Part::htmlViewActiveChanged(bool active)
     widget()->setProperty("thoughtsNativeDocumentView", active && Thoughts::HtmlDocumentView::webViewAvailable());
     if (QWidget *container = widget()->findChild<QWidget *>(QStringLiteral("thoughtsPageSplitter"))) container->parentWidget()->setFocusProxy(active ? static_cast<QWidget *>(m_htmlView) : static_cast<QWidget *>(m_pageView.data()));
     if (active) refreshHtmlComments();
+    // The PDF's tools are greyed out in the HTML edition.
+    updateToolsForShownView();
     // A review in progress follows the view: the review overview presents the card again (in
     // the view now shown, revealed or flipped as it was).
     const QString reviewCard = str(m_reviewCardRecord, QStringLiteral("card_id"));
@@ -795,6 +797,8 @@ void Part::openHtmlLink(const QJsonObject &message)
     const QString target = str(message, QStringLiteral("target")).isEmpty() ? str(message, QStringLiteral("href")) : str(message, QStringLiteral("target"));
     if (kind == QLatin1String("web") || kind == QLatin1String("mailto")) {
         const QUrl url(target);
+        // This computer's server's page of a Library document opens the document here.
+        if (openServerPageLink(url)) return;
         if (url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("mailto")) QDesktopServices::openUrl(url);
         return;
     }

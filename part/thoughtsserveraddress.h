@@ -101,4 +101,12 @@ QByteArray storedToken(const QString &account, const QString &address, QString *
 // What to tell the owner when a stored token is not sent to `address`.
 QString tokenWithheldMessage(const QString &account, const QString &issuedFor, const QString &address);
 
+// Signing in or out, or storing a token by hand, changes the server or the tokens while Thoughts
+// runs. Whatever keeps a token or a client for later compares connectionGeneration() with the
+// value it read them at and reads them again when it moved. connectionChanged() moves it. It
+// counts per binary: the app and its document part each move their own, see
+// Part::reloadServerConnection.
+quint64 connectionGeneration();
+void connectionChanged();
+
 }

@@ -196,7 +196,13 @@ void Fetcher::fetch(const QString &sha256, QObject *context, Done done)
 
 QNetworkReply *Fetcher::serverDownload(const QString &sha256, Failure *failure)
 {
+    if (m_client && m_clientGeneration != ServerAddress::connectionGeneration()) {
+        // Signed in or out since: a new client with the new token. The old one stays a child
+        // of this Fetcher, so the downloads it still runs end as they would have.
+        m_client = nullptr;
+    }
     if (!m_client) {
+        m_clientGeneration = ServerAddress::connectionGeneration();
         QByteArray token = qgetenv("THOUGHTS_TOKEN").trimmed();
         const QString address = ServerAddress::configured();
         if (token.isEmpty()) token = ServerAddress::storedToken(Platform::desktopDeviceAccount(), address);

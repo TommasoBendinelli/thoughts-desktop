@@ -955,7 +955,8 @@ void ThumbnailWidget::paint(QPainter &p, const QRect _clipRect)
     // draw page outline and pixmap
     if (clipRect.top() < m_pixmapHeight + m_margin) {
         // if page is bookmarked draw a colored border
-        const bool isBookmarked = m_parent->m_document->bookmarkManager()->isBookmarked(pageNumber());
+        // Bookmarks are not offered any more, so a page bookmarked earlier is not marked.
+        const bool isBookmarked = false;
         // draw the inner rect
         p.setPen(isBookmarked ? QColor(0xFF8000) : Qt::black);
         p.drawRect(m_margin / 2 - 1, m_margin / 2 - 1, m_pixmapWidth + 1, m_pixmapHeight + 1);

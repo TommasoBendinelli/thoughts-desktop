@@ -62,7 +62,7 @@ inline QList<Placeholder> placeholders()
         {QStringLiteral("answer_source"), QStringLiteral("the answer's source file and lines (between the card's markers)")},
         {QStringLiteral("answer_text"), QStringLiteral("the answer itself: those source lines, else the PDF text (not in the defaults)")},
         {QStringLiteral("answer_feedback"), QStringLiteral("the passages of the answer marked Liked or Disliked during reviews, with their comments")},
-        {QStringLiteral("current_review"), QStringLiteral("the answer being given now in the review bar (tags, interval, notes), not saved yet")},
+        {QStringLiteral("current_review"), QStringLiteral("the answer being given now (before step, tags, interval, notes), not saved yet")},
     };
 }
 

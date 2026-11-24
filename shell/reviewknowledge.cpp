@@ -1846,6 +1846,13 @@ QJsonObject documentFeedback(const Library &library, const QJsonObject &request,
         if (const QString updated = record.value(QStringLiteral("updated_at")).toString(); !updated.isEmpty()) item.insert(QStringLiteral("updated_at"), updated);
         if (DocumentFeedback::isAttachmentFeedback(record)) item.insert(QStringLiteral("view"), DocumentFeedback::attachmentView());
         if (DocumentFeedback::canResolve(record)) item.insert(QStringLiteral("resolved"), DocumentFeedback::isResolved(record));
+        if (DocumentFeedback::isAttachmentDrawing(record)) {
+            // Drawn on a snapshot of the page (document-feedback.md 10.1): its strokes and area are on that picture.
+            const QJsonObject snapshot = DocumentFeedback::snapshotOf(record);
+            item.insert(QStringLiteral("snapshot"), QJsonObject{{QStringLiteral("object_sha256"), snapshot.value(QStringLiteral("object_sha256"))},
+                                                                {QStringLiteral("width"), snapshot.value(QStringLiteral("width"))},
+                                                                {QStringLiteral("height"), snapshot.value(QStringLiteral("height"))}});
+        }
         if (DocumentFeedback::isDrawing(record)) {
             item.insert(QStringLiteral("strokes"), int(DocumentFeedback::strokesOf(record).size()));
             item.insert(QStringLiteral("area"), rounded(DocumentFeedback::strokeBounds(record)));

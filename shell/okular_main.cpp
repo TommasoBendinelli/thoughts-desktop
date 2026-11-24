@@ -279,6 +279,23 @@ static void showAgentNotesWhenReady(const QJsonObject &request, int attempts = 0
     }
 }
 
+// Shows Sign In filled from a thoughts://connect link, once the first window exists. The person
+// presses Sign In; the link alone never signs in.
+static void showSignInWhenReady(const Thoughts::AppSignIn::ConnectLink &link, int attempts = 0)
+{
+    const bool hasShell = std::any_of(QApplication::topLevelWidgets().cbegin(), QApplication::topLevelWidgets().cend(), [](QWidget *widget) {
+        return qobject_cast<Shell *>(widget);
+    });
+    if (hasShell && attempts > 0) {
+        Shell::showSignIn(link);
+    } else if (attempts < 300) {
+        // Always from the event loop, not inside the file-open event that brought the link.
+        QTimer::singleShot(attempts == 0 ? 0 : 100, qApp, [link, attempts] {
+            showSignInWhenReady(link, attempts + 1);
+        });
+    }
+}
+
 // Shows the card in the Library's Review Card tab. A link that launches
 // Thoughts arrives before the first window exists; wait for it rather than
 // opening a second one.
@@ -321,6 +338,14 @@ bool FileOpenEventHandler::eventFilter(QObject *object, QEvent *event)
 
     auto *fileOpenEvent = static_cast<QFileOpenEvent *>(event);
     const QUrl requestedUrl = fileOpenEvent->url();
+    if (Thoughts::AppSignIn::isConnectLinkUrl(requestedUrl)) {
+        if (const std::optional<Thoughts::AppSignIn::ConnectLink> link = Thoughts::AppSignIn::connectLinkFromUrl(requestedUrl)) {
+            showSignInWhenReady(*link);
+        } else {
+            qWarning() << "thoughts://connect: the link is malformed and was ignored";
+        }
+        return true;
+    }
     const QString cardId = reviewCardIdFromUrl(requestedUrl);
     if (!cardId.isEmpty()) {
         showReviewCardWhenReady(cardId);

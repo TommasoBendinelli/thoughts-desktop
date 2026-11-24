@@ -77,19 +77,46 @@ public:
         if (!publishedPath && !importedPath) return {};
         const auto expected = entry.value(QStringLiteral("pdf_sha256")).toString();
         if (!verifiedSha.isEmpty()) return verifiedSha == expected ? entry : QJsonObject();
+        return hasBytes(path, expected) ? entry : QJsonObject();
+    }
+    // The identity of @p path when its bytes are a version the Library published: the current one
+    // (forFile), or an earlier one still in its Library generation folder
+    // (.thoughts-library-stage-<revision> in the root), as that generation's own index lists it,
+    // with that version's pdf_sha256. A reader tab keeps an earlier version on screen while a newer
+    // one is ready. Empty when the document is no longer in the Library.
+    QJsonObject forVersion(const QString &path, const QString &verifiedSha = {}) const {
+        if (const auto current = forFile(path, verifiedSha); !current.isEmpty()) return current;
+        const QFileInfo info(path);
+        const QFileInfo generation(info.absolutePath());
+        const auto root = QFileInfo(m_root).canonicalFilePath();
+        if (!info.isFile() || root.isEmpty() || !generation.fileName().startsWith(QLatin1String(".thoughts-library-stage-"))
+            || QFileInfo(generation.absolutePath()).canonicalFilePath() != root) return {};
+        const auto documentId = byFilename(info.fileName()).value(QStringLiteral("document_id")).toString();
+        if (!validId(documentId)) return {};
+        for (const auto &value : read(QDir(generation.absoluteFilePath()).filePath(QStringLiteral(".thoughts-library-index.json"))).value(QStringLiteral("pdfs")).toArray()) {
+            const auto entry = value.toObject();
+            if (entry.value(QStringLiteral("filename")).toString() != info.fileName() || entry.value(QStringLiteral("document_id")).toString() != documentId) continue;
+            const auto expected = entry.value(QStringLiteral("pdf_sha256")).toString();
+            if (!verifiedSha.isEmpty()) return verifiedSha == expected ? entry : QJsonObject();
+            return hasBytes(path, expected) ? entry : QJsonObject();
+        }
+        return {};
+    }
+    // Whether the file at @p path has the SHA-256 @p expected (remembered per file identity).
+    static bool hasBytes(const QString &path, const QString &expected) {
         static QMutex mutex;
         static QCache<QString, bool> verified(1024);
         const auto identity = artifactFileIdentity(path);
         const auto key = identity + QLatin1Char(':') + expected;
-        if (identity.isEmpty()) return {};
-        { QMutexLocker guard(&mutex); if (verified.contains(key)) return entry; }
+        if (identity.isEmpty()) return false;
+        { QMutexLocker guard(&mutex); if (verified.contains(key)) return true; }
         QFile file(path);
-        if (!file.open(QIODevice::ReadOnly)) return {};
+        if (!file.open(QIODevice::ReadOnly)) return false;
         QCryptographicHash hash(QCryptographicHash::Sha256);
         if (!hash.addData(&file) || artifactFileIdentity(path) != identity
-            || QString::fromLatin1(hash.result().toHex()) != expected) return {};
+            || QString::fromLatin1(hash.result().toHex()) != expected) return false;
         { QMutexLocker guard(&mutex); verified.insert(key, new bool(true)); }
-        return entry;
+        return true;
     }
 
     QString registerImport(const QString &filename, const QString &sha, const QString &path, QString *error) const {

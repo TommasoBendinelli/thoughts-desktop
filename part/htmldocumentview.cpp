@@ -2,6 +2,7 @@
 #include "htmldocumentview.h"
 
 #include "htmleditionserver.h"
+#include "htmllivewebview.h"
 #include "htmlmacnative.h"
 
 #include <QApplication>
@@ -58,6 +59,14 @@ HtmlDocumentView::HtmlDocumentView(QWidget *parent)
     m_bar->setObjectName(QStringLiteral("thoughtsHtmlViewBar"));
     auto *bar = new QHBoxLayout(m_bar);
     bar->setContentsMargins(8, 2, 8, 2);
+    // A live page: "Live · <address>" (its Reload and Take Snapshot are with the buttons).
+    m_liveLabel = new QLabel(m_bar);
+    m_liveLabel->setObjectName(QStringLiteral("thoughtsHtmlLiveLabel"));
+    m_liveLabel->setTextFormat(Qt::PlainText);
+    m_liveLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_liveLabel->setMinimumWidth(80);
+    m_liveLabel->hide();
+    bar->addWidget(m_liveLabel, 2);
     m_notice = new QLabel(m_bar);
     m_notice->setObjectName(QStringLiteral("thoughtsHtmlViewNotice"));
     m_notice->setWordWrap(true);
@@ -84,6 +93,12 @@ HtmlDocumentView::HtmlDocumentView(QWidget *parent)
         bar->addWidget(button);
         return button;
     };
+    m_reload = addButton(tr("Reload"), tr("Load the live page again"), QStringLiteral("thoughtsHtmlLiveReload"));
+    m_reload->hide();
+    m_takeSnapshot = addButton(tr("Take Snapshot"), QString(), QStringLiteral("thoughtsHtmlLiveTakeSnapshot"));
+    m_takeSnapshot->hide();
+    connect(m_reload, &QToolButton::clicked, this, &HtmlDocumentView::reloadRequested);
+    connect(m_takeSnapshot, &QToolButton::clicked, this, &HtmlDocumentView::takeSnapshotRequested);
     QToolButton *smaller = addButton(QStringLiteral("A\u2212"), tr("Smaller text"), QStringLiteral("thoughtsHtmlTextSmaller"));
     m_textSize = new QLabel(m_bar);
     m_textSize->setObjectName(QStringLiteral("thoughtsHtmlTextSize"));
@@ -110,15 +125,37 @@ HtmlDocumentView::HtmlDocumentView(QWidget *parent)
     m_readAloudHost->setObjectName(QStringLiteral("thoughtsHtmlReadAloudHost"));
     m_readAloudHost->hide();
     outer->addWidget(m_readAloudHost);
+    m_stackHost = stackHost;
     m_stack = new QStackedLayout(stackHost);
     m_stack->setContentsMargins(0, 0, 0, 0);
-    m_messageLabel = new QLabel(stackHost);
+    // The message, with its buttons below it (Retry, Open / Cancel).
+    m_messagePage = new QWidget(stackHost);
+    m_messagePage->setObjectName(QStringLiteral("thoughtsHtmlViewMessagePage"));
+    auto *messageLayout = new QVBoxLayout(m_messagePage);
+    messageLayout->addStretch(1);
+    m_messageLabel = new QLabel(m_messagePage);
     m_messageLabel->setObjectName(QStringLiteral("thoughtsHtmlViewMessage"));
     m_messageLabel->setAlignment(Qt::AlignCenter);
     m_messageLabel->setWordWrap(true);
     m_messageLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_messageLabel->setMargin(24);
-    m_stack->addWidget(m_messageLabel);
+    messageLayout->addWidget(m_messageLabel);
+    auto *messageButtons = new QHBoxLayout;
+    messageButtons->addStretch(1);
+    m_messageAction = new QToolButton(m_messagePage);
+    m_messageAction->setObjectName(QStringLiteral("thoughtsHtmlViewMessageAction"));
+    m_messageAction->hide();
+    m_messageCancel = new QToolButton(m_messagePage);
+    m_messageCancel->setObjectName(QStringLiteral("thoughtsHtmlViewMessageCancel"));
+    m_messageCancel->hide();
+    messageButtons->addWidget(m_messageCancel);
+    messageButtons->addWidget(m_messageAction);
+    messageButtons->addStretch(1);
+    messageLayout->addLayout(messageButtons);
+    messageLayout->addStretch(2);
+    connect(m_messageAction, &QToolButton::clicked, this, &HtmlDocumentView::messageActionClicked);
+    connect(m_messageCancel, &QToolButton::clicked, this, &HtmlDocumentView::messageCancelClicked);
+    m_stack->addWidget(m_messagePage);
     m_holdTimer.setSingleShot(true);
     m_holdTimer.setInterval(120);
     connect(&m_holdTimer, &QTimer::timeout, this, [this] { flushHeld(true); });
@@ -129,13 +166,26 @@ HtmlDocumentView::HtmlDocumentView(QWidget *parent)
         showMessage(tr("HTML not available: there is no web view here."));
     }
 #ifdef Q_OS_MACOS
+    // A click on the WKWebView goes to the web view, not to Qt: a popup open over it (the feedback
+    // editor) would never learn of a click outside it.
+    HtmlMacNative::closePopupsOnWebViewClicks();
     connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
-        // Programmatic focus elsewhere in our window: keys must leave the WKWebView (Spike 2).
-        if (!m_web || !now || now == m_container || now->window() != window()) {
+        // Programmatic focus elsewhere in our window, or in a popup opened over it (the feedback
+        // editor's comment): keys must leave the WKWebView (Spike 2). The popup gets its keys
+        // through our window, whose first responder the WKWebView otherwise stays: it then kept
+        // Space (scrolling the page) and the arrows, and only the other keys reached the comment.
+        if ((!m_web && !m_liveWeb) || !now || now == m_container || (m_liveContainer && now == m_liveContainer)) {
             return;
         }
-        if (HtmlMacNative::webViewHasNativeFocus(m_web)) {
-            HtmlMacNative::focusQt(now);
+        QWidget *top = now->window();
+        while (top && top->windowType() == Qt::Popup && top->parentWidget()) {
+            top = top->parentWidget()->window();
+        }
+        if (top != window()) {
+            return;
+        }
+        if ((m_web && HtmlMacNative::webViewHasNativeFocus(m_web)) || (m_liveWeb && m_liveWeb->hasNativeFocus())) {
+            HtmlMacNative::focusQt(now->window() == window() ? now : this);
         }
         m_pageFocused = false;
     });
@@ -147,6 +197,7 @@ HtmlDocumentView::~HtmlDocumentView()
     m_pendingCalls.clear();
     m_pollTimer.stop();
     removeNativeTransport();
+    destroyLive();
 }
 
 bool HtmlDocumentView::webViewAvailable()
@@ -160,15 +211,29 @@ bool HtmlDocumentView::webViewAvailable()
 #endif
 }
 
-void HtmlDocumentView::showMessage(const QString &text)
+void HtmlDocumentView::showMessage(const QString &text, const QString &actionText, const QString &cancelText)
 {
     m_messageLabel->setText(text);
-    m_stack->setCurrentWidget(m_messageLabel);
+    m_messageAction->setText(actionText);
+    m_messageAction->setVisible(!actionText.isEmpty());
+    m_messageCancel->setText(cancelText);
+    m_messageCancel->setVisible(!cancelText.isEmpty());
+    m_stack->setCurrentWidget(m_messagePage);
 }
 
 QString HtmlDocumentView::message() const
 {
-    return m_stack->currentWidget() == m_messageLabel ? m_messageLabel->text() : QString();
+    return m_stack->currentWidget() == m_messagePage ? m_messageLabel->text() : QString();
+}
+
+QString HtmlDocumentView::messageActionText() const
+{
+    return m_stack->currentWidget() == m_messagePage && !m_messageAction->isHidden() ? m_messageAction->text() : QString();
+}
+
+QString HtmlDocumentView::messageCancelText() const
+{
+    return m_stack->currentWidget() == m_messagePage && !m_messageCancel->isHidden() ? m_messageCancel->text() : QString();
 }
 
 QWindow *HtmlDocumentView::webWindow() const
@@ -178,11 +243,20 @@ QWindow *HtmlDocumentView::webWindow() const
 
 QWidget *HtmlDocumentView::webContainer() const
 {
-    return m_container;
+    return m_live ? m_liveContainer : m_container;
 }
 
 void HtmlDocumentView::snapshotPage(std::function<void(const QImage &)> done)
 {
+    // A live page as its own web view draws it.
+    if (m_live) {
+        if (m_liveWeb) {
+            m_liveWeb->snapshot(std::move(done));
+        } else {
+            done(QImage());
+        }
+        return;
+    }
 #ifdef Q_OS_MACOS
     if (m_web) {
         HtmlMacNative::snapshot(m_web, std::move(done));
@@ -211,7 +285,7 @@ void HtmlDocumentView::ensureWebView()
     web->settings()->setAttribute(QWebViewSettings::WebAttribute::AllowFileAccess, false);
     web->settings()->setAttribute(QWebViewSettings::WebAttribute::LocalContentCanAccessFileUrls, false);
     m_web = web;
-    m_container = QWidget::createWindowContainer(web, m_messageLabel->parentWidget());
+    m_container = QWidget::createWindowContainer(web, m_stackHost);
     m_container->setObjectName(QStringLiteral("thoughtsHtmlViewContainer"));
     m_container->setFocusPolicy(Qt::StrongFocus);
     m_stack->addWidget(m_container);
@@ -271,6 +345,7 @@ void HtmlDocumentView::loadEdition(const QString &bundleDir, const QString &entr
     m_loadOptions = options;
     m_bundleDir = bundleDir;
     m_attachment = false;
+    destroyLive();
     m_pollTimer.stop();
     m_transportKind = QStringLiteral("http");
     if (!m_server->serve(bundleDir)) {
@@ -300,6 +375,7 @@ void HtmlDocumentView::loadAttachment(const QUrl &url, const QJsonObject &option
     m_bundleDir.clear();
     m_attachment = true;
     m_pageUrl = url;
+    destroyLive();
     m_pollTimer.stop();
 #if THOUGHTS_HAVE_QTWEBVIEW
     if (!webViewAvailable()) {
@@ -325,12 +401,106 @@ void HtmlDocumentView::unload()
     m_attachment = false;
     m_pageUrl = QUrl();
     m_transportKind.clear();
+    destroyLive();
 #if THOUGHTS_HAVE_QTWEBVIEW
     if (m_web) {
         asWebView(m_web)->setUrl(QUrl(QStringLiteral("about:blank")));
     }
 #endif
     showMessage(QString());
+}
+
+void HtmlDocumentView::loadLive(const QUrl &url)
+{
+    // Nothing of an embedded page or edition keeps running behind it.
+    unload();
+    m_live = true;
+    m_liveLoaded = false;
+    m_liveUrl = url;
+    m_transportKind = QStringLiteral("live");
+    if (!HtmlLiveWebView::available()) {
+        Q_EMIT liveLoadFailed(tr("there is no web view for live pages here"));
+        return;
+    }
+    m_liveWeb = new HtmlLiveWebView(this);
+    connect(m_liveWeb, &HtmlLiveWebView::loadCommitted, this, [this] {
+        if (m_liveContainer) m_stack->setCurrentWidget(m_liveContainer);
+    });
+    connect(m_liveWeb, &HtmlLiveWebView::loadFinished, this, [this](const QUrl &loaded) {
+        m_liveLoaded = true;
+        if (m_liveContainer) m_stack->setCurrentWidget(m_liveContainer);
+        Q_EMIT liveLoaded(loaded);
+    });
+    connect(m_liveWeb, &HtmlLiveWebView::loadFailed, this, [this](const QString &error) {
+        m_liveLoaded = false;
+        Q_EMIT liveLoadFailed(error);
+    });
+    connect(m_liveWeb, &HtmlLiveWebView::linkRequested, this, &HtmlDocumentView::externalLinkRequested);
+    connect(m_liveWeb, &HtmlLiveWebView::selectionMenuRequested, this, &HtmlDocumentView::liveSelectionMenuRequested);
+    connect(m_liveWeb, &HtmlLiveWebView::selectionChoice, this, &HtmlDocumentView::liveSelectionChoice);
+    if (m_liveSelectionFeedback) m_liveWeb->setSelectionFeedbackProvider(m_liveSelectionFeedback);
+    if (m_liveWeb->window()) {
+        m_liveContainer = QWidget::createWindowContainer(m_liveWeb->window(), m_stackHost);
+        m_liveContainer->setObjectName(QStringLiteral("thoughtsHtmlLiveContainer"));
+        m_liveContainer->setFocusPolicy(Qt::StrongFocus);
+        m_stack->addWidget(m_liveContainer);
+    }
+    showMessage(tr("Loading %1\u2026").arg(url.toDisplayString()));
+    m_liveWeb->load(url);
+}
+
+void HtmlDocumentView::reloadLive()
+{
+    if (!m_live) {
+        return;
+    }
+    if (!m_liveWeb) {
+        loadLive(m_liveUrl);
+        return;
+    }
+    // From a message (a failure): "Loading…" until the page shows again.
+    if (m_stack->currentWidget() != m_liveContainer) {
+        showMessage(tr("Loading %1\u2026").arg(m_liveUrl.toDisplayString()));
+    }
+    m_liveLoaded = false;
+    m_liveWeb->reload();
+}
+
+void HtmlDocumentView::callLive(const QString &body, const QJsonObject &args, std::function<void(bool, const QString &, const QString &)> done)
+{
+    if (!m_live || !m_liveWeb) {
+        done(false, QString(), tr("no live page is shown"));
+        return;
+    }
+    m_liveWeb->callAsync(body, args, std::move(done));
+}
+
+void HtmlDocumentView::setLiveSelectionFeedbackProvider(std::function<bool()> provider)
+{
+    m_liveSelectionFeedback = std::move(provider);
+    if (m_liveWeb) m_liveWeb->setSelectionFeedbackProvider(m_liveSelectionFeedback);
+}
+
+void HtmlDocumentView::copyLiveSelection()
+{
+    if (m_live && m_liveWeb) {
+        m_liveWeb->copySelection();
+    }
+}
+
+void HtmlDocumentView::destroyLive()
+{
+    m_live = false;
+    m_liveLoaded = false;
+    m_liveUrl = QUrl();
+    // The container (and with it the foreign window) before the web view it shows.
+    if (m_liveContainer) {
+        if (m_stack) m_stack->removeWidget(m_liveContainer);
+        delete m_liveContainer;
+        m_liveContainer = nullptr;
+    }
+    delete m_liveWeb;
+    m_liveWeb = nullptr;
 }
 
 bool HtmlDocumentView::isLoadedPage(const QUrl &url) const
@@ -603,8 +773,8 @@ void HtmlDocumentView::setTheme(const QString &theme)
 
 void HtmlDocumentView::focusPage()
 {
-    if (m_container) {
-        m_container->setFocus(Qt::OtherFocusReason);
+    if (QWidget *container = webContainer()) {
+        container->setFocus(Qt::OtherFocusReason);
     }
 }
 
@@ -671,5 +841,40 @@ QString HtmlDocumentView::selectionActionText() const
 bool HtmlDocumentView::selectionActionEnabled() const
 {
     return !m_selectionAction->isHidden() && m_selectionAction->isEnabled();
+}
+
+QString HtmlDocumentView::selectionActionToolTip() const
+{
+    return m_selectionAction->toolTip();
+}
+
+void HtmlDocumentView::setLiveBar(const QString &text)
+{
+    m_liveLabel->setText(text);
+    m_liveLabel->setToolTip(text);
+    m_liveLabel->setVisible(!text.isEmpty());
+    m_reload->setVisible(!text.isEmpty());
+    m_takeSnapshot->setVisible(!text.isEmpty());
+}
+
+QString HtmlDocumentView::liveBarText() const
+{
+    return m_liveLabel->isHidden() ? QString() : m_liveLabel->text();
+}
+
+void HtmlDocumentView::setTakeSnapshotAction(bool enabled, const QString &toolTip)
+{
+    m_takeSnapshot->setEnabled(enabled);
+    m_takeSnapshot->setToolTip(toolTip);
+}
+
+bool HtmlDocumentView::takeSnapshotEnabled() const
+{
+    return !m_takeSnapshot->isHidden() && m_takeSnapshot->isEnabled();
+}
+
+QString HtmlDocumentView::takeSnapshotToolTip() const
+{
+    return m_takeSnapshot->toolTip();
 }
 }

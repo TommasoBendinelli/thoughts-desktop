@@ -6,10 +6,12 @@
 #include "projectreadingcontext.h"
 #include "projectfeedback.h"
 #include "thoughtsplatform.h"
+#include "thoughtsserveraddress.h"
 #include "thoughtshome.h"
 #include "sourceowner.h"
 #include "documentidentity.h"
 #include "pdflinkoverridedialog.h"
+#include "pdfplacelink.h"
 #include "reviewcardfeedback.h"
 #include "feedbackversion.h"
 #include "pdfversions.h"
@@ -17,6 +19,9 @@
 #include "reviewfeedbackoverlay.h"
 #include "documentfeedback.h"
 #include "documentfeedbackoverlay.h"
+#include "readingoverlaylayer.h"
+#include "readingoverlaylist.h"
+#include "readingoverlays.h"
 #include <QCache>
 #include <QMutex>
 #include <QMutexLocker>
@@ -55,6 +60,7 @@
 #include <QStackedWidget>
 #include <QContextMenuEvent>
 #include <QCryptographicHash>
+#include <QKeySequence>
 #include <QCursor>
 #include <QDate>
 #include <QDateTime>
@@ -92,6 +98,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QScopedValueRollback>
 #include <QScrollBar>
 #include <QSplitter>
@@ -193,6 +200,7 @@
 #include "agentproposaldecisionqueue.h"
 #include "agentproposalhoverbar.h"
 #include "shell/syncstatuslabels.h"
+#include "shell/thoughtspagelink.h"
 #include "side_reviews.h"
 #include "sidebar.h"
 #include "signaturepanel.h"
@@ -650,6 +658,15 @@ Part::Part(QObject *parent, const QVariantList &args)
         }
     });
     connect(m_reviewsWidget, &Reviews::agentProposalsResolutionRequested, this, &Part::resolveAgentProposalsFromSidebar);
+    // The Proposals tab's arrows: proposal decisions only (⌘Z also takes back a newer annotation).
+    connect(m_reviewsWidget, &Reviews::agentProposalUndoRequested, this, [this] {
+        if (m_agentProposalUndoState.available && m_agentProposalUndoEnabled) undoLastAgentProposalResolution();
+    });
+    connect(m_reviewsWidget, &Reviews::agentProposalRedoRequested, this, &Part::redoAgentProposalResolution);
+    connect(m_reviewsWidget, &Reviews::agentProposalRowsTimed, this, [this](qint64 durationMs, int rows, int superseded) {
+        Q_EMIT developerEvent(QStringLiteral("proposal.list.loaded"),
+                              {{QStringLiteral("duration_ms"), durationMs}, {QStringLiteral("rows"), rows}, {QStringLiteral("superseded"), superseded}});
+    });
     connect(m_reviewsWidget, &Reviews::agentProposalReviewRequested, this, [this](const QString &proposalId) { requestAgentProposalReview(proposalId); });
     connect(m_reviewsWidget, &Reviews::agentProposalsChanged, this, [this] {
         if (!m_pageView) {
@@ -690,6 +707,27 @@ Part::Part(QObject *parent, const QVariantList &args)
     rightLayout->setSpacing(0);
     //	KToolBar * rtb = new KToolBar( rightContainer, "mainToolBarSS" );
     //	rightLayout->addWidget( rtb );
+    // A newer version of the Library PDF on screen is ready; the tab keeps this one (keepShownVersion).
+    m_newerVersionMessage = new KMessageWidget(rightContainer);
+    m_newerVersionMessage->setObjectName(QStringLiteral("newerVersionMessage"));
+    m_newerVersionMessage->setVisible(false);
+    m_newerVersionMessage->setWordWrap(true);
+    m_newerVersionMessage->setMessageType(KMessageWidget::Information);
+    m_newerVersionMessage->setPosition(KMessageWidget::Position::Header);
+    m_newerVersionMessage->setCloseButtonVisible(false);
+    m_newerVersionMessage->setText(i18n("A newer version of this document is ready."));
+    m_showNewestVersionAction = new QAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Show Newest Version"), m_newerVersionMessage);
+    m_showNewestVersionAction->setObjectName(QStringLiteral("showNewestVersion"));
+    connect(m_showNewestVersionAction, &QAction::triggered, this, [this] { showNewestVersion(); });
+    m_newerVersionMessage->addAction(m_showNewestVersionAction);
+    rightLayout->addWidget(m_newerVersionMessage);
+    // Show Newest Version during a Sync: the reload waits for its end, never longer than this.
+    m_newestVersionTimer = new QTimer(this);
+    m_newestVersionTimer->setSingleShot(true);
+    m_newestVersionTimer->setInterval(30000);
+    connect(m_newestVersionTimer, &QTimer::timeout, this, [this] {
+        if (m_newestVersionRequested) reloadNewestVersion();
+    });
     m_migrationMessage = new KMessageWidget(rightContainer);
     m_migrationMessage->setVisible(false);
     m_migrationMessage->setWordWrap(true);
@@ -749,7 +787,20 @@ Part::Part(QObject *parent, const QVariantList &args)
     m_pageView->setCommentRecordProvider([this](const QString &id) { return currentCommentDetailsRecord(id); });
     m_pageView->setLinkOverrideHandlers([this](const Okular::Action *action, int page) { return openPdfLinkOverride(action, page); },
                                         [this](QMenu *menu, const Okular::Action *action, int page) { addPdfLinkOverrideActions(menu, action, page); });
+    // A web link of the PDF to this computer's server's "Open in Thoughts" page opens the
+    // document here (core asks before the browser, for every way a link is followed), and so does
+    // a link to a place in a Library PDF.
+    Thoughts::setWebLinkHandler(m_document, this, [this](const QUrl &link) { return openPdfPlaceLink(link) || openServerPageLink(link); });
     connect(m_pageView, &PageView::agentProposalOverlaysReloaded, this, &Part::locateOpenAgentProposal);
+    connect(m_pageView, &PageView::agentProposalWindowClosed, this, [this](const QString &proposalId) {
+        if (m_reviewsWidget) {
+            m_reviewsWidget->agentProposalWindowClosed(proposalId);
+        }
+    });
+    connect(m_pageView, &PageView::agentProposalOverlaysTimed, this, [this](qint64 durationMs, int overlays, int superseded) {
+        Q_EMIT developerEvent(QStringLiteral("proposal.overlays.loaded"),
+                              {{QStringLiteral("duration_ms"), durationMs}, {QStringLiteral("overlays"), overlays}, {QStringLiteral("superseded"), superseded}});
+    });
     connect(m_pageView, &PageView::reviewFeedbackChanged, this, &Part::reviewFeedbackChanged);
     m_pageView->reviewFeedback()->setWriter([this](const QJsonObject &record, QString *error) {
         if (!m_fedoraRepository) {
@@ -765,6 +816,32 @@ Part::Part(QObject *parent, const QVariantList &args)
         }
         const auto own = projectFeedbackToDocument(record, error);
         return own && m_fedoraRepository->enqueueDocumentFeedback(*own, error);
+    });
+    // Pictures on comments (document-feedback.md §12): kept here with drawings' snapshots, by their
+    // SHA-256, and uploaded before the record that names them.
+    m_pageView->setFeedbackPictureStore({
+        [this](const QByteArray &bytes, QString *error) {
+            if (!m_fedoraRepository) {
+                if (error) *error = i18n("The local sync queue is not available.");
+                return QString();
+            }
+            return m_fedoraRepository->keepFeedbackSnapshot(bytes, error);
+        },
+        [this](const QString &sha256) { return m_fedoraRepository ? m_fedoraRepository->feedbackSnapshot(sha256) : QByteArray(); },
+        [this](const QString &sha256, QObject *context, std::function<void(bool)> done) {
+            if (!m_fedoraRepository) {
+                done(false);
+                return;
+            }
+            m_fedoraRepository->fetchFeedbackSnapshot(sha256, context, std::move(done));
+        }});
+    // Delete Mark and Delete Overlay: the user's revisions of an agent's overlay, queued.
+    m_pageView->readingOverlays()->setWriter([this](const QJsonObject &record, QString *error) {
+        if (!m_fedoraRepository) {
+            if (error) *error = i18n("The local sync queue is not available.");
+            return false;
+        }
+        return m_fedoraRepository->enqueueReadingOverlay(record, error);
     });
     m_pageView->reviewFeedback()->setBatchWriter([this](const QList<QJsonObject> &records, QString *error) {
         if (!m_fedoraRepository) {
@@ -796,15 +873,50 @@ Part::Part(QObject *parent, const QVariantList &args)
         showDocumentFeedbackList();
     });
     connect(m_pageView.data(), &PageView::documentFeedbackAdded, this, [this](const QString &feedbackId) {
+        // What was just given shows on the page, also when its kind's markup was off.
+        showMarkupOfFeedback(feedbackId);
         if (showAnnotationsForNewEntry()) m_reviewsWidget->selectFeedback(feedbackId);
     });
     connect(m_pageView.data(), &PageView::annotationAdded, this, [this](Okular::Annotation *annotation, int pageNumber) {
+        if (annotation && Okular::AnnotationUtils::isCommentAnnotation(annotation)) setMarkupShown(AnnotationModel::Comment, true);
         if (showAnnotationsForNewEntry()) m_reviewsWidget->selectAnnotation(annotation, pageNumber);
     });
     connect(m_reviewsWidget.data(), &Reviews::feedbackRequested, this, &Part::showFeedback);
     connect(m_reviewsWidget.data(), &Reviews::feedbackDeleteRequested, m_pageView.data(), &PageView::deleteDocumentFeedback);
     connect(m_reviewsWidget.data(), &Reviews::feedbackResolveRequested, m_pageView.data(), &PageView::resolveDocumentFeedback);
     connect(m_reviewsWidget.data(), &Reviews::earlierFeedbackToggled, this, [this](bool shown) { m_pageView->documentFeedback()->setShowEarlier(shown); });
+    // The Overlay tab lists the page's reading overlays; opening it, or a mark, shows them.
+    m_reviewsWidget->readingOverlayList()->setLayer(m_pageView->readingOverlays());
+    connect(m_reviewsWidget.data(), &Reviews::readingOverlaysOpened, this, &Part::showReadingOverlayMarkup);
+    connect(m_reviewsWidget->readingOverlayList(), &Thoughts::ReadingOverlayList::markRequested, this, &Part::showReadingOverlayMark);
+    // A mark's popup on the page: its byline shows the mark in the Overlay tab; Ask About This sends
+    // its page to the agent (through the Shell).
+    connect(m_pageView.data(), &PageView::readingOverlayMarkRevealRequested, this, &Part::revealReadingOverlayMark);
+    connect(m_pageView.data(), &PageView::readingOverlayQuestionAsked, this, &Part::askAboutReadingOverlayMark);
+    // A mark's note: its picture in the popup, and the note itself in Agent Notes (the Shell has them).
+    connect(m_pageView.data(), &PageView::readingOverlayNoteRequested, this, &Part::requestReadingOverlayMarkNote);
+    connect(m_pageView.data(), &PageView::readingOverlayNoteOpenRequested, this, &Part::requestOpenAgentNote);
+    // Copy Request names this document: its title (else its file name), Library file and document ID.
+    m_reviewsWidget->readingOverlayRequestBar()->setDocumentProvider([this] {
+        Thoughts::ReadingOverlayRequestBar::Document document;
+        document.filename = url().isLocalFile() ? QFileInfo(localFilePath()).fileName() : url().fileName();
+        document.documentId = m_pageView ? m_pageView->readingOverlays()->documentId() : QString();
+        const QString title = m_document->metaData(QStringLiteral("DocumentTitle")).toString().simplified();
+        document.name = title.isEmpty() ? QFileInfo(document.filename).completeBaseName() : title;
+        return document;
+    });
+    connect(m_reviewsWidget->readingOverlayList(), &Thoughts::ReadingOverlayList::failed, this, [this](const QString &message) { noticeMessage(message); });
+    connect(m_pageView.data(), &PageView::readingOverlaysChanged, this, [this] {
+        // An overlay a link asked for: the PDF's identity is known now, or Sync brought it.
+        const auto *overlays = m_pageView->readingOverlays();
+        if (m_pendingReadingOverlay.isEmpty() || !overlays->hasDocument()) return;
+        if (!m_pendingReadingOverlayNoticed || !overlays->record(m_pendingReadingOverlay).isEmpty()) {
+            QTimer::singleShot(0, this, [this] {
+                const QString pending = m_pendingReadingOverlay;
+                if (!pending.isEmpty()) showReadingOverlay(pending);
+            });
+        }
+    });
     m_pageView->documentFeedback()->setAttachmentVersions([this](const QString &path) { return attachmentVersion(path); });
     connect(m_pageView.data(), &PageView::commentRelatedMetadataSaveRequested, this, [this](const QString &annotationId, int page, const QString &contents, const QVariantMap &metadataPatch) {
         const QVariantMap result = editReviewAnnotation(annotationId, page, contents, metadataPatch);
@@ -828,6 +940,13 @@ Part::Part(QObject *parent, const QVariantList &args)
     connect(m_pageView.data(), &PageView::commentRelatedOpenSourceRequested, this, &Part::requestOpenCommentSource);
     connect(m_pageView.data(), &PageView::agentProposalReviewRequested, this, [this](const QString &proposalId) { requestAgentProposalReview(proposalId); });
     connect(m_pageView.data(), &PageView::agentProposalResolutionRequested, this, &Part::resolveAgentProposalFromCard);
+    // ⌘Z and ⇧⌘Z in the proposal's window: as the reader's Undo and Redo.
+    connect(m_pageView.data(), &PageView::agentProposalUndoRequested, this, [this] {
+        if (m_undoAction && m_undoAction->isEnabled()) m_undoAction->trigger();
+    });
+    connect(m_pageView.data(), &PageView::agentProposalRedoRequested, this, [this] {
+        if (auto *redo = actionCollection()->action(QStringLiteral("edit_redo")); redo && redo->isEnabled()) redo->trigger();
+    });
     m_pageView->setAgentProposalDecisionStateProvider([this](const QString &proposalId) { return agentProposalDecisionState(proposalId); });
     m_liveProposalDecisions = new Thoughts::LiveProposalDecisionQueue(this);
     connect(m_liveProposalDecisions, &Thoughts::LiveProposalDecisionQueue::finished, this, &Part::finishLiveAgentProposalDecision);
@@ -897,13 +1016,23 @@ Part::Part(QObject *parent, const QVariantList &args)
         m_pageView->closeReviewAnnotationWindow();
         m_pageView->showReviewMasks(regions, PageView::ReviewMaskStyle::SidebarHighlight, navigate);
     });
+    // A card of the newest version while an earlier one is kept: that version, then the card there.
+    // Queued: the reload rebuilds the list the card was chosen in.
+    connect(
+        m_reviewsWidget.data(), &Reviews::newestVersionCardRequested, this,
+        [this](const QString &cardId) {
+            if (!m_keepingShownVersion) return;
+            m_cardAfterNewestVersion = cardId;
+            showNewestVersion();
+        },
+        Qt::QueuedConnection);
     connect(m_reviewsWidget.data(), &Reviews::clearReviewCardPresentationRequested, m_pageView.data(), &PageView::clearReviewMask);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardHighlightHidden, m_pageView.data(), &PageView::clearSidebarReviewHighlight);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardEditRequested, this, &Part::requestEditReviewCard);
+    connect(m_reviewsWidget.data(), &Reviews::reviewCardWholeDocumentRequested, this, &Part::requestWholeDocumentReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardOpenRequested, this, &Part::requestOpenReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardReviewRequested, this, &Part::requestReviewReviewCard);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardsMergeRequested, this, &Part::requestMergeReviewCards);
-    connect(m_reviewsWidget.data(), &Reviews::reviewCardKindRequested, this, &Part::requestReviewCardKind);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardsRetireRequested, this, &Part::requestRetireReviewCards);
     connect(m_reviewsWidget.data(), &Reviews::reviewCardsDeleteRequested, this, &Part::requestDeleteReviewCards);
     // Showing or hiding a kind in the Annotations list also shows or hides its
@@ -911,28 +1040,7 @@ Part::Part(QObject *parent, const QVariantList &args)
     // saved and every open document follows, exactly as from the toolbar menu.
     // The Review cards toggle is only the general layer of all card answers; a
     // review session's own answer mask is drawn independently of it.
-    connect(m_reviewsWidget.data(), &Reviews::typeFilterClicked, this, [this](int itemType, bool shown) {
-        QString name;
-        switch (itemType) {
-        case AnnotationModel::Comment:
-            name = QStringLiteral("highlight_comments");
-            break;
-        case AnnotationModel::Feedback:
-            name = QStringLiteral("highlight_feedback");
-            break;
-        case AnnotationModel::AgentProposal:
-            name = QStringLiteral("highlight_agent_edits");
-            break;
-        case AnnotationModel::ReviewCard:
-            name = QStringLiteral("highlight_review_cards");
-            break;
-        default:
-            return;
-        }
-        if (QAction *toggle = actionCollection()->action(name)) {
-            toggle->setChecked(shown);
-        }
-    });
+    connect(m_reviewsWidget.data(), &Reviews::typeFilterClicked, this, &Part::setMarkupShown);
     connect(m_pageView.data(), &PageView::reviewCardEditRequested, m_reviewsWidget.data(), &Reviews::editActiveReviewCard);
     connect(m_pageView.data(), &PageView::annotationClicked, m_reviewsWidget.data(), &Reviews::selectAnnotation);
 
@@ -970,7 +1078,10 @@ Part::Part(QObject *parent, const QVariantList &args)
     connect(m_watcher, &KDirWatch::deleted, this, &Part::slotFileDirty);
     m_dirtyHandler = new QTimer(this);
     m_dirtyHandler->setSingleShot(true);
-    connect(m_dirtyHandler, &QTimer::timeout, this, [this] { slotAttemptReload(); });
+    // The file changed on disk: a Library PDF on screen stays (with the newer-version bar), any other reloads.
+    connect(m_dirtyHandler, &QTimer::timeout, this, [this] {
+        if (!keepShownVersion(localFilePath())) slotAttemptReload();
+    });
     m_docsCommentRefreshTimer = new QTimer(this);
     m_docsCommentRefreshTimer->setSingleShot(true);
     m_docsCommentRefreshTimer->setInterval(80);
@@ -1008,8 +1119,12 @@ Part::Part(QObject *parent, const QVariantList &args)
                                                                                                   m_pageView->reviewFeedback()->document(),
                                                                                                   m_pageView->reviewFeedback()->homeCards(), true));
         if (m_pageView && m_pageView->documentFeedback()->hasDocument()) {
-            if (m_projectFeedback.reading) refreshDocumentFeedback();
-            else m_pageView->documentFeedback()->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(projections, m_pageView->documentFeedback()->documentId(), true));
+            if (m_projectFeedback.reading) {
+                refreshDocumentFeedback();
+            } else {
+                m_pageView->documentFeedback()->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(projections, m_pageView->documentFeedback()->documentId(), true));
+                refreshReadingOverlays();
+            }
         }
         if (m_htmlReader && m_htmlReader->isActive()) {
             refreshHtmlComments();
@@ -1068,6 +1183,8 @@ Part::Part(QObject *parent, const QVariantList &args)
         const QString currentRoot = QDir(m_docsRenderRoot).filePath(QStringLiteral("current_pdfs"));
         const QString currentPath = QDir(currentRoot).filePath(filename);
         if (!QFileInfo(currentPath).isFile()) {
+            // Gone from the Library: no newer version to show.
+            updateNewerVersionBar();
             return;
         }
         const auto published = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(currentPath);
@@ -1075,9 +1192,14 @@ Part::Part(QObject *parent, const QVariantList &args)
             setFileToWatch(localFilePath());
             return;
         }
-        if (published.value(QStringLiteral("pdf_sha256")).toString() == m_libraryActivationPdfSha256
-            && m_document->relocateUnchangedBackingFile(currentPath, QUrl::fromLocalFile(currentPath))) {
+        // The bytes on screen: those the tab opened, or the earlier version it keeps.
+        const QString shownSha256 = m_keepingShownVersion ? m_docsOpenedPdfSha256 : m_libraryActivationPdfSha256;
+        // The pages stay read from the immutable generation file (as a tab opens them), so a later
+        // version kept on screen keeps its bytes.
+        if (published.value(QStringLiteral("pdf_sha256")).toString() == shownSha256
+            && m_document->relocateUnchangedBackingFile(QFileInfo(currentPath).canonicalFilePath(), QUrl::fromLocalFile(currentPath))) {
             // The loaded bytes and selection remain valid; only storage moved.
+            stopKeepingShownVersion();
             setUrl(QUrl::fromLocalFile(currentPath));
             setLocalFilePath(currentPath);
             m_docsCommentPdfPath = currentPath;
@@ -1085,6 +1207,11 @@ Part::Part(QObject *parent, const QVariantList &args)
             m_docsOpenedPdfPath = QFileInfo(currentPath).canonicalFilePath();
             scheduleDocsCommentRefresh();
             setFileToWatch(currentPath);
+            return;
+        }
+        // A Library PDF read in the page view keeps the version on screen, with the bar.
+        if (keepShownVersion(currentPath)) {
+            setFileToWatch(localFilePath());
             return;
         }
 
@@ -1114,6 +1241,8 @@ Part::Part(QObject *parent, const QVariantList &args)
             }
             scheduleDocsCommentRefresh();
         }
+        // Show Newest Version waited for the Sync: its end, or the start of another, shows it now.
+        if (m_newestVersionRequested) reloadNewestVersion();
         Q_EMIT fedoraManualSyncStateChanged(static_cast<int>(state), message, details);
     });
     // A build that a Sync left running on the server has ended: what checkFedoraRemoteWork would
@@ -1264,7 +1393,12 @@ void Part::setupViewerActions()
     m_historyBack = nullptr;
     m_historyNext = nullptr;
 
-    m_addBookmark = KStandardAction::addBookmark(this, SLOT(slotAddBookmark()), ac);
+    // Not in the action collection: KDE's standard menu layout puts any action named
+    // bookmark_add into a Bookmarks menu of its own.
+    m_addBookmark = KStandardAction::addBookmark(this, SLOT(slotAddBookmark()), this);
+    // Bookmarks are not offered (unused, 19 Nov): no menu, no
+    // page-menu entries and no shortcut. ⌘B shows and hides the sidebar (show_leftpanel).
+    ac->setDefaultShortcuts(m_addBookmark, {});
     m_addBookmarkText = m_addBookmark->text();
     m_addBookmarkIcon = m_addBookmark->icon();
     m_bookmarkList->setAddBookmarkAction(m_addBookmark);
@@ -1410,7 +1544,7 @@ void Part::setViewerShortcuts()
     ac->setDefaultShortcut(m_findNext, QKeySequence());
     ac->setDefaultShortcut(m_findPrev, QKeySequence());
 
-    ac->setDefaultShortcut(m_addBookmark, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_B));
+    ac->setDefaultShortcuts(m_addBookmark, {});
 
     ac->setDefaultShortcut(m_beginningOfDocument, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Home));
     ac->setDefaultShortcut(m_endOfDocument, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_End));
@@ -1453,7 +1587,12 @@ void Part::setupActions()
     const QString preferredSidebarIcon = m_sidebar->layoutDirection() == Qt::LeftToRight ? QStringLiteral("sidebar-expand-left") : QStringLiteral("sidebar-expand-right");
     m_showLeftPanel->setIcon(QIcon::fromTheme(preferredSidebarIcon, QIcon::fromTheme(QStringLiteral("view-sidetree"))));
     connect(m_showLeftPanel, &QAction::toggled, this, &Part::slotShowLeftPanel);
-    ac->setDefaultShortcut(m_showLeftPanel, QKeySequence(Qt::Key_F7));
+    // F7, and ⌘B as editors hide their sidebar (on macOS Control-B too).
+    QList<QKeySequence> sidebarShortcuts{QKeySequence(Qt::Key_F7), QKeySequence(Qt::CTRL | Qt::Key_B)};
+#ifdef Q_OS_MACOS
+    sidebarShortcuts.append(QKeySequence(Qt::META | Qt::Key_B));
+#endif
+    ac->setDefaultShortcuts(m_showLeftPanel, sidebarShortcuts);
     m_showLeftPanel->setChecked(Okular::Settings::showLeftPanel());
     slotShowLeftPanel();
 
@@ -2765,6 +2904,8 @@ bool Part::closeUrl(bool promptToSave)
     }
     m_outsideCommentsPdfPath.clear();
     m_outsideCommentsSha256.clear();
+    // Opening a document, a reload and Show Newest Version show its newest version.
+    stopKeepingShownVersion();
 
     if (m_swapInsteadOfOpening) {
         // If we're swapping the backing file, we don't want to close the
@@ -2773,7 +2914,10 @@ bool Part::closeUrl(bool promptToSave)
     }
 
     m_document->setHistoryClean(true);
-    if (m_pageView) m_pageView->documentFeedback()->clear();
+    if (m_pageView) {
+        m_pageView->documentFeedback()->clear();
+        m_pageView->readingOverlays()->clear();
+    }
     m_reviewUndoIndices.clear();
     m_reviewRedoIndices.clear();
     m_reviewMetadataHistory.clear();
@@ -3023,7 +3167,7 @@ void Part::slotFileDirty(const QString &path)
 // Attempt to reload the document, one or more times, optionally from a different URL
 bool Part::slotAttemptReload(bool oneShot, const QUrl &newUrl)
 {
-    if (m_syncUiDeferred) {
+    if (m_syncUiDeferred && !m_reloadDuringSync) {
         m_syncPdfReloadPending = true;
         if (m_syncPdfReloadSource != url() || !newUrl.isEmpty()) { m_syncPdfReloadTarget = newUrl; }
         m_syncPdfReloadSource = url();
@@ -3122,6 +3266,142 @@ bool Part::slotAttemptReload(bool oneShot, const QUrl &newUrl)
     }
 
     return reloadSucceeded;
+}
+
+// Whether @p path is a file of a Library generation folder in @p docsRoot
+// (.thoughts-library-stage-<revision>): its bytes never change there.
+static bool isLibraryGenerationFile(const QString &docsRoot, const QString &path)
+{
+    static const QRegularExpression generationName(QStringLiteral("^\\.thoughts-library-stage-[0-9a-f]{64}$"));
+    const QFileInfo file(path);
+    const QFileInfo generation(file.absolutePath());
+    const QString root = QFileInfo(docsRoot).canonicalFilePath();
+    return file.isFile() && !root.isEmpty() && generationName.match(generation.fileName()).hasMatch()
+        && QFileInfo(generation.absolutePath()).canonicalFilePath() == root;
+}
+
+// Since 19 November feedback belongs to the PDF version it was given on: before, a Sync
+// that reloaded the open PDF took away what had just been added. A Library PDF read in the page
+// view keeps the version on screen: its bytes stay in the immutable Library generation it was
+// opened from (held against the cleanup of old generations), what is given meanwhile is given on
+// it, and a bar offers the newest version. A PDF from elsewhere, a Project read as one PDF, an
+// HTML view or page in front, or bytes that are no longer kept at a path reload as before.
+bool Part::keepShownVersion(const QString &newestPath)
+{
+    if (!m_document->isOpened() || !url().isLocalFile() || m_isReloading || newestPath.isEmpty()) return false;
+    const QFileInfo newest(newestPath);
+    if (!newest.isFile() || newest.absoluteFilePath() != QFileInfo(localFilePath()).absoluteFilePath()) return false;
+    // The version waiting: the one the Library index lists now (verified when its generation was activated).
+    const QString newestSha256 = Thoughts::DocumentIdentityStore(m_docsRenderRoot).byFilename(newest.fileName()).value(QStringLiteral("pdf_sha256")).toString().toLower();
+    if (newestSha256.isEmpty()) return false;
+    if (!m_keepingShownVersion) {
+        // A verified Library identity is only found for a Library tab (startDocsPdfIdentityVerification).
+        if (m_attachmentTab || m_attachmentShown || htmlViewActive() || !m_docsOpenedPdfIdentityVerified || m_docsOpenedPdfSha256.size() != 64
+            || Thoughts::ProjectReadingContext::load(m_docsOpenedPdfPath))
+            return false;
+        if (!isLibraryGenerationFile(m_docsRenderRoot, m_docsOpenedPdfPath) || newest.canonicalFilePath() == QFileInfo(m_docsOpenedPdfPath).canonicalFilePath())
+            return false;
+    }
+    // The newest is the version on screen after all: the reload shows it as before.
+    if (newestSha256 == m_docsOpenedPdfSha256) return false;
+    const bool started = !m_keepingShownVersion;
+    if (started) {
+        m_keepingShownVersion = true;
+        m_heldLibraryGeneration = QFileInfo(m_docsOpenedPdfPath).absolutePath();
+        FedoraRepository::holdLibraryGeneration(m_heldLibraryGeneration);
+    }
+    // The Cards list shows the cards placed on the newest version too, marked so.
+    if (m_reviewsWidget) m_reviewsWidget->setNewestVersionSha256(newestSha256);
+    updateNewerVersionBar();
+    if (started) Q_EMIT keptVersionChanged(true);
+    return true;
+}
+
+void Part::stopKeepingShownVersion()
+{
+    const bool stopped = std::exchange(m_keepingShownVersion, false);
+    m_newestVersionRequested = false;
+    m_cardAfterNewestVersion.clear();
+    if (m_newestVersionTimer) m_newestVersionTimer->stop();
+    if (!m_heldLibraryGeneration.isEmpty()) FedoraRepository::releaseLibraryGeneration(std::exchange(m_heldLibraryGeneration, QString()));
+    if (m_reviewsWidget) m_reviewsWidget->setNewestVersionSha256(QString());
+    updateNewerVersionBar();
+    if (stopped) Q_EMIT keptVersionChanged(false);
+}
+
+void Part::updateNewerVersionBar()
+{
+    if (!m_newerVersionMessage) return;
+    // Over the page view only: an HTML view or page in front shows no PDF version. A running Sync
+    // never hides it: the reload asked for meanwhile waits for its end, and the bar says so.
+    m_newerVersionMessage->setText(m_newestVersionRequested ? i18n("Showing the newest version when the Sync ends…")
+                                                            : i18n("A newer version of this document is ready."));
+    if (m_showNewestVersionAction) m_showNewestVersionAction->setEnabled(!m_newestVersionRequested);
+    m_newerVersionMessage->setVisible(m_keepingShownVersion && !m_attachmentShown && !htmlViewActive() && QFileInfo::exists(localFilePath()));
+}
+
+QString Part::shownFilePath() const
+{
+    return m_keepingShownVersion ? m_docsOpenedPdfPath : localFilePath();
+}
+
+bool Part::keepsEarlierVersion() const
+{
+    return m_keepingShownVersion;
+}
+
+bool Part::showNewestVersion()
+{
+    if (!m_keepingShownVersion || !QFileInfo::exists(localFilePath())) return false;
+    m_dirtyHandler->stop();
+    // During a Sync the reload waits for its end, as every reload does then, with the bar saying
+    // so; it happens at the latest when another Sync starts or after m_newestVersionTimer.
+    if (m_syncUiDeferred) {
+        m_newestVersionRequested = true;
+        if (!m_newestVersionTimer->isActive()) m_newestVersionTimer->start();
+        updateNewerVersionBar();
+        return true;
+    }
+    return reloadNewestVersion();
+}
+
+bool Part::reloadNewestVersion()
+{
+    if (!m_keepingShownVersion) {
+        m_newestVersionRequested = false;
+        return false;
+    }
+    m_newestVersionTimer->stop();
+    // Taken now: the reload closes the version kept (stopKeepingShownVersion) and the Cards list.
+    const QString card = std::exchange(m_cardAfterNewestVersion, QString());
+    const QJsonArray cards = m_sidebarReviewCards;
+    bool reloaded = false;
+    {
+        // Asked for: not deferred again by the Sync that may be running.
+        const QScopedValueRollback<bool> duringSync(m_reloadDuringSync, true);
+        reloaded = slotAttemptReload(true, url());
+    }
+    if (!reloaded) {
+        m_newestVersionRequested = false;
+        updateNewerVersionBar();
+        return false;
+    }
+    if (!card.isEmpty() && m_reviewsWidget) {
+        // The Shell gives the cards again once the document has opened; without one, those it gave.
+        if (!m_reviewsWidget->selectReviewCard(card)) {
+            setSidebarReviewCards(cards);
+            m_reviewsWidget->selectReviewCard(card);
+        }
+    }
+    return true;
+}
+
+QJsonObject Part::shownLibraryIdentity() const
+{
+    if (!url().isLocalFile()) return {};
+    const QString path = shownFilePath();
+    const QString verified = !m_docsOpenedPdfSha256.isEmpty() && QFileInfo(m_docsOpenedPdfPath) == QFileInfo(path) ? m_docsOpenedPdfSha256 : QString();
+    return Thoughts::DocumentIdentityStore(m_docsRenderRoot).forVersion(path, verified);
 }
 
 void Part::updateViewActions()
@@ -3434,7 +3714,8 @@ std::optional<Part::PdfLinkContext> Part::pdfLinkContext(const Okular::Action *a
         if (!url().isLocalFile()) {
             return std::nullopt;
         }
-        const QJsonObject identity = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(localFilePath());
+        // The links of the version on screen.
+        const QJsonObject identity = shownLibraryIdentity();
         context.sourceDocumentId = identity.value(QStringLiteral("document_id")).toString();
         context.sourcePdfSha256 = identity.value(QStringLiteral("pdf_sha256")).toString();
     }
@@ -3513,6 +3794,56 @@ std::optional<Part::PdfLinkContext> Part::pdfLinkContext(const Okular::Action *a
 QJsonObject Part::pdfLinkOverride(const PdfLinkContext &context) const
 {
     return Thoughts::PdfLinkOverrides::findOverride(m_fedoraProjections, context.sourceDocumentId, context.link);
+}
+
+bool Part::openServerPageLink(const QUrl &url)
+{
+    if (!isSignalConnected(QMetaMethod::fromSignal(&Part::requestOpenPageLink)) || !Thoughts::serverPageLink(url, Thoughts::ownServerOrigins())) {
+        return false;
+    }
+    Q_EMIT requestOpenPageLink(url);
+    return true;
+}
+
+bool Part::openPdfPlaceLink(const QUrl &url)
+{
+    if (url.scheme() != QLatin1String("thoughts-pdf-link") || !isSignalConnected(QMetaMethod::fromSignal(&Part::requestOpenPdfPlaceLink))) {
+        return false;
+    }
+    Q_EMIT requestOpenPdfPlaceLink(url.toString());
+    return true;
+}
+
+bool Part::showPdfPlace(const QString &href)
+{
+    const std::optional<Thoughts::PdfPlaceLink> link = Thoughts::parsePdfPlaceLink(href);
+    if (!link || !m_pageView || !m_document->isOpened() || m_document->pages() == 0) {
+        return false;
+    }
+    const int page = std::min(link->page, int(m_document->pages()) - 1);
+    // PDF points need the page's crop box in points, which only the PDF generator knows.
+    const QVariantMap info = m_document->metaData(QStringLiteral("ThoughtsPageInfo"), page).toMap();
+    QSizeF crop(info.value(QStringLiteral("width")).toDouble(), info.value(QStringLiteral("height")).toDouble());
+    const Okular::Page *shown = m_document->page(page);
+    if ((!link->point && !link->rect) || crop.isEmpty() || !shown) {
+        // The page's top; a passage an earlier link marked goes.
+        m_pageView->showPlace(page, std::nullopt, std::nullopt);
+        return true;
+    }
+    // Poppler gives the crop box as the page's /Rotate shows it; the link is in the PDF's own
+    // user space, before that turn. The page is shown turned by /Rotate and the reader's rotation.
+    if (int(shown->orientation()) % 2 == 1) {
+        crop.transpose();
+    }
+    const int turns = int(shown->totalOrientation());
+    std::optional<QPointF> point;
+    std::optional<QRectF> rect;
+    if (link->point) point = Thoughts::normalizedPdfPoint(*link->point, crop, turns);
+    if (link->rect) rect = Thoughts::normalizedPdfRect(*link->rect, crop, turns);
+    // The place is in the PDF: an HTML edition shown instead gives way to it.
+    setDocumentView(QStringLiteral("pdf"));
+    m_pageView->showPlace(page, point, rect);
+    return true;
 }
 
 bool Part::openPdfLinkOverride(const Okular::Action *action, int page)
@@ -4101,9 +4432,10 @@ bool Part::saveAs(const QUrl &saveUrl, SaveAsFlags flags)
                 // Otherwise just copy the open file.
                 // make use of the already downloaded (in case of remote URLs) file,
                 // no point in downloading that again
-                QUrl srcUrl = QUrl::fromLocalFile(localFilePath());
+                // The version on screen (an earlier one kept while a newer one is ready too).
+                QUrl srcUrl = QUrl::fromLocalFile(shownFilePath());
                 // duh, our local file disappeared...
-                if (!QFile::exists(localFilePath())) {
+                if (!QFile::exists(shownFilePath())) {
                     if (url().isLocalFile()) {
 #ifdef OKULAR_KEEP_FILE_OPEN
                         // local file: try to get it back from the open handle on it
@@ -4592,16 +4924,10 @@ void Part::showMenu(const Okular::Page *page, const QPoint point, const QString 
             const QIcon &syncIcon = QIcon::fromTheme(QStringLiteral("emblem-synchronizing"), QIcon::fromTheme(QStringLiteral("view-refresh")));
             popup.addAction(syncIcon, i18n("Sync Thumbnail with Page"), m_thumbnailList.data(), &ThumbnailList::syncThumbnail);
         }
-        if ((!isCurrentPage && m_document->bookmarkManager()->isBookmarked(page->number())) || (isCurrentPage && m_document->bookmarkManager()->isBookmarked(m_document->viewport()))) {
-            removeBookmark = popup.addAction(QIcon::fromTheme(QStringLiteral("bookmark-remove"), QIcon::fromTheme(QStringLiteral("edit-delete-bookmark"))), i18n("Remove Bookmark"));
-        } else {
-            addBookmark = popup.addAction(QIcon::fromTheme(QStringLiteral("bookmark-new")), i18n("Add Bookmark"));
-        }
+        // Bookmarks are not offered: no Add/Remove Bookmark or Previous/Next Bookmark here.
         if (m_pageView->canFitPageWidth()) {
             fitPageWidth = popup.addAction(QIcon::fromTheme(QStringLiteral("zoom-fit-best")), i18n("Fit Width"));
         }
-        popup.addAction(m_prevBookmark);
-        popup.addAction(m_nextBookmark);
         reallyShow = true;
     }
 
@@ -4969,8 +5295,8 @@ bool Part::exportPdfWithComments(const QUrl &destination)
             return false;
         }
         sourceUrl = QUrl::fromLocalFile(temporaryPath);
-    } else if (QFileInfo::exists(localFilePath())) {
-        sourceUrl = QUrl::fromLocalFile(localFilePath());
+    } else if (QFileInfo::exists(shownFilePath())) {
+        sourceUrl = QUrl::fromLocalFile(shownFilePath());
     } else {
         return false;
     }
@@ -5421,6 +5747,7 @@ void Part::clearDocsCommentWatcher()
         m_docsCommentMutationFlushTimer->stop();
     }
     m_pendingReviewAnnotationId.clear();
+    m_pendingReviewAnnotationClock.invalidate();
     if (!m_applyingCommentStorage) {
         m_commentService.reset(); m_legacyCommentStates.clear();
         m_commentUndoTokens.clear(); m_commentRedoTokens.clear(); m_commentHistoryDocumentIndex.clear();
@@ -7432,7 +7759,11 @@ void Part::startDocsPdfIdentityVerification(const QUrl &documentUrl, const QStri
         return;
     }
     const QString logicalPath = QFileInfo(documentUrl.toLocalFile()).absoluteFilePath();
-    const QString openedPath = openedPathOverride.isEmpty() ? QFileInfo(documentUrl.toLocalFile()).canonicalFilePath() : QFileInfo(openedPathOverride).absoluteFilePath();
+    // An earlier version kept on screen: its own file, not the newer one the path leads to now.
+    const QString keptPath = m_keepingShownVersion ? m_document->metaData(QStringLiteral("OpenedFilePath")).toString() : QString();
+    const QString openedPath = !openedPathOverride.isEmpty() ? QFileInfo(openedPathOverride).absoluteFilePath()
+        : !keptPath.isEmpty()                             ? QFileInfo(keptPath).absoluteFilePath()
+                                                          : QFileInfo(documentUrl.toLocalFile()).canonicalFilePath();
     if (openedPath.isEmpty()) {
         return;
     }
@@ -7627,6 +7958,7 @@ QJsonObject Part::effectiveFedoraProjections() const
 
 void Part::setSidebarReviewCards(const QJsonArray &cards)
 {
+    m_sidebarReviewCards = cards;
     m_reviewsWidget->setReviewCards(cards);
     // A retired card stays on the PDF version it was retired on: the HTML view and the
     // attachments show the current one, so they leave it out.
@@ -7851,8 +8183,12 @@ QVariantMap Part::focusAgentProposal(const QString &proposalId, const QString &s
     if (!viewport.isValid()) {
         return {{QStringLiteral("focused"), false}, {QStringLiteral("pending"), false}, {QStringLiteral("error"), i18n("SyncTeX could not locate this proposal in the current PDF.")}};
     }
-    m_document->setViewport(viewport, nullptr, true);
+    // Scrolled to only when near; a page out of sight is shown at once (no pages drawn in between).
+    m_document->setViewport(viewport, nullptr, std::abs(int(m_document->currentPage()) - viewport.pageNumber) <= 1);
     m_pageView->setLastSourceLocationViewport(viewport);
+    // SyncTeX names a line, not a passage: the window goes beside a strip of the page there.
+    const double lineY = viewport.rePos.enabled ? viewport.rePos.normalizedY : 0.0;
+    m_pageView->placeAgentProposalWindowNear(proposalId, viewport.pageNumber, QRectF(0.0, std::clamp(lineY - 0.015, 0.0, 0.97), 1.0, 0.03));
     return {{QStringLiteral("focused"), true}, {QStringLiteral("pending"), false}, {QStringLiteral("mode"), QStringLiteral("synctex")}};
 }
 
@@ -7867,9 +8203,23 @@ QVariantMap Part::openAgentProposalReview(const QString &proposalId, const QStri
     if (!m_pageView || !m_reviewsWidget || proposalId.isEmpty()) {
         return {{QStringLiteral("opened"), false}, {QStringLiteral("pending"), false}, {QStringLiteral("error"), i18n("The proposal review is unavailable.")}};
     }
+    // A new opening, unless this is a retry of one still waiting for its row.
+    AgentProposalOpenTiming &timing = m_agentProposalOpenTiming;
+    if (timing.id != proposalId || timing.windowShownMs >= 0 || !timing.requested.isValid()) {
+        timing = {};
+        timing.id = proposalId;
+        timing.requested.start();
+    }
+    ++timing.attempts;
     QString sourceError;
     if (!sourcePath.isEmpty() && m_reviewsWidget->agentProposal(proposalId).id != proposalId) {
+        QElapsedTimer sourceRead;
+        sourceRead.start();
+        const int readsBefore = m_reviewsWidget->agentProposalSourceReads();
         sourceError = m_reviewsWidget->loadAgentProposalSource(proposalId, sourcePath);
+        ++timing.sourceChecks;
+        timing.sourceReads += m_reviewsWidget->agentProposalSourceReads() - readsBefore;
+        timing.sourceReadMs += sourceRead.elapsed();
     }
     const AgentProposalSidebarEntry proposal = m_reviewsWidget->agentProposal(proposalId);
     if (proposal.id == proposalId) {
@@ -7881,7 +8231,21 @@ QVariantMap Part::openAgentProposalReview(const QString &proposalId, const QStri
         m_currentAgentProposalSourcePath = proposal.sourcePath;
         m_currentAgentProposalSourceLine = proposal.sourceLine;
         m_currentAgentProposalTargetsCurrentText = proposedTextIsEmpty;
+        // Asked for: it shows on the page, also when the Agent proposals markup was off (Visible
+        // markup), through the same switch, so the setting, the menu and the page agree.
+        setMarkupShown(AnnotationModel::AgentProposal, true);
         m_pageView->openAgentProposalWindow(proposal);
+        revealAgentProposalInSidebar(proposalId);
+        timing.windowShownMs = timing.requested.elapsed();
+        timing.locating.start();
+        Q_EMIT developerEvent(QStringLiteral("proposal.open.window_shown"),
+                              {{QStringLiteral("proposal_id"), proposalId},
+                               {QStringLiteral("duration_ms"), timing.windowShownMs},
+                               {QStringLiteral("attempts"), timing.attempts},
+                               {QStringLiteral("source_checks"), timing.sourceChecks},
+                               {QStringLiteral("source_reads"), timing.sourceReads},
+                               {QStringLiteral("source_read_ms"), timing.sourceReadMs},
+                               {QStringLiteral("overlays_ready"), m_pageView->agentProposalOverlaysReady()}});
         locateOpenAgentProposal();
         return {{QStringLiteral("opened"), true}, {QStringLiteral("pending"), false}};
     }
@@ -7908,12 +8272,25 @@ void Part::locateOpenAgentProposal()
         if (!m_agentProposalTextSearchRunning) {
             m_document->resetSearch(AgentProposalSearchId);
         }
+        reportAgentProposalLocated(m_currentAgentProposalReviewId, QStringLiteral("overlay"));
         return;
     }
     if (m_locatedAgentProposalReviewId == m_currentAgentProposalReviewId) {
         return;
     }
     if (!m_pageView->agentProposalOverlaysReady()) {
+        if (m_agentProposalOpenTiming.id == m_currentAgentProposalReviewId) {
+            ++m_agentProposalOpenTiming.overlayWaits;
+        }
+        return;
+    }
+    // A proposal written after the PDF was built is not in it: the text it would replace is, so
+    // that is looked for at once instead of first searching every page for the proposed text.
+    bool builtKnown = false;
+    const bool built = m_pageView->agentProposalBuiltIntoPdf(m_currentAgentProposalReviewId, &builtKnown);
+    if (builtKnown && !built && !m_currentAgentProposalTargetsCurrentText && !m_currentAgentProposalFallbackText.trimmed().isEmpty()) {
+        startAgentProposalTextSearch(m_currentAgentProposalReviewId, m_currentAgentProposalFallbackText, QString(), true,
+                                     m_currentAgentProposalSourcePath, m_currentAgentProposalSourceLine);
         return;
     }
     startAgentProposalTextSearch(m_currentAgentProposalReviewId,
@@ -7938,7 +8315,10 @@ void Part::startAgentProposalTextSearch(const QString &proposalId,
             return;
         }
         const QVariantMap result = focusAgentProposal(proposalId, sourcePath, sourceLine);
-        if (!result.value(QStringLiteral("focused")).toBool() && !result.value(QStringLiteral("pending")).toBool()) {
+        if (result.value(QStringLiteral("focused")).toBool()) {
+            reportAgentProposalLocated(proposalId, result.value(QStringLiteral("mode")).toString());
+        } else if (!result.value(QStringLiteral("pending")).toBool()) {
+            reportAgentProposalLocated(proposalId, QStringLiteral("unavailable"));
             QTimer::singleShot(0, this, [this, proposalId] {
                 if (m_pageView && m_currentAgentProposalReviewId == proposalId) {
                     m_pageView->showAgentProposalLocationUnavailable(proposalId);
@@ -7978,12 +8358,18 @@ void Part::startAgentProposalTextSearch(const QString &proposalId,
     m_agentProposalTextSearchSourceLine = sourceLine;
     m_agentProposalTextSearchTargetsCurrentText = targetsCurrentText;
     m_agentProposalTextSearchRunning = true;
+    if (m_agentProposalOpenTiming.id == proposalId) {
+        ++m_agentProposalOpenTiming.textSearches;
+        m_agentProposalOpenTiming.textSearch.start();
+    }
+    // The view is moved once the match is known (finishAgentProposalTextSearch), not by the
+    // search: it scrolled there through every page in between, then moved again.
     m_document->searchText(AgentProposalSearchId,
                            query,
                            true,
                            Qt::CaseInsensitive,
                            Document::NextMatch,
-                           true,
+                           false,
                            QColor(255, 210, 0, 150));
 }
 
@@ -7996,11 +8382,19 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
     const int completedSourceLine = m_agentProposalTextSearchSourceLine;
     const bool completedSearchTargetsCurrentText = m_agentProposalTextSearchTargetsCurrentText;
     m_agentProposalTextSearchRunning = false;
+    if (m_agentProposalOpenTiming.id == completedProposalId && m_agentProposalOpenTiming.textSearch.isValid()) {
+        // The search runs from the first page, one page per event-loop turn.
+        const QList<Document::SearchResult> found = status == Document::MatchFound ? m_document->searchResults(AgentProposalSearchId) : QList<Document::SearchResult>();
+        m_agentProposalOpenTiming.pagesSearched += found.isEmpty() ? int(m_document->pages()) : found.constFirst().pageNumber + 1;
+        m_agentProposalOpenTiming.textSearchMs += m_agentProposalOpenTiming.textSearch.elapsed();
+        m_agentProposalOpenTiming.textSearch.invalidate();
+    }
 
     if (completedProposalId == m_currentAgentProposalReviewId && m_pageView->selectAgentProposal(completedProposalId)) {
         m_locatedAgentProposalReviewId = completedProposalId;
         m_document->resetSearch(AgentProposalSearchId);
         m_pendingAgentProposalTextSearchId.clear();
+        reportAgentProposalLocated(completedProposalId, QStringLiteral("overlay"));
         return;
     }
 
@@ -8008,9 +8402,13 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
         const QList<Document::SearchResult> matches = m_document->searchResults(AgentProposalSearchId);
         if (!matches.isEmpty() && !matches.constFirst().area.isEmpty()) {
             m_locatedAgentProposalReviewId = completedProposalId;
+            reportAgentProposalLocated(completedProposalId, completedSearchTargetsCurrentText && !m_currentAgentProposalTargetsCurrentText
+                                                                ? QStringLiteral("fallback_text_search") : QStringLiteral("text_search"));
             const Document::SearchResult &match = matches.constFirst();
             const Okular::NormalizedRect &rect = match.area.constFirst();
             const Okular::Page *page = m_document->page(match.pageNumber);
+            // The passage the window goes beside: the match, or the whole proposal once its end is found.
+            QRectF passage(QPointF(rect.left, rect.top), QPointF(rect.right, rect.bottom));
             if (page) {
                 std::unique_ptr<Okular::RegularAreaRect> endMatch;
                 for (const QString &endQuery : agentProposalEndSearchQueries(completedProposalText)) {
@@ -8028,6 +8426,7 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
                     const Okular::TextSelection selection(Okular::NormalizedPoint(rect.left, startY), Okular::NormalizedPoint(endX, endY));
                     std::unique_ptr<Okular::RegularAreaRect> fullArea = page->textArea(selection);
                     if (fullArea && !fullArea->isEmpty()) {
+                        for (const Okular::NormalizedRect &piece : std::as_const(*fullArea)) passage |= QRectF(QPointF(piece.left, piece.top), QPointF(piece.right, piece.bottom));
                         m_pageView->setAgentProposalTextHighlight(match.pageNumber, std::move(fullArea));
                         m_document->resetSearch(AgentProposalSearchId);
                     }
@@ -8038,7 +8437,8 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
             viewport.rePos.pos = DocumentViewport::TopLeft;
             viewport.rePos.normalizedX = std::max(0.0, rect.left - 0.04);
             viewport.rePos.normalizedY = std::max(0.0, rect.top - 0.10);
-            m_document->setViewport(viewport, nullptr, true);
+            m_document->setViewport(viewport, nullptr, std::abs(int(m_document->currentPage()) - match.pageNumber) <= 1);
+            m_pageView->placeAgentProposalWindowNear(completedProposalId, match.pageNumber, passage);
         }
         if (completedSearchTargetsCurrentText) {
             m_pageView->showAgentProposalBuildRequired(completedProposalId);
@@ -8053,7 +8453,10 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
             return;
         } else {
             const QVariantMap result = focusAgentProposal(completedProposalId, completedSourcePath, completedSourceLine);
-            if (!result.value(QStringLiteral("focused")).toBool() && !result.value(QStringLiteral("pending")).toBool()) {
+            if (result.value(QStringLiteral("focused")).toBool()) {
+                reportAgentProposalLocated(completedProposalId, result.value(QStringLiteral("mode")).toString());
+            } else if (!result.value(QStringLiteral("pending")).toBool()) {
+                reportAgentProposalLocated(completedProposalId, QStringLiteral("unavailable"));
                 m_pageView->showAgentProposalLocationUnavailable(completedProposalId);
             }
         }
@@ -8080,6 +8483,41 @@ void Part::finishAgentProposalTextSearch(Document::SearchStatus status)
     }
 }
 
+void Part::revealAgentProposalInSidebar(const QString &proposalId)
+{
+    if (!m_reviewsWidget) {
+        return;
+    }
+    // With the sidebar shown, the Annotations list is shown with its Proposals; a search's
+    // results or a card under review keep the sidebar as it is.
+    const bool sidebarShown = m_showLeftPanel && m_showLeftPanel->isChecked() && !m_sidebar->isTransientWidgetVisible() && !(m_pageView && m_pageView->reviewingCard());
+    if (sidebarShown && m_sidebar->currentItem() != m_reviewsWidget) {
+        m_sidebar->setCurrentItem(m_reviewsWidget);
+        updateSidebarDisplayActions();
+    }
+    m_reviewsWidget->selectAgentProposal(proposalId, sidebarShown);
+}
+
+void Part::reportAgentProposalLocated(const QString &proposalId, const QString &method)
+{
+    AgentProposalOpenTiming &timing = m_agentProposalOpenTiming;
+    if (timing.id != proposalId || timing.reported || timing.windowShownMs < 0) {
+        return;
+    }
+    timing.reported = true;
+    Q_EMIT developerEvent(QStringLiteral("proposal.open.located"),
+                          {{QStringLiteral("proposal_id"), proposalId},
+                           {QStringLiteral("method"), method},
+                           {QStringLiteral("duration_ms"), timing.requested.elapsed()},
+                           {QStringLiteral("window_ms"), timing.windowShownMs},
+                           {QStringLiteral("locate_ms"), timing.locating.elapsed()},
+                           {QStringLiteral("attempts"), timing.attempts},
+                           {QStringLiteral("overlay_waits"), timing.overlayWaits},
+                           {QStringLiteral("text_searches"), timing.textSearches},
+                           {QStringLiteral("pages_searched"), timing.pagesSearched},
+                           {QStringLiteral("text_search_ms"), timing.textSearchMs}});
+}
+
 void Part::requestAgentProposalReview(const QString &proposalId, int attempt)
 {
     if (attempt == 0) {
@@ -8092,8 +8530,9 @@ void Part::requestAgentProposalReview(const QString &proposalId, int attempt)
         m_pendingAgentProposalReviewId.clear();
         return;
     }
-    if (result.value(QStringLiteral("pending")).toBool() && attempt < 40) {
-        QTimer::singleShot(50, this, [this, proposalId, attempt] { requestAgentProposalReview(proposalId, attempt + 1); });
+    // Asked again soon while the PDF's proposals are read (cheap now: no source is read again).
+    if (result.value(QStringLiteral("pending")).toBool() && attempt < 100) {
+        QTimer::singleShot(20, this, [this, proposalId, attempt] { requestAgentProposalReview(proposalId, attempt + 1); });
         return;
     }
     m_pendingAgentProposalReviewId.clear();
@@ -8156,6 +8595,9 @@ void Part::queueLiveAgentProposalDecision(const QStringList &proposalIds, const 
     PendingLiveProposalDecision pending;
     pending.clock.start();
     pending.proposalIds = proposalIds;
+    pending.requestedIds = proposalIds;
+    pending.label = m_reviewsWidget->agentProposal(proposalIds.constFirst()).motivation;
+    pending.redo = std::exchange(m_queueingAgentProposalRedo, false);
     pending.action = action;
     pending.target = url().isLocalFile() ? QFileInfo(url().toLocalFile()).fileName() : QString();
     // The other half of a move pair is decided with it (§12): hide it too when this document shows it.
@@ -8299,22 +8741,31 @@ void Part::finishLiveAgentProposalDecision(const Thoughts::LiveProposalDecisionR
         return;
     }
 
-    m_agentProposalUndoState = {true,
-                                false,
-                                {},
-                                pending.proposalIds,
-                                pending.action,
-                                result.request.sourcePath,
-                                result.updatedSourceSha256,
-                                result.previousContents,
-                                pending.target};
-    m_agentProposalUndoState.otherSources = result.otherSources;
+    AgentProposalUndoState decided{true,
+                                   false,
+                                   {},
+                                   pending.proposalIds,
+                                   pending.action,
+                                   result.request.sourcePath,
+                                   result.updatedSourceSha256,
+                                   result.previousContents,
+                                   pending.target};
+    decided.otherSources = result.otherSources;
+    decided.requestedIds = pending.requestedIds;
+    decided.label = pending.label;
+    pushAgentProposalUndoState(decided, pending.redo);
+    // Saved only here until a Sync sends it: without this the decision waited
+    // for the next Sync anyone started, while agents could change the same
+    // proposals on the server.
+    Q_EMIT agentProposalsDecidedLocally();
     if (m_pendingLiveProposalDecisions.isEmpty()) {
         hideAgentProposalStatus(true);
         if (m_pageView) {
             const int count = pending.proposalIds.size();
-            m_pageView->displayMessage(accept ? i18np("Accepted — saved to TeX. No PDF rebuild needed.", "%1 proposals accepted — saved to TeX. No PDF rebuild needed.", count)
-                                              : i18np("Rejected — saved to TeX. Sync to update the PDF.", "%1 proposals rejected — saved to TeX. Sync to update the PDF.", count),
+            // Said where the user looks: how to take it back.
+            const QString undoKey = QKeySequence(QKeySequence::Undo).toString(QKeySequence::NativeText);
+            m_pageView->displayMessage(accept ? i18np("Accepted — saved to TeX. %2 undoes it.", "%1 proposals accepted — saved to TeX. %2 undoes it.", count, undoKey)
+                                              : i18np("Rejected — saved to TeX. %2 undoes it.", "%1 proposals rejected — saved to TeX. %2 undoes it.", count, undoKey),
                                        QString(),
                                        PageViewMessage::Info,
                                        2500);
@@ -8373,8 +8824,8 @@ void Part::handleAgentProposalResolutionStatus(const QString &operationId, const
             ? i18n("Acceptance undone — proposal restored. No PDF rebuild needed.")
             : i18n("Rejection undone — proposal restored. PDF update queued.");
         restoreAgentProposalSurfaces(pending.proposalIds);
-        m_agentProposalUndoState = {};
-        hideAgentProposalStatus(false);
+        popAgentProposalUndoState();
+        hideAgentProposalStatus(m_agentProposalUndoState.available);
         Q_EMIT agentProposalResolutionStatusChanged(operationId,
                                                     pending.proposalIds,
                                                     QStringLiteral("undo_") + pending.action,
@@ -8391,7 +8842,7 @@ void Part::handleAgentProposalResolutionStatus(const QString &operationId, const
             m_pageView->showAgentProposalResolutionSuccess(proposalId, success);
         }
     }
-    m_agentProposalUndoState = {true,
+    pushAgentProposalUndoState({true,
                                 true,
                                 operationId,
                                 pending.proposalIds,
@@ -8399,7 +8850,8 @@ void Part::handleAgentProposalResolutionStatus(const QString &operationId, const
                                 {},
                                 {},
                                 {},
-                                url().isLocalFile() ? QFileInfo(url().toLocalFile()).fileName() : QString()};
+                                url().isLocalFile() ? QFileInfo(url().toLocalFile()).fileName() : QString()},
+                               false);
     hideAgentProposalStatus(true);
     Q_EMIT agentProposalResolutionStatusChanged(operationId, pending.proposalIds, pending.action, status, success);
     m_pendingAgentProposalResolutions.remove(operationId);
@@ -8448,7 +8900,72 @@ void Part::updateUndoAction()
     const bool commentUndo = !m_commentUndoTokens.isEmpty() && m_commentHistoryDocumentIndex.value(m_commentUndoTokens.last()) == m_document->undoHistoryIndex();
     m_undoAction->setEnabled((m_pageView && m_pageView->canUndoAnnotation())
                              || (m_agentProposalUndoState.available ? m_agentProposalUndoEnabled : commentUndo || m_document->canUndo()));
-    if (auto *redo = actionCollection()->action(QStringLiteral("edit_redo"))) redo->setEnabled(!m_commentRedoTokens.isEmpty() || m_document->canRedo());
+    if (auto *redo = actionCollection()->action(QStringLiteral("edit_redo")))
+        redo->setEnabled(!m_agentProposalRedoStack.isEmpty() || !m_commentRedoTokens.isEmpty() || m_document->canRedo());
+    updateAgentProposalHistoryControls();
+}
+
+void Part::pushAgentProposalUndoState(AgentProposalUndoState state, bool redo)
+{
+    if (m_agentProposalUndoState.available) {
+        m_agentProposalUndoHistory.append(m_agentProposalUndoState);
+        while (m_agentProposalUndoHistory.size() > 100) m_agentProposalUndoHistory.removeFirst();
+    }
+    m_agentProposalUndoState = std::move(state);
+    if (!redo) m_agentProposalRedoStack.clear();
+    updateUndoAction();
+}
+
+void Part::popAgentProposalUndoState()
+{
+    m_agentProposalUndoState = m_agentProposalUndoHistory.isEmpty() ? AgentProposalUndoState{} : m_agentProposalUndoHistory.takeLast();
+    updateUndoAction();
+}
+
+void Part::updateAgentProposalHistoryControls()
+{
+    if (!m_reviewsWidget) return;
+    const auto shortened = [](const QString &text) {
+        const QString line = text.simplified();
+        return line.size() > 80 ? line.left(80).trimmed() + QStringLiteral("…") : line;
+    };
+    const auto decision = [&shortened](const QString &action, const QString &label, int count) {
+        const bool accept = action == QLatin1String("accept");
+        if (label.isEmpty()) return accept ? i18np("accepting 1 proposal", "accepting %1 proposals", count) : i18np("rejecting 1 proposal", "rejecting %1 proposals", count);
+        return accept ? i18n("accepting “%1”", shortened(label)) : i18n("rejecting “%1”", shortened(label));
+    };
+    const QString undoKey = QKeySequence(QKeySequence::Undo).toString(QKeySequence::NativeText);
+    const QString redoKey = QKeySequence(QKeySequence::Redo).toString(QKeySequence::NativeText);
+    const bool canUndo = m_agentProposalUndoState.available && m_agentProposalUndoEnabled;
+    const bool canRedo = !m_agentProposalRedoStack.isEmpty() && m_pendingLiveProposalDecisions.isEmpty();
+    const auto &undo = m_agentProposalUndoState;
+    const QString undoTip = canUndo ? i18n("Undo %1 (%2)", decision(undo.action, undo.label, int(undo.requestedIds.isEmpty() ? undo.proposalIds.size() : undo.requestedIds.size())), undoKey) : QString();
+    const QString redoTip = canRedo ? i18n("Redo %1 (%2)", decision(m_agentProposalRedoStack.constLast().action, m_agentProposalRedoStack.constLast().label,
+                                                                  int(m_agentProposalRedoStack.constLast().proposalIds.size())), redoKey)
+                                    : QString();
+    m_reviewsWidget->setAgentProposalHistory(canUndo, undoTip, canRedo, redoTip);
+}
+
+void Part::redoAgentProposalResolution()
+{
+    if (m_agentProposalRedoStack.isEmpty() || !m_liveProposalDecisions || !m_pendingLiveProposalDecisions.isEmpty()) return;
+    const AgentProposalRedo redo = m_agentProposalRedoStack.takeLast();
+    QFile source(redo.sourcePath);
+    const QString missing = redo.proposalIds.isEmpty() || m_reviewsWidget->agentProposal(redo.proposalIds.constFirst()).id.isEmpty()
+        ? i18n("The proposal is no longer pending, so it was not decided again.")
+        : QString();
+    if (!missing.isEmpty() || !source.open(QIODevice::ReadOnly)) {
+        showAgentProposalStatus(missing.isEmpty() ? i18n("The proposal's source could not be read, so it was not decided again.") : missing,
+                                KMessageWidget::Error, m_agentProposalUndoState.available);
+        updateUndoAction();
+        return;
+    }
+    const QString sha256 = QString::fromLatin1(QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256).toHex());
+    // The decision made again is written like a click's, and ⌘Z takes it back again.
+    m_queueingAgentProposalRedo = true;
+    queueLiveAgentProposalDecision(redo.proposalIds, redo.sourcePath, sha256, redo.action);
+    m_queueingAgentProposalRedo = false;
+    updateUndoAction();
 }
 
 void Part::restoreAgentProposalSurfaces(const QStringList &proposalIds, bool reloadSources)
@@ -8496,11 +9013,12 @@ void Part::undoLastAgentProposalResolution()
         return;
     }
     restoreAgentProposalSurfaces(undo.proposalIds);
-    m_agentProposalUndoState = {};
+    m_agentProposalRedoStack.append({undo.requestedIds.isEmpty() ? undo.proposalIds : undo.requestedIds, undo.action, undo.sourcePath, undo.label});
+    popAgentProposalUndoState();
     const QString success = undo.action == QLatin1String("accept")
         ? i18n("Acceptance undone — proposal restored. No PDF rebuild needed.")
         : i18n("Rejection undone — proposal restored. The next Sync updates the PDF.");
-    hideAgentProposalStatus(false);
+    hideAgentProposalStatus(m_agentProposalUndoState.available);
     Q_EMIT agentProposalResolutionStatusChanged({},
                                                 undo.proposalIds,
                                                 QStringLiteral("undo_") + undo.action,
@@ -8531,6 +9049,16 @@ QVariantMap Part::fedoraManualSyncState() const
         : QVariantMap {{QStringLiteral("state"), static_cast<int>(FedoraRepository::ManualSyncState::Failed)},
                        {QStringLiteral("message"), QStringLiteral("Sync with the server is unavailable.")},
                        {QStringLiteral("details"), QString()}};
+}
+
+bool Part::reloadServerConnection()
+{
+    Thoughts::ServerAddress::connectionChanged();
+    if (!m_fedoraRepository) {
+        return false;
+    }
+    m_fedoraRepository->reloadServerConnection();
+    return m_fedoraRepository->serverConnectionReloadPending();
 }
 
 void Part::checkFedoraRemoteWork()
@@ -8925,7 +9453,8 @@ void Part::unsetDummyMode()
     if (auto *redo = actionCollection()->action(QStringLiteral("edit_redo"))) {
         disconnect(redo, nullptr, m_document, nullptr);
         connect(redo, &QAction::triggered, this, [this] {
-            if (!m_commentRedoTokens.isEmpty() && m_commentHistoryDocumentIndex.value(m_commentRedoTokens.last()) == m_document->undoHistoryIndex()) redoCommentDeletion(m_commentRedoTokens.last());
+            if (!m_agentProposalRedoStack.isEmpty()) redoAgentProposalResolution();
+            else if (!m_commentRedoTokens.isEmpty() && m_commentHistoryDocumentIndex.value(m_commentRedoTokens.last()) == m_document->undoHistoryIndex()) redoCommentDeletion(m_commentRedoTokens.last());
             else m_document->redo();
         });
     }
@@ -9169,6 +9698,14 @@ void Part::slotCopyTextSelectionOrAnnotation()
         text->copy();
         return;
     }
+    // A live page: its own selection, read in Thoughts' script world (it has no viewer).
+    if (m_attachmentShown && m_attachmentView && m_attachmentReader->isLive()) {
+        m_attachmentView->callLive(QStringLiteral("const selection = getSelection(); return selection ? String(selection) : '';"), {},
+                                   [](bool ok, const QString &text, const QString &) {
+                                       if (ok && !text.isEmpty()) QGuiApplication::clipboard()->setText(text);
+                                   });
+        return;
+    }
     // An HTML attachment: ⌘C is Qt's, so copy the page's selection (never masked text).
     if (m_attachmentShown && m_attachmentView && m_attachmentReader->isReady()) {
         m_attachmentView->call(QStringLiteral("copySelection"), {}, [](bool ok, const QJsonValue &result, const QString &) {
@@ -9372,6 +9909,10 @@ bool Part::openUnplacedComment(const QString &annotationId, int expectedPage)
         previousFocusWidget->setFocus(Qt::OtherFocusReason);
     }
     Q_EMIT unplacedCommentOpened(id, page > 0 && page <= int(m_document->pages()) ? page : 0);
+    // Its row in the Annotations list is the highlighted one, as for a comment with a place.
+    if (m_reviewsWidget) {
+        m_reviewsWidget->selectComment(id, m_showLeftPanel && m_showLeftPanel->isChecked());
+    }
     return true;
 }
 
@@ -9382,10 +9923,21 @@ bool Part::openReviewAnnotation(const QString &annotationId, int expectedPage)
     }
 
     if (shouldSyncDocsComments(url()) && (!m_docsOpenedPdfIdentityVerified || m_docsCommentLoadWatcher->isRunning() || m_docsCommentRefreshQueued)) {
+        if (m_pendingReviewAnnotationId != annotationId || !m_pendingReviewAnnotationClock.isValid()) {
+            m_pendingReviewAnnotationClock.start();
+        }
         m_pendingReviewAnnotationId = annotationId;
         m_pendingReviewAnnotationPage = expectedPage;
         return true;
     }
+    // Developer log: how long the comment waited for this document's comments, where it opened.
+    const qint64 waitedMs = m_pendingReviewAnnotationClock.isValid() ? m_pendingReviewAnnotationClock.elapsed() : 0;
+    m_pendingReviewAnnotationClock.invalidate();
+    const auto reportShown = [this, &annotationId, waitedMs](bool placed, int page) {
+        Q_EMIT developerEvent(QStringLiteral("comment.open.shown"),
+                              {{QStringLiteral("comment_id"), annotationId}, {QStringLiteral("waited_ms"), waitedMs},
+                               {QStringLiteral("placed"), placed}, {QStringLiteral("page"), page + 1}});
+    };
     QString id = annotationId;
     if (id.startsWith(QLatin1String("id:"))) {
         id.remove(0, 3);
@@ -9410,6 +9962,7 @@ bool Part::openReviewAnnotation(const QString &annotationId, int expectedPage)
     const int preferredPage = expectedPage - 1;
     if (Okular::Annotation *annotation = annotationOnPage(preferredPage)) {
         delete m_unplacedCommentPanel.data();
+        reportShown(true, preferredPage);
         return m_reviewsWidget->selectAndOpenAnnotation(annotation, preferredPage);
     }
     for (uint pageNumber = 0; pageNumber < m_document->pages(); ++pageNumber) {
@@ -9418,9 +9971,11 @@ bool Part::openReviewAnnotation(const QString &annotationId, int expectedPage)
         }
         if (Okular::Annotation *annotation = annotationOnPage(static_cast<int>(pageNumber))) {
             delete m_unplacedCommentPanel.data();
+            reportShown(true, static_cast<int>(pageNumber));
             return m_reviewsWidget->selectAndOpenAnnotation(annotation, static_cast<int>(pageNumber));
         }
     }
+    reportShown(false, expectedPage - 1);
     return openUnplacedComment(id, expectedPage);
 }
 
@@ -9482,8 +10037,10 @@ void Part::exportProjectPdf(const QJsonObject &project, const QString &destinati
 
 QVariantMap Part::reviewDocumentPayload() const
 {
-    auto payload = m_pageView ? m_pageView->reviewDocumentPayload() : QVariantMap {{QStringLiteral("error"), i18n("The page view is unavailable.")}};
-    const auto identity = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(payload.value(QStringLiteral("pdf_path")).toString(), payload.value(QStringLiteral("pdf_sha256")).toString());
+    // A card is made on the version on screen (an earlier one kept while a newer one is ready too).
+    auto payload = m_pageView ? m_pageView->reviewDocumentPayload(m_keepingShownVersion ? m_docsOpenedPdfPath : QString())
+                              : QVariantMap {{QStringLiteral("error"), i18n("The page view is unavailable.")}};
+    const auto identity = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forVersion(payload.value(QStringLiteral("pdf_path")).toString(), payload.value(QStringLiteral("pdf_sha256")).toString());
     payload.insert(QStringLiteral("document_id"), identity.value(QStringLiteral("document_id")).toString());
     return payload;
 }
@@ -9618,8 +10175,9 @@ void Part::setReviewFeedbackCard(const QJsonObject &card, const QVariantList &re
     m_reviewCardRecord = card;
     m_reviewCardRegions = regions;
     if (!m_pageView) return;
-    const QString path = localFilePath();
-    QString documentId = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(path).value(QStringLiteral("document_id")).toString();
+    // The PDF on screen (an earlier version kept while a newer one is ready too).
+    const QString path = shownFilePath();
+    QString documentId = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forVersion(path).value(QStringLiteral("document_id")).toString();
     const QJsonObject primary = card.value(QStringLiteral("primary")).toObject();
     if (documentId.isEmpty()) documentId = primary.value(QStringLiteral("pdf_document_id")).toString(primary.value(QStringLiteral("document_id")).toString());
     QString sha256 = !m_docsOpenedPdfSha256.isEmpty() && QFileInfo(m_docsOpenedPdfPath) == QFileInfo(path) ? m_docsOpenedPdfSha256 : QString();
@@ -9636,9 +10194,12 @@ void Part::setReviewFeedbackCard(const QJsonObject &card, const QVariantList &re
 void Part::refreshDocumentFeedback()
 {
     if (!m_pageView) return;
+    // The overlays belong to the same document and PDF version, however this ends.
+    const auto overlays = qScopeGuard([this] { refreshReadingOverlays(); });
     m_attachmentVersions.clear();
     auto *feedback = m_pageView->documentFeedback();
-    const QString path = url().isLocalFile() ? localFilePath() : QString();
+    // The PDF on screen: feedback given now is given on it, and what shows is what was given on it.
+    const QString path = url().isLocalFile() ? shownFilePath() : QString();
     m_projectFeedback = {};
     if (path.isEmpty() || !m_document->isOpened()) {
         feedback->clear();
@@ -9654,8 +10215,7 @@ void Part::refreshDocumentFeedback()
         return;
     }
     // The Library identity of these bytes: the entry is returned only when the file is its PDF.
-    const QString verified = !m_docsOpenedPdfSha256.isEmpty() && QFileInfo(m_docsOpenedPdfPath) == QFileInfo(path) ? m_docsOpenedPdfSha256 : QString();
-    const QJsonObject identity = Thoughts::DocumentIdentityStore(m_docsRenderRoot).forFile(path, verified);
+    const QJsonObject identity = shownLibraryIdentity();
     const QString documentId = identity.value(QStringLiteral("document_id")).toString();
     const QString sha256 = identity.value(QStringLiteral("pdf_sha256")).toString().toLower();
     if (!Thoughts::DocumentIdentityStore::validId(documentId) || sha256.size() != 64) {
@@ -9666,6 +10226,33 @@ void Part::refreshDocumentFeedback()
     // Feedback written now records this PDF version.
     feedback->setReviewVersion(Thoughts::FeedbackVersion::forPdf(m_docsRenderRoot, path, false, sha256));
     feedback->setRecords(Thoughts::DocumentFeedback::recordsOfDocument(m_fedoraProjections, documentId, true));
+}
+
+void Part::refreshReadingOverlays()
+{
+    if (!m_pageView) return;
+    auto *overlays = m_pageView->readingOverlays();
+    const auto *feedback = m_pageView->documentFeedback();
+    // Overlays show where feedback can be given: a Library PDF (or Project reading) with its version.
+    if (!feedback->hasDocument() || !m_document->isOpened()) {
+        overlays->clear();
+        return;
+    }
+    overlays->setDocument(feedback->documentId(), feedback->pdfSha256(), int(m_document->pages()));
+    if (!m_projectFeedback.reading) {
+        overlays->setRecords(Thoughts::ReadingOverlays::recordsOfDocument(m_fedoraProjections, feedback->documentId(), true));
+        return;
+    }
+    // A Project read as one PDF: each document's overlays at its pages there, newest first.
+    QList<Thoughts::ReadingOverlayLayer::Source> sources;
+    for (const Thoughts::ReadingDocument &document : std::as_const(m_projectFeedback.reading->documents)) {
+        for (const QJsonObject &record : Thoughts::ReadingOverlays::recordsOfDocument(m_fedoraProjections, document.id, true))
+            sources.append({record, document.firstPage, document.pdfSha256});
+    }
+    std::stable_sort(sources.begin(), sources.end(), [](const auto &a, const auto &b) {
+        return a.record.value(QStringLiteral("created_at")).toString() > b.record.value(QStringLiteral("created_at")).toString();
+    });
+    overlays->setSources(sources);
 }
 
 bool Part::refreshProjectDocumentFeedback(const QString &path)
@@ -9742,6 +10329,144 @@ void Part::showDocumentFeedbackList()
     if (m_attachmentReader) m_attachmentReader->setFeedback(shown);
 }
 
+void Part::setMarkupShown(int itemType, bool shown)
+{
+    QString name;
+    switch (itemType) {
+    case AnnotationModel::Comment:
+        name = QStringLiteral("highlight_comments");
+        break;
+    case AnnotationModel::Feedback:
+        name = QStringLiteral("highlight_feedback");
+        break;
+    case AnnotationModel::AgentProposal:
+        name = QStringLiteral("highlight_agent_edits");
+        break;
+    case AnnotationModel::ReviewCard:
+        name = QStringLiteral("highlight_review_cards");
+        break;
+    default:
+        return;
+    }
+    if (QAction *toggle = actionCollection()->action(name)) {
+        toggle->setChecked(shown);
+    }
+}
+
+void Part::showMarkupOfFeedback(const QString &feedbackId)
+{
+    if (!m_pageView) return;
+    const QJsonObject record = m_pageView->documentFeedback()->record(feedbackId);
+    // A drawing or a text box shows whatever the switches; feedback in an HTML page shows in it.
+    if (record.isEmpty() || Thoughts::DocumentFeedback::isPageMark(record) || Thoughts::DocumentFeedback::isAttachmentFeedback(record)) return;
+    setMarkupShown(Thoughts::DocumentFeedback::kindOf(record) == Thoughts::DocumentFeedback::other() ? AnnotationModel::Comment : AnnotationModel::Feedback, true);
+}
+
+void Part::showReadingOverlayMarkup()
+{
+    if (QAction *toggle = actionCollection()->action(QStringLiteral("highlight_reading_overlays"))) toggle->setChecked(true);
+}
+
+bool Part::showReadingOverlayMark(const QString &overlayId, const QString &markId)
+{
+    if (!m_pageView) return false;
+    showReadingOverlayMarkup();
+    return m_pageView->flashReadingOverlayMark(overlayId, markId);
+}
+
+void Part::setReadingOverlayMarkNoteImage(const QString &noteId, const QImage &image)
+{
+    if (m_pageView) m_pageView->setReadingOverlayNoteImage(noteId, image);
+}
+
+bool Part::revealReadingOverlayMark(const QString &overlayId, const QString &markId)
+{
+    if (!m_pageView || !m_reviewsWidget) return false;
+    const QJsonObject record = m_pageView->readingOverlays()->record(overlayId);
+    if (record.isEmpty() || Thoughts::ReadingOverlays::isDeleted(record)) return false;
+    // As an overlay link shows it (showReadingOverlay), without moving the page: the mark is on it.
+    showReadingOverlayMarkup();
+    chooseSidebarDisplay(m_reviewsWidget);
+    m_reviewsWidget->showReadingOverlays(overlayId);
+    return m_reviewsWidget->readingOverlayList()->revealMark(overlayId, markId);
+}
+
+bool Part::askAboutReadingOverlayMark(const QString &overlayId, const QString &markId, const QString &question)
+{
+    if (!m_pageView) return false;
+    auto *overlays = m_pageView->readingOverlays();
+    const QJsonObject record = overlays->record(overlayId);
+    const Thoughts::ReadingOverlayLayer::Mark mark = overlays->mark(overlayId, markId);
+    if (record.isEmpty() || Thoughts::ReadingOverlays::isDeleted(record) || mark.mark.isEmpty()) return false;
+    if (mark.rects.isEmpty()) {
+        noticeMessage(i18n("This passage is not in this version of the PDF."));
+        return false;
+    }
+    // The mark's page (its first line's) with each of its lines there.
+    const int page = mark.rects.constFirst().first;
+    QJsonArray regions;
+    for (const auto &[markPage, rect] : mark.rects) {
+        if (markPage == page) regions.append(QJsonArray{rect.left(), rect.top(), rect.right(), rect.bottom()});
+    }
+    const QJsonObject request{{QStringLiteral("overlay"), record},
+                              {QStringLiteral("mark"), mark.mark},
+                              {QStringLiteral("page"), page},
+                              {QStringLiteral("regions"), regions},
+                              {QStringLiteral("colour"), Thoughts::ReadingOverlayLayer::kindColour(Thoughts::ReadingOverlays::kindOf(mark.mark)).name()},
+                              {QStringLiteral("question"), question}};
+    if (!isSignalConnected(QMetaMethod::fromSignal(&Part::requestAskAboutReadingOverlayMark))) {
+        noticeMessage(i18n("Asking an agent about a mark needs the Thoughts app."));
+        return false;
+    }
+    Q_EMIT requestAskAboutReadingOverlayMark(request);
+    return true;
+}
+
+bool Part::showReadingOverlay(const QString &requested)
+{
+    // A copy: what is asked may be m_pendingReadingOverlay itself, which is cleared below.
+    const QString overlayId = requested;
+    if (!m_pageView || !m_reviewsWidget) return false;
+    auto *overlays = m_pageView->readingOverlays();
+    if (!overlays->hasDocument()) {
+        // Just opened: once the PDF's Library identity is known.
+        m_pendingReadingOverlay = overlayId;
+        m_pendingReadingOverlayNoticed = false;
+        return false;
+    }
+    showReadingOverlayMarkup();
+    chooseSidebarDisplay(m_reviewsWidget);
+    const QJsonObject record = overlays->record(overlayId);
+    if (record.isEmpty() || Thoughts::ReadingOverlays::isDeleted(record)) {
+        m_reviewsWidget->showReadingOverlays();
+        if (record.isEmpty()) {
+            // Not synced here yet: shown when Sync brings it.
+            m_pendingReadingOverlay = overlayId;
+            m_pendingReadingOverlayNoticed = true;
+            noticeMessage(i18n("This reading overlay is not on this computer yet. It opens here once Sync brings it."));
+        } else {
+            m_pendingReadingOverlay.clear();
+            noticeMessage(i18n("This reading overlay was deleted."));
+        }
+        return true;
+    }
+    m_pendingReadingOverlay.clear();
+    overlays->setShown(overlayId, true);
+    m_reviewsWidget->showReadingOverlays(overlayId);
+    // The page at its first mark found in this version.
+    const QList<Thoughts::ReadingOverlayLayer::Mark> marks = overlays->marks(overlayId);
+    if (!marks.isEmpty() && !marks.constFirst().rects.isEmpty()) {
+        const auto &[page, rect] = marks.constFirst().rects.constFirst();
+        Okular::DocumentViewport viewport(page - 1);
+        viewport.rePos.enabled = true;
+        viewport.rePos.normalizedX = rect.center().x();
+        viewport.rePos.normalizedY = rect.top();
+        viewport.rePos.pos = Okular::DocumentViewport::TopLeft;
+        m_document->setViewport(viewport, nullptr, false);
+    }
+    return true;
+}
+
 bool Part::showAnnotationsForNewEntry()
 {
     if (m_sidebar->isTransientWidgetVisible() || m_pageView->reviewingCard()) return false;
@@ -9765,7 +10490,7 @@ QVariantList Part::reviewFeedbackItems()
     // The file shown, for pictures of passages given on it.
     for (QVariant &item : items) {
         QVariantMap map = item.toMap();
-        map.insert(QStringLiteral("displayed_pdf_path"), localFilePath());
+        map.insert(QStringLiteral("displayed_pdf_path"), shownFilePath());
         item = map;
     }
     return items;
@@ -9850,6 +10575,8 @@ void Part::clearReviewMask()
     if (m_attachmentReader && (m_attachmentReviewShown || !m_attachmentReader->reviewCardId().isEmpty())) {
         m_attachmentReviewShown = false;
         m_attachmentReader->clearReview();
+        // A newer version that came during the review shows now.
+        if (m_attachmentFollowPending) m_attachmentFollowTimer->start();
         m_attachmentView->setNotice(QString(), QString());
         updateAttachmentSelectionAction();
         // A page opened for the review goes when the review moves on to a card elsewhere (the next

@@ -21,6 +21,12 @@ void ServerLink::setServer(const QUrl &baseUrl, const QByteArray &token)
 
 bool ServerLink::ensure()
 {
+    if (!m_explicit && m_generation != ServerAddress::connectionGeneration()) {
+        // Signed in or out since: read the address and the token again.
+        m_generation = ServerAddress::connectionGeneration();
+        m_token.clear();
+        m_baseUrl.clear();
+    }
     if (!m_explicit && (m_token.isEmpty() || !m_baseUrl.isValid() || m_baseUrl.isEmpty())) {
         m_token = qgetenv("THOUGHTS_TOKEN").trimmed();
         if (QStandardPaths::isTestModeEnabled() && (m_token.isEmpty() || !ServerAddress::overriddenByEnvironment())) {

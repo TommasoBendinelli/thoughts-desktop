@@ -4,12 +4,14 @@
 #include "reviewcardfeedback.h"
 
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
 #include <QPair>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
 
 #include <functional>
 #include <optional>
@@ -40,10 +42,20 @@ QString kindsCapability();
 QString drawingCapability();
 // Servers that also accept a text box (§11); the same goes for them.
 QString textCapability();
+// Servers that also accept a drawing in an HTML attachment, made on a snapshot of the page (§10.1);
+// the same goes for them.
+QString htmlDrawingCapability();
+// Servers that also accept pictures on a comment (§12); the same goes for records with pictures.
+QString picturesCapability();
 QString projectionKey(const QString &feedbackId);
 
 // How many pages around the anchor's pages a quote is searched on another PDF version (§4).
 constexpr int pageWindow = 3;
+// Page furniture (a page number, a running head) is a line within furnitureBand of the page's foot
+// or head, set apart from the rest of the page's text by more than furnitureGap times its height
+// (the server's rule for reading overlays, reading_overlays.FURNITURE_BAND / FURNITURE_GAP).
+constexpr double furnitureBand = 0.08;
+constexpr double furnitureGap = 1.5;
 
 // ---------------------------------------------------------------- records (§1, §3)
 
@@ -68,7 +80,11 @@ QJsonObject resolve(const QJsonObject &record, bool resolved, const QString &ori
 // Whether @p record shows now: a like, a dislike or an open question on the version it was made on
 // (the displayed PDF, or in an HTML attachment the page's @p attachmentSha256), a comment on every
 // version until it is resolved.
+// @p attachmentSha256: the page's version as attachmentVersionOf gives it (a live page's load included).
 bool shownOn(const QJsonObject &record, const QString &displayedPdfSha256, const QString &attachmentSha256 = QString());
+// A page's version for shownOn: its sha256, and for a live page the load shown or given on
+// (anchor.live.loaded_at, html-live-pages.md §2.1): after a Reload the feedback is from an earlier version.
+QString attachmentVersionOf(const QString &pageSha256, const QString &liveLoadedAt = QString());
 
 // A drawing on a page of the PDF (§10): pencil strokes, in normalized page coordinates, in the field
 // "drawing". Its anchor names the page and never changes, because the server keeps anchors as they
@@ -95,8 +111,43 @@ QRectF strokeBounds(const QJsonObject &record);
 // A first write of a drawing on @p page (1-based) of the PDF @p pdfSha256.
 QJsonObject createDrawing(int page, const QList<Stroke> &strokes, const QString &documentId, const QString &pdfSha256, const QString &originId,
                           const QDateTime &now = QDateTime::currentDateTimeUtc());
-// The next revision of a drawing, with @p strokes.
+// The next revision of a drawing, with @p strokes; the rest of its "drawing" (a snapshot, fields
+// another client added) stays.
 QJsonObject withStrokes(const QJsonObject &record, const QList<Stroke> &strokes, const QString &originId, const QDateTime &now = QDateTime::currentDateTimeUtc());
+
+// A drawing in an HTML attachment (§10.1): an interactive page has no fixed layout, so it is drawn
+// on a snapshot, a picture of the page as the user saw it, uploaded as an object before the record
+// ("drawing.snapshot": object_sha256, media_type, width and height in pixels). Its strokes are
+// normalized to the snapshot, its anchor is that of §8 with the quote "Drawing", and it is shown as
+// its snapshot with the strokes on top, never on the live page or on the PDF.
+bool isAttachmentDrawing(const QJsonObject &record);
+constexpr int maximumSnapshotSide = 20000;
+// drawing.snapshot of @p record (empty without one), and its object.
+QJsonObject snapshotOf(const QJsonObject &record);
+QString snapshotSha256(const QJsonObject &record);
+QJsonObject snapshotJson(const QString &objectSha256, const QString &mediaType, int width, int height);
+// A first write of a drawing on @p snapshot of the page @p placement names
+// (HtmlAttachmentReader::newCardFields: html_attachment and page_state) in the document @p documentId,
+// whose PDF @p pdfSha256 linked the page.
+QJsonObject createAttachmentDrawing(const QJsonObject &placement, const QJsonObject &snapshot, const QList<Stroke> &strokes, const QString &documentId,
+                                    const QString &pdfSha256, const QString &originId, const QDateTime &now = QDateTime::currentDateTimeUtc());
+
+// Pictures on a comment (§12): a Like, Dislike, Question, other comment or text box may carry up to
+// maximumPictures pictures ("pictures": object_sha256, media_type, width and height, as a
+// snapshot), objects uploaded before the record; never a drawing. An edit may add or remove them.
+// A picture is at most maximumPictureSide pixels on its longer side: JPEG for a photo, PNG for a
+// screenshot.
+constexpr int maximumPictures = 8;
+constexpr int maximumPictureSide = 2048;
+// The record's pictures, oldest first (the valid ones; none for a drawing).
+QJsonArray picturesOf(const QJsonObject &record);
+QStringList pictureSha256s(const QJsonObject &record);
+bool hasPictures(const QJsonObject &record);
+// @p record with @p pictures (no field when there are none).
+QJsonObject withPictures(const QJsonObject &record, const QJsonArray &pictures);
+// " [2 pictures: the Thoughts document_feedback tool shows them]" for Copy for agent, empty
+// without pictures (the phone writes the same words).
+QString agentPicturesNote(const QJsonObject &record);
 
 // A text box on a page of the PDF (§11): text typed where the user clicked, of kind "text". The text
 // is the comment, so every list of comments shows it; the field "text_box" says where it is: its
@@ -117,10 +168,12 @@ QJsonObject createTextBox(int page, const QRectF &rect, double fontSize, const Q
 QJsonObject withTextBox(const QJsonObject &record, const QRectF &rect, double fontSize, const QString &text, const QString &originId,
                         const QDateTime &now = QDateTime::currentDateTimeUtc());
 
-// A drawing or a text box: made on its page of one PDF, not on a passage. It has no quote to look
-// for, never changes passage, is never resolved, and shows whatever Visible markup says.
+// A drawing or a text box: made on its page of one PDF (or, a drawing, on a snapshot of an HTML
+// attachment), not on a passage. It has no quote to look for, never changes passage, is never
+// resolved, and shows whatever Visible markup says.
 bool isPageMark(const QJsonObject &record);
-// Where a page mark is on its page: the strokes of a drawing, the rect of a text box.
+// Where a page mark is on its page of the PDF: the strokes of a drawing, the rect of a text box.
+// Empty for a drawing in an HTML attachment, which is on no page of the PDF.
 QRectF pageMarkBounds(const QJsonObject &record);
 
 // The anchor of such a record from HtmlAttachmentReader::newCardFields, in the document it belongs to.
@@ -145,7 +198,8 @@ QJsonObject merge(const QJsonObject &stored, const QJsonObject &incoming);
 
 // Empty when @p record is a valid document_feedback record for the server (§1), otherwise why
 // not: the card feedback rules for the shared fields, no card_id, view absent or "pdf", and
-// anchor.pdf with 1-200 regions.
+// anchor.pdf with 1-200 regions (or an HTML attachment without regions, §8); a drawing has a
+// snapshot in an HTML attachment and none on the PDF (§10.1).
 QString validationError(const QJsonObject &record);
 // Queues @p record for the server (base revision = revision - 1).
 bool enqueue(DesktopSyncOutbox &outbox, const QJsonObject &record, QString *error = nullptr);
@@ -183,8 +237,16 @@ struct Placement {
 // the pages around them. @p pageText gives the text of whole pages in order, joined with "\n"
 // (ReviewCardFeedback::answerText over every glyph of each page); it is only asked for when a
 // search is needed. Never written back.
+// A quote not found in the pages' text is searched once more without the page furniture between
+// them (withoutPageFurniture), so a passage that runs on across a page break is found.
 Placement place(const QJsonObject &record, const QString &displayedPdfSha256, int pageCount,
                 const std::function<ReviewCardFeedback::AnswerText(const QList<int> &pages)> &pageText);
+
+// @p text (whole pages, as place's pageText gives it) without the characters of the page furniture
+// between its pages: the foot of each page but the last and the head of each but the first. The
+// glyphs stay as they are, so the result's source still points at them. @p text itself when there
+// is none.
+ReviewCardFeedback::AnswerText withoutPageFurniture(const ReviewCardFeedback::AnswerText &text);
 
 // quote.prefix / quote.suffix of a selection: up to ReviewCardFeedback::contextLength characters
 // of @p text right before and after the glyphs for which @p selected (1-based page, normalized

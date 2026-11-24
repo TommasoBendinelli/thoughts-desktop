@@ -385,6 +385,8 @@ private Q_SLOTS:
     void testClaimsWaitWhenTheServerCannotBeAsked();
     void testConflictResolutionCarriesClaims();
     void testFedoraMergeOfAConflictingSourceIsInstalled();
+    void testSourceSentAloneCarriesItsClaims();
+    void testFolderAddedOnAnotherDeviceInstalls();
     void testUnansweredSourceApplyIsRepeated();
     void testEditDuringFedoraMergeKeepsItsBase();
     void testFrozenCopyOnDesktopsEarlierBase_data();
@@ -1083,6 +1085,65 @@ void ProposalDecisionsTest::testFedoraMergeOfAConflictingSourceIsInstalled()
     QCOMPARE(server.publications.size(), 1);
     QCOMPARE(server.heads.value(Relative).value(QStringLiteral("revision")).toInt(), 3);
     QCOMPARE(read(workspace.source()), merged);
+}
+
+// 18 Nov: proposals were accepted on this computer while agents changed
+// the same file on the server, so this computer's merge conflicted and the
+// source went to the server alone. Sent without its claims, the server recorded the
+// accepted proposals as removed outside Thoughts.
+void ProposalDecisionsTest::testSourceSentAloneCarriesItsClaims()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray merged = (QStringLiteral("Intro.\nNew line.\n") + SecondWrapper).toUtf8();
+    server.commit(Relative, (Base + SecondWrapper).toUtf8());
+    {
+        // The app's own tables, which hold the claims too, as on a computer that has synced.
+        DesktopSyncStore store(workspace.database());
+        QString error;
+        QVERIFY2(store.open(&error), qPrintable(error));
+    }
+    QVERIFY(workspace.decide(QStringLiteral("accept")));
+    QCOMPARE(read(workspace.source()), QByteArray("Intro.\nNew line.\nOutro.\n"));
+    const QList<QJsonObject> claims = ProposalDecisions::storedClaims(workspace.database());
+    QCOMPARE(claims.size(), 1);
+    server.applyResult = merged;
+
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.applies.size(), 1);
+    QCOMPARE(server.applies.first().value(QStringLiteral("proposal_decisions")).toArray(), QJsonArray{claims.first()});
+    // Answered: the claim expires, and no later publication sends it again.
+    QVERIFY(ProposalDecisions::storedClaims(workspace.database()).isEmpty());
+    QCOMPARE(read(workspace.source()), merged);
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    for (const QJsonObject &publication : std::as_const(server.publications)) QVERIFY(!publication.contains(QStringLiteral("proposal_decisions")));
+}
+
+// A folder a Project of this Library connects, made on another device (the server's
+// add_source_folder), installs here although this computer does not have it yet: the
+// manifest lists only the folders found here (18 Nov: the math Project's folder never came).
+void ProposalDecisionsTest::testFolderAddedOnAnotherDeviceInstalls()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare());
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QString added = QStringLiteral("docs-added/tex/source/note.tex");
+    server.commit(added, "Added on the server.\n");
+    // Not connected to a Project here: it stays on the server.
+    QVERIFY2(workspace.install(server, &failure), qPrintable(failure));
+    QVERIFY(!QFileInfo::exists(QDir(workspace.root()).filePath(added)));
+    QCOMPARE(ProjectConfiguration::missingConnectedFolders(workspace.root()), QStringList());
+    QVERIFY(connectFolder(workspace.root(), QStringLiteral("docs-added")));
+    // What makes Sync run the installer although neither the server nor the manifest changed.
+    QCOMPARE(ProjectConfiguration::missingConnectedFolders(workspace.root()), QStringList{QStringLiteral("docs-added")});
+    QVERIFY2(workspace.install(server, &failure), qPrintable(failure));
+    QCOMPARE(read(QDir(workspace.root()).filePath(added)), QByteArray("Added on the server.\n"));
+    QCOMPARE(ProjectConfiguration::missingConnectedFolders(workspace.root()), QStringList());
 }
 
 // Fedora committed the source sent alone but its answer was lost, or came

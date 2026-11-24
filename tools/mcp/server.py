@@ -507,6 +507,10 @@ async def create_proposal(
     In Markdown the document links are relative paths: other.md#source-label:label (same
     folder), ../../docs-<folder>/path.md#source-label:label (another folder) and pdfKey.pdf#anchor
     (bare Library filename: a PDF of any Project); no fragment = document start.
+    Never link a Library document by the Thoughts server's web page for it
+    (\\href{https://<server>/open/document/<id>?page=N}{text} or the Markdown link to it): it opens
+    a browser, so it is refused (reason server_page_link) with the Thoughts link in suggestion.
+    \\SourceLink / \\CrossSourceLink take the label document-start for a note's start.
     A link that would not resolve fails the call with error_code invalid_link; links lists each
     one with reason, message and, when known, suggestion (e.g. the \\PdfLink with the PDF's
     Library filename). Nothing is written; fix the text and call again with a new request_id.

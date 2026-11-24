@@ -200,6 +200,38 @@ inline void supersede(Cache &cache, QHash<QString, QString> &keyOfOwner, const Q
 }
 }
 
+// The files this thread read through the caches of this header and of
+// fileidentitycache.h, and the reads they saved. A Library load reports both
+// per stage in the developer log.
+struct FileReadCounts {
+    // Files opened and read.
+    qint64 reads = 0;
+    // Reads saved: the file was unchanged since it was read.
+    qint64 hits = 0;
+    // PDFs read whole to compute their SHA-256, and their bytes.
+    qint64 pdfHashes = 0;
+    qint64 pdfHashBytes = 0;
+
+    FileReadCounts operator-(const FileReadCounts &earlier) const
+    {
+        return {reads - earlier.reads, hits - earlier.hits, pdfHashes - earlier.pdfHashes, pdfHashBytes - earlier.pdfHashBytes};
+    }
+    FileReadCounts &operator+=(const FileReadCounts &other)
+    {
+        reads += other.reads;
+        hits += other.hits;
+        pdfHashes += other.pdfHashes;
+        pdfHashBytes += other.pdfHashBytes;
+        return *this;
+    }
+};
+
+THOUGHTS_ARTIFACT_CACHE_SHARED inline FileReadCounts &fileReadCounts()
+{
+    static thread_local FileReadCounts counts;
+    return counts;
+}
+
 namespace VerifiedArtifactCacheDetail
 {
 inline bool readVerified(const QString &path, const QString &digest, QByteArray *contents, const QString &owner, bool keepBytes)
@@ -213,6 +245,7 @@ inline bool readVerified(const QString &path, const QString &digest, QByteArray 
         QMutexLocker lock(&state.mutex);
         if (const auto *cached = state.bytes.object(key)) {
             ++state.bytesHits;
+            ++fileReadCounts().hits;
             if (contents) *contents = *cached;
             return true;
         }
@@ -220,9 +253,13 @@ inline bool readVerified(const QString &path, const QString &digest, QByteArray 
         // artifact can be read again without hashing it again.
         knownGood = state.verified.contains(key);
     }
-    if (knownGood && !contents) return true;
+    if (knownGood && !contents) {
+        ++fileReadCounts().hits;
+        return true;
+    }
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly) || file.size() > 256 * 1024 * 1024) return false;
+    ++fileReadCounts().reads;
     const QByteArray raw = file.readAll();
     if (artifactFileIdentity(path) != identity || (!knownGood && artifactBytesSha256(raw) != digest.toLatin1())) return false;
     if (contents) *contents = raw;

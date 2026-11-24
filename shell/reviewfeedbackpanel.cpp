@@ -194,7 +194,14 @@ void ReviewFeedbackPanel::rebuild()
 {
     m_built = true;
     while (QLayoutItem *child = m_listLayout->takeAt(0)) {
-        delete child->widget();
+        if (QWidget *row = child->widget()) {
+            // Gone from the panel now, deleted at the next turn of the event
+            // loop: a row can be the button whose click led here, or the focus
+            // widget a caller still holds (Shell::setActiveTab).
+            row->hide();
+            row->setParent(nullptr);
+            row->deleteLater();
+        }
         delete child;
     }
     m_list->setStyleSheet(historyStyleSheet(palette()));

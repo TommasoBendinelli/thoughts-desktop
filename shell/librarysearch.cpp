@@ -66,7 +66,10 @@ bool exec(QSqlDatabase &db, const QString &sql, QString *error)
 bool ensureSchema(QSqlDatabase &db, QString *error)
 {
     if (!exec(db, QStringLiteral("PRAGMA journal_mode=WAL"), error)
-        || !exec(db, QStringLiteral("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"), error)) {
+        || !exec(db, QStringLiteral("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"), error)
+        // The PDFs built from a source (LaTeX, Markdown), ranked before imported PDFs; rewritten
+        // with the titles on every update, so an older index only lacks it until then.
+        || !exec(db, QStringLiteral("CREATE TABLE IF NOT EXISTS sourced_pdfs(pdf_path TEXT PRIMARY KEY)"), error)) {
         return false;
     }
     QSqlQuery version(db);
@@ -326,6 +329,16 @@ bool LibrarySearchIndex::update(const QList<LibrarySearchPdf> &pdfs, const QList
                 remember.bindValue(1, wanted[pdf.pdfPath].identity);
                 remember.bindValue(2, pdf.metadataTitle);
                 ok = ok && remember.exec();
+            }
+            // Which PDFs have a source, for the ranking (documentHits).
+            ok = ok && exec(db, QStringLiteral("DELETE FROM sourced_pdfs"), error);
+            QSqlQuery storeSourced(db);
+            storeSourced.prepare(QStringLiteral("INSERT OR IGNORE INTO sourced_pdfs(pdf_path) VALUES (?)"));
+            for (const LibrarySearchPdf &pdf : pdfs) {
+                if (!ok) break;
+                if (!pdf.sourced) continue;
+                storeSourced.bindValue(0, pdf.pdfPath);
+                ok = storeSourced.exec();
             }
             // Document rows match names, so they follow renames even when the PDF is unchanged.
             ok = ok && exec(db, QStringLiteral("DELETE FROM titles"), error);
@@ -675,8 +688,11 @@ struct DocumentMatch {
 // One row for each document: its name, how many pages match best and how often the words occur on
 // them, and the best of those pages.
 // The document search panel lists every match of the document that is opened from it.
+// @p sourced: the PDFs built from a source (LaTeX, Markdown); among equally good matches they come
+// before imported PDFs (23 Nov 2026).
 QList<LibrarySearchHit> documentHits(const QSqlDatabase &db, const QStringList &expressions, const QList<QRegularExpression> &asTyped,
-                                     const QHash<QString, QString> &titles, int limit, double *bestRank, bool *phraseMatched, QString *error)
+                                     const QHash<QString, QString> &titles, const QSet<QString> &sourced, int limit, double *bestRank, bool *phraseMatched,
+                                     QString *error)
 {
     QHash<QString, DocumentMatch> matches;
     for (int expression = 0; expression < expressions.size(); ++expression) {
@@ -726,12 +742,14 @@ QList<LibrarySearchHit> documentHits(const QSqlDatabase &db, const QStringList &
     }
 
     QList<QString> order = matches.keys();
-    std::sort(order.begin(), order.end(), [&matches](const QString &a, const QString &b) {
+    std::sort(order.begin(), order.end(), [&matches, &sourced](const QString &a, const QString &b) {
         const DocumentMatch &left = matches[a];
         const DocumentMatch &right = matches[b];
         if (left.tier() != right.tier()) return left.tier() < right.tier();
-        // Within a tier: its name holds the words, then the most pages, then the best page.
+        // Within a tier: its name holds the words, then a document with a source, then the most
+        // pages, then the best page.
         if ((left.titleTier == left.tier()) != (right.titleTier == right.tier())) return left.titleTier == left.tier();
+        if (sourced.contains(a) != sourced.contains(b)) return sourced.contains(a);
         if (left.pageRows.size() != right.pageRows.size()) return left.pageRows.size() > right.pageRows.size();
         if (left.rank() != right.rank()) return left.rank() < right.rank();
         return a < b;
@@ -776,10 +794,12 @@ QList<LibrarySearchHit> documentHits(const QSqlDatabase &db, const QStringList &
         hits.append(hit);
     }
     // The count is on the row, so within a tier the rows follow it.
-    std::stable_sort(hits.begin(), hits.end(), [&matches](const LibrarySearchHit &a, const LibrarySearchHit &b) {
+    std::stable_sort(hits.begin(), hits.end(), [&matches, &sourced](const LibrarySearchHit &a, const LibrarySearchHit &b) {
         const DocumentMatch &left = matches[a.pdfPath];
         const DocumentMatch &right = matches[b.pdfPath];
-        if (left.tier() != right.tier() || (left.titleTier == left.tier()) != (right.titleTier == right.tier())) return false;
+        if (left.tier() != right.tier() || (left.titleTier == left.tier()) != (right.titleTier == right.tier())
+            || sourced.contains(a.pdfPath) != sourced.contains(b.pdfPath))
+            return false;
         return a.matches > b.matches;
     });
     if (!order.isEmpty()) {
@@ -832,12 +852,16 @@ QList<LibrarySearchHit> LibrarySearchIndex::search(const QString &query, Library
         if (openDatabase(m_path, connection, error)) {
             QSqlDatabase db = QSqlDatabase::database(connection, false);
             QHash<QString, QString> titles;
+            QSet<QString> sourcedPdfs;
             QHash<QString, QPair<QString, QString>> sourceFiles; // path -> relative path, project
             QSqlQuery names(db);
             if (documents) {
                 names.exec(QStringLiteral("SELECT pdf_path, title FROM titles"));
                 while (names.next()) {
                     titles.insert(names.value(0).toString(), names.value(1).toString());
+                }
+                if (names.exec(QStringLiteral("SELECT pdf_path FROM sourced_pdfs"))) {
+                    while (names.next()) sourcedPdfs.insert(names.value(0).toString());
                 }
             }
             if (sources) {
@@ -852,7 +876,7 @@ QList<LibrarySearchHit> LibrarySearchIndex::search(const QString &query, Library
                 bool phraseMatched = false;
                 double best = 0;
                 if (group.perDocument) {
-                    group.hits = documentHits(db, {phrase, finished, match}, asTyped, titles, group.limit, &best, &phraseMatched, error);
+                    group.hits = documentHits(db, {phrase, finished, match}, asTyped, titles, sourcedPdfs, group.limit, &best, &phraseMatched, error);
                     group.score = best - (phraseMatched ? 1000.0 : 0.0);
                     continue;
                 }

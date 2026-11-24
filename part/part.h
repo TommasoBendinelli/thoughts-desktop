@@ -71,6 +71,7 @@ class KToggleAction;
 class KToggleFullScreenAction;
 class QTemporaryFile;
 class QAction;
+class QImage;
 class QJsonObject;
 class QTimer;
 class QSplitter;
@@ -83,6 +84,7 @@ class HtmlDocumentView;
 class HtmlReader;
 class HtmlAttachmentReader;
 struct HtmlAttachmentTarget;
+class SnapshotDrawingDialog;
 namespace HtmlEdition
 {
 class Store;
@@ -212,6 +214,14 @@ public:
     Q_INVOKABLE void exportProjectPdf(const QJsonObject &project, const QString &destination);
     Q_INVOKABLE QVariantMap reviewDocumentPayloadForPage(int page) const;
     Q_INVOKABLE QString localDocumentPath() const;
+    // The file whose bytes are on screen: localFilePath(), or, while this tab keeps an earlier
+    // version of its Library PDF on screen (a newer one is ready), that version's file in its
+    // Library generation.
+    Q_INVOKABLE QString shownFilePath() const;
+    // Whether this tab keeps an earlier version on screen while a newer one is ready.
+    Q_INVOKABLE bool keepsEarlierVersion() const;
+    // Show Newest Version: the reload that keeps the page; false when no newer version waits.
+    Q_INVOKABLE bool showNewestVersion();
     Q_INVOKABLE void updateFromFedora(const QString &traceId = QString());
     Q_INVOKABLE void updateFromFedoraWithoutRenderCheck(const QString &traceId = QString());
     Q_INVOKABLE void updateDocumentFromFedora(const QString &target, bool publishSources, const QString &traceId = QString());
@@ -232,6 +242,14 @@ public:
     // A comment on a passage from the Library: written, or opened (false until this document knows it).
     Q_INVOKABLE bool enqueueDocumentFeedbackRecord(const QVariantMap &record);
     Q_INVOKABLE bool openDocumentFeedback(const QString &feedbackId);
+    // A reading overlay (reading-overlays.md §4, a thoughts://open/document?…&overlay= link): the
+    // Annotations sidebar on the Overlay tab at that overlay, shown on the page with Visible markup ›
+    // Reading overlays on, and the page at its first mark. Asked while the PDF's Library identity
+    // is still being read (false), or before Sync brought the overlay, it opens once they are here.
+    Q_INVOKABLE bool showReadingOverlay(const QString &requested);
+    // The picture of a reading overlay mark's note (requestReadingOverlayMarkNote); null when it
+    // could not be had (the popup keeps the comment).
+    Q_INVOKABLE void setReadingOverlayMarkNoteImage(const QString &noteId, const QImage &image);
     // Queues one agent_conversation record (part/agentconversations.h); false when it is invalid or the queue is unavailable.
     Q_INVOKABLE bool enqueueAgentConversation(const QVariantMap &record);
     // Re-insert the source markers of anchor-removed comments; returns {success, results, message}.
@@ -260,6 +278,11 @@ public:
     // Asks the server whether it holds work this computer has not pulled; answers with
     // fedoraRemoteWorkChecked.
     Q_INVOKABLE void checkFedoraRemoteWork();
+    // The app signed in or out, or stored a token by hand: this part's requests and the
+    // repository's read the address and tokens again (FedoraRepository::reloadServerConnection).
+    // The part is a plugin with its own copy of ServerAddress, so the app asks it here.
+    // Answers whether the repository waits for a running Sync first.
+    Q_INVOKABLE bool reloadServerConnection();
     Q_INVOKABLE void requestFedoraBuildForTarget(const QString &target, const QString &traceId = QString());
     Q_INVOKABLE void requestFedoraRenderStatus(const QString &target);
     Q_INVOKABLE void requestFedoraRenderStateAfterExplicitOperation();
@@ -319,6 +342,11 @@ public:
     // Marks a passage ({page, rect} regions, as a card's) and scrolls to it, without storing
     // anything: the place of a History entry in the version of the PDF it was made on.
     Q_INVOKABLE bool showPassageRegions(const QVariantList &regions);
+    // A link to a place in this PDF (thoughts-pdf-link:<file>.pdf?page=N&x=&y=&rect=, part/pdfplacelink.h;
+    // its filename is the Shell's business): page N with (x, y) near the top of the view and rect
+    // highlighted until the next click or for a few seconds; only the page when the link names
+    // no place, or the document is no PDF. False for another link or before a document is open.
+    Q_INVOKABLE bool showPdfPlace(const QString &href);
 
     // The HTML view (thoughts-html-view-SPEC.md): true while this document shows its HTML edition
     // (or the reason it cannot) instead of the PDF.
@@ -357,12 +385,28 @@ public:
     // ordinary one.
     Q_INVOKABLE void leaveHtmlAttachmentTab();
     Q_INVOKABLE void openHtmlAttachmentInBrowser();
+    // Live pages (thoughts-server protocol/html-live-pages.md): Reload, Take Snapshot (the page as
+    // it is now, after the user confirms, written as the page and sent by Sync; the tab then shows
+    // it embedded) and Go Live Again (a snapshot's stub written back, with its address).
+    Q_INVOKABLE void reloadLivePage();
+    Q_INVOKABLE void takeLiveSnapshot();
+    Q_INVOKABLE bool goLiveAgain();
     // Tests without a web view (the offscreen platform): links show their page inside Thoughts
-    // anyway, as in the app.
+    // anyway, as in the app (a live page as if it had a web view of its own).
     static void setHtmlAttachmentsWithoutWebViewForTesting(bool inside);
+    // Tests: the answer to Take Snapshot's and Go Live Again's questions (1 replace, 0 cancel,
+    // -1 ask).
+    static void setLivePageAnswerForTesting(int answer);
+    // Tests: the picture of a page (a live page's feedback, Send to Agent's picture) in place of
+    // the web view's (a null image: the web view's).
+    static void setLivePagePictureForTesting(const QImage &picture);
     // State for tests and agents: shown, path, sha256, url, ready, transport, cards_supported,
-    // selection, review_card, review_state, review_blocks, review_revealed, placement.
+    // selection, review_card, review_state, review_blocks, review_revealed, placement; live,
+    // live_url, live_state, live_bar, snapshot_enabled, snapshot_of.
     Q_INVOKABLE QVariantMap htmlAttachmentState() const;
+    // Send to Agent from a page's tab: the page as the web view shows it, given later by
+    // htmlAttachmentPictureReady(@p requestId, …); false when no page is shown (or loaded) to picture.
+    Q_INVOKABLE bool requestHtmlAttachmentPicture(const QString &requestId);
 
     void setModified(bool modified) override;
 
@@ -416,6 +460,27 @@ Q_SIGNALS:
     void enablePrintAction(bool enable);
     void requestCommentsOverview();
     void requestOpenDocumentLink(const QUrl &url, const QString &destination, const QString &viewport);
+    // A link to this computer's Thoughts server's "Open in Thoughts" page of a document
+    // (shell/thoughtspagelink.h serverPageLink): the Shell opens the document at the page, as it
+    // opens a thoughts:// page link.
+    void requestOpenPageLink(const QUrl &url);
+    // A link of the PDF to a place in a Library PDF (thoughts-pdf-link:, part/pdfplacelink.h): the
+    // Shell opens that PDF there, as it opens an agent note's link.
+    void requestOpenPdfPlaceLink(const QString &href);
+    // Ask About This in a reading overlay mark's popup (reading-overlays.md §4): the Shell sends the
+    // mark's page to the agent as Send Page does (agent-notes.md, "Pages sent to one session").
+    // @p request has "overlay" (the record), "mark" (the mark), "page" (1-based, of the PDF on
+    // screen), "regions" (the mark's rectangles on that page, [left, top, right, bottom]
+    // normalized), "colour" (the kind's, #rrggbb) and "question" (as typed, may be empty).
+    void requestAskAboutReadingOverlayMark(const QJsonObject &request);
+    // A reading overlay mark's popup shows its note's picture (reading-overlays.md "Mark notes"):
+    // the Shell fetches the agent note by its id and answers with setReadingOverlayMarkNoteImage.
+    void requestReadingOverlayMarkNote(const QString &noteId);
+    // A click on that picture: the note in the Agent Notes window, also though no list has it.
+    void requestOpenAgentNote(const QString &noteId);
+    // The tab starts or stops keeping an earlier version on screen while a newer one is ready
+    // (keepsEarlierVersion()): the Shell marks its tab.
+    void keptVersionChanged(bool kept);
     void navigationViewportChanged(bool historyEntry);
     void requestNavigationHistory(bool forward);
     void requestSyncOperations();
@@ -442,13 +507,13 @@ Q_SIGNALS:
     // Feedback on the PDF chosen in a page's tab: shown in the document's tab (Shell::openTrackedFeedback).
     void requestOpenDocumentFeedback(const QString &pdfPath, const QString &feedbackId);
     void requestEditReviewCard(const QString &cardId);
+    // Cover the Whole Document… in the Cards list (Shell::coverSidebarReviewCardDocument).
+    void requestWholeDocumentReviewCard(const QString &cardId);
     void requestOpenReviewCard(const QString &cardId);
     // Review now in the Cards list: the card alone in the Review window (Shell::reviewSidebarReviewCard).
     void requestReviewReviewCard(const QString &cardId);
     // Merge cards… in the Cards list: the cards of this document to merge into one (Shell::mergeSidebarReviewCards).
     void requestMergeReviewCards(const QStringList &cardIds);
-    // The Cards list's Make project card, Make knowledge card or Follow the Project (Shell::setSidebarReviewCardKind).
-    void requestReviewCardKind(const QString &cardId, const QString &kind);
     // The Cards list's Retire card and Delete card… (Shell::retireSidebarReviewCards, Shell::deleteSidebarReviewCards).
     void requestRetireReviewCards(const QStringList &cardIds);
     void requestDeleteReviewCards(const QStringList &cardIds);
@@ -465,6 +530,8 @@ Q_SIGNALS:
     void syncTransferProgressChanged(const QString &traceId, const QJsonObject &absoluteSnapshot);
     void syncJournalEvent(const QString &traceId, const QJsonObject &event);
     void globalSyncRequested();
+    // The answer to requestHtmlAttachmentPicture (a null picture: the web view gave none).
+    void htmlAttachmentPictureReady(const QString &requestId, const QImage &picture);
     void fedoraRenderStatusChanged(const QString &target, const QJsonObject &status);
     void fedoraBuildSourceDiffReady(const QString &buildId, const QJsonObject &diff, const QString &error);
     // The answer to checkFedoraRemoteWork.
@@ -480,6 +547,9 @@ Q_SIGNALS:
                                               const QString &action,
                                               const QString &status,
                                               const QString &message);
+    // An Accept or Reject in this reader was saved to its source on this
+    // computer: the app sends it with a Sync shortly after (Shell::proposalDecided).
+    void agentProposalsDecidedLocally();
     void sourceConflictResolutionBundleReady(const QVariantMap &bundle, const QString &error);
     // Timing and outcome events for the developer log (ids and durations only).
     void developerEvent(const QString &event, const QJsonObject &metadata);
@@ -600,11 +670,43 @@ private:
     QJsonObject pdfLinkOverride(const PdfLinkContext &context) const;
     // Opens the Library document chosen for the link; false when the original link should be followed.
     bool openPdfLinkOverride(const Okular::Action *action, int page);
+    // A web link to this computer's server's "Open in Thoughts" page of a document goes to the
+    // Shell (requestOpenPageLink) instead of the browser: true when it did.
+    bool openServerPageLink(const QUrl &url);
+    // A thoughts-pdf-link: of the PDF goes to the Shell (requestOpenPdfPlaceLink): true when it did.
+    bool openPdfPlaceLink(const QUrl &url);
     void addPdfLinkOverrideActions(QMenu *menu, const Okular::Action *action, int page);
     void choosePdfLinkOverrideTarget(const PdfLinkContext &context);
     void removePdfLinkOverride(const PdfLinkContext &context);
     bool queuePdfLinkOverride(const QJsonObject &record);
     bool aboutToShowContextMenu(QMenu *menu, QAction *action, QMenu *contextMenu);
+    // A newer version of the PDF on screen is on disk at @p newestPath (a Sync activated it, or
+    // the file was replaced): true when this tab keeps the version on screen and shows the
+    // newer-version bar, false when it should reload as before.
+    bool keepShownVersion(const QString &newestPath);
+    // Show Newest Version now (also during a Sync), then the card asked for (m_cardAfterNewestVersion).
+    bool reloadNewestVersion();
+    void stopKeepingShownVersion();
+    void updateNewerVersionBar();
+    // The Library identity of the bytes on screen (DocumentIdentityStore::forVersion).
+    QJsonObject shownLibraryIdentity() const;
+    // The Visible markup switch of @p itemType (AnnotationModel::ItemType), as the toolbar menu
+    // sets it (saved; every open document follows).
+    void setMarkupShown(int itemType, bool shown);
+    // The markup of a document feedback record turned on: what was just given or is asked for shows.
+    void showMarkupOfFeedback(const QString &feedbackId);
+    // Visible markup › Reading overlays on: opening the Overlay tab, a mark or an overlay link does it.
+    void showReadingOverlayMarkup();
+    // A mark asked for from the Overlay tab: the page goes to it and flashes it.
+    bool showReadingOverlayMark(const QString &overlayId, const QString &markId);
+    // A mark popup's byline: the Overlay tab at the mark (the page stays where it is).
+    bool revealReadingOverlayMark(const QString &overlayId, const QString &markId);
+    // A mark popup's Ask About This: requestAskAboutReadingOverlayMark for the mark's page.
+    bool askAboutReadingOverlayMark(const QString &overlayId, const QString &markId, const QString &question);
+    // The overlay a link asked for before the PDF's identity was known or Sync brought it
+    // (showReadingOverlay), and whether the reader was told it is not here yet.
+    QString m_pendingReadingOverlay;
+    bool m_pendingReadingOverlayNoticed = false;
     // The sidebar panels and the Overview and Review windows, at the end of a right-click menu, so
     // they are one click away from the pointer.
     void addReadingActions(QMenu *menu);
@@ -706,6 +808,11 @@ private:
                                       const QString &sourcePath,
                                       int sourceLine);
     void finishAgentProposalTextSearch(Okular::Document::SearchStatus status);
+    // Developer log: how the open proposal was found on the page (overlay, text_search,
+    // synctex or unavailable), once per opening.
+    void reportAgentProposalLocated(const QString &proposalId, const QString &method);
+    // The proposal just shown in its window becomes the highlighted row of the Annotations list.
+    void revealAgentProposalInSidebar(const QString &proposalId);
     void resolveAgentProposalFromCard(const QString &proposalId, const QString &action);
     // Several at once: one decision for each source file, so one write and one Undo.
     void resolveAgentProposalsFromSidebar(const QStringList &proposalIds, const QString &action);
@@ -715,6 +822,10 @@ private:
     void finishLiveAgentProposalDecision(const Thoughts::LiveProposalDecisionResult &result);
     void handleAgentProposalResolutionStatus(const QString &operationId, const QString &status, const QString &message);
     void undoLastAgentProposalResolution();
+    // Redo (⇧⌘Z, the Proposals tab's arrow): the last undone decision of a local source, made again.
+    void redoAgentProposalResolution();
+    // ⌘Z and ⇧⌘Z, and the Proposals tab's arrows with what they would do.
+    void updateAgentProposalHistoryControls();
     void showAgentProposalStatus(const QString &message, KMessageWidget::MessageType messageType, bool undoEnabled);
     void hideAgentProposalStatus(bool undoEnabled);
     void setAgentProposalUndoEnabled(bool enabled);
@@ -796,6 +907,9 @@ private:
     // PDF version, and its records from the projections. Nothing for a PDF without a known
     // document ID or for a project reading.
     void refreshDocumentFeedback();
+    // The reading overlays (reading-overlays.md) of the same document: its records from the
+    // projections; in a Project read as one PDF, those of each of its documents at their pages.
+    void refreshReadingOverlays();
     // Opens Annotations on what was just added, unless a search or a review is using the screen.
     bool showAnnotationsForNewEntry();
     void showHtmlNotShownMenu();
@@ -834,9 +948,48 @@ private:
     void showAttachmentContextMenu(const QJsonObject &message);
     QPoint attachmentClick(const QJsonObject &message) const;
     void giveAttachmentFeedback(const QString &polarity, bool withComment, const QString &kind = QString());
-    void saveAttachmentFeedback(const QString &polarity, const QJsonObject &selection, bool withComment, const QString &kind);
+    // @p pictures (document-feedback.md 12) go with the record, and into a comment's editor.
+    void saveAttachmentFeedback(const QString &polarity, const QJsonObject &selection, bool withComment, const QString &kind, const QJsonArray &pictures = QJsonArray());
+    // The page's selection is done with (after feedback): the viewer's, or the live page's.
+    void clearAttachmentSelection();
+    // Text feedback on a live page (html-live-pages.md 2.1), the reader's and not the page's: a
+    // right click on selected text shows this menu instead of the web view's (Like, Dislike,
+    // Question…, Comment… and Copy; Copy alone when the selection cannot be read), with the
+    // selection read in the page's isolated script world. The record is feedback in the page (§8)
+    // on the live stub, with one picture of what was shown (§12) where the server keeps pictures.
+    void requestLiveSelectionMenu();
+    // The live page's menu of selected text (html-live-pages.md §2.1): whether it offers feedback
+    // now, and the item the reader chose ("like", "dislike", "question", "comment").
+    bool liveSelectionFeedbackOffered() const;
+    void chooseLiveSelection(const QString &choice);
+    void addLiveSelectionMenuActions(QMenu *menu, const QJsonObject &selection);
+    void giveLiveFeedback(const QString &polarity, bool withComment, const QString &kind, const QJsonObject &selection);
+    void saveLiveFeedback(const QString &polarity, const QJsonObject &selection, bool withComment, const QString &kind, const QImage &shown);
+    bool livePagePicturesSupported() const;
+    // @p shown kept on this computer as a comment's picture: opaque, JPEG, at most 2048 pixels on
+    // its longer side. Empty (with @p error) when it could not be kept.
+    QJsonObject keepLivePagePicture(const QImage &shown, QString *error);
+    // Whether the live page @p target at @p address is still the one shown.
+    bool showsLivePage(const Thoughts::HtmlAttachmentTarget &target, const QUrl &address) const;
     // The current SHA-256 of an HTML attachment (the version rule of its feedback), kept until the document changes.
     QString attachmentVersion(const QString &path);
+    // The page at @p path as this computer shows it: the version the PDF's source bundle carries,
+    // or the one this computer wrote over it since (a snapshot, a stub) until the bundle has it.
+    Thoughts::HtmlAttachmentTarget resolveHtmlPage(const QString &path, QString *error) const;
+    // A live page: "consent" (asking), "loading", "loaded", "unreachable", "unavailable" (no web
+    // view for it here); empty for an embedded page.
+    QString m_liveState;
+    // When the live page shown last loaded (RFC 3339 UTC, ms): the version its feedback is given on.
+    QString m_liveLoadedAt;
+    bool m_liveSnapshotBusy = false;
+    void showLiveMessage();
+    void updateLivePageBar();
+    void liveMessageAction();
+    void liveMessageCancel();
+    // Take Snapshot after the page's serializer answered (@p serialized: its JSON): confirms,
+    // writes, Syncs and shows the snapshot. False with an empty @p error when the user cancelled.
+    bool saveLiveSnapshot(const QString &serialized, QString *error);
+    bool replaceHtmlPage(const QByteArray &bytes, QString *error);
     QHash<QString, QString> m_attachmentVersions;
     void showDocumentFeedbackList();
     // A feedback row of Annotations: the passage on the PDF or in its HTML attachment, and its
@@ -844,6 +997,28 @@ private:
     void showFeedback(const QString &feedbackId, bool edit);
     std::function<bool(QString *error)> m_attachmentFeedbackUndo;
     QTimer *m_attachmentFeedbackUndoTimer = nullptr;
+    // A shown page follows the newest version Sync brings: Sync replaces the pointer of the PDF's
+    // source bundle (documents/<pdf>.json) when the page changes, and the page shows again where it
+    // was (its page state and scroll). Not during a review of one of its cards: after it.
+    KDirWatch *m_attachmentWatcher = nullptr;
+    QTimer *m_attachmentFollowTimer = nullptr;
+    QStringList m_attachmentWatchedFiles;
+    bool m_attachmentFollowPending = false;
+    int m_attachmentFollowGeneration = 0;
+    void watchHtmlAttachmentSource();
+    void followHtmlAttachmentSource();
+    // Draw on This Page (document-feedback.md 10.1): the pencil on an HTML attachment page takes a
+    // snapshot of the page as the user sees it and opens it to draw on; Save keeps the picture on
+    // this computer and queues the drawing, which the next Sync uploads after its picture. A
+    // drawing's row opens its snapshot with its strokes, to add strokes or delete it. Never drawn on
+    // the live page.
+    void drawOnAttachmentPage();
+    void openNewAttachmentDrawing(QImage snapshot, const Thoughts::HtmlAttachmentTarget &target, const QJsonObject &pageState);
+    void openAttachmentDrawing(const QString &feedbackId);
+    Thoughts::SnapshotDrawingDialog *newSnapshotDrawingDialog(const QImage &snapshot, const QJsonObject &record);
+    QPointer<Thoughts::SnapshotDrawingDialog> m_snapshotDrawing;
+    // The PDF's tools for what is shown: greyed out on an HTML page or the HTML edition.
+    void updateToolsForShownView();
     QPointer<TOC> m_toc;
     bool m_tocEnabled;
     QPointer<MiniBarLogic> m_miniBarLogic;
@@ -873,14 +1048,35 @@ private:
         QList<Thoughts::AgentProposalSourceChange> otherSources;
         // When it was decided, for ⌘Z against the user's newer annotations.
         qint64 at = QDateTime::currentMSecsSinceEpoch();
+        // The ids the user decided (without a move partner), and the first one's motivation.
+        QStringList requestedIds;
+        QString label;
     };
     AgentProposalUndoState m_agentProposalUndoState;
+    // Older decisions, newest last: ⌘Z steps back through them one by one (24 Nov).
+    QList<AgentProposalUndoState> m_agentProposalUndoHistory;
+    // Undone decisions of local sources, newest last: Redo makes them again.
+    struct AgentProposalRedo {
+        QStringList proposalIds;
+        QString action;
+        QString sourcePath;
+        QString label;
+    };
+    QList<AgentProposalRedo> m_agentProposalRedoStack;
+    bool m_queueingAgentProposalRedo = false;
+    // A written decision becomes the one ⌘Z takes back; the one before goes into the history. A new
+    // decision (not Redo's) ends what Redo could make again.
+    void pushAgentProposalUndoState(AgentProposalUndoState state, bool redo);
+    void popAgentProposalUndoState();
     // Accept/Reject of proposals in local sources: the window closes at once,
     // the source write runs on this queue (one at a time, in click order).
     Thoughts::LiveProposalDecisionQueue *m_liveProposalDecisions = nullptr;
     void queueLiveAgentProposalDecision(const QStringList &proposalIds, const QString &sourcePath, const QString &sourceSha256, const QString &action);
     struct PendingLiveProposalDecision {
         QStringList proposalIds;
+        QStringList requestedIds;
+        QString label;
+        bool redo = false;
         QString action;
         QElapsedTimer clock;
         qint64 hiddenNs = 0;
@@ -903,6 +1099,22 @@ private:
     QString m_libraryActivationPdfFilename;
     QString m_libraryActivationDocumentId;
     QString m_libraryActivationPdfSha256;
+    // A newer version of the Library PDF on screen is ready and the tab keeps the version on screen
+    // (its bytes stay at m_docsOpenedPdfPath, in the generation folder held for it), with this bar.
+    QPointer<KMessageWidget> m_newerVersionMessage;
+    QPointer<QAction> m_showNewestVersionAction;
+    bool m_keepingShownVersion = false;
+    // Show Newest Version was chosen: the reload waits for the Sync that is running, at the latest
+    // until another Sync starts or this timer ends (reloadNewestVersion).
+    bool m_newestVersionRequested = false;
+    QTimer *m_newestVersionTimer = nullptr;
+    // A reload asked for by the user that a running Sync does not defer.
+    bool m_reloadDuringSync = false;
+    // A card of the Cards list placed on the newest version: shown there once that version is.
+    QString m_cardAfterNewestVersion;
+    // The cards the Shell gave the Cards list last (setSidebarReviewCards).
+    QJsonArray m_sidebarReviewCards;
+    QString m_heldLibraryGeneration;
     QTimer *m_docsCommentRefreshTimer = nullptr;
     QTimer *m_docsSourceReconcileTimer = nullptr;
     bool m_docsCompanionActive = false;
@@ -1010,6 +1222,27 @@ private:
     int m_pendingAgentProposalTextSearchSourceLine = 0;
     bool m_pendingAgentProposalTextSearchTargetsCurrentText = false;
     bool m_agentProposalTextSearchRunning = false;
+    // One opening of a proposal, from the first request (the Library's double-click, a
+    // click on the page or in the sidebar) until it is located, for the developer log.
+    struct AgentProposalOpenTiming {
+        QString id;
+        QElapsedTimer requested;
+        QElapsedTimer locating;
+        QElapsedTimer textSearch;
+        qint64 windowShownMs = -1;
+        int attempts = 0;
+        int sourceChecks = 0;
+        int sourceReads = 0;
+        qint64 sourceReadMs = 0;
+        int overlayWaits = 0;
+        int textSearches = 0;
+        int pagesSearched = 0;
+        qint64 textSearchMs = 0;
+        bool reported = false;
+    };
+    AgentProposalOpenTiming m_agentProposalOpenTiming;
+    // A comment waiting for its projection (see m_pendingReviewAnnotationId): since when.
+    QElapsedTimer m_pendingReviewAnnotationClock;
     int m_docsCommentMutationRetryAttempt = 0;
     struct ReviewMetadataHistoryEntry {
         QString annotationId;

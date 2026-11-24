@@ -2,6 +2,7 @@
 #pragma once
 #include <QCryptographicHash>
 #include <QDir>
+#include <QFileInfo>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -12,6 +13,8 @@
 #include <QUuid>
 #include "sourceowner.h"
 #include "verifiedartifactcache.h"
+#include "fileidentitycache.h"
+#include <algorithm>
 #include <atomic>
 
 namespace Thoughts {
@@ -48,11 +51,13 @@ public:
         if (!QFileInfo(path).isSymLink() && !identity.isEmpty()) {
             if (const auto *entry = cache.object(path); entry && entry->identity == identity) {
                 if (error && !entry->error.isEmpty()) *error = entry->error;
+                ++fileReadCounts().hits;
                 return entry->value;
             }
         }
         QString failure;
         ++reads();
+        if (!identity.isEmpty()) ++fileReadCounts().reads;
         const auto value = readUncached(path, &failure);
         if (artifactFileIdentity(path) != identity) {
             cache.remove(path);
@@ -133,6 +138,25 @@ public:
         return !value.isEmpty() && value != QLatin1String(".") && !QDir::isAbsolutePath(value)
             && QDir::cleanPath(value) == value && !value.split(QLatin1Char('/')).contains(QStringLiteral(".."))
             && !value.contains(QLatin1Char('\\')) && !value.contains(QLatin1Char('\n'));
+    }
+    // The docs-* folders this computer's Projects connect that are not here (sorted). One added
+    // on another device shows up only here: neither the source manifest, which lists the folders
+    // found here, nor the server's source frontier changes when a Project gains it.
+    static QStringList missingConnectedFolders(const QString &root) {
+        QStringList missing;
+        for (const auto &filename : DefaultFolderLocation::manifestPaths(root)) {
+            const auto configuration = read(filename);
+            const auto defaultId = configuration.value(QStringLiteral("default_folder_id"));
+            for (const auto &raw : configuration.value(QStringLiteral("source_folders")).toArray()) {
+                const auto folder = raw.toObject();
+                const auto path = folder.value(QStringLiteral("path")).toString();
+                if (folder.value(QStringLiteral("folder_id")) == defaultId || !path.startsWith(QLatin1String("docs-")) || path.contains(QLatin1Char('/'))
+                    || path.contains(QLatin1Char('\\')) || missing.contains(path) || QFileInfo(QDir(root).filePath(path)).isDir()) continue;
+                missing.append(path);
+            }
+        }
+        std::sort(missing.begin(), missing.end());
+        return missing;
     }
     static QJsonObject find(const QString &root, const QString &owner, QString *filename = nullptr, QString *error = nullptr) {
         QJsonObject result;

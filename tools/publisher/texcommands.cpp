@@ -176,14 +176,19 @@ QStringList activePdfLinkKeys(const QString &input)
 
 QList<LinkCommand> activeLinkCommands(const QString &input)
 {
+    return activeCommands(input, linkCommandNames(), 3);
+}
+
+QList<LinkCommand> activeCommands(const QString &input, const QStringList &names, int arguments)
+{
     const Text source = Py::toCodePoints(input);
     QList<LinkCommand> commands;
-    scanActiveCommands(source, linkCommandNames(), [&](const QString &name, size_t start, size_t commandEnd) {
+    scanActiveCommands(source, names, [&](const QString &name, size_t start, size_t commandEnd) {
         LinkCommand command;
         command.name = name;
         command.line = 1 + int(std::count(source.cbegin(), source.cbegin() + start, U'\n'));
         size_t end = commandEnd;
-        for (int index = 0; index < 3; ++index) {
+        for (int index = 0; index < arguments; ++index) {
             const auto argument = bracedArgument(source, end);
             if (!argument) {
                 break;

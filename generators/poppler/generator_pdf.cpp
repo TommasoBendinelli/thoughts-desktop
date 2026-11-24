@@ -167,7 +167,17 @@ private:
     QComboBox *m_scaleMode;
 };
 
-static void fillViewportFromLinkDestination(Okular::DocumentViewport &viewport, const Poppler::LinkDestination &destination)
+// A figure's named destination (hyperref's figure.N or figure.caption.N, also after a "<document id>/"
+// prefix) is its caption, below the figure: shown at the top of the view, the figure was out of view.
+static bool isFigureDestination(const QString &name)
+{
+    const QString last = name.section(QLatin1Char('/'), -1);
+    return last.startsWith(QLatin1String("figure.")) || last.startsWith(QLatin1String("subfigure."));
+}
+
+// @p name: the destination's name when it has one. A figure's is centred in the view, so the figure
+// above its caption shows too (23 Nov 2026: a link to a figure showed what is below it).
+static void fillViewportFromLinkDestination(Okular::DocumentViewport &viewport, const Poppler::LinkDestination &destination, const QString &name = QString())
 {
     viewport.pageNumber = destination.pageNumber() - 1;
 
@@ -190,6 +200,11 @@ static void fillViewportFromLinkDestination(Okular::DocumentViewport &viewport, 
         viewport.rePos.normalizedY = top;
         viewport.rePos.enabled = true;
         viewport.rePos.pos = Okular::DocumentViewport::TopLeft;
+        if (isFigureDestination(name)) {
+            // Centred vertically on the caption; horizontally on the page, as figures are.
+            viewport.rePos.normalizedX = 0.5;
+            viewport.rePos.pos = Okular::DocumentViewport::Center;
+        }
     }
     /* TODO
     if ( dest->getChangeZoom() )
@@ -1821,7 +1836,7 @@ QVariant PDFGenerator::metaData(const QString &key, const QVariant &option) cons
         std::unique_ptr<Poppler::LinkDestination> ld = target ? target->linkDestination(optionString) : nullptr;
         userMutex()->unlock();
         if (ld) {
-            fillViewportFromLinkDestination(viewport, *ld);
+            fillViewportFromLinkDestination(viewport, *ld, optionString);
             if (viewport.pageNumber >= 0) viewport.pageNumber += offset;
         }
         if (viewport.pageNumber >= 0) {

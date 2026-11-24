@@ -380,9 +380,12 @@ QSet<QString> pathSet(const Json &authored)
 
 bool isHtmlSourcePath(const QString &path, const QString &project)
 {
-    const QStringList parts = path.split(QLatin1Char('/'));
-    if (!Py::isConnectedFolderName(project) || parts.size() < 3 || parts.at(0) != project
-        || (parts.at(1) != QLatin1String("tex") && parts.at(1) != QLatin1String("markdown"))) {
+    // `project` is a source folder: a connected docs-* folder or a Project's default folder.
+    if (!SourceOwner::isOwner(project) || !path.startsWith(project + QLatin1Char('/'))) {
+        return false;
+    }
+    const QStringList parts = path.mid(project.size() + 1).split(QLatin1Char('/'));
+    if (parts.size() < 2 || (parts.at(0) != QLatin1String("tex") && parts.at(0) != QLatin1String("markdown"))) {
         return false;
     }
     for (const QString &part : parts) {

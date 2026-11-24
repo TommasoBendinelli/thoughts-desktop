@@ -197,6 +197,8 @@ int main(int argc, char **argv)
 
     if (!parser.isSet(QStringLiteral("presentation")) && !parser.isSet(QStringLiteral("print-and-exit"))) {
         Shell::showCommentsOverviewOnStartup();
+        // Not connected to the configured server: Sign In rather than silently unconnected.
+        Shell::offerSignInOnStartup();
     }
 
 #if defined(Q_OS_MACOS)

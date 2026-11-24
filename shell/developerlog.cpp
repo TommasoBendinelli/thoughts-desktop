@@ -330,7 +330,9 @@ void DeveloperLog::record(const QString &event, const QJsonObject &metadata, boo
     std::lock_guard<std::mutex> lock(registryMutex);
     if (active && (!verboseOnly || active->d->verbose)) {
         if (event == QLatin1String("app.started") || event.startsWith(QLatin1String("library."))
-            || event.startsWith(QLatin1String("comments.refresh")) || event.startsWith(QLatin1String("source_tracking."))) {
+            || event.startsWith(QLatin1String("comments.refresh")) || event.startsWith(QLatin1String("source_tracking."))
+            || event.startsWith(QLatin1String("proposal.open.")) || event.startsWith(QLatin1String("proposal.list.")) || event.startsWith(QLatin1String("proposal.overlays."))
+            || event.startsWith(QLatin1String("comment.open.")) || event == QLatin1String("reader.tab.activated")) {
             QJsonObject performanceEntry {{QStringLiteral("time"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
                                           {QStringLiteral("event"), event}, {QStringLiteral("data"), metadata}};
             active->d->performanceEntries.append(performanceEntry);

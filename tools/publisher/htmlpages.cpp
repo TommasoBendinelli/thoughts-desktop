@@ -6,6 +6,7 @@
 #include "sha256.h"
 #include "sourceapi.h"
 #include "sourceinventory.h"
+#include "sourceowner.h"
 #include "thoughtignore.h"
 
 #include <QDateTime>
@@ -27,10 +28,10 @@ const QString pageDirectory = QStringLiteral("tex/support/html");
 const QString attachmentManifest = QStringLiteral("tex/support/thoughts_html_attachments.txt");
 constexpr qint64 maximumPageBytes = 100000000;
 
+// A connected docs-* folder or a Project's default folder (.thoughts/projects/<hex>/default).
 bool isFolder(const QString &name)
 {
-    static const QRegularExpression folder(QStringLiteral("^docs-[A-Za-z0-9_.-]+$"));
-    return folder.match(name).hasMatch();
+    return SourceOwner::isOwner(name);
 }
 
 bool isPageName(const QString &name)
@@ -156,15 +157,19 @@ QString apiErrorCode(const Py::Exception &error)
 
 bool isHtmlPagePath(const QString &path)
 {
-    const QStringList parts = path.split(QLatin1Char('/'));
-    return parts.size() == 5 && isFolder(parts.at(0)) && parts.mid(1, 3).join(QLatin1Char('/')) == pageDirectory && isPageName(parts.at(4));
+    const QString owner = SourceOwner::of(path);
+    if (owner.isEmpty()) {
+        return false;
+    }
+    const QStringList parts = path.mid(owner.size() + 1).split(QLatin1Char('/'));
+    return parts.size() == 4 && parts.mid(0, 3).join(QLatin1Char('/')) == pageDirectory && isPageName(parts.at(3));
 }
 
 QStringList htmlPageFolders(const QStringList &paths)
 {
     QSet<QString> folders;
     for (const QString &path : paths) {
-        const QString owner = path.section(QLatin1Char('/'), 0, 0);
+        const QString owner = SourceOwner::of(path);
         if (isFolder(owner)) {
             folders.insert(owner);
         }

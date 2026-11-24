@@ -27,7 +27,11 @@
 #include <optional>
 
 #include "agentproposalparser.h"
+#include "appsignin.h"
+#include "reviewstore.h"
 
+class KMessageWidget;
+class QAction;
 class QCloseEvent;
 class QCheckBox;
 class QComboBox;
@@ -281,6 +285,9 @@ public:
     void setFedoraProjections(const QJsonObject &projections);
     void setPdfSyncState(const QJsonObject &state);
     void showServerDetails();
+    // Sign In (signindialog.h), filled from a thoughts://connect link when one is given. An open
+    // Sign In is brought forward (and filled again) rather than opened twice.
+    void showSignIn(const std::optional<AppSignIn::ConnectLink> &link = std::nullopt);
     void showSummary();
     void reloadReviewCards();
     // An agent created a Project or imported a PDF through the app (create-project, import-document).
@@ -365,6 +372,9 @@ Q_SIGNALS:
     void reviewCorrespondenceReviewRequested(const QVariantMap &payload);
     // "Remove from Project" on an agent conversation row: @p record is the removed next revision to queue.
     void agentConversationRemoveRequested(const QVariantMap &record);
+    // This computer signed in or out, or a server address or device token was saved in the
+    // Server dialog: the app connects with what is stored now, without a restart.
+    void serverConnectionChanged();
 
 protected:
     void showEvent(QShowEvent *event) override;
@@ -422,6 +432,10 @@ private Q_SLOTS:
     void moveLibrarySourceDocument(const QJsonObject &project, const QJsonObject &document);
     void setSourceMovePlanner(SourceMovePlanner planner) { m_sourceMovePlanner = std::move(planner); }
     void setServerTokenWriter(ServerTokenWriter writer) { m_serverTokenWriter = std::move(writer); }
+    // Where Sign In and the Server dialog keep tokens and send requests (tests: a fake secret
+    // store and server). A token writer set above is used when these give none.
+    void setServerAccountHooks(AppSignIn::Hooks hooks) { m_serverAccountHooks = std::move(hooks); }
+    AppSignIn::Hooks serverAccountHooks() const;
     void editLibraryProject(const QJsonObject &project, const QString &action, const QJsonObject &document = {});
     // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow,
     // queued as a set_review_kind Library-project action, and Retire project cards….
@@ -441,6 +455,7 @@ private Q_SLOTS:
 private:
     SourceMovePlanner m_sourceMovePlanner;
     ServerTokenWriter m_serverTokenWriter;
+    AppSignIn::Hooks m_serverAccountHooks;
     void requestSourceMovePlan(const QJsonObject &request, QObject *context,
                                std::function<void(const QJsonObject &plan, const QString &error)> reply);
     struct CommentState {
@@ -548,7 +563,8 @@ private:
     void finishDocumentReload(const QString &stem, const std::optional<TrackedCommentDocument> &document);
     void startFullReload(bool discoverIncludedSources = false, const QString &reason = {});
     void finishFullReload(const QList<TrackedCommentDocument> &documents, bool liveSourcesValid = true, std::optional<quint64> generation = std::nullopt,
-                          const QByteArray &catalogBaseline = {}, const QMap<QString, QString> &settingsIdentity = {});
+                          const QByteArray &catalogBaseline = {}, const QMap<QString, QString> &settingsIdentity = {},
+                          const QString &projectStoreIdentity = {});
     void enqueueMutation(PendingMutation mutation);
     void startNextMutation();
     void finishMutation(const PendingMutation &mutation, const QVariantMap &result);
@@ -556,7 +572,7 @@ private:
     bool shouldIgnoreLocalWrite(const QString &path);
     void flushQueuedMutations();
     void refreshWatchPaths();
-    void requestCatalogCheck(bool inventory);
+    void requestCatalogCheck(bool inventory, const QString &reason = QStringLiteral("request"));
     void refreshFileSnapshots();
     void restoreWindowState();
     void saveWindowState();
@@ -565,6 +581,8 @@ private:
     void applyLibraryColumnDefaults();
     void setLibraryColumnVisible(int column, bool visible);
     void saveLibraryColumns();
+    // No widths saved yet: each column fits its contents and Project takes what is left.
+    void fitLibraryColumns();
     void updateCommentSummary();
     void updateDashboardSummary(bool refreshLibrary = true);
     void updateSyncBuildSummary();
@@ -617,7 +635,19 @@ private:
     QTimer *m_reloadTimer = nullptr;
     QTimer *m_autoSaveTimer = nullptr;
     QTimer *m_persistenceRetryTimer = nullptr;
+    // The Library change check (catalogue signature): after a change event, at
+    // most one per CatalogCheckSpacingMs, none during a full reload, and a
+    // fallback every CatalogFallbackCheckMs while the window is shown.
+    static constexpr int CatalogCheckDelayMs = 500;
+    static constexpr int CatalogCheckSpacingMs = 2000;
+    static constexpr int CatalogFallbackCheckMs = 60000;
     QTimer *m_catalogPollTimer = nullptr;
+    QTimer *m_catalogFallbackTimer = nullptr;
+    int m_catalogCheckDelayMs = CatalogCheckDelayMs;
+    int m_catalogCheckSpacingMs = CatalogCheckSpacingMs;
+    QElapsedTimer m_lastCatalogCheck;
+    // What asked for the next check (developer log).
+    QSet<QString> m_catalogCheckReasons;
     bool m_catalogSignatureCheckRunning = false;
     bool m_catalogCheckRequested = false;
     // Canonical source path -> Library PDF filenames published from it.
@@ -685,6 +715,17 @@ private:
     // Review: Browse cards and Mental Model, as on the phone.
     QTabWidget *m_reviewPage = nullptr;
     ReviewCardsWidget *m_reviewCardsWidget = nullptr;
+    // Cards Thoughts retired because their passage left the note (ReviewAutoRetire): one notice
+    // above the tabs, with Restore for one card and Show (Browse cards, Retired) for several. Each
+    // retirement is told once: remembered as shown when the notice is on screen.
+    KMessageWidget *m_autoRetireNotice = nullptr;
+    QAction *m_autoRetireRestoreAction = nullptr;
+    QAction *m_autoRetireShowAction = nullptr;
+    QList<ReviewAutoRetire::Notice> m_autoRetireNotices; // What the notice tells, oldest first.
+    void addAutoRetireNotices(const QList<ReviewAutoRetire::Notice> &notices);
+    // The notice as the cards stand now: a card restored since (here or elsewhere) leaves it.
+    void updateAutoRetireNotice();
+    void rememberShownAutoRetireNotices();
     MentalModelView *m_mentalModelView = nullptr;
     QLabel *m_librarySummary = nullptr;
     QLabel *m_librarySelectionDetails = nullptr;
@@ -804,6 +845,10 @@ private:
     bool m_restoredWindowState = false;
     // Set while code moves Library columns, so only the user's moves are saved.
     bool m_libraryColumnsUpdating = false;
+    // Whether the Library columns have widths of their own (restored, or set by the user); until then
+    // they fit their contents after each rebuild.
+    bool m_libraryColumnsSized = false;
+    QTimer *m_libraryColumnsSaveTimer = nullptr;
     bool m_editorDirty = false;
     bool m_chatGptUrlDirty = false;
     bool m_openChatGptAfterSave = false;

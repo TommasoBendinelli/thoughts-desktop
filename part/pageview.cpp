@@ -3,6 +3,9 @@
 #include "feedbackversion.h"
 #include "reviewmaskgeometry.h"
 #include "documentfeedbackoverlay.h"
+#include "readingoverlaylayer.h"
+#include "readingoverlaylist.h"
+#include "readingoverlays.h"
 #include "reviewfeedbackeditor.h"
 #include "reviewfeedbackoverlay.h"
 #include "../gui/textlinepath.h"
@@ -42,6 +45,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QVBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QFile>
@@ -53,6 +57,7 @@
 #include <QJsonObject>
 #include <QLineEdit>
 #include <QLoggingCategory>
+#include <QHash>
 #include <QMap>
 #include <QMenu>
 #include <QMimeData>
@@ -64,10 +69,13 @@
 #include <QPointer>
 #include <QRegularExpression>
 #include <QDomElement>
+#include <QScreen>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
 #include <QSet>
+#include <QStyle>
 #include <QSignalBlocker>
 #include <QScopeGuard>
 #include <QStandardPaths>
@@ -343,11 +351,33 @@ public:
     bool agentProposalPressHeld = false;
     bool agentProposalPressCancelled = false;
     bool agentProposalTextHighlight = false;
+    // The passage a link to a place shows (showPlace): a text selection of its own, gone with
+    // the next click or when placeHighlightTimer fires.
+    bool placeHighlight = false;
+    QTimer *placeHighlightTimer = nullptr;
     QSet<QString> suppressedAgentProposalIds;
     QSet<QString> decidedAgentProposalIds;
     QPointer<AgentProposalWindow> agentProposalWindow;
+    // The passage the open proposal window goes beside (page, normalized rect), until placed.
+    struct AgentProposalPlacement {
+        QString proposalId;
+        int page = -1;
+        QRectF rect;
+    };
+    std::optional<AgentProposalPlacement> agentProposalPlacement;
     quint64 agentProposalReloadGeneration = 0;
     bool agentProposalOverlaysReady = false;
+    // Developer log: a burst of overlay readings, from its first start until one is delivered.
+    QElapsedTimer agentProposalReloadClock;
+    int agentProposalReloadsSuperseded = 0;
+    // The document the places are (being) read for, whether a reading is under way, and whether
+    // another one was asked for meanwhile (reloadAgentProposalOverlays(true)).
+    QUrl agentProposalOverlaysUrl;
+    bool agentProposalReloadRunning = false;
+    bool agentProposalReloadAgain = false;
+    // The proposals the PDF's source artifact says it was built with, when one matches the PDF.
+    QSet<QString> builtAgentProposalIds;
+    bool builtAgentProposalIdsKnown = false;
     // Open / Accept / Reject next to a hovered or held marker.
     QPointer<AgentProposalHoverBar> agentProposalHoverBar;
     QTimer *agentProposalHoverShowTimer = nullptr;
@@ -401,6 +431,11 @@ public:
     bool erasing = false;
     QPointF eraserAt;
     QHash<QString, Erased> erased;
+    // What the reader shows instead of the pages (setShownInstead), what the pencil does on an HTML
+    // page, and whether the document has pages (updateActionState), for the tools' state.
+    PageView::ShownInstead shownInstead = PageView::ShownInstead::Nothing;
+    std::function<void()> htmlPagePencil;
+    bool hasPages = false;
     // The user's annotations in this view, newest last, for ⌘Z: the record, whether the step was a
     // pencil stroke (taken back one at a time), the PDF's own undo position then (a later change of
     // that kind is undone first) and when. An eraser drag is one step for every drawing it changed.
@@ -466,6 +501,21 @@ public:
     // Answer feedback of the card under review (drawn only while its answer is revealed).
     Thoughts::ReviewFeedbackOverlay *reviewFeedback = nullptr;
     Thoughts::DocumentFeedbackOverlay *documentFeedback = nullptr;
+    // Where document feedback's pictures are kept (Part sets it with the repository).
+    Thoughts::ReviewFeedbackEditor::PictureStore feedbackPictureStore;
+    // Agents' reading guides (reading-overlays.md): the overlays of the PDF on screen; the mark the
+    // Overlay tab asked for, flashed while overlayFlashTicks counts down; the comment marker pressed.
+    Thoughts::ReadingOverlayLayer *readingOverlays = nullptr;
+    QList<QPair<int, QRectF>> overlayFlashRects;
+    int overlayFlashTicks = 0;
+    QTimer *overlayFlashTimer = nullptr;
+    QStringList pressedOverlayMarker;
+    QPointer<QWidget> overlayMarkPopup;
+    // The pictures of marks' notes (reading-overlays.md "Mark notes") by note_id, the newest few
+    // (oldest first in overlayNoteImageOrder), and the notes asked for and not answered yet.
+    QHash<QString, QImage> overlayNoteImages;
+    QStringList overlayNoteImageOrder;
+    QSet<QString> overlayNoteRequested;
     // A rectangle whose menu is open: what its feedback is about, instead of the text selection.
     QList<QPair<int, QRectF>> feedbackAreaLines;
     QString feedbackAreaText;
@@ -546,6 +596,7 @@ public:
     KToggleAction *aHighlightFeedback = nullptr;
     KToggleAction *aHighlightAgentEdits = nullptr;
     KToggleAction *aHighlightReviewCards = nullptr;
+    KToggleAction *aHighlightReadingOverlays = nullptr;
     QActionGroup *viewModeActionGroup = nullptr;
     ColorModeMenu *aColorModeMenu = nullptr;
     KToggleAction *aViewContinuous = nullptr;
@@ -652,6 +703,13 @@ PageView::PageView(QWidget *parent, Okular::Document *document)
         endPassageChangeIfStale();
         Q_EMIT documentFeedbackChanged();
     });
+    d->readingOverlays = new Thoughts::ReadingOverlayLayer(this);
+    // A mark made on another PDF version is found in the pages' text as feedback is, from the same glyphs.
+    d->readingOverlays->setPageText([this](const QList<int> &pages) { return d->documentFeedback->pagesText(pages); });
+    connect(d->readingOverlays, &Thoughts::ReadingOverlayLayer::changed, this, [this] {
+        viewport()->update();
+        Q_EMIT readingOverlaysChanged();
+    });
     d->setting_viewCols = Okular::Settings::viewColumns();
     d->rtl_Mode = Okular::Settings::rtlReadingDirection();
 
@@ -706,6 +764,10 @@ PageView::PageView(QWidget *parent, Okular::Document *document)
             const QSignalBlocker blocker(d->aHighlightReviewCards);
             d->aHighlightReviewCards->setChecked(Okular::Settings::highlightReviewCards());
         }
+        if (d->aHighlightReadingOverlays) {
+            const QSignalBlocker blocker(d->aHighlightReadingOverlays);
+            d->aHighlightReadingOverlays->setChecked(Okular::Settings::highlightReadingOverlays());
+        }
         if (!Okular::Settings::highlightComments()) {
             // Comments that are no longer painted must also stop being clickable.
             d->mouseCommentCandidate = nullptr;
@@ -740,6 +802,22 @@ PageView::PageView(QWidget *parent, Okular::Document *document)
     d->agentProposalHoverShowTimer->setSingleShot(true);
     d->agentProposalHoverShowTimer->setInterval(AgentProposalHoverShowDelayMs);
     connect(d->agentProposalHoverShowTimer, &QTimer::timeout, this, &PageView::showAgentProposalHoverBar);
+    d->placeHighlightTimer = new QTimer(this);
+    d->placeHighlightTimer->setSingleShot(true);
+    d->placeHighlightTimer->setInterval(6000);
+    connect(d->placeHighlightTimer, &QTimer::timeout, this, [this] {
+        if (d->placeHighlight) textSelectionClear();
+    });
+    // A mark asked for from the Overlay tab blinks three times.
+    d->overlayFlashTimer = new QTimer(this);
+    d->overlayFlashTimer->setInterval(180);
+    connect(d->overlayFlashTimer, &QTimer::timeout, this, [this] {
+        if (--d->overlayFlashTicks <= 0) {
+            d->overlayFlashTimer->stop();
+            d->overlayFlashRects.clear();
+        }
+        viewport()->update();
+    });
     d->agentProposalHoldTimer = new QTimer(this);
     d->agentProposalHoldTimer->setSingleShot(true);
     d->agentProposalHoldTimer->setInterval(QGuiApplication::styleHints()->mousePressAndHoldInterval());
@@ -776,6 +854,10 @@ PageView::PageView(QWidget *parent, Okular::Document *document)
     d->scroller->setScrollerProperties(prop);
 
     connect(d->scroller, &QScroller::stateChanged, this, [this](QScroller::State s) { slotRequestVisiblePixmaps(s); });
+    // The proposal window goes beside its passage once the view stopped moving there.
+    connect(d->scroller, &QScroller::stateChanged, this, [this](QScroller::State s) {
+        if (s == QScroller::Inactive && d->agentProposalPlacement) QTimer::singleShot(0, this, &PageView::applyAgentProposalWindowPlacement);
+    });
 
     // the apparently "magic" value of 20 is the same used internally in QScrollArea
     verticalScrollBar()->setCursor(Qt::ArrowCursor);
@@ -1038,6 +1120,17 @@ void PageView::setupViewerActions(KActionCollection *ac)
     connect(d->aHighlightReviewCards, &QAction::toggled, this, [](bool checked) {
         Okular::Settings::setHighlightReviewCards(checked);
         Okular::Settings::self()->save();
+    });
+    // Agents' reading guides (reading-overlays.md §4); off hides every overlay.
+    d->aHighlightReadingOverlays = new KToggleAction(i18n("Reading overlays"), this);
+    d->aHighlightReadingOverlays->setChecked(Okular::Settings::highlightReadingOverlays());
+    d->aHighlightReadingOverlays->setToolTip(i18n("Show agents' reading overlays: what to read, skim or skip, and their comments"));
+    ac->addAction(QStringLiteral("highlight_reading_overlays"), d->aHighlightReadingOverlays);
+    highlightMenu->addAction(d->aHighlightReadingOverlays);
+    connect(d->aHighlightReadingOverlays, &QAction::toggled, this, [this](bool checked) {
+        Okular::Settings::setHighlightReadingOverlays(checked);
+        Okular::Settings::self()->save();
+        viewport()->update();
     });
 
     // Continuous view action, add to view mode action menu.
@@ -2083,12 +2176,16 @@ bool PageView::selectAgentProposal(const QString &proposalId)
         found = matchingOverlay({}, false);
     }
     if (found == d->agentProposalOverlays.cend()) {
-        if (!d->agentProposalOverlaysReady) {
+        // Never read yet: read now. A reading under way is not started again; it was thrown away
+        // and restarted here, so a proposal opened while its PDF loaded waited for a second one.
+        if (!d->agentProposalOverlaysReady && !d->agentProposalReloadRunning) {
             reloadAgentProposalOverlays();
         }
         return false;
     }
     d->selectedAgentProposalId = proposalId;
+    // A jump to a page out of sight is immediate: scrolling there drew every page in between.
+    const bool nearby = std::abs(static_cast<int>(d->document->currentPage()) - found->page) <= 1;
     Okular::DocumentViewport focusViewport(found->page);
     const Okular::Page *page = d->document->page(found->page);
     if (page && page->width() > 0.0 && page->height() > 0.0) {
@@ -2101,9 +2198,63 @@ bool PageView::selectAgentProposal(const QString &proposalId)
             (found->normalized ? found->rect.top() : found->rect.top() / page->height()) - 0.10);
         focusViewport.rePos.pos = Okular::DocumentViewport::TopLeft;
     }
-    d->document->setViewport(focusViewport, nullptr, true);
+    d->document->setViewport(focusViewport, nullptr, nearby);
     viewport()->update();
+    if (page && page->width() > 0.0 && page->height() > 0.0) {
+        const QRectF rect = found->normalized ? found->rect
+                                              : QRectF(found->rect.left() / page->width(), found->rect.top() / page->height(), found->rect.width() / page->width(),
+                                                       found->rect.height() / page->height());
+        placeAgentProposalWindowNear(proposalId, found->page, rect);
+    }
     return true;
+}
+
+void PageView::placeAgentProposalWindowNear(const QString &proposalId, int page, const QRectF &rect)
+{
+    if (!d->agentProposalWindow || d->agentProposalWindow->proposalId() != proposalId || page < 0 || !rect.isValid()) return;
+    d->agentProposalPlacement = PageViewPrivate::AgentProposalPlacement{proposalId, page, rect};
+    // After the view's move there (a smooth scroll ends in stateChanged) and its layout.
+    if (d->scroller->state() == QScroller::Inactive) QTimer::singleShot(0, this, &PageView::applyAgentProposalWindowPlacement);
+}
+
+QRect PageView::globalPageRect(int page, const QRectF &rect) const
+{
+    for (const PageViewItem *item : std::as_const(d->items)) {
+        if (!item->isVisible() || item->pageNumber() != page) continue;
+        const QRect geometry = item->uncroppedGeometry();
+        const QRectF onView(geometry.x() + rect.left() * geometry.width() - horizontalScrollBar()->value(),
+                            geometry.y() + rect.top() * geometry.height() - verticalScrollBar()->value(), rect.width() * geometry.width(), rect.height() * geometry.height());
+        return QRect(viewport()->mapToGlobal(onView.topLeft().toPoint()), onView.size().toSize().expandedTo(QSize(1, 1)));
+    }
+    return {};
+}
+
+void PageView::applyAgentProposalWindowPlacement()
+{
+    if (!d->agentProposalPlacement || d->scroller->state() != QScroller::Inactive) return;
+    const auto placement = *std::exchange(d->agentProposalPlacement, std::nullopt);
+    if (!d->agentProposalWindow || !d->agentProposalWindow->isVisible() || d->agentProposalWindow->proposalId() != placement.proposalId) return;
+    const QRect passage = globalPageRect(placement.page, placement.rect);
+    QRect page;
+    for (const PageViewItem *item : std::as_const(d->items)) {
+        if (item->pageNumber() != placement.page) continue;
+        page = QRect(viewport()->mapToGlobal(item->croppedGeometry().topLeft() - QPoint(horizontalScrollBar()->value(), verticalScrollBar()->value())),
+                     item->croppedGeometry().size());
+    }
+    // The page's width as far as it is on screen: a page wider than the view has no room beside it.
+    const QRect view(viewport()->mapToGlobal(QPoint(0, 0)), viewport()->size());
+    page = QRect(QPoint(std::max(page.left(), view.left()), page.top()), QPoint(std::min(page.right(), view.right()), page.bottom()));
+    const QScreen *shown = screen();
+    if (!passage.isValid() || !shown) return;
+    d->agentProposalWindow->placeBeside(passage, page, shown->availableGeometry());
+}
+
+void PageView::placeAgentProposalWindowInCorner()
+{
+    const QScreen *shown = screen();
+    if (!d->agentProposalWindow || !shown) return;
+    d->agentProposalPlacement.reset();
+    d->agentProposalWindow->placeInCorner(QRect(viewport()->mapToGlobal(QPoint(0, 0)), viewport()->size()), shown->availableGeometry());
 }
 
 bool PageView::agentProposalOverlaysReady() const
@@ -2111,9 +2262,18 @@ bool PageView::agentProposalOverlaysReady() const
     return d->agentProposalOverlaysReady;
 }
 
+bool PageView::agentProposalBuiltIntoPdf(const QString &proposalId, bool *known) const
+{
+    const bool isKnown = d->agentProposalOverlaysReady && d->builtAgentProposalIdsKnown && d->agentProposalOverlaysUrl == d->document->currentDocument();
+    if (known) {
+        *known = isKnown;
+    }
+    return isKnown && d->builtAgentProposalIds.contains(proposalId);
+}
+
 void PageView::refreshAgentProposalOverlays()
 {
-    reloadAgentProposalOverlays();
+    reloadAgentProposalOverlays(true);
 }
 
 void PageView::setAgentProposalTextHighlight(int page, std::unique_ptr<Okular::RegularAreaRect> area)
@@ -2159,6 +2319,53 @@ void PageView::showPassageRegions(const QList<QPair<int, QRectF>> &regions)
     viewport()->update();
 }
 
+void PageView::showPlace(int page, std::optional<QPointF> point, std::optional<QRectF> rect)
+{
+    textSelectionClear();
+    const int pages = static_cast<int>(d->document->pages());
+    if (page < 0 || page >= pages || d->items.size() != pages) return;
+    if (rect && rect->isValid()) {
+        // The passage marked as a found proposal is, until the next click or a few seconds on.
+        auto area = std::make_unique<Okular::RegularAreaRect>();
+        area->append(Okular::NormalizedRect(rect->left(), rect->top(), rect->right(), rect->bottom()));
+        d->pagesWithTextSelection.insert(page);
+        d->document->setPageTextSelection(page, std::move(area), QColor(255, 210, 0, 150));
+        d->placeHighlight = true;
+        d->placeHighlightTimer->start();
+    }
+    if (!point && rect && rect->isValid()) point = rect->topLeft();
+    Okular::DocumentViewport focus(page);
+    if (point) {
+        // A view resized a moment ago (a window just shown) lays its pages out first: the margin
+        // is in pixels of the page as it will be shown.
+        if (d->delayResizeEventTimer->isActive()) delayedResizeEvent();
+        else if (d->dirtyLayout) slotRelayoutPages();
+        // The point a little below the top of the view: a margin of pixels, not of the page,
+        // which can be many screens tall (a web article saved as one page).
+        const PageViewItem *item = d->items.at(page);
+        const QRect geometry = item->croppedGeometry();
+        const Okular::NormalizedRect &crop = item->crop();
+        const double marginY = geometry.height() > 0 ? std::min(viewport()->height() / 8.0, 80.0) / geometry.height() * (crop.bottom - crop.top) : 0.02;
+        const double marginX = geometry.width() > 0 ? 24.0 / geometry.width() * (crop.right - crop.left) : 0.02;
+        focus.rePos.enabled = true;
+        focus.rePos.normalizedX = std::max(0.0, point->x() - marginX);
+        focus.rePos.normalizedY = std::max(0.0, point->y() - marginY);
+        focus.rePos.pos = Okular::DocumentViewport::TopLeft;
+    }
+    d->document->setViewport(focus, nullptr, false);
+    viewport()->update();
+}
+
+bool PageView::placeHighlightShown() const
+{
+    return d->placeHighlight;
+}
+
+void PageView::setPlaceHighlightDuration(int milliseconds)
+{
+    d->placeHighlightTimer->setInterval(milliseconds);
+}
+
 void PageView::openAgentProposalWindow(const AgentProposalSidebarEntry &proposal)
 {
     hideAgentProposalHoverBar();
@@ -2174,16 +2381,19 @@ void PageView::openAgentProposalWindow(const AgentProposalSidebarEntry &proposal
             d->selectedAgentProposalId.clear();
             clearAgentProposalTextHighlight();
             viewport()->update();
+            if (d->agentProposalWindow) {
+                Q_EMIT agentProposalWindowClosed(d->agentProposalWindow->proposalId());
+            }
         });
         connect(d->agentProposalWindow, &AgentProposalWindow::resolutionRequested, this, &PageView::agentProposalResolutionRequested);
+        connect(d->agentProposalWindow, &AgentProposalWindow::undoRequested, this, &PageView::agentProposalUndoRequested);
+        connect(d->agentProposalWindow, &AgentProposalWindow::redoRequested, this, &PageView::agentProposalRedoRequested);
         connect(d->agentProposalWindow, &AgentProposalWindow::openSourceRequested, this, &PageView::agentProposalOpenSourceRequested);
     }
     d->agentProposalWindow->setProposal(proposal);
-    if (firstOpen) {
-        const QPoint parentCenter = mapToGlobal(rect().center());
-        d->agentProposalWindow->move(parentCenter.x() - d->agentProposalWindow->width() / 2,
-                                     parentCenter.y() - d->agentProposalWindow->height() / 2);
-    }
+    // Out of the way until the passage is found (then beside it): the view's top right corner.
+    d->agentProposalPlacement.reset();
+    if (firstOpen || !d->agentProposalWindow->isVisible()) placeAgentProposalWindowInCorner();
     d->agentProposalWindow->show();
     d->agentProposalWindow->raise();
     d->agentProposalWindow->activateWindow();
@@ -2193,6 +2403,8 @@ void PageView::showAgentProposalLocationUnavailable(const QString &proposalId)
 {
     if (d->agentProposalWindow && d->agentProposalWindow->proposalId() == proposalId) {
         d->agentProposalWindow->setLocationUnavailable(true);
+        // Nowhere on the page to be beside: the view's corner, not over the middle of the page.
+        placeAgentProposalWindowInCorner();
     }
 }
 
@@ -2278,7 +2490,7 @@ void PageView::restoreAgentProposal(const QString &proposalId)
     }
     d->suppressedAgentProposalIds.remove(proposalId);
     d->decidedAgentProposalIds.remove(proposalId);
-    reloadAgentProposalOverlays();
+    reloadAgentProposalOverlays(true);
 }
 
 bool PageView::pdfLinkAnchorDocument() const
@@ -2716,8 +2928,12 @@ void PageView::notifySetup(const QList<Okular::Page *> &pageSet, int setupFlags)
         // The card's answer and feedback were placed on the pages (and PDF version) just replaced;
         // presenting the card again sets them for the new ones.
         d->reviewFeedback->clear();
-        // Document feedback is placed again on the new pages (the part sets the PDF version).
+        // Document feedback is placed again on the new pages (the part sets the PDF version), and
+        // so are the reading overlays' marks.
         d->documentFeedback->resetPages();
+        d->readingOverlays->resetPages();
+        d->overlayFlashRects.clear();
+        delete d->overlayMarkPopup.data();
         cancelPassageChange();
     }
     const bool allowfillforms = d->document->isAllowed(Okular::AllowFillForms);
@@ -2885,7 +3101,7 @@ void PageView::notifySetup(const QList<Okular::Page *> &pageSet, int setupFlags)
             d->agentProposalWindow->close();
         }
     }
-    reloadAgentProposalOverlays();
+    reloadAgentProposalOverlays(!(setupFlags & (Okular::DocumentObserver::DocumentChanged | Okular::DocumentObserver::UrlChanged)));
     selectionClear();
 }
 
@@ -2965,6 +3181,84 @@ void PageView::updateActionState(bool haspages, bool /*hasformwidgets*/)
     }
     if (d->aFitWindowToPage) {
         d->aFitWindowToPage->setEnabled(haspages && !getContinuousMode());
+    }
+    d->hasPages = haspages;
+    // An HTML page or edition shown instead keeps the PDF's tools greyed out.
+    if (d->shownInstead != ShownInstead::Nothing) applyShownInsteadToTools();
+}
+
+void PageView::setShownInstead(ShownInstead shown)
+{
+    if (d->shownInstead == shown) return;
+    d->shownInstead = shown;
+    applyShownInsteadToTools();
+}
+
+PageView::ShownInstead PageView::shownInstead() const
+{
+    return d->shownInstead;
+}
+
+void PageView::setHtmlPagePencil(std::function<void()> drawOnPage)
+{
+    d->htmlPagePencil = std::move(drawOnPage);
+}
+
+void PageView::applyShownInsteadToTools()
+{
+    // Before setupActions there are no tools of the reader to grey out.
+    if (!d->aMouseDraw) return;
+    const bool pdf = d->shownInstead == ShownInstead::Nothing;
+    const QString elsewhere = i18nc("@info:tooltip a tool that does nothing on an HTML page", "Works on PDF pages");
+    // Each tool as updateActionState leaves it on the PDF, with its own tip there.
+    const struct {
+        QAction *action;
+        QString tip;
+        bool enabled;
+    } tools[] = {
+        {d->aMouseNormal, QString(), d->hasPages},
+        {d->aMouseZoom, QString(), d->hasPages},
+        {d->aMouseSelect, i18n("Select an area"), d->hasPages},
+        {d->aMouseTextSelect, i18n("Select and highlight text"), d->hasPages},
+        {d->aMouseTableSelect, QString(), d->hasPages},
+        {d->aMouseMagnifier, QString(), d->document->supportsTiles()},
+        {d->aMouseTextBox, i18n("Text box"), d->hasPages},
+    };
+    for (const auto &tool : tools) {
+        if (!tool.action) continue;
+        tool.action->setEnabled(pdf && tool.enabled);
+        tool.action->setToolTip(pdf ? tool.tip : elsewhere);
+    }
+    if (d->aMouseModeMenu) d->aMouseModeMenu->setEnabled(pdf && d->hasPages);
+    // The pencil draws on a snapshot of an HTML attachment page; the HTML edition keeps no drawings.
+    d->aMouseDraw->setEnabled(d->hasPages && d->shownInstead != ShownInstead::HtmlEdition);
+    d->aMouseDraw->setToolTip(d->shownInstead == ShownInstead::HtmlEdition ? elsewhere
+                                  : d->shownInstead == ShownInstead::HtmlPage ? i18n("Draw on This Page")
+                                  : Okular::Settings::pencilEraser()          ? i18nc("@info:tooltip the pencil's button while it erases", "Eraser")
+                                                                              : i18n("Pencil"));
+}
+
+QAction *PageView::mouseModeAction() const
+{
+    switch (d->mouseMode) {
+    case Okular::Settings::EnumMouseMode::Browse:
+        return d->aMouseNormal;
+    case Okular::Settings::EnumMouseMode::Zoom:
+        return d->aMouseZoom;
+    case Okular::Settings::EnumMouseMode::RectSelect:
+        return d->aMouseSelect;
+    case Okular::Settings::EnumMouseMode::TableSelect:
+        return d->aMouseTableSelect;
+    case Okular::Settings::EnumMouseMode::Magnifier:
+        return d->aMouseMagnifier;
+    case Okular::Settings::EnumMouseMode::TextSelect:
+        return d->aMouseTextSelect;
+    case Okular::Settings::EnumMouseMode::Draw:
+        return d->aMouseDraw;
+    case Okular::Settings::EnumMouseMode::TextBox:
+        return d->aMouseTextBox;
+    default:
+        return nullptr;
     }
 }
 
@@ -3517,6 +3811,7 @@ void PageView::paintEvent(QPaintEvent *pe)
 
             // 1) Layer 0: paint items and clear bg on unpainted rects
             drawDocumentOnPainter(contentsRect, &pixmapPainter);
+            paintReadingOverlays(&pixmapPainter, contentsRect);
             paintLinkIndicators(&pixmapPainter, contentsRect);
             // 2a) Layer 1a: paint (blend) transparent selection (rectangle)
             if (!selectionRect.isNull() && selectionRect.intersects(contentsRect) && !selectionRectInternal.contains(contentsRect)) {
@@ -3605,6 +3900,7 @@ void PageView::paintEvent(QPaintEvent *pe)
         } else {
             // 1) Layer 0: paint items and clear bg on unpainted rects
             drawDocumentOnPainter(contentsRect, &screenPainter);
+            paintReadingOverlays(&screenPainter, contentsRect);
             paintLinkIndicators(&screenPainter, contentsRect);
             // 2a) Layer 1a: paint opaque selection (rectangle)
             if (!selectionRect.isNull() && selectionRect.intersects(contentsRect) && !selectionRectInternal.contains(contentsRect)) {
@@ -5054,6 +5350,323 @@ bool PageView::documentFeedbackVisible() const
     return d->documentFeedback->hasDocument() && (Okular::Settings::highlightComments() || Okular::Settings::highlightFeedback());
 }
 
+Thoughts::ReadingOverlayLayer *PageView::readingOverlays() const
+{
+    return d->readingOverlays;
+}
+
+bool PageView::readingOverlaysVisible() const
+{
+    return d->readingOverlays->hasDocument() && Okular::Settings::highlightReadingOverlays();
+}
+
+void PageView::paintReadingOverlays(QPainter *painter, const QRect &contentsRect) const
+{
+    const auto map = [this, &contentsRect](int page, const QRectF &rect) {
+        const QRectF shown = reviewFeedbackRect(page, rect);
+        return shown.intersects(contentsRect) ? shown : QRectF();
+    };
+    QSet<int> pages;
+    for (const PageViewItem *item : std::as_const(d->items)) {
+        if (item->isVisible() && item->uncroppedGeometry().intersects(contentsRect)) pages.insert(item->pageNumber() + 1);
+    }
+    if (pages.isEmpty()) return;
+    painter->save();
+    // Nothing of an agent's shows over a masked review answer either.
+    const QPainterPath hidden = hiddenAnswerArea();
+    if (!hidden.isEmpty()) {
+        QPainterPath open;
+        open.addRect(contentsRect);
+        painter->setClipPath(open.subtracted(hidden), Qt::IntersectClip);
+    }
+    // The washes are on the page image, under the user's markup (drawDocumentOnPainter); the
+    // comment markers in the margin over everything.
+    if (readingOverlaysVisible()) d->readingOverlays->paintMarkers(painter, pages, map);
+    // The mark the Overlay tab asked for, on while the count is even.
+    if (!d->overlayFlashRects.isEmpty() && d->overlayFlashTicks % 2 == 0) {
+        const QColor blue(25, 95, 190);
+        painter->setRenderHint(QPainter::Antialiasing, true);
+        painter->setPen(QPen(blue, 2.0));
+        painter->setBrush(QColor(blue.red(), blue.green(), blue.blue(), 40));
+        for (const auto &[page, rect] : std::as_const(d->overlayFlashRects)) {
+            const QRectF shown = map(page, rect);
+            if (!shown.isEmpty()) painter->drawRoundedRect(shown.adjusted(-2.0, -1.5, 2.0, 1.5), 2.0, 2.0);
+        }
+    }
+    painter->restore();
+}
+
+QStringList PageView::readingOverlayMarkAt(const QPointF &contentPoint, bool *marker)
+{
+    if (marker) *marker = false;
+    if (!readingOverlaysVisible() || hiddenAnswerArea().contains(contentPoint)) return {};
+    const PageViewItem *item = pickItemOnPoint(int(contentPoint.x()), int(contentPoint.y()));
+    if (!item) return {};
+    const Thoughts::ReadingOverlayLayer::Hit hit = d->readingOverlays->hitTest(item->pageNumber() + 1, contentPoint, [this](int page, const QRectF &rect) {
+        return reviewFeedbackRect(page, rect);
+    });
+    if (hit.isEmpty()) return {};
+    if (marker) *marker = hit.marker;
+    return {hit.overlayId, hit.markId};
+}
+
+bool PageView::flashReadingOverlayMark(const QString &overlayId, const QString &markId)
+{
+    const Thoughts::ReadingOverlayLayer::Mark mark = d->readingOverlays->mark(overlayId, markId);
+    if (mark.rects.isEmpty()) {
+        d->messageWindow->display(i18n("This passage is not in this version of the PDF."), QString(), PageViewMessage::Warning, 4000);
+        return false;
+    }
+    const auto &[page, rect] = mark.rects.constFirst();
+    Okular::DocumentViewport viewport(page - 1);
+    viewport.rePos.enabled = true;
+    viewport.rePos.normalizedX = rect.center().x();
+    viewport.rePos.normalizedY = rect.center().y();
+    viewport.rePos.pos = Okular::DocumentViewport::Center;
+    d->document->setViewport(viewport, nullptr, true);
+    d->overlayFlashRects = mark.rects;
+    d->overlayFlashTicks = 6;
+    d->overlayFlashTimer->start();
+    this->viewport()->update();
+    return true;
+}
+
+bool PageView::readingOverlayFlashShown() const
+{
+    return !d->overlayFlashRects.isEmpty();
+}
+
+namespace
+{
+// A label that does something when clicked: the byline of a reading overlay mark's popup.
+class PopupLinkLabel : public QLabel
+{
+public:
+    PopupLinkLabel(std::function<void()> clicked, QWidget *parent)
+        : QLabel(parent)
+        , m_clicked(std::move(clicked))
+    {
+        setCursor(Qt::PointingHandCursor);
+    }
+
+protected:
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton && rect().contains(event->position().toPoint()) && m_clicked) {
+            event->accept();
+            // Last: it may close the popup this label is in.
+            const auto clicked = m_clicked;
+            clicked();
+            return;
+        }
+        QLabel::mouseReleaseEvent(event);
+    }
+
+private:
+    std::function<void()> m_clicked;
+};
+}
+
+QWidget *PageView::openReadingOverlayMarkPopup(const QString &overlayId, const QString &markId)
+{
+    delete d->overlayMarkPopup.data();
+    const QJsonObject record = d->readingOverlays->record(overlayId);
+    const QJsonObject mark = Thoughts::ReadingOverlays::markOf(record, markId);
+    if (mark.isEmpty() || Thoughts::ReadingOverlays::isDeleted(record)) return nullptr;
+    auto *popup = new QFrame(this, Qt::Popup);
+    popup->setObjectName(QStringLiteral("readingOverlayMarkPopup"));
+    popup->setAttribute(Qt::WA_DeleteOnClose);
+    popup->setFrameShape(QFrame::StyledPanel);
+    auto *layout = new QVBoxLayout(popup);
+    layout->setContentsMargins(12, 10, 12, 10);
+    layout->setSpacing(6);
+    const QString kind = Thoughts::ReadingOverlays::kindOf(mark);
+    const QString kindName = kind == Thoughts::ReadingOverlays::read() ? i18nc("@label reading overlay mark", "Read carefully")
+        : kind == Thoughts::ReadingOverlays::skim()                    ? i18nc("@label reading overlay mark", "Skim")
+        : kind == Thoughts::ReadingOverlays::skip()                    ? i18nc("@label reading overlay mark", "You can skip this")
+                                                                       : i18nc("@label reading overlay mark", "Note");
+    const QString noteId = Thoughts::ReadingOverlays::noteIdOf(mark);
+    popup->setProperty("overlayId", overlayId);
+    popup->setProperty("markId", markId);
+    popup->setProperty("noteId", noteId);
+    auto *heading = new QLabel(popup);
+    heading->setObjectName(QStringLiteral("readingOverlayMarkKind"));
+    heading->setTextFormat(Qt::RichText);
+    heading->setText(QStringLiteral("<span style=\"color:%1\">\u25A0</span> <b>%2</b>")
+                         .arg(Thoughts::ReadingOverlayLayer::kindColour(kind).name(), kindName.toHtmlEscaped()));
+    layout->addWidget(heading);
+    // The comment; a mark with a note shows the note's picture here instead, once it is here.
+    const QString commentText = Thoughts::ReadingOverlays::commentOf(mark);
+    if (!commentText.isEmpty()) {
+        auto *comment = new QLabel(Thoughts::breakableText(commentText), popup);
+        comment->setObjectName(QStringLiteral("readingOverlayMarkComment"));
+        comment->setTextFormat(Qt::PlainText);
+        comment->setWordWrap(true);
+        comment->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        layout->addWidget(comment);
+    }
+    // The start of the passage, as the Overlay tab lists it.
+    auto *quote = new QLabel(QStringLiteral("“%1”").arg(Thoughts::breakableText(Thoughts::ReadingOverlays::quoteStart(mark))), popup);
+    quote->setObjectName(QStringLiteral("readingOverlayMarkQuote"));
+    quote->setTextFormat(Qt::PlainText);
+    quote->setWordWrap(true);
+    QFont italic = quote->font();
+    italic.setItalic(true);
+    quote->setFont(italic);
+    QPalette secondary = quote->palette();
+    secondary.setColor(QPalette::WindowText, secondary.color(QPalette::PlaceholderText));
+    quote->setPalette(secondary);
+    layout->addWidget(quote);
+    // The byline: who made the overlay and which one; a click shows the mark in the Overlay tab.
+    const QString label = Thoughts::ReadingOverlays::authorLabel(record);
+    const QString title = record.value(QStringLiteral("title")).toString();
+    auto *author = new PopupLinkLabel(
+        [this, popup, overlayId, markId] {
+            popup->close();
+            Q_EMIT readingOverlayMarkRevealRequested(overlayId, markId);
+        },
+        popup);
+    author->setText(Thoughts::breakableText(label.isEmpty() ? title : i18nc("@info agent label · overlay title", "%1 · %2", label, title)));
+    author->setObjectName(QStringLiteral("readingOverlayMarkAuthor"));
+    author->setTextFormat(Qt::PlainText);
+    author->setWordWrap(true);
+    author->setToolTip(i18n("Show this mark in the Overlay tab"));
+    QPalette link = author->palette();
+    link.setColor(QPalette::WindowText, link.color(QPalette::Link));
+    author->setPalette(link);
+    layout->addWidget(author);
+    // A question for the agent that made the overlay, and the page goes to it.
+    auto *question = new QLineEdit(popup);
+    question->setObjectName(QStringLiteral("readingOverlayMarkQuestion"));
+    question->setPlaceholderText(i18n("Your question (optional)"));
+    question->setMaxLength(2000);
+    question->setClearButtonEnabled(true);
+    layout->addSpacing(2);
+    layout->addWidget(question);
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    auto *ask = new QPushButton(QIcon::fromTheme(QStringLiteral("document-send")), i18n("Ask About This"), popup);
+    ask->setObjectName(QStringLiteral("readingOverlayAskAboutThis"));
+    ask->setDefault(true);
+    ask->setToolTip(Thoughts::ReadingOverlays::conversationId(record).isEmpty()
+                        ? i18n("Send this page, with the passage marked, to an agent with your question. You see it before it goes.")
+                        : i18n("Send this page, with the passage marked, to the conversation that made this overlay, with your question. You see it before it goes."));
+    buttons->addWidget(ask);
+    layout->addLayout(buttons);
+    for (QWidget *widget : popup->findChildren<QLabel *>()) widget->setMaximumWidth(380);
+    popup->setMinimumWidth(300);
+    connect(ask, &QPushButton::clicked, this, [this, popup, question, overlayId, markId] {
+        const QString asked = question->text();
+        popup->close();
+        Q_EMIT readingOverlayQuestionAsked(overlayId, markId, asked);
+    });
+    connect(question, &QLineEdit::returnPressed, ask, &QPushButton::click);
+    d->overlayMarkPopup = popup;
+    const auto image = noteId.isEmpty() ? d->overlayNoteImages.constEnd() : d->overlayNoteImages.constFind(noteId);
+    if (image != d->overlayNoteImages.constEnd()) showReadingOverlayNoteImage(popup, *image);
+    placeReadingOverlayMarkPopup(popup, overlayId, markId);
+    popup->show();
+    question->setFocus(Qt::PopupFocusReason);
+    // The note's picture, once: the comment shows until it is here (setReadingOverlayNoteImage).
+    if (!noteId.isEmpty() && image == d->overlayNoteImages.constEnd() && !d->overlayNoteRequested.contains(noteId)) {
+        d->overlayNoteRequested.insert(noteId);
+        Q_EMIT readingOverlayNoteRequested(noteId);
+    }
+    return popup;
+}
+
+void PageView::placeReadingOverlayMarkPopup(QWidget *popup, const QString &overlayId, const QString &markId)
+{
+    // Below its marker, or below the mark's first line when the marker is not on screen.
+    const auto map = [this](int page, const QRectF &rect) { return reviewFeedbackRect(page, rect); };
+    QRectF anchor = d->readingOverlays->markerRect(overlayId, markId, map);
+    if (anchor.isEmpty()) {
+        const auto rects = d->readingOverlays->mark(overlayId, markId).rects;
+        if (!rects.isEmpty()) anchor = map(rects.constFirst().first, rects.constFirst().second);
+    }
+    popup->adjustSize();
+    const QPoint below = anchor.isEmpty() ? QCursor::pos() : viewport()->mapToGlobal((anchor.bottomRight() - QPointF(contentAreaPosition())).toPoint() + QPoint(0, 4));
+    QPoint at(below.x() - popup->width(), below.y());
+    if (const QScreen *screen = QGuiApplication::screenAt(below)) {
+        const QRect available = screen->availableGeometry();
+        at.setX(std::clamp(at.x(), available.left(), std::max(available.left(), available.right() - popup->width())));
+        if (at.y() + popup->height() > available.bottom()) at.setY(std::max(available.top(), below.y() - popup->height() - int(anchor.height()) - 8));
+    }
+    popup->move(at);
+}
+
+void PageView::showReadingOverlayNoteImage(QWidget *popup, const QImage &image)
+{
+    auto *layout = qobject_cast<QVBoxLayout *>(popup->layout());
+    if (!layout || image.isNull() || image.width() <= 0 || popup->findChild<QScrollArea *>(QStringLiteral("readingOverlayMarkNoteScroll"))) return;
+    const QString noteId = popup->property("noteId").toString();
+    // As wide as reading wants (on a narrow screen, what it has); at most 60 % of the screen tall,
+    // scrolling beyond.
+    const QScreen *screen = this->screen() ? this->screen() : QGuiApplication::primaryScreen();
+    const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
+    const QMargins margins = layout->contentsMargins();
+    const int popupWidth = std::min(readingOverlayNotePopupWidth, std::max(260, available.width() - 32));
+    const int width = popupWidth - margins.left() - margins.right();
+    const int maximumHeight = std::max(120, int(available.height() * 0.6));
+    auto *scroll = new QScrollArea(popup);
+    scroll->setObjectName(QStringLiteral("readingOverlayMarkNoteScroll"));
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    int shownWidth = width;
+    int shownHeight = qRound(double(image.height()) * shownWidth / image.width());
+    if (shownHeight > maximumHeight) {
+        // Taller than the room: narrower by the scroll bar, which then shows.
+        shownWidth = width - style()->pixelMetric(QStyle::PM_ScrollBarExtent, nullptr, scroll->verticalScrollBar());
+        shownHeight = qRound(double(image.height()) * shownWidth / image.width());
+    }
+    auto *picture = new PopupLinkLabel(
+        [this, popup, noteId] {
+            popup->close();
+            Q_EMIT readingOverlayNoteOpenRequested(noteId);
+        },
+        scroll);
+    picture->setObjectName(QStringLiteral("readingOverlayMarkNote"));
+    picture->setToolTip(i18n("Open this note in Agent Notes: zoom in, draw on it, reply to the agent"));
+    const qreal ratio = std::max<qreal>(1.0, popup->devicePixelRatioF());
+    QPixmap pixmap = QPixmap::fromImage(image.scaled(QSize(qRound(shownWidth * ratio), qRound(shownHeight * ratio)), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+    pixmap.setDevicePixelRatio(ratio);
+    picture->setPixmap(pixmap);
+    picture->setFixedSize(shownWidth, shownHeight);
+    scroll->setWidget(picture);
+    scroll->setFixedSize(width, std::min(shownHeight, maximumHeight));
+    // In place of the comment, right under the kind.
+    int index = layout->indexOf(popup->findChild<QLabel *>(QStringLiteral("readingOverlayMarkKind"))) + 1;
+    if (QLabel *comment = popup->findChild<QLabel *>(QStringLiteral("readingOverlayMarkComment"))) {
+        index = layout->indexOf(comment);
+        delete comment;
+    }
+    layout->insertWidget(index, scroll);
+    for (QLabel *label : popup->findChildren<QLabel *>()) {
+        if (label != picture) label->setMaximumWidth(width);
+    }
+    popup->setFixedWidth(popupWidth);
+    if (popup->isVisible()) {
+        // Measured with the picture: shown now, not once the event loop gets to it.
+        scroll->show();
+        placeReadingOverlayMarkPopup(popup, popup->property("overlayId").toString(), popup->property("markId").toString());
+    }
+}
+
+void PageView::setReadingOverlayNoteImage(const QString &noteId, const QImage &image)
+{
+    d->overlayNoteRequested.remove(noteId);
+    // Not had: the comment stays, and the next popup asks again.
+    if (noteId.isEmpty() || image.isNull()) return;
+    if (!d->overlayNoteImages.contains(noteId)) {
+        d->overlayNoteImageOrder.append(noteId);
+        while (d->overlayNoteImageOrder.size() > 8) d->overlayNoteImages.remove(d->overlayNoteImageOrder.takeFirst());
+    }
+    d->overlayNoteImages.insert(noteId, image);
+    QWidget *popup = d->overlayMarkPopup.data();
+    if (popup && popup->isVisible() && popup->property("noteId").toString() == noteId) showReadingOverlayNoteImage(popup, image);
+}
+
 bool PageView::answerMasked() const
 {
     // While a review card's answer is masked, nothing over it may give it away (hiddenAnswerArea):
@@ -5126,16 +5739,27 @@ bool PageView::showDocumentFeedback(const QString &feedbackId, bool edit)
     return edit ? openDocumentFeedbackEditor(feedbackId) != nullptr : !rects.isEmpty();
 }
 
+void PageView::setFeedbackPictureStore(const Thoughts::ReviewFeedbackEditor::PictureStore &store)
+{
+    d->feedbackPictureStore = store;
+}
+
+Thoughts::ReviewFeedbackEditor::PictureStore PageView::feedbackPictureStore() const
+{
+    return d->feedbackPictureStore;
+}
+
 Thoughts::ReviewFeedbackEditor *PageView::openDocumentFeedbackEditor(const QString &feedbackId, const QRect &anchor)
 {
     const QJsonObject record = d->documentFeedback->record(feedbackId);
     if (record.isEmpty() || record.value(QStringLiteral("deleted")).toBool()) return nullptr;
     auto *editor = new Thoughts::ReviewFeedbackEditor(record, false, this, true);
+    editor->enablePictures(d->feedbackPictureStore);
     connect(editor, &Thoughts::ReviewFeedbackEditor::saveRequested, this, [this, feedbackId, editor](const QString &polarity, const QString &comment) {
         const QJsonObject current = d->documentFeedback->record(feedbackId);
         QString error;
-        // A text box keeps its place and font, and its box fits the new text.
-        const auto next = [&]() {
+        // A text box keeps its place and font, and its box fits the new text; the pictures are the editor's.
+        const auto nextText = [&]() {
             if (!Thoughts::DocumentFeedback::isTextBox(current) || d->documentFeedback->rectsOf(feedbackId).isEmpty())
                 return Thoughts::DocumentFeedback::withKind(Thoughts::DocumentFeedback::edit(current, polarity, comment, Thoughts::Platform::reviewOriginId()), editor->kind());
             const double fontSize = Thoughts::DocumentFeedback::textBoxFontSize(current);
@@ -5143,6 +5767,7 @@ Thoughts::ReviewFeedbackEditor *PageView::openDocumentFeedbackEditor(const QStri
             return Thoughts::DocumentFeedback::withTextBox(current, textBoxRectAt(d->documentFeedback->rectsOf(feedbackId).constFirst().first, Thoughts::DocumentFeedback::textBoxRect(current).topLeft(), fontSize, text),
                                                            fontSize, text, Thoughts::Platform::reviewOriginId());
         };
+        const auto next = [&]() { return Thoughts::DocumentFeedback::withPictures(nextText(), editor->pictures()); };
         if (current.isEmpty() || !d->documentFeedback->write(Thoughts::FeedbackVersion::stamped(next(), d->documentFeedback->reviewVersion()), &error))
             d->messageWindow->display(i18n("The feedback could not be saved: %1", error), QString(), PageViewMessage::Error, 5000);
     });
@@ -5153,8 +5778,15 @@ Thoughts::ReviewFeedbackEditor *PageView::openDocumentFeedbackEditor(const QStri
     connect(editor, &Thoughts::ReviewFeedbackEditor::changePassageRequested, this, [this, feedbackId](const QString &polarity, const QString &kind, const QString &comment) {
         startPassageChange(true, feedbackId, polarity, kind, comment);
     });
-    editor->popupAt(anchor.isValid() ? anchor : feedbackGlobalRect(d->documentFeedback->rectsOf(feedbackId)));
+    editor->popupAt(anchor.isValid() ? anchor : visiblePart(feedbackGlobalRect(d->documentFeedback->rectsOf(feedbackId))));
     return editor;
+}
+
+QRect PageView::visiblePart(const QRect &global) const
+{
+    // Beside what of the passage is on screen: a long one reaches far beyond the window.
+    const QRect shown(viewport()->mapToGlobal(QPoint(0, 0)), viewport()->size());
+    return global.intersects(shown) ? global.intersected(shown) : global;
 }
 
 Thoughts::ReviewFeedbackEditor *PageView::openNewDocumentFeedbackEditor(const QString &kind)
@@ -5168,8 +5800,9 @@ Thoughts::ReviewFeedbackEditor *PageView::openNewDocumentFeedbackEditor(const QS
     }
     // Nothing is saved until Save.
     auto *editor = new Thoughts::ReviewFeedbackEditor(Thoughts::DocumentFeedback::withKind(draft, kind), true, this, true);
+    editor->enablePictures(d->feedbackPictureStore);
     connect(editor, &Thoughts::ReviewFeedbackEditor::saveRequested, this, [this, draft, editor](const QString &polarity, const QString &comment) {
-        QJsonObject record = Thoughts::DocumentFeedback::withKind(draft, editor->kind());
+        QJsonObject record = Thoughts::DocumentFeedback::withPictures(Thoughts::DocumentFeedback::withKind(draft, editor->kind()), editor->pictures());
         record.insert(QStringLiteral("polarity"), polarity);
         record.insert(QStringLiteral("comment"), Thoughts::ReviewCardFeedback::cleanComment(comment));
         // Created when saved.
@@ -5319,26 +5952,51 @@ void PageView::showFeedbackUndo(const std::function<bool(QString *error)> &write
     QTimer::singleShot(5000, banner, &QObject::deleteLater);
 }
 
-void PageView::reloadAgentProposalOverlays()
+void PageView::reloadAgentProposalOverlays(bool keepCurrent)
 {
-    d->agentProposalOverlays.clear();
-    d->selectedAgentProposalId.clear();
-    d->agentProposalOverlaysReady = false;
     const QUrl documentUrl = d->document->currentDocument();
+    const bool sameDocument = keepCurrent && documentUrl == d->agentProposalOverlaysUrl;
+    if (sameDocument && d->agentProposalReloadRunning) {
+        d->agentProposalReloadAgain = true;
+        return;
+    }
+    if (d->agentProposalReloadClock.isValid()) {
+        ++d->agentProposalReloadsSuperseded;
+    } else {
+        d->agentProposalReloadClock.start();
+        d->agentProposalReloadsSuperseded = 0;
+    }
+    d->agentProposalOverlaysUrl = documentUrl;
+    d->agentProposalReloadAgain = false;
+    if (!sameDocument || !d->agentProposalOverlaysReady) {
+        d->agentProposalOverlays.clear();
+        d->selectedAgentProposalId.clear();
+        d->agentProposalOverlaysReady = false;
+        d->builtAgentProposalIds.clear();
+        d->builtAgentProposalIdsKnown = false;
+    }
     if (d->docsRoot.isEmpty() || !documentUrl.isLocalFile()) {
+        d->agentProposalOverlays.clear();
         d->agentProposalOverlaysReady = true;
+        d->agentProposalReloadRunning = false;
+        d->agentProposalReloadClock.invalidate();
         Q_EMIT agentProposalOverlaysReloaded();
         return;
     }
+    d->agentProposalReloadRunning = true;
     viewport()->update();
 
     const QString docsRoot = d->docsRoot;
-    const QString pdfPath = documentUrl.toLocalFile();
+    // The bytes on screen (an earlier version kept while a newer one is ready: its own file).
+    const QString openedPath = d->document->metaData(QStringLiteral("OpenedFilePath")).toString();
+    const QString pdfPath = openedPath.isEmpty() ? documentUrl.toLocalFile() : openedPath;
     const int pageCount = static_cast<int>(d->document->pages());
     const quint64 generation = ++d->agentProposalReloadGeneration;
     const QPointer<PageView> guard(this);
     QThreadPool::globalInstance()->start([guard, documentUrl, docsRoot, pdfPath, pageCount, generation] {
         QList<Thoughts::AgentProposalOverlay> overlays;
+        QSet<QString> builtIds;
+        bool builtIdsKnown = false;
         const QFileInfo pdfInfo(pdfPath);
         QFile pdfFile(pdfInfo.absoluteFilePath());
         if (pdfFile.open(QIODevice::ReadOnly)) {
@@ -5374,7 +6032,9 @@ void PageView::reloadAgentProposalOverlays()
                                     for (const QJsonValue &value : manifest.value(QStringLiteral("agent_proposals")).toArray()) {
                                         const QJsonObject proposal = value.toObject();
                                         proposalsById.insert(proposal.value(QStringLiteral("id")).toString(), proposal);
+                                        builtIds.insert(proposal.value(QStringLiteral("id")).toString());
                                     }
+                                    builtIdsKnown = manifest.value(QStringLiteral("agent_proposals")).isArray();
                                     const bool hasV2Correspondence = manifest.value(QStringLiteral("review_correspondence_schema_version")).toInt() == 2;
                                     if (hasV2Correspondence) {
                                         for (const QJsonValue &value : manifest.value(QStringLiteral("review_correspondences")).toArray()) {
@@ -5477,10 +6137,13 @@ void PageView::reloadAgentProposalOverlays()
         }
         QMetaObject::invokeMethod(
             guard.data(),
-            [guard, documentUrl, generation, overlays = std::move(overlays)]() mutable {
+            [guard, documentUrl, generation, overlays = std::move(overlays), builtIds = std::move(builtIds), builtIdsKnown]() mutable {
                 if (!guard || guard->d->agentProposalReloadGeneration != generation || guard->d->document->currentDocument() != documentUrl) {
                     return;
                 }
+                guard->d->agentProposalReloadRunning = false;
+                guard->d->builtAgentProposalIds = std::move(builtIds);
+                guard->d->builtAgentProposalIdsKnown = builtIdsKnown;
                 overlays.removeIf([guard](const Thoughts::AgentProposalOverlay &overlay) {
                     return guard->d->suppressedAgentProposalIds.contains(overlay.id) || guard->d->decidedAgentProposalIds.contains(overlay.id);
                 });
@@ -5491,10 +6154,18 @@ void PageView::reloadAgentProposalOverlays()
                 }
                 guard->d->agentProposalOverlays = Thoughts::mergeAgentProposalOverlayLines(std::move(overlays), pageSizes);
                 guard->d->agentProposalOverlaysReady = true;
+                if (guard->d->agentProposalReloadClock.isValid()) {
+                    Q_EMIT guard->agentProposalOverlaysTimed(guard->d->agentProposalReloadClock.elapsed(), int(guard->d->agentProposalOverlays.size()),
+                                                             guard->d->agentProposalReloadsSuperseded);
+                    guard->d->agentProposalReloadClock.invalidate();
+                }
                 // A toolbar stays only if its marker is still where it was.
                 guard->checkAgentProposalHoverAnchor();
                 guard->viewport()->update();
                 Q_EMIT guard->agentProposalOverlaysReloaded();
+                if (guard && std::exchange(guard->d->agentProposalReloadAgain, false)) {
+                    guard->reloadAgentProposalOverlays(true);
+                }
             },
             Qt::QueuedConnection);
     });
@@ -5848,7 +6519,7 @@ QString PageView::agentProposalAt(const PageViewItem *pageItem, const QPoint &ev
     return {};
 }
 
-QVariantMap PageView::reviewDocumentPayload() const
+QVariantMap PageView::reviewDocumentPayload(const QString &shownPath) const
 {
     QVariantMap result;
     const QUrl url = d->document->currentDocument();
@@ -5856,7 +6527,7 @@ QVariantMap PageView::reviewDocumentPayload() const
         result.insert(QStringLiteral("error"), i18n("Open a local PDF before generating review cards."));
         return result;
     }
-    const QFileInfo info(url.toLocalFile());
+    const QFileInfo info(shownPath.isEmpty() ? url.toLocalFile() : shownPath);
     if (info.suffix().compare(QLatin1String("pdf"), Qt::CaseInsensitive) != 0 || d->document->pages() == 0) {
         result.insert(QStringLiteral("error"), i18n("The current document is not a readable PDF."));
         return result;
@@ -6602,6 +7273,10 @@ void PageView::mousePressEvent(QMouseEvent *e)
     if (d->items.isEmpty()) {
         return;
     }
+    // A linked passage stays marked until the next click.
+    if (d->placeHighlight) {
+        textSelectionClear();
+    }
 
     // if performing a selection or dyn zooming, disable mouse press
     if (d->mouseSelecting || (e->button() != Qt::MiddleButton && (e->buttons() & Qt::MiddleButton))) {
@@ -6649,6 +7324,19 @@ void PageView::mousePressEvent(QMouseEvent *e)
 
     d->pressedAgentProposalMarker.clear();
     d->agentProposalHoldTimer->stop();
+    d->pressedOverlayMarker.clear();
+    if (e->button() == Qt::LeftButton && agentProposalMarkerAt(eventPos).isEmpty()) {
+        // A press on a reading overlay's comment marker opens its popup on release.
+        bool marker = false;
+        const QStringList mark = readingOverlayMarkAt(eventPos, &marker);
+        if (marker) {
+            d->pressedOverlayMarker = mark;
+            d->mousePressPos = e->globalPosition();
+            d->scroller->stop();
+            e->accept();
+            return;
+        }
+    }
     if (e->button() == Qt::LeftButton) {
         d->pressedAgentProposalMarker = agentProposalMarkerAt(eventPos);
         if (!d->pressedAgentProposalMarker.isEmpty()) {
@@ -6950,6 +7638,16 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
 
     if (d->mouseMode == Okular::Settings::EnumMouseMode::TextBox) {
         if (e->button() == Qt::LeftButton) releaseTextBoxTool(eventPos);
+        e->accept();
+        return;
+    }
+
+    if (leftButton && !d->pressedOverlayMarker.isEmpty()) {
+        const QStringList pressed = std::exchange(d->pressedOverlayMarker, {});
+        const QPointF pressPos = std::exchange(d->mousePressPos, QPointF());
+        bool marker = false;
+        if (readingOverlayMarkAt(eventPos, &marker) == pressed && marker && (pressPos - e->globalPosition()).manhattanLength() < QApplication::startDragDistance())
+            openReadingOverlayMarkPopup(pressed.at(0), pressed.at(1));
         e->accept();
         return;
     }
@@ -7601,13 +8299,22 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                         }
                     }
 
+                    // What Open source needs, read before the menu opens: while it is open a Sync that
+                    // brings a new PDF reloads the document, and the page under it is gone when it
+                    // returns (18 Nov crash in Page::textSelection after Open source).
+                    const Okular::RegularAreaRect *sourceSelection = item->page() ? item->page()->textSelection() : nullptr;
+                    const bool sourceSelected = sourceSelection && !sourceSelection->isEmpty();
+                    const int sourcePageNumber = item->pageNumber() + 1;
+                    const Okular::NormalizedPoint sourcePoint = sourceSelected ? sourceSelection->constFirst().center() : Okular::NormalizedPoint();
+                    const QString sourceText = d->selectedText();
+                    openTexSource->setEnabled(sourceSelected);
+
                     Q_EMIT contextMenuReady(menu);
                     const QAction *choice = menu->exec(e->globalPosition().toPoint());
                     if (choice == copyText) {
                         copyTextSelection(TextCopyMode::AsProvided);
                     } else if (choice == openTexSource) {
-                        const Okular::NormalizedPoint sourcePoint = item->page()->textSelection()->constFirst().center();
-                        Q_EMIT openTexSourceRequested(item->pageNumber() + 1, sourcePoint.x, sourcePoint.y, d->selectedText());
+                        Q_EMIT openTexSourceRequested(sourcePageNumber, sourcePoint.x, sourcePoint.y, sourceText);
                     } else if (choice == strikethroughText) {
                         annotateTextSelection(Okular::HighlightAnnotation::StrikeOut);
                     } else if (choice == highlightText) {
@@ -7990,6 +8697,17 @@ bool PageView::viewportEvent(QEvent *e)
             e->accept();
             return true;
         }
+        bool overlayMarker = false;
+        const QStringList overlayMark = (d->annotator && d->annotator->active()) || d->mouseAnnotation->isMouseOver()
+            ? QStringList() : readingOverlayMarkAt(contentAreaPoint(he->pos()), &overlayMarker);
+        const QString overlayComment = overlayMark.isEmpty()
+            ? QString() : Thoughts::ReadingOverlays::commentOf(Thoughts::ReadingOverlays::markOf(d->readingOverlays->record(overlayMark.at(0)), overlayMark.at(1)));
+        if (overlayMarker && !overlayComment.isEmpty()) {
+            // The agent's comment on the mark (reading-overlays.md §4).
+            QToolTip::showText(he->globalPos(), overlayComment, viewport());
+            e->accept();
+            return true;
+        }
         if (d->mouseAnnotation->isMouseOver()) {
             d->mouseAnnotation->routeTooltipEvent(he);
         } else {
@@ -8014,6 +8732,9 @@ bool PageView::viewportEvent(QEvent *e)
                 if (!tip.isEmpty()) {
                     QToolTip::showText(he->globalPos(), tip, viewport(), r);
                 }
+            } else if (!overlayComment.isEmpty()) {
+                // Over a wash: its comment too.
+                QToolTip::showText(he->globalPos(), overlayComment, viewport());
             }
         }
         e->accept();
@@ -8149,6 +8870,14 @@ void PageView::drawDocumentOnPainter(const QRect contentsRect, QPainter *p)
 
     // create a region from which we'll subtract painted rects
     QRegion remainingArea(contentsRect);
+
+    // Agents' reading overlays (reading-overlays.md §4): their washes on the page image, under the
+    // text selection, highlights and annotations, as on no other painting of the pages.
+    const PagePainter::UnderlayScope readingOverlays(readingOverlaysVisible() ? PagePainter::Underlay([this](QPainter *painter, const Okular::Page *page,
+                                                                                                            const std::function<QRectF(const QRectF &)> &map) {
+        d->readingOverlays->paintWashes(painter, int(page->number()) + 1, map);
+    })
+                                                                                                      : PagePainter::Underlay());
 
     // This loop draws the actual pages
     // iterate over all items painting the ones intersecting contentsRect
@@ -8363,6 +9092,7 @@ PageViewItem *PageView::pickItemOnPoint(int x, int y)
 void PageView::textSelectionClear()
 {
     d->agentProposalTextHighlight = false;
+    d->placeHighlight = false;
     // something to clear
     if (!d->pagesWithTextSelection.isEmpty()) {
         for (const int page : std::as_const(d->pagesWithTextSelection)) {
@@ -8841,6 +9571,8 @@ void PageView::updateCursor(const QPoint p)
     } else if (scrollerState == QScroller::Pressed || scrollerState == QScroller::Dragging) {
         setCursor(Qt::ClosedHandCursor);
     } else if (!agentProposalMarkerAt(p).isEmpty()) {
+        setCursor(Qt::PointingHandCursor);
+    } else if (bool marker = false; !readingOverlayMarkAt(p, &marker).isEmpty() && marker) {
         setCursor(Qt::PointingHandCursor);
     } else if (pageItem) {
         double nX = pageItem->absToPageX(p.x());
@@ -9913,6 +10645,13 @@ void PageView::slotSetMouseTextSelect()
 
 void PageView::slotSetMouseDraw()
 {
+    // On an HTML page the pencil draws on a snapshot of the page; the PDF keeps the tool it had.
+    if (d->shownInstead == ShownInstead::HtmlPage && d->htmlPagePencil) {
+        if (QAction *inUse = mouseModeAction()) inUse->setChecked(true);
+        else d->aMouseDraw->setChecked(false);
+        d->htmlPagePencil();
+        return;
+    }
     // The button again: back to the tool it replaced.
     if (d->mouseMode == Okular::Settings::EnumMouseMode::Draw) {
         stopDrawing();
@@ -9955,6 +10694,8 @@ void PageView::slotFollowPencil()
         d->aMouseDraw->setToolTip(eraser ? i18nc("@info:tooltip the pencil's button while it erases", "Eraser") : i18n("Pencil"));
         if (d->mouseMode == Okular::Settings::EnumMouseMode::Draw) updateCursor();
     }
+    // On an HTML page or edition the pencil's tip says what it does there.
+    if (d->shownInstead != ShownInstead::Nothing) applyShownInsteadToTools();
 }
 
 void PageView::slotSetMouseTableSelect()

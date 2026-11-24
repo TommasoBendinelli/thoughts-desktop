@@ -11,6 +11,8 @@
 #include <QStringList>
 #include <QVariantMap>
 #include <functional>
+
+namespace Poppler { class Document; }
 namespace Thoughts {
 inline constexpr auto reviewFingerprintMethod = "poppler-rgb-96-v1";
 QJsonArray limitBasicCardExtent(const QJsonArray &candidates, const QString &pdfSha256);
@@ -52,6 +54,11 @@ struct ReviewArea {
     QRectF rect;
     bool textSelection = false;
 };
+// "Cover the whole document": one answer area per page around its text, from below the title on
+// the first page (its first lines set larger than the text below them) to the end, leaving out each
+// page's running header, footer and page number. Empty when the PDF cannot be read.
+QList<ReviewArea> wholeDocumentReviewAreas(Poppler::Document *pdf);
+QList<ReviewArea> wholeDocumentReviewAreas(const QString &pdfPath);
 ReviewAnchorPlan planReviewSourceAnchor(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
                                       const QString &pdfSha256, int page, const QRectF &region, const QString &cardId);
 // Links every area to complete lines of one editable source file and marks one segment per
@@ -63,6 +70,12 @@ ReviewAnchorPlan planReviewSourceAnchor(const QString &docsRoot, const QString &
 // An area whose words the build's lines cannot place (its source changed since the build, or
 // SyncTeX lines that do not name the words) is placed by its whole text in the current source
 // (locateReviewTextInSource), or keeps the line mapping's error: never a PDF-only card.
+// When the source changed since the build (proposals accepted, the new PDF not here yet) and
+// the text cannot place an area, the build's lines place it in the build's text (the bundle's
+// snapshot), checked there as for a current build; a line diff of that text and the current one
+// maps the passage to the current lines, which get the markers. Every line of the passage must be
+// unchanged, with none added between them; otherwise the area is refused ("This passage changed
+// since the PDF was built. Wait for the new PDF ..."). Without the build's text, as before.
 // A PDF without editable source gives withoutSource, as for one area.
 ReviewAnchorPlan planReviewSourceAnchors(const QString &docsRoot, const QString &bundleRoot, const QString &pdfPath,
                                          const QString &pdfSha256, const QList<ReviewArea> &areas, const QString &cardId,

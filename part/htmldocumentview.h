@@ -26,6 +26,7 @@ class QWindow;
 namespace Thoughts
 {
 class HtmlEditionServer;
+class HtmlLiveWebView;
 
 class OKULARPART_EXPORT HtmlDocumentView : public QWidget
 {
@@ -39,9 +40,12 @@ public:
     // False when this build has no Qt WebView (THOUGHTS_HTML_VIEW off).
     static bool webViewAvailable();
 
-    // Replaces the page by a centred message ("HTML is being built", "HTML not available: …").
-    void showMessage(const QString &text);
+    // Replaces the page by a centred message ("HTML is being built", "HTML not available: …"),
+    // with up to two buttons under it (messageActionClicked, messageCancelClicked).
+    void showMessage(const QString &text, const QString &actionText = QString(), const QString &cancelText = QString());
     QString message() const;
+    QString messageActionText() const;
+    QString messageCancelText() const;
 
     // Serves `bundleDir` and loads `entry`; injects the viewer and calls load(options) (the
     // transport, css and theme are filled in). `ready` follows the viewer's ready message.
@@ -53,7 +57,35 @@ public:
     // (the http transport would need connect-src). Navigation away from the page is stopped:
     // web links go to externalLinkRequested().
     void loadAttachment(const QUrl &url, const QJsonObject &options);
-    // Leaves the page (about:blank): its scripts stop; nothing is injected.
+    // A live page (thoughts-server protocol/html-live-pages.md §2): `url` in a web view of its
+    // own (HtmlLiveWebView: the network and the page's scripts, a non-persistent data store, no
+    // viewer and no message handler), never in the one of embedded pages, which shows nothing
+    // meanwhile. "Loading…" until the page shows; then liveLoaded, or liveLoadFailed. Links to
+    // other origins arrive as externalLinkRequested.
+    void loadLive(const QUrl &url);
+    bool isLive() const
+    {
+        return m_live;
+    }
+    bool isLiveLoaded() const
+    {
+        return m_live && m_liveLoaded;
+    }
+    QUrl liveUrl() const
+    {
+        return m_liveUrl;
+    }
+    // Reload (and Retry): the page again, or its address after a failure.
+    void reloadLive();
+    // Runs `body`, an async function body with the argument argsJson (@p args), in the live page's
+    // isolated script world (Take Snapshot, reading the selection).
+    void callLive(const QString &body, const QJsonObject &args, std::function<void(bool ok, const QString &result, const QString &error)> done);
+    // The live web view's own Copy of its selection.
+    void copyLiveSelection();
+    // Asked as the live page's menu of selected text opens (HtmlLiveWebView::setSelectionFeedbackProvider).
+    void setLiveSelectionFeedbackProvider(std::function<bool()> provider);
+    // Leaves the page (about:blank): its scripts stop; nothing is injected. A live page's web view
+    // (and its storage) is gone.
     void unload();
     bool isAttachment() const
     {
@@ -102,6 +134,14 @@ public:
     void setSelectionAction(const QString &text, bool visible, bool enabled, const QString &toolTip = QString());
     QString selectionActionText() const;
     bool selectionActionEnabled() const;
+    QString selectionActionToolTip() const;
+    // A live page's bar: `text` ("Live · <address>") with Reload and Take Snapshot (enabled as
+    // set by setTakeSnapshotAction); an empty text hides them.
+    void setLiveBar(const QString &text);
+    QString liveBarText() const;
+    void setTakeSnapshotAction(bool enabled, const QString &toolTip);
+    bool takeSnapshotEnabled() const;
+    QString takeSnapshotToolTip() const;
     void setTextSizeLabel(int percent);
     // A strip below the page for the Read Aloud bar.
     QWidget *readAloudHost() const
@@ -118,6 +158,20 @@ Q_SIGNALS:
     void noticeClicked();
     void selectionActionClicked();
     void openInBrowserRequested();
+    // A live page: it loaded (the first time or again), or could not be loaded.
+    void liveLoaded(const QUrl &url);
+    void liveLoadFailed(const QString &error);
+    // The reader right-clicked selected text of the live page: its web view showed no menu, the
+    // receiver shows its own (html-live-pages.md §2.1).
+    void liveSelectionMenuRequested();
+    // An item of the live page's menu of selected text: "like", "dislike", "question" or "comment".
+    void liveSelectionChoice(const QString &choice);
+    // The live bar's Reload and Take Snapshot.
+    void reloadRequested();
+    void takeSnapshotRequested();
+    // The message's buttons (showMessage).
+    void messageActionClicked();
+    void messageCancelClicked();
     // A link of an attachment page that would leave it (http, https, mailto). userGesture: the
     // reader clicked or typed in this window just before, so the page did not navigate by itself
     // (always false where Thoughts cannot see the page's clicks; the receiver then asks).
@@ -136,6 +190,7 @@ private:
     void installNativeTransport();
     void removeNativeTransport();
     bool isLoadedPage(const QUrl &url) const;
+    void destroyLive();
 
 public:
     // Whether a navigation counts as the reader's own: an input at most this long ago.
@@ -164,6 +219,19 @@ private:
     QWidget *m_readAloudHost = nullptr;
     std::function<void(int)> m_textSizeHandler;
     QLabel *m_messageLabel = nullptr;
+    QWidget *m_messagePage = nullptr;
+    QWidget *m_stackHost = nullptr;
+    QToolButton *m_messageAction = nullptr;
+    QToolButton *m_messageCancel = nullptr;
+    QLabel *m_liveLabel = nullptr;
+    QToolButton *m_reload = nullptr;
+    QToolButton *m_takeSnapshot = nullptr;
+    HtmlLiveWebView *m_liveWeb = nullptr;
+    std::function<bool()> m_liveSelectionFeedback;
+    QWidget *m_liveContainer = nullptr;
+    bool m_live = false;
+    bool m_liveLoaded = false;
+    QUrl m_liveUrl;
     QWidget *m_container = nullptr;
     QWindow *m_web = nullptr; // QWebView (a QWindow) when Qt WebView is available
     HtmlEditionServer *m_server = nullptr;

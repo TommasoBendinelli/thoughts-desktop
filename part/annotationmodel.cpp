@@ -605,7 +605,12 @@ QVariant AnnotationModel::data(const QModelIndex &index, int role) const
     }
     if (item->type == AnnItem::Type::ReviewCard) {
         if (role == Qt::DisplayRole) return item->card.question;
-        if (role == Qt::DecorationRole) return QIcon::fromTheme(QStringLiteral("view-card"), QIcon::fromTheme(QStringLiteral("view-list-details")));
+        if (role == Qt::DecorationRole) {
+            // A project card (work in progress, review-card-kinds.md §5) shows a briefcase; a knowledge card the card list.
+            if (item->card.schedule.value(QStringLiteral("review_kind")).toString() == QLatin1String("project"))
+                return QIcon::fromTheme(QStringLiteral("tools"), QIcon::fromTheme(QStringLiteral("view-task")));
+            return QIcon::fromTheme(QStringLiteral("view-card"), QIcon::fromTheme(QStringLiteral("view-list-details")));
+        }
         if (role == ReviewCardKindRole) return item->card.schedule.toVariantMap();
         // Worded against the clock when asked, so "Due in 2 hours" turns into "Due now" by itself.
         if (role == ReviewCardScheduleRole || role == ReviewCardScheduleTagsRole || role == ReviewCardSchedulePartsRole || role == ReviewCardDueRole
@@ -620,15 +625,19 @@ QVariant AnnotationModel::data(const QModelIndex &index, int role) const
             if (item->card.retired && item->card.page < 0)
                 return i18n("Review card: %1\n%2It stays on the PDF version it was on when it was retired (%3): open that version from its History to see it there.",
                             item->card.question.toHtmlEscaped(), details, item->card.pdfSha256.left(12));
+            if (item->card.onNewestVersion)
+                return i18n("Review card: %1\n%2It is on the newest version of this PDF. Select it to show that version.", item->card.question.toHtmlEscaped(), details);
             return item->card.page < 0
                 ? i18n("Review card: %1\n%2The answer’s PDF location needs updating.", item->card.question.toHtmlEscaped(), details)
                 : i18n("Review card: %1\n%2Select to highlight the answer in the PDF. Double-click or press Enter to jump to its location.", item->card.question.toHtmlEscaped(), details);
         }
         if (role == PageRole) return item->card.page;
         if (role == PagesRole) { QVariantList pages; for (int page : item->card.pages) pages.append(page); return pages; }
+        if (role == ReviewCardOnNewestVersionRole) return item->card.onNewestVersion;
         if (role == ReviewCardStatusRole) {
             // A retired card is never placed again: it stays on its own version, which is not this one.
             if (item->card.retired && item->card.page < 0) return i18n("On the PDF version it was retired on");
+            if (item->card.onNewestVersion) return i18n("On the newest version");
             return item->card.page < 0 ? i18n("PDF location needs updating") : d->reviewCardStatuses.value(item->card.id);
         }
         if (role == CandidateRole) return item->card.candidate;

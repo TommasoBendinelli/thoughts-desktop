@@ -143,7 +143,8 @@ class Fetcher : public QObject
     Q_OBJECT
 public:
     explicit Fetcher(Store *store, QObject *parent = nullptr);
-    // Defaults: THOUGHTS_TOKEN or the desktop device secret, ServerAddress::configured().
+    // Defaults: THOUGHTS_TOKEN or the desktop device secret, ServerAddress::configured(), read
+    // again after ServerAddress::connectionChanged().
     void setServer(const QUrl &baseUrl, const QByteArray &token);
     // Asks the server for the PDF's edition state and records it; `done(state, error)`.
     void checkState(const QString &pdfSha, const QString &filename, QObject *context, std::function<void(std::optional<State>, QString)> done);
@@ -158,6 +159,9 @@ private:
     QUrl m_baseUrl;
     QByteArray m_token;
     bool m_serverSet = false;
+    // setServer() gave the server (tests): it is kept whatever happens.
+    bool m_serverGiven = false;
+    quint64 m_serverGeneration = 0;
     QHash<QString, QList<std::pair<QPointer<QObject>, std::function<void(bool, QString)>>>> m_installs;
 };
 }

@@ -123,11 +123,13 @@ private:
 public:
     // Which highlights show (Visible markup); drawings and text boxes always do.
     void setShownKinds(bool comments, bool feedback);
+    // The text of whole pages of the displayed PDF in order, from the glyphs kept for feedback (also
+    // what reading overlays search their marks in, readingoverlaylayer.h).
+    ReviewCardFeedback::AnswerText pagesText(const QList<int> &pages) const;
 
 private:
     DocumentFeedback::Placement placementOf(const QJsonObject &record);
     QList<ReviewCardFeedback::Glyph> pageGlyphs(int page) const;
-    ReviewCardFeedback::AnswerText pagesText(const QList<int> &pages) const;
     int pageCount() const;
 
     Okular::Document *m_document = nullptr;

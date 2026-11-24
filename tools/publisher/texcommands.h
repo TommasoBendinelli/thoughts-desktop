@@ -36,4 +36,8 @@ struct LinkCommand {
 // \PdfLink keys the build inputs declare.
 QList<LinkCommand> activeLinkCommands(const QString &source);
 
+// Every active command of names in source with up to arguments braced
+// arguments, found by the same scanner: e.g. the \href commands of a source.
+QList<LinkCommand> activeCommands(const QString &source, const QStringList &names, int arguments);
+
 }

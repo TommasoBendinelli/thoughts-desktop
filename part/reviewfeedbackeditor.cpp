@@ -7,8 +7,24 @@
 
 #include <KLocalizedString>
 
+#include <QCursor>
 #include <QApplication>
+#include <QBuffer>
 #include <QButtonGroup>
+#include <QClipboard>
+#include <QCryptographicHash>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QImage>
+#include <QImageReader>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QMimeData>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QUrl>
 #include <QColor>
 #include <QDateTime>
 #include <QFontMetrics>
@@ -19,6 +35,8 @@
 #include <QLabel>
 #include <QLocale>
 #include <QMouseEvent>
+#include <QPixmap>
+#include <QPointer>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScreen>
@@ -149,6 +167,20 @@ ReviewFeedbackEditor::ReviewFeedbackEditor(const QJsonObject &record, bool isNew
     });
     layout->addWidget(m_comment);
 
+    // Pictures (§12), shown once enablePictures offers them.
+    m_picturesRow = new QWidget(this);
+    m_picturesRow->setObjectName(QStringLiteral("reviewFeedbackPictures"));
+    m_picturesLayout = new QHBoxLayout(m_picturesRow);
+    m_picturesLayout->setContentsMargins(0, 4, 0, 0);
+    m_picturesLayout->setSpacing(6);
+    m_picturesRow->hide();
+    layout->addWidget(m_picturesRow);
+    m_pictureMessage = new QLabel(this);
+    m_pictureMessage->setObjectName(QStringLiteral("reviewFeedbackPictureMessage"));
+    m_pictureMessage->setWordWrap(true);
+    m_pictureMessage->hide();
+    layout->addWidget(m_pictureMessage);
+
     if (!isNew) {
         const QString created = record.value(QStringLiteral("created_at")).toString();
         const QString updated = record.value(QStringLiteral("updated_at")).toString();
@@ -246,22 +278,272 @@ bool ReviewFeedbackEditor::isNew() const
 
 bool ReviewFeedbackEditor::changed() const
 {
-    return m_new || kind() != DocumentFeedback::kindOf(m_record) || polarity() != m_record.value(QStringLiteral("polarity")).toString() || comment() != m_record.value(QStringLiteral("comment")).toString();
+    return m_new || kind() != DocumentFeedback::kindOf(m_record) || polarity() != m_record.value(QStringLiteral("polarity")).toString() || comment() != m_record.value(QStringLiteral("comment")).toString()
+        || (m_picturesEnabled && m_pictures != DocumentFeedback::picturesOf(m_record));
 }
 
 void ReviewFeedbackEditor::keep()
 {
     if (std::exchange(m_finished, true)) return;
-    // A new one with nothing written is nothing to keep, and a question, a comment or a text box is its text.
-    if (comment().isEmpty() && (m_new || (!kind().isEmpty() && !DocumentFeedback::isDrawing(m_record)))) return;
+    // A new one with nothing written is nothing to keep, and a question or a comment is its text,
+    // or its pictures; a text box is its text alone. A new one's own pictures (a live page's
+    // picture of what was shown) are not something the user wrote.
+    const QStringList given = m_new ? DocumentFeedback::pictureSha256s(m_record) : QStringList();
+    const bool pictures = m_picturesEnabled && std::any_of(m_pictures.cbegin(), m_pictures.cend(), [&given](const QJsonValue &picture) {
+                              return !given.contains(picture.toObject().value(QStringLiteral("object_sha256")).toString());
+                          });
+    if (comment().isEmpty() && (DocumentFeedback::isTextBox(m_record) || (!pictures && (m_new || (!kind().isEmpty() && !DocumentFeedback::isDrawing(m_record))))))
+        return;
     if (changed()) Q_EMIT saveRequested(polarity(), comment());
 }
 
 void ReviewFeedbackEditor::hideEvent(QHideEvent *event)
 {
-    // However it goes away: a click elsewhere, Esc, another application.
-    keep();
+    // However it goes away: a click elsewhere, Esc, another application. Not while the user
+    // chooses pictures: it comes back after.
+    if (!m_choosingPicture) keep();
     QFrame::hideEvent(event);
+}
+
+void ReviewFeedbackEditor::enablePictures(const PictureStore &store)
+{
+    if (DocumentFeedback::isDrawing(m_record) || !store.keep || !store.load) return;
+    m_store = store;
+    m_picturesEnabled = true;
+    m_pictures = DocumentFeedback::picturesOf(m_record);
+    m_comment->installEventFilter(this);
+    m_comment->viewport()->installEventFilter(this);
+    // A picture can be dropped on the comment or on the row of pictures.
+    m_picturesRow->setAcceptDrops(true);
+    m_picturesRow->installEventFilter(this);
+    m_picturesRow->show();
+    rebuildPictures();
+}
+
+QJsonArray ReviewFeedbackEditor::pictures() const
+{
+    return m_picturesEnabled ? m_pictures : DocumentFeedback::picturesOf(m_record);
+}
+
+QByteArray ReviewFeedbackEditor::encodedPicture(const QImage &source, bool png, QString *mediaType)
+{
+    if (source.isNull()) return {};
+    QImage image = source;
+    const int side = DocumentFeedback::maximumPictureSide;
+    if (image.width() > side || image.height() > side) image = image.scaled(side, side, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    // JPEG has no transparency: a picture with some stays PNG.
+    const bool asPng = png || image.hasAlphaChannel();
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::WriteOnly);
+    const bool written = asPng ? image.save(&buffer, "PNG") : image.convertToFormat(QImage::Format_RGB32).save(&buffer, "JPEG", 88);
+    if (!written) return {};
+    if (mediaType) *mediaType = asPng ? QStringLiteral("image/png") : QStringLiteral("image/jpeg");
+    return bytes;
+}
+
+bool ReviewFeedbackEditor::addPictureBytes(const QByteArray &bytes, const QString &mediaType, const QSize &size, QString *error)
+{
+    if (m_pictures.size() >= DocumentFeedback::maximumPictures) {
+        if (error) *error = i18n("A comment holds at most %1 pictures.", DocumentFeedback::maximumPictures);
+        return false;
+    }
+    const QString sha256 = m_store.keep(bytes, error);
+    if (sha256.isEmpty()) return false;
+    // The same picture twice is one picture.
+    for (const QJsonValue &picture : std::as_const(m_pictures)) {
+        if (picture.toObject().value(QStringLiteral("object_sha256")).toString() == sha256) return true;
+    }
+    m_pictures.append(DocumentFeedback::snapshotJson(sha256, mediaType, size.width(), size.height()));
+    return true;
+}
+
+void ReviewFeedbackEditor::addPictureImage(const QImage &image, bool png)
+{
+    QString mediaType, error;
+    const QByteArray bytes = encodedPicture(image, png, &mediaType);
+    QImage kept;
+    kept.loadFromData(bytes);
+    if (bytes.isEmpty() || kept.isNull()) error = i18n("The picture could not be read.");
+    else addPictureBytes(bytes, mediaType, kept.size(), &error);
+    m_pictureMessage->setText(error);
+    m_pictureMessage->setVisible(!error.isEmpty());
+    rebuildPictures();
+}
+
+void ReviewFeedbackEditor::addPictureFiles(const QStringList &paths)
+{
+    QStringList problems;
+    for (const QString &path : paths) {
+        QImageReader reader(path);
+        // As the camera held it.
+        reader.setAutoTransform(true);
+        const QByteArray format = reader.format().toLower();
+        const QImage image = reader.read();
+        if (image.isNull()) {
+            problems.append(i18n("%1 is not a picture Thoughts can read.", QFileInfo(path).fileName()));
+            continue;
+        }
+        // A screenshot or a drawing stays sharp as PNG; a photo is JPEG.
+        const bool png = format == "png" || format == "gif" || format == "bmp";
+        QString mediaType, error;
+        const QByteArray bytes = encodedPicture(image, png, &mediaType);
+        QImage kept;
+        kept.loadFromData(bytes);
+        if (bytes.isEmpty() || kept.isNull() || !addPictureBytes(bytes, mediaType, kept.size(), &error))
+            problems.append(error.isEmpty() ? i18n("%1 could not be added.", QFileInfo(path).fileName()) : error);
+        if (m_pictures.size() >= DocumentFeedback::maximumPictures) break;
+    }
+    problems.removeDuplicates();
+    m_pictureMessage->setText(problems.join(QLatin1Char('\n')));
+    m_pictureMessage->setVisible(!problems.isEmpty());
+    rebuildPictures();
+}
+
+bool ReviewFeedbackEditor::hasPicture(const QMimeData *data)
+{
+    if (!data) return false;
+    if (data->hasImage()) return true;
+    for (const QUrl &url : data->urls()) {
+        if (url.isLocalFile() && !QImageReader::imageFormat(url.toLocalFile()).isEmpty()) return true;
+    }
+    return false;
+}
+
+void ReviewFeedbackEditor::addPicturesFrom(const QMimeData *data)
+{
+    QStringList files;
+    for (const QUrl &url : data->urls()) {
+        if (url.isLocalFile() && !QImageReader::imageFormat(url.toLocalFile()).isEmpty()) files.append(url.toLocalFile());
+    }
+    if (!files.isEmpty()) {
+        addPictureFiles(files);
+        return;
+    }
+    // A copied screenshot: PNG.
+    addPictureImage(qvariant_cast<QImage>(data->imageData()), true);
+}
+
+void ReviewFeedbackEditor::choosePictureFiles()
+{
+    // The editor is a popup: it steps aside while the file dialog is open, then comes back.
+    m_choosingPicture = true;
+    hide();
+    const QString folder = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    const QStringList files = QFileDialog::getOpenFileNames(parentWidget(), i18n("Add Pictures"), folder,
+                                                            i18n("Pictures (*.png *.jpg *.jpeg *.heic *.heif *.gif *.webp *.tif *.tiff *.bmp)"));
+    m_choosingPicture = false;
+    if (!files.isEmpty()) addPictureFiles(files);
+    popupAt(m_anchor);
+}
+
+void ReviewFeedbackEditor::rebuildPictures()
+{
+    while (QLayoutItem *item = m_picturesLayout->takeAt(0)) {
+        if (item->widget()) item->widget()->deleteLater();
+        delete item;
+    }
+    const int thumb = 56;
+    for (int index = 0; index < m_pictures.size(); ++index) {
+        const QJsonObject picture = m_pictures.at(index).toObject();
+        const QString sha256 = picture.value(QStringLiteral("object_sha256")).toString();
+        auto *button = new QToolButton(m_picturesRow);
+        button->setObjectName(QStringLiteral("reviewFeedbackPicture"));
+        button->setFixedSize(thumb + 6, thumb + 6);
+        button->setIconSize(QSize(thumb, thumb));
+        button->setAutoRaise(true);
+        QImage image;
+        image.loadFromData(m_store.load(sha256));
+        if (image.isNull()) {
+            // Made on another device and not here yet: fetched, then shown.
+            button->setText(QStringLiteral("…"));
+            button->setToolTip(i18n("This picture is not on this computer yet."));
+            button->setStyleSheet(QStringLiteral("QToolButton { border: 1px dashed palette(mid); border-radius: 4px; }"));
+            if (m_store.fetch && !m_fetching.contains(sha256)) {
+                m_fetching.insert(sha256);
+                QPointer<ReviewFeedbackEditor> self(this);
+                m_store.fetch(sha256, this, [self](bool found) {
+                    if (self && found) self->rebuildPictures();
+                });
+            }
+        } else {
+            // A square of its middle, so every thumbnail is the same size and its × sits on its corner.
+            const QImage filled = image.scaled(thumb * 2, thumb * 2, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+            const QImage square = filled.copy((filled.width() - thumb * 2) / 2, (filled.height() - thumb * 2) / 2, thumb * 2, thumb * 2);
+            button->setIcon(QPixmap::fromImage(square));
+            button->setToolTip(i18n("Open the picture"));
+            connect(button, &QToolButton::clicked, this, [this, picture] { openPicture(picture); });
+        }
+        auto *remove = new QToolButton(button);
+        remove->setObjectName(QStringLiteral("reviewFeedbackRemovePicture"));
+        remove->setText(QStringLiteral("×"));
+        remove->setToolTip(i18n("Remove the picture"));
+        remove->setFixedSize(18, 18);
+        remove->setStyleSheet(QStringLiteral("QToolButton { border-radius: 9px; background: rgba(0, 0, 0, 0.55); color: white; font-weight: 600; padding: 0; }"));
+        // On the picture's top right corner (the icon is centred in the button).
+        remove->move(button->width() - (button->width() - thumb) / 2 - remove->width() + 4, (button->height() - thumb) / 2 - 4);
+        connect(remove, &QToolButton::clicked, this, [this, sha256] {
+            for (int i = 0; i < m_pictures.size(); ++i) {
+                if (m_pictures.at(i).toObject().value(QStringLiteral("object_sha256")).toString() == sha256) {
+                    m_pictures.removeAt(i);
+                    break;
+                }
+            }
+            m_pictureMessage->hide();
+            rebuildPictures();
+        });
+        m_picturesLayout->addWidget(button);
+    }
+    if (m_pictures.size() < DocumentFeedback::maximumPictures) {
+        auto *add = new QToolButton(m_picturesRow);
+        add->setObjectName(QStringLiteral("reviewFeedbackAddPicture"));
+        add->setText(i18n("Add Picture…"));
+        add->setToolTip(i18n("Add a picture to this comment. You can also paste one (%1) or drop one here.", QKeySequence(QKeySequence::Paste).toString(QKeySequence::NativeText)));
+        add->setAutoRaise(true);
+        connect(add, &QToolButton::clicked, this, &ReviewFeedbackEditor::choosePictureFiles);
+        m_picturesLayout->addWidget(add);
+    }
+    m_picturesLayout->addStretch(1);
+    if (isVisible()) adjustSize();
+}
+
+void ReviewFeedbackEditor::openPicture(const QJsonObject &picture)
+{
+    const QString sha256 = picture.value(QStringLiteral("object_sha256")).toString();
+    const QByteArray bytes = m_store.load(sha256);
+    if (bytes.isEmpty()) return;
+    // A copy with its type's extension, for the picture viewer.
+    const QString folder = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath(QStringLiteral("thoughts-pictures"));
+    const QString path = QDir(folder).filePath(sha256 + (picture.value(QStringLiteral("media_type")).toString() == QLatin1String("image/png") ? QStringLiteral(".png") : QStringLiteral(".jpg")));
+    if (!QFileInfo::exists(path)) {
+        QSaveFile file(path);
+        if (!QDir().mkpath(folder) || !file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+}
+
+bool ReviewFeedbackEditor::eventFilter(QObject *watched, QEvent *event)
+{
+    if (!m_picturesEnabled) return QFrame::eventFilter(watched, event);
+    // ⌘V with a picture on the clipboard adds it; text pastes as text.
+    if (watched == m_comment && event->type() == QEvent::KeyPress && static_cast<QKeyEvent *>(event)->matches(QKeySequence::Paste)) {
+        const QMimeData *data = QApplication::clipboard()->mimeData();
+        if (hasPicture(data)) {
+            addPicturesFrom(data);
+            return true;
+        }
+    }
+    // A picture dropped on the comment is added to it.
+    if ((watched == m_comment->viewport() || watched == m_picturesRow)
+        && (event->type() == QEvent::DragEnter || event->type() == QEvent::DragMove || event->type() == QEvent::Drop)) {
+        auto *drop = static_cast<QDropEvent *>(event);
+        if (hasPicture(drop->mimeData())) {
+            drop->acceptProposedAction();
+            if (event->type() == QEvent::Drop) addPicturesFrom(drop->mimeData());
+            return true;
+        }
+    }
+    return QFrame::eventFilter(watched, event);
 }
 
 void ReviewFeedbackEditor::mousePressEvent(QMouseEvent *event)
@@ -276,9 +558,17 @@ void ReviewFeedbackEditor::mousePressEvent(QMouseEvent *event)
 
 void ReviewFeedbackEditor::popupAt(const QRect &anchor)
 {
+    m_anchor = anchor;
     adjustSize();
     QPoint position(anchor.left(), anchor.bottom() + 6);
+    // A passage taller than the screen has its centre below it (24 Nov 2026: a Dislike of a paragraph, its
+    // figure and caption): then the screen of its top, of the pointer, of the window, so the editor never
+    // opens out of sight.
     const QScreen *screen = QGuiApplication::screenAt(anchor.center());
+    if (!screen) screen = QGuiApplication::screenAt(anchor.topLeft());
+    if (!screen) screen = QGuiApplication::screenAt(QCursor::pos());
+    if (!screen && parentWidget()) screen = parentWidget()->screen();
+    if (!screen) screen = QGuiApplication::primaryScreen();
     if (screen) {
         const QRect available = screen->availableGeometry();
         if (position.y() + height() > available.bottom()) position.setY(anchor.top() - height() - 6);

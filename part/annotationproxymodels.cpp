@@ -68,7 +68,8 @@ bool PageFilterProxyModel::filterAcceptsRow(int row, const QModelIndex &sourcePa
     if (!(index.data(AnnotationModel::ItemTypeRole).toInt() & mVisibleItemTypes)) return false;
     const int page = index.data(AnnotationModel::PageRole).toInt();
     if (mGroupByCurrentPage && index.data(AnnotationModel::ItemTypeRole).toInt() == AnnotationModel::ReviewCard) {
-        return index.data(AnnotationModel::PagesRole).toList().contains(mCurrentPage);
+        // A card on the newest version has no page here: it is listed whatever the page.
+        return index.data(AnnotationModel::ReviewCardOnNewestVersionRole).toBool() || index.data(AnnotationModel::PagesRole).toList().contains(mCurrentPage);
     }
     if (mGroupByCurrentPage && index.data(AnnotationModel::ItemTypeRole).toInt() == AnnotationModel::Comment) {
         const auto threadId = [this](const QModelIndex &comment) {

@@ -1,0 +1,9 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <!-- Live HTML pages (thoughts-server protocol/html-live-pages.md): Take Snapshot's serializer
+         and the selection that text feedback reads (§2.1). -->
+    <qresource prefix="/thoughts/html-live">
+        <file>snapshot.js</file>
+        <file>selection.js</file>
+    </qresource>
+</RCC>

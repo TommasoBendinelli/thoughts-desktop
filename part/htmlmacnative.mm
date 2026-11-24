@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "htmlmacnative.h"
 
+#include <QApplication>
 #include <QWidget>
 #include <QWindow>
 
@@ -35,6 +36,11 @@ WKWebView *findWebView(QWindow *webView)
     }
     for (QObject *child : webView->children()) {
         if (auto *window = qobject_cast<QWindow *>(child)) {
+            // Only a window that has its native view: winId() would create one, and while the
+            // window closes (Thoughts quitting) that crashed in QWidgetPrivate::create.
+            if (!window->handle()) {
+                continue;
+            }
             NSView *view = reinterpret_cast<NSView *>(window->winId());
             if ([view isKindOfClass:[WKWebView class]]) {
                 return (WKWebView *)view;
@@ -61,7 +67,12 @@ void focusQt(QWidget *widget)
 
 bool webViewHasNativeFocus(QWindow *webView)
 {
-    WKWebView *wk = findWebView(webView);
+    return viewHasNativeFocus(findWebView(webView));
+}
+
+bool viewHasNativeFocus(void *view)
+{
+    NSView *wk = (NSView *)view;
     if (!wk || !wk.window) {
         return false;
     }
@@ -81,7 +92,12 @@ bool setAppearance(QWindow *webView, int mode)
 
 void snapshot(QWindow *webView, std::function<void(const QImage &)> done)
 {
-    WKWebView *wk = findWebView(webView);
+    snapshotView(findWebView(webView), std::move(done));
+}
+
+void snapshotView(void *webView, std::function<void(const QImage &)> done)
+{
+    WKWebView *wk = (WKWebView *)webView;
     if (!wk) {
         done(QImage());
         return;
@@ -154,9 +170,39 @@ void watchUserInput()
                                                      }] retain];
 }
 
+void closePopupsOnWebViewClicks()
+{
+    static id monitor = nil;
+    if (monitor) {
+        return;
+    }
+    monitor = [[NSEvent addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown)
+                                                     handler:^NSEvent *(NSEvent *event) {
+                                                         QWidget *popup = QApplication::activePopupWidget();
+                                                         NSView *content = event.window.contentView;
+                                                         if (!popup || !content) {
+                                                             return event;
+                                                         }
+                                                         NSView *frame = content.superview ? content.superview : content;
+                                                         NSView *hit = [content hitTest:[frame convertPoint:event.locationInWindow fromView:nil]];
+                                                         for (NSView *view = hit; view; view = view.superview) {
+                                                             if ([view isKindOfClass:[WKWebView class]]) {
+                                                                 popup->close();
+                                                                 return nil;
+                                                             }
+                                                         }
+                                                         return event;
+                                                     }] retain];
+}
+
 qint64 millisecondsSinceUserInput(QWindow *webView)
 {
-    WKWebView *wk = findWebView(webView);
+    return millisecondsSinceUserInputInView(findWebView(webView));
+}
+
+qint64 millisecondsSinceUserInputInView(void *view)
+{
+    NSView *wk = (NSView *)view;
     if (!wk || !wk.window || lastUserInputAt <= 0 || wk.window.windowNumber != lastUserInputWindow) {
         return -1;
     }

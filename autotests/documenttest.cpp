@@ -34,12 +34,34 @@ class DocumentTest : public QObject
 
 private Q_SLOTS:
     void testProjectReading();
+    void testFigureLinksAreCentred();
     void testCloseDuringRotationJob();
     void testRelocateUnchangedDocumentPreservesState();
     void testDocdataMigration();
     void testEvaluateKeystrokeEventChange_data();
     void testEvaluateKeystrokeEventChange();
 };
+
+void DocumentTest::testFigureLinksAreCentred()
+{
+    // A link to a figure lands on its caption, below the figure: the view centres it so the figure
+    // shows too. Other targets (a section) stay at the top of the view.
+    Okular::SettingsCore::instance(QStringLiteral("documenttest"));
+    Okular::Document document(nullptr);
+    const QString path = QStringLiteral(KDESRCDIR "data/pdf_with_figure_link.pdf");
+    QCOMPARE(document.openDocument(path, QUrl::fromLocalFile(path), QMimeDatabase().mimeTypeForFile(path)), Okular::Document::OpenSuccess);
+    const Okular::DocumentViewport figure(document.metaData(QStringLiteral("NamedViewport"), QStringLiteral("figure.1")).toString());
+    QVERIFY(figure.isValid());
+    QCOMPARE(figure.pageNumber, 1);
+    QVERIFY(figure.rePos.enabled);
+    QCOMPARE(figure.rePos.pos, Okular::DocumentViewport::Center);
+    QCOMPARE(figure.rePos.normalizedX, 0.5);
+    QVERIFY(figure.rePos.normalizedY > 0.3); // the caption, below the tall figure
+    const Okular::DocumentViewport section(document.metaData(QStringLiteral("NamedViewport"), QStringLiteral("section.1")).toString());
+    QVERIFY(section.isValid());
+    QCOMPARE(section.rePos.pos, Okular::DocumentViewport::TopLeft);
+    document.closeDocument();
+}
 
 void DocumentTest::testProjectReading()
 {

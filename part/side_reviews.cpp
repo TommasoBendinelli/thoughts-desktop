@@ -38,8 +38,10 @@
 #include <QPixmap>
 #include <QPromise>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QResizeEvent>
 #include <QSizePolicy>
+#include <QStackedWidget>
 #include <QStandardPaths>
 #include <QSet>
 #include <QStringList>
@@ -47,6 +49,7 @@
 #include <QStyledItemDelegate>
 #include <QThreadPool>
 #include <QTimer>
+#include <QToolButton>
 #include <QToolBar>
 #include <QTreeView>
 
@@ -58,6 +61,7 @@
 // local includes
 #include "annotationmodel.h"
 #include "documentfeedback.h"
+#include "readingoverlaylist.h"
 #include "reviewcardfeedback.h"
 #include "../shell/agentproposalparser.h"
 #include "annotationpopup.h"
@@ -73,6 +77,7 @@
 #include "reviewcardregions.h"
 
 #include <algorithm>
+#include <functional>
 #include <tuple>
 #include <utility>
 
@@ -112,11 +117,26 @@ protected:
     }
 
 private:
+    // The width @p columns columns of the buttons need, each as wide as its widest button.
+    int widthFor(int columns) const
+    {
+        int total = 4 + m_layout->spacing() * (columns - 1);
+        for (int column = 0; column < columns; ++column) {
+            int widest = 0;
+            for (int index = column; index < m_buttons.size(); index += columns) widest = std::max(widest, m_buttons.at(index)->sizeHint().width());
+            total += widest;
+        }
+        return total;
+    }
+
+    // One row when they fit; else two rows (the Overlay tab made five buttons); else two columns.
     int columnsFor(int width) const
     {
-        int oneRow = 4;
-        for (const QPushButton *button : m_buttons) oneRow += button->sizeHint().width();
-        return width >= oneRow ? int(m_buttons.size()) : 2;
+        const int all = int(m_buttons.size());
+        if (width >= widthFor(all)) return all;
+        const int half = (all + 1) / 2;
+        if (half > 2 && width >= widthFor(half)) return half;
+        return 2;
     }
 
     void arrange(bool force)
@@ -487,6 +507,75 @@ static QVariant loadArtifactAgentProposalRows(const QString &docsRoot, const QUr
     return result;
 }
 
+// The proposals in the order of the text (24 Nov), so the first one listed is the first one in the
+// text: a row's place is the chain of \input lines that reaches its file from a file no
+// other source inputs, then its own line. So a proposal of a section fragment comes where main.tex
+// inputs it, whether or not the build placed it in the PDF. A file no chain reaches comes after.
+// Each row keeps its place as "reading_order", for a proposal shown again later.
+static void sortAgentProposalRowsInReadingOrder(QVariantList &rows, const QStringList &sourcePaths)
+{
+    QStringList files = sourcePaths;
+    for (const QVariant &row : std::as_const(rows)) {
+        const QString path = row.toMap().value(QStringLiteral("source_path")).toString();
+        if (!path.isEmpty() && !files.contains(path)) files.append(path);
+    }
+    static const QRegularExpression input(QStringLiteral(R"(\\(?:input|include|subfile)\s*\{([^{}]*)\})"));
+    static const QRegularExpression comment(QStringLiteral(R"((?<!\\)%)"));
+    QHash<QString, QList<std::pair<int, QString>>> includes;
+    QSet<QString> included;
+    for (const QString &file : std::as_const(files)) {
+        QFile source(file);
+        if (!source.open(QIODevice::ReadOnly)) continue;
+        const QStringList lines = QString::fromUtf8(source.readAll()).split(QLatin1Char('\n'));
+        for (int index = 0; index < lines.size(); ++index) {
+            QString line = lines.at(index);
+            if (const auto commented = comment.match(line); commented.hasMatch()) line.truncate(commented.capturedStart());
+            for (auto match = input.globalMatch(line); match.hasNext();) {
+                QString name = match.next().captured(1).trimmed();
+                if (name.isEmpty()) continue;
+                if (QFileInfo(name).suffix().isEmpty()) name += QStringLiteral(".tex");
+                // As TeX finds it from the project folder: the one source whose path ends so.
+                const QString suffix = QLatin1Char('/') + QDir::cleanPath(name);
+                QString target;
+                int matches = 0;
+                for (const QString &candidate : std::as_const(files)) {
+                    if (candidate != file && candidate.endsWith(suffix)) {
+                        target = candidate;
+                        ++matches;
+                    }
+                }
+                if (matches == 1) {
+                    includes[file].append({index + 1, target});
+                    included.insert(target);
+                }
+            }
+        }
+    }
+    QHash<QString, QList<int>> start;
+    std::function<void(const QString &, const QList<int> &)> visit = [&](const QString &file, const QList<int> &key) {
+        start.insert(file, key);
+        for (const auto &[line, child] : std::as_const(includes[file])) {
+            if (!start.contains(child)) visit(child, key + QList<int>{line});
+        }
+    };
+    int next = 0;
+    for (const QString &file : std::as_const(files)) {
+        if (!included.contains(file) && !start.contains(file)) visit(file, {next++});
+    }
+    for (const QString &file : std::as_const(files)) {
+        if (!start.contains(file)) visit(file, {next++});
+    }
+    for (QVariant &value : rows) {
+        QVariantMap row = value.toMap();
+        const QList<int> key = start.value(row.value(QStringLiteral("source_path")).toString(), {next}) + QList<int>{row.value(QStringLiteral("source_line")).toInt()};
+        row.insert(QStringLiteral("reading_order"), QVariant::fromValue(key));
+        value = row;
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const QVariant &a, const QVariant &b) {
+        return a.toMap().value(QStringLiteral("reading_order")).value<QList<int>>() < b.toMap().value(QStringLiteral("reading_order")).value<QList<int>>();
+    });
+}
+
 // Explicit overview source locations remain usable when PDF metadata is missing or stale.
 static QVariant loadAgentProposalRows(const QString &docsRoot, const QUrl &documentUrl, const QStringList &additionalSources)
 {
@@ -543,6 +632,7 @@ static QVariant loadAgentProposalRows(const QString &docsRoot, const QUrl &docum
         decidedIds.removeAll(row.toMap().value(QStringLiteral("id")).toString());
     }
     result.insert(QStringLiteral("decided_ids"), decidedIds);
+    sortAgentProposalRowsInReadingOrder(rows, paths);
     result.insert(QStringLiteral("rows"), rows);
     result.insert(QStringLiteral("source_paths"), paths);
     return result;
@@ -736,7 +826,9 @@ public:
                 const QRect pagesRect(option.rect.left() + 28, option.rect.top() + 8, pagesWidth - 6, option.fontMetrics.height());
                 painter->drawText(pagesRect, Qt::AlignLeft | Qt::AlignTop, option.fontMetrics.elidedText(pages, Qt::ElideRight, pagesRect.width()));
             }
-            painter->setPen(option.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
+            // A card on the newest version (an earlier one is on screen): dimmed, with its label below.
+            const bool elsewhere = index.data(AnnotationModel::ReviewCardOnNewestVersionRole).toBool();
+            painter->setPen(option.palette.color(selected ? QPalette::HighlightedText : elsewhere ? QPalette::PlaceholderText : QPalette::Text));
             const QRect textRect = option.rect.adjusted(28 + pagesWidth, 8, -25, -8);
             QRect questionBounds;
             painter->drawText(textRect, Qt::TextWordWrap | Qt::AlignTop, index.data().toString(), &questionBounds);
@@ -844,7 +936,11 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
         button->setFocusPolicy(Qt::TabFocus);
         button->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
         typeFilters->addButton(button);
-        connect(button, &QPushButton::toggled, this, &Reviews::updateTypeFilter);
+        connect(button, &QPushButton::toggled, this, [this, button](bool on) {
+            // Switched while the overlays are listed: back to the list, with this switch as asked.
+            if (readingOverlaysShown()) leaveReadingOverlays(button, on);
+            else updateTypeFilter();
+        });
         // Only a user click shows or hides markup; restoring or programmatic changes do not.
         connect(button, &QPushButton::clicked, this, [this, itemType](bool on) {
             Q_EMIT typeFilterClicked(itemType, on);
@@ -856,13 +952,69 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
                                      QStringLiteral("reviewsFeedbackFilter"), filterConfig.readEntry("ShowFeedback", true), AnnotationModel::Feedback);
     m_proposalsFilter = addTypeFilter(i18n("Proposals"), i18n("Agent proposals"), QStringLiteral("reviewsProposalsFilter"), filterConfig.readEntry("ShowProposals", true), AnnotationModel::AgentProposal);
     m_reviewCardsFilter = addTypeFilter(i18n("Cards"), i18n("Review cards"), QStringLiteral("reviewsCardsFilter"), filterConfig.readEntry("ShowReviewCards", true), AnnotationModel::ReviewCard);
+    // Overlay (reading-overlays.md §4): agents' reading guides. Unlike the switches before it, it
+    // is a tab: while it is on, the overlays are listed instead of the annotations.
+    m_overlayTab = new QPushButton(i18n("Overlay"), typeFilters);
+    m_overlayTab->setObjectName(QStringLiteral("reviewsOverlayTab"));
+    m_overlayTab->setCheckable(true);
+    m_overlayTab->setAutoDefault(false);
+    m_overlayTab->setToolTip(i18n("Reading overlays: what agents marked to read, skim or skip in this PDF, with their comments"));
+    m_overlayTab->setFocusPolicy(Qt::TabFocus);
+    m_overlayTab->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
+    typeFilters->addButton(m_overlayTab);
+    connect(m_overlayTab, &QPushButton::clicked, this, [this](bool on) {
+        if (on) {
+            showReadingOverlays();
+            Q_EMIT readingOverlaysOpened();
+        } else {
+            leaveReadingOverlays(nullptr, false);
+        }
+    });
     vLayout->addWidget(typeFilters);
+    m_pages = new QStackedWidget(this);
+    m_listPage = new QWidget(m_pages);
+    auto *listLayout = new QVBoxLayout(m_listPage);
+    listLayout->setContentsMargins(0, 0, 0, 0);
+    listLayout->setSpacing(6);
+    m_pages->addWidget(m_listPage);
+    m_readingOverlayPage = new QWidget(m_pages);
+    auto *overlayLayout = new QVBoxLayout(m_readingOverlayPage);
+    overlayLayout->setContentsMargins(0, 0, 0, 0);
+    overlayLayout->setSpacing(4);
+    m_readingOverlayRequestBar = new Thoughts::ReadingOverlayRequestBar(m_readingOverlayPage);
+    overlayLayout->addWidget(m_readingOverlayRequestBar);
+    m_readingOverlayList = new Thoughts::ReadingOverlayList(m_readingOverlayPage);
+    overlayLayout->addWidget(m_readingOverlayList, 1);
+    m_pages->addWidget(m_readingOverlayPage);
+    connect(m_readingOverlayList, &Thoughts::ReadingOverlayList::shownCountChanged, this, [this](int count) {
+        // The number of overlays shown on the page, when there are any (§4).
+        m_overlayTab->setText(count > 0 ? i18nc("@title:tab reading overlays, with how many show on the page", "Overlay %1", count) : i18n("Overlay"));
+    });
+    vLayout->addWidget(m_pages, 1);
     auto *searchRow = new QHBoxLayout;
     searchRow->setSpacing(6);
     searchRow->addWidget(m_searchLine, 1);
+    // Back and forward through the proposal decisions (24 Nov): arrows for Undo and Redo.
+    const auto historyButton = [this](const char *objectName, const QString &icon, const QString &text) {
+        auto *button = new QToolButton(this);
+        button->setObjectName(QLatin1String(objectName));
+        button->setIcon(QIcon::fromTheme(icon));
+        button->setText(text);
+        button->setAccessibleName(text);
+        button->setAutoRaise(true);
+        button->setEnabled(false);
+        button->hide();
+        return button;
+    };
+    m_proposalUndo = historyButton("reviewsProposalUndo", QStringLiteral("edit-undo"), i18n("Undo Decision"));
+    m_proposalRedo = historyButton("reviewsProposalRedo", QStringLiteral("edit-redo"), i18n("Redo Decision"));
+    connect(m_proposalUndo, &QToolButton::clicked, this, &Reviews::agentProposalUndoRequested);
+    connect(m_proposalRedo, &QToolButton::clicked, this, &Reviews::agentProposalRedoRequested);
+    searchRow->addWidget(m_proposalUndo);
+    searchRow->addWidget(m_proposalRedo);
     searchRow->addWidget(m_sourceLinkIndicator);
-    vLayout->addLayout(searchRow);
-    vLayout->addWidget(m_view);
+    listLayout->addLayout(searchRow);
+    listLayout->addWidget(m_view);
     // What the version rule hides (document-feedback.md section 9): one line, never lost.
     m_earlierFeedback = new QPushButton(this);
     m_earlierFeedback->setObjectName(QStringLiteral("reviewsEarlierFeedback"));
@@ -870,7 +1022,7 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
     m_earlierFeedback->setCheckable(true);
     m_earlierFeedback->hide();
     connect(m_earlierFeedback, &QPushButton::clicked, this, &Reviews::earlierFeedbackToggled);
-    vLayout->addWidget(m_earlierFeedback);
+    listLayout->addWidget(m_earlierFeedback);
     // The Retired filter: retired cards stay on the PDF version they were retired on, so this
     // version lists them only when asked, unplaced; that version (from History) draws them.
     m_retiredCardsFilter = new QPushButton(this);
@@ -887,9 +1039,9 @@ Reviews::Reviews(QWidget *parent, Okular::Document *document, const QString &doc
         config.sync();
         rebuildReviewCards();
     });
-    vLayout->addWidget(m_retiredCardsFilter);
+    listLayout->addWidget(m_retiredCardsFilter);
     updateTypeFilter();
-    vLayout->addWidget(toolBar);
+    listLayout->addWidget(toolBar);
 
     toolBar->setIconSize(QSize(16, 16));
     toolBar->setMovable(false);
@@ -1068,6 +1220,10 @@ void Reviews::startAgentProposalRefresh()
     const QUrl documentUrl = m_agentProposalRequestedUrl;
     m_agentProposalRunningUrl = documentUrl;
     m_agentProposalRefreshInFlight = true;
+    if (!m_agentProposalRefreshClock.isValid()) {
+        m_agentProposalRefreshClock.start();
+        m_agentProposalRefreshesSuperseded = 0;
+    }
     QPromise<QVariant> promise;
     const QFuture<QVariant> future = promise.future();
     promise.start();
@@ -1081,9 +1237,17 @@ void Reviews::startAgentProposalRefresh()
 
 void Reviews::finishAgentProposalRefresh()
 {
+    const QSet<QString> sourcesAddedInFlight = std::exchange(m_agentProposalSourcesAddedInFlight, {});
     const bool superseded = m_agentProposalRefreshPending || m_agentProposalRunningUrl != m_agentProposalRequestedUrl || m_document->currentDocument() != m_agentProposalRequestedUrl;
     if (!superseded) {
         const QVariantMap payload = m_agentProposalWatcher->result().toMap();
+        // A source asked for meanwhile that this reading did not include: shown now, read next.
+        const QStringList readSources = payload.value(QStringLiteral("source_paths")).toStringList();
+        for (const QString &sourcePath : sourcesAddedInFlight) {
+            if (!readSources.contains(sourcePath)) {
+                m_agentProposalRefreshPending = true;
+            }
+        }
         if (!payload.value(QStringLiteral("live_sources_valid"), true).toBool()) {
             if (m_agentProposalTransientRetries < 10) {
                 ++m_agentProposalTransientRetries;
@@ -1114,6 +1278,7 @@ void Reviews::finishAgentProposalRefresh()
             entry.liveSource = row.value(QStringLiteral("live_source")).toBool();
             entry.localSourcePresent = row.value(QStringLiteral("local_source_present")).toBool();
             entry.resolutionError = row.value(QStringLiteral("resolution_error")).toString();
+            entry.readingOrder = row.value(QStringLiteral("reading_order")).value<QList<int>>();
             if (!entry.id.isEmpty() && !m_suppressedAgentProposalIds.contains(entry.id)) {
                 entries.append(entry);
             }
@@ -1133,6 +1298,10 @@ void Reviews::finishAgentProposalRefresh()
         m_model->setSourceComments(sourceComments);
         const QStringList decidedIds = payload.value(QStringLiteral("decided_ids")).toStringList();
         m_decidedAgentProposalIds = QSet<QString>(decidedIds.cbegin(), decidedIds.cend());
+        if (m_agentProposalRefreshClock.isValid()) {
+            Q_EMIT agentProposalRowsTimed(m_agentProposalRefreshClock.elapsed(), int(entries.size()), m_agentProposalRefreshesSuperseded);
+            m_agentProposalRefreshClock.invalidate();
+        }
         Q_EMIT agentProposalsChanged();
         m_agentProposalSourcePaths.clear();
         for (const QString &path : payload.value(QStringLiteral("source_paths")).toStringList()) {
@@ -1146,6 +1315,9 @@ void Reviews::finishAgentProposalRefresh()
     }
     m_agentProposalRefreshInFlight = false;
     if (m_agentProposalRefreshPending || m_agentProposalRunningUrl != m_agentProposalRequestedUrl) {
+        if (superseded) {
+            ++m_agentProposalRefreshesSuperseded;
+        }
         startAgentProposalRefresh();
     }
 }
@@ -1254,7 +1426,7 @@ void Reviews::selectAnnotation(Okular::Annotation *annotation, int pageNumber)
     m_view->setFocus(Qt::MouseFocusReason);
 }
 
-void Reviews::revealRow(const QModelIndex &viewIndex)
+void Reviews::revealRow(const QModelIndex &viewIndex, QAbstractItemView::ScrollHint hint)
 {
     if (m_view->isRowHidden(viewIndex.row(), viewIndex.parent())) {
         m_searchLine->clear();
@@ -1270,7 +1442,72 @@ void Reviews::revealRow(const QModelIndex &viewIndex)
     }
 
     m_view->selectionModel()->setCurrentIndex(viewIndex, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
-    m_view->scrollTo(viewIndex, QAbstractItemView::PositionAtCenter);
+    m_view->scrollTo(viewIndex, hint);
+}
+
+QModelIndex Reviews::sourceIndexForItem(int itemType, const QString &id) const
+{
+    if (id.isEmpty()) {
+        return {};
+    }
+    const std::function<QModelIndex(const QModelIndex &)> find = [this, itemType, &id, &find](const QModelIndex &parent) -> QModelIndex {
+        for (int row = 0; row < m_model->rowCount(parent); ++row) {
+            const QModelIndex index = m_model->index(row, 0, parent);
+            if (index.data(AnnotationModel::ItemTypeRole).toInt() == itemType && index.data(AnnotationModel::ItemIdRole).toString() == id) {
+                return index;
+            }
+            if (const QModelIndex found = find(index); found.isValid()) {
+                return found;
+            }
+        }
+        return {};
+    };
+    return find({});
+}
+
+bool Reviews::selectItem(int itemType, const QString &id, bool showType)
+{
+    const QModelIndex source = sourceIndexForItem(itemType, id);
+    if (!source.isValid()) {
+        return false;
+    }
+    if (showType) {
+        (itemType == AnnotationModel::AgentProposal ? m_proposalsFilter : m_commentsFilter)->setChecked(true);
+    }
+    const QModelIndex viewIndex = m_authorProxy->mapFromSource(m_groupProxy->mapFromSource(m_filterProxy->mapFromSource(source)));
+    if (!viewIndex.isValid()) {
+        return false;
+    }
+    // Already the highlighted row (the click that opened it): the list stays where it is.
+    if (m_view->currentIndex() == viewIndex && m_view->selectionModel()->isSelected(viewIndex) && !m_view->isRowHidden(viewIndex.row(), viewIndex.parent())) {
+        return true;
+    }
+    revealRow(viewIndex, QAbstractItemView::EnsureVisible);
+    return true;
+}
+
+bool Reviews::selectAgentProposal(const QString &proposalId, bool showType)
+{
+    m_shownAgentProposalId = proposalId;
+    return selectItem(AnnotationModel::AgentProposal, proposalId, showType);
+}
+
+void Reviews::agentProposalWindowClosed(const QString &proposalId)
+{
+    if (proposalId.isEmpty() || m_shownAgentProposalId != proposalId) {
+        return;
+    }
+    m_shownAgentProposalId.clear();
+    m_reselectShownAgentProposal = false;
+    const QModelIndex current = annotationModelIndex(m_view->currentIndex());
+    if (current.data(AnnotationModel::ItemTypeRole).toInt() == AnnotationModel::AgentProposal && current.data(AnnotationModel::ItemIdRole).toString() == proposalId) {
+        m_view->selectionModel()->clear();
+    }
+}
+
+bool Reviews::selectComment(const QString &commentId, bool showType)
+{
+    return selectItem(AnnotationModel::Comment, commentId, showType);
 }
 
 void Reviews::selectFeedback(const QString &feedbackId)
@@ -1337,8 +1574,8 @@ void Reviews::openCommentWindow(const QModelIndex &index)
     vp.rePos.pos = Okular::DocumentViewport::Center;
     vp.rePos.normalizedX = (nr.right + nr.left) / 2.0;
     vp.rePos.normalizedY = (nr.bottom + nr.top) / 2.0;
-    // setting the viewport
-    m_document->setViewport(vp, nullptr, true);
+    // setting the viewport: scrolled to when near, a page out of sight shown at once
+    m_document->setViewport(vp, nullptr, std::abs(int(m_document->currentPage()) - pageNumber) <= 1);
 
     m_view->setReviewNavigationActive(true);
     Q_EMIT openReviewAnnotationWindow(selectedAnnotation, selectedPage);
@@ -1398,6 +1635,55 @@ void Reviews::activateAgentProposal(const QModelIndex &index)
     }
 }
 
+Thoughts::ReadingOverlayList *Reviews::readingOverlayList() const
+{
+    return m_readingOverlayList;
+}
+
+Thoughts::ReadingOverlayRequestBar *Reviews::readingOverlayRequestBar() const
+{
+    return m_readingOverlayRequestBar;
+}
+
+bool Reviews::readingOverlaysShown() const
+{
+    return m_pages->currentWidget() == m_readingOverlayPage;
+}
+
+void Reviews::showReadingOverlays(const QString &overlayId)
+{
+    if (!readingOverlaysShown()) {
+        // The switches look off while the overlays are listed; what they were comes back after.
+        m_typeFiltersBeforeOverlays = {m_commentsFilter->isChecked(), m_feedbackFilter->isChecked(), m_proposalsFilter->isChecked(), m_reviewCardsFilter->isChecked()};
+        for (QPushButton *button : {m_commentsFilter, m_feedbackFilter, m_proposalsFilter, m_reviewCardsFilter}) {
+            const QSignalBlocker blocker(button);
+            button->setChecked(false);
+        }
+        m_pages->setCurrentWidget(m_readingOverlayPage);
+    }
+    {
+        const QSignalBlocker blocker(m_overlayTab);
+        m_overlayTab->setChecked(true);
+    }
+    if (!overlayId.isEmpty()) m_readingOverlayList->revealOverlay(overlayId);
+}
+
+void Reviews::leaveReadingOverlays(QPushButton *switched, bool on)
+{
+    if (!readingOverlaysShown()) return;
+    const QList<QPushButton *> switches{m_commentsFilter, m_feedbackFilter, m_proposalsFilter, m_reviewCardsFilter};
+    for (int index = 0; index < switches.size(); ++index) {
+        const QSignalBlocker blocker(switches.at(index));
+        switches.at(index)->setChecked(switches.at(index) == switched ? on : m_typeFiltersBeforeOverlays.value(index, true));
+    }
+    {
+        const QSignalBlocker blocker(m_overlayTab);
+        m_overlayTab->setChecked(false);
+    }
+    m_pages->setCurrentWidget(m_listPage);
+    updateTypeFilter();
+}
+
 void Reviews::updateTypeFilter()
 {
     const QModelIndex selectedSource = annotationModelIndex(m_view->currentIndex());
@@ -1405,6 +1691,11 @@ void Reviews::updateTypeFilter()
         | (m_proposalsFilter->isChecked() ? AnnotationModel::AgentProposal : 0)
         | (m_reviewCardsFilter->isChecked() ? AnnotationModel::ReviewCard : 0);
     m_filterProxy->setVisibleItemTypes(types);
+    // The decision arrows belong to the Proposals tab.
+    if (m_proposalUndo) {
+        m_proposalUndo->setVisible(m_proposalsFilter->isChecked());
+        m_proposalRedo->setVisible(m_proposalsFilter->isChecked());
+    }
     // Cards hidden from the list: the selected card's answer is no longer highlighted on the page.
     if (!m_reviewCardsFilter->isChecked()) hideActiveReviewCardHighlight();
     if (selectedSource.isValid()) {
@@ -1421,6 +1712,14 @@ void Reviews::updateTypeFilter()
     config.sync();
 }
 
+void Reviews::setAgentProposalHistory(bool canUndo, const QString &undoTip, bool canRedo, const QString &redoTip)
+{
+    m_proposalUndo->setEnabled(canUndo);
+    m_proposalUndo->setToolTip(canUndo ? undoTip : i18n("No proposal decision to undo"));
+    m_proposalRedo->setEnabled(canRedo);
+    m_proposalRedo->setToolTip(canRedo ? redoTip : i18n("No undone proposal decision to redo"));
+}
+
 AgentProposalSidebarEntry Reviews::agentProposal(const QString &proposalId) const
 {
     return m_suppressedAgentProposalIds.contains(proposalId) ? AgentProposalSidebarEntry {} : m_model->agentProposal(proposalId);
@@ -1432,17 +1731,41 @@ QString Reviews::loadAgentProposalSource(const QString &proposalId, const QStrin
     if (sourcePath.isEmpty()) {
         return i18n("The proposal's source is unavailable or outside the documentation folder. Its resolution status could not be checked.");
     }
-    QFile source(sourcePath);
-    if (!source.open(QIODevice::ReadOnly)) {
-        return i18n("The proposal's source could not be read. Its resolution status could not be checked.");
-    }
-    const Thoughts::AgentProposalParse parsed = Thoughts::parseAgentProposals(sourcePath, QString::fromUtf8(source.readAll()));
-    if (!parsed.proposal(proposalId)) {
-        const QString code = parsed.refusalCode(proposalId);
-        if (code != QLatin1String(Thoughts::AgentProposalIssueCode::UnknownId)) {
-            return i18n("This proposal cannot be decided until its source is fixed: %1", Thoughts::agentProposalIssueMessage(code));
+    // The PDF was just opened and its proposals are being read, most often from this very source:
+    // nothing is read here meanwhile. That reading is followed by one of this source only if it did
+    // not include it, and the source is checked here only if the proposal is still missing then.
+    if (m_agentProposalRefreshInFlight && m_agentProposalRunningUrl == m_document->currentDocument() && m_agentProposalRequestedUrl == m_agentProposalRunningUrl) {
+        if (!m_additionalAgentProposalSources.contains(sourcePath)) {
+            m_additionalAgentProposalSources.append(sourcePath);
+            m_agentProposalSourcesAddedInFlight.insert(sourcePath);
         }
-        return i18n("This proposal ID is absent from the current source. It may have been resolved or edited; its absence alone does not identify an accept or reject decision.");
+        return {};
+    }
+    // The Library asks again every few milliseconds while the PDF's proposals are read: the
+    // source is read and parsed once for each version of it, not on every attempt.
+    const QFileInfo sourceInfo(sourcePath);
+    const QString checkKey = proposalId + QLatin1Char('\n') + sourcePath + QLatin1Char('\n') + QString::number(sourceInfo.size()) + QLatin1Char(':')
+        + QString::number(sourceInfo.lastModified().toMSecsSinceEpoch());
+    if (checkKey != m_agentProposalSourceCheckKey) {
+        m_agentProposalSourceCheckKey.clear();
+        ++m_agentProposalSourceReads;
+        QFile source(sourcePath);
+        if (!source.open(QIODevice::ReadOnly)) {
+            return i18n("The proposal's source could not be read. Its resolution status could not be checked.");
+        }
+        const Thoughts::AgentProposalParse parsed = Thoughts::parseAgentProposals(sourcePath, QString::fromUtf8(source.readAll()));
+        QString error;
+        if (!parsed.proposal(proposalId)) {
+            const QString code = parsed.refusalCode(proposalId);
+            error = code != QLatin1String(Thoughts::AgentProposalIssueCode::UnknownId)
+                ? i18n("This proposal cannot be decided until its source is fixed: %1", Thoughts::agentProposalIssueMessage(code))
+                : i18n("This proposal ID is absent from the current source. It may have been resolved or edited; its absence alone does not identify an accept or reject decision.");
+        }
+        m_agentProposalSourceCheckKey = checkKey;
+        m_agentProposalSourceCheckError = error;
+    }
+    if (!m_agentProposalSourceCheckError.isEmpty()) {
+        return m_agentProposalSourceCheckError;
     }
     if (!m_additionalAgentProposalSources.contains(sourcePath)) {
         if (m_agentProposalRequestedUrl != m_document->currentDocument()) {
@@ -1488,6 +1811,10 @@ void Reviews::restoreAgentProposal(const QString &proposalId, bool reload)
     if (!proposal.id.isEmpty() && m_model->agentProposal(proposalId).id.isEmpty()) {
         QList<AgentProposalSidebarEntry> proposals = m_model->agentProposals();
         proposals.append(proposal);
+        // Back in its place in the text.
+        std::stable_sort(proposals.begin(), proposals.end(), [](const AgentProposalSidebarEntry &a, const AgentProposalSidebarEntry &b) {
+            return a.readingOrder < b.readingOrder;
+        });
         m_model->setAgentProposals(proposals);
     }
     if (reload) {
@@ -1629,29 +1956,19 @@ void Reviews::contextMenuRequested(const QPoint pos)
         open->setObjectName(QStringLiteral("openSidebarReviewCard"));
         auto *edit = menu.addAction(i18n("Edit…"));
         edit->setObjectName(QStringLiteral("editSidebarReviewCard"));
+        // The card's answer becomes every page's text below the title (Shell::coverSidebarReviewCardDocument).
+        auto *wholeDocument = menu.addAction(i18n("Cover the Whole Document…"));
+        wholeDocument->setObjectName(QStringLiteral("wholeDocumentSidebarReviewCard"));
         // Two or more selected cards become one (Shell::mergeSidebarReviewCards).
         auto *merge = menu.addAction(i18n("Merge cards…"));
         merge->setObjectName(QStringLiteral("mergeSidebarReviewCards"));
         merge->setEnabled(selectedCards.size() >= 2);
-        // Knowledge card or project card (review-card-kinds.md §5), as the shell's schedule says.
-        const QVariantMap kind = annotationModelIndex(currentIndex).data(AnnotationModel::ReviewCardKindRole).toMap();
-        QAction *makeKind = nullptr;
-        QAction *follow = nullptr;
+        // The card's kind (knowledge or project, review-card-kinds.md §5) is chosen in Edit… since 23 Nov 2026.
         QAction *retire = nullptr;
         QAction *remove = nullptr;
         // Retire and Delete act on the selection when the right-clicked card is part of it, else on that card.
         const QStringList affected = selectedCards.contains(id) && selectedCards.size() > 1 ? selectedCards : QStringList{id};
         if (!annotationModelIndex(currentIndex).data(AnnotationModel::CandidateRole).toBool()) {
-            menu.addSeparator();
-            const bool project = kind.value(QStringLiteral("review_kind")).toString() == QLatin1String("project");
-            makeKind = menu.addAction(project ? i18n("Make knowledge card") : i18n("Make project card"));
-            makeKind->setObjectName(QStringLiteral("kindSidebarReviewCard"));
-            makeKind->setData(project ? QStringLiteral("knowledge") : QStringLiteral("project"));
-            if (kind.value(QStringLiteral("review_kind_source")).toString() == QLatin1String("card") && kind.contains(QStringLiteral("projects_kind"))) {
-                follow = menu.addAction(kind.value(QStringLiteral("projects_kind")).toString() == QLatin1String("project") ? i18n("Follow the Project (Project)")
-                                                                                                                         : i18n("Follow the Project (Knowledge)"));
-                follow->setObjectName(QStringLiteral("followProjectSidebarReviewCard"));
-            }
             // Retire card takes it out of review and keeps its history (Library › Restore to review brings it
             // back); Delete card… asks first, then removes it and its history for good.
             menu.addSeparator();
@@ -1664,9 +1981,8 @@ void Reviews::contextMenuRequested(const QPoint pos)
         if (chosen == reviewNow) Q_EMIT reviewCardReviewRequested(id);
         else if (chosen == open) Q_EMIT reviewCardOpenRequested(id);
         else if (chosen == edit) Q_EMIT reviewCardEditRequested(id);
+        else if (chosen == wholeDocument) Q_EMIT reviewCardWholeDocumentRequested(id);
         else if (chosen == merge) Q_EMIT reviewCardsMergeRequested(selectedCards);
-        else if (chosen && chosen == makeKind) Q_EMIT reviewCardKindRequested(id, makeKind->data().toString());
-        else if (chosen && chosen == follow) Q_EMIT reviewCardKindRequested(id, QStringLiteral("follow_project"));
         else if (chosen && chosen == retire) Q_EMIT reviewCardsRetireRequested(affected);
         else if (chosen && chosen == remove) Q_EMIT reviewCardsDeleteRequested(affected);
         return;
@@ -1837,6 +2153,9 @@ void Reviews::saveTreeState()
 {
     AnnotationStateSaver saver(m_view);
     m_expansionKeys = saver.expansionKeys();
+    const QModelIndex current = annotationModelIndex(m_view->currentIndex());
+    m_reselectShownAgentProposal = !m_shownAgentProposalId.isEmpty() && current.data(AnnotationModel::ItemTypeRole).toInt() == AnnotationModel::AgentProposal
+        && current.data(AnnotationModel::ItemIdRole).toString() == m_shownAgentProposalId;
 }
 
 void Reviews::restoreTreeState()
@@ -1844,6 +2163,11 @@ void Reviews::restoreTreeState()
     AnnotationStateSaver saver(m_view);
     saver.restoreExpanded(m_expansionKeys);
     if (m_searchLine && !m_searchLine->text().isEmpty()) m_searchLine->updateSearch(m_searchLine->text());
+    // The list read again (a source changed, the PDF's proposals arrived): the proposal in its
+    // window stays the highlighted row.
+    if (std::exchange(m_reselectShownAgentProposal, false) && !m_view->currentIndex().isValid()) {
+        selectItem(AnnotationModel::AgentProposal, m_shownAgentProposalId, false);
+    }
 }
 
 QAbstractItemModel *Reviews::annotationsModel() const
@@ -1858,10 +2182,19 @@ void Reviews::setUnplacedComments(const QMap<QString, QString> &comments)
     m_model->setUnplacedComments(comments);
 }
 
+void Reviews::setNewestVersionSha256(const QString &sha256)
+{
+    if (m_newestPdfSha256 == sha256) return;
+    m_newestPdfSha256 = sha256;
+    rebuildReviewCards();
+}
+
 void Reviews::setReviewCards(const QJsonArray &cards)
 {
     if (!m_document->isOpened() || !m_document->currentDocument().isLocalFile()) return;
-    const QFileInfo pdf(m_document->currentDocument().toLocalFile());
+    // The version on screen (an earlier one kept while a newer one is ready: its own file).
+    const QString opened = m_document->metaData(QStringLiteral("OpenedFilePath")).toString();
+    const QFileInfo pdf(opened.isEmpty() ? m_document->currentDocument().toLocalFile() : opened);
     if (m_reviewPdfSha256.isEmpty()) {
         QFile file(pdf.absoluteFilePath());
         if (file.open(QIODevice::ReadOnly)) {
@@ -1914,6 +2247,9 @@ void Reviews::rebuildReviewCards()
         }
         const QString state = card.value(QStringLiteral("reanchor")).toObject().value(QStringLiteral("state")).toString();
         const bool placedHere = !regions.isEmpty() && !m_reviewPdfSha256.isEmpty() && cardPdfSha256 == (child ? child->document.pdfSha256 : m_reviewPdfSha256);
+        // Placed on the newest version, which is ready while this tab keeps an earlier one on screen.
+        const bool onNewestVersion = !placedHere && !retired && !earlierVersion && !child && !regions.isEmpty() && !m_newestPdfSha256.isEmpty()
+            && cardPdfSha256 == m_newestPdfSha256;
         // A retired card keeps the placement it had when it was retired: valid on its own version only.
         bool valid = retired ? earlierVersion && placedHere
                              : placedHere && status == QLatin1String("approved") && (state.isEmpty() || state == QLatin1String("succeeded"));
@@ -1946,19 +2282,20 @@ void Reviews::rebuildReviewCards()
         const QString scheduleState = schedule.value(QStringLiteral("state")).toString();
         const bool placementPending = !valid || status == QLatin1String("needs_reanchor")
             || (!state.isEmpty() && state != QLatin1String("succeeded"));
-        if (!retired && !shownSha256.isEmpty() && !Thoughts::isHtmlAttachmentCard(card) && cardPdfSha256 != shownSha256
+        if (!retired && !onNewestVersion && !shownSha256.isEmpty() && !Thoughts::isHtmlAttachmentCard(card) && cardPdfSha256 != shownSha256
             && (scheduleState == QLatin1String("new") || scheduleState == QLatin1String("learning") || scheduleState == QLatin1String("review"))) {
             schedule.insert(QStringLiteral("state"), QStringLiteral("unavailable"));
             schedule.remove(QStringLiteral("due_from"));
         }
         // Why the queue does not offer it (AnnotationModel::reviewCardSchedule words it).
-        if (schedule.value(QStringLiteral("state")).toString() == QLatin1String("unavailable") && placementPending && !Thoughts::isHtmlAttachmentCard(card))
+        if (schedule.value(QStringLiteral("state")).toString() == QLatin1String("unavailable") && placementPending && !onNewestVersion && !Thoughts::isHtmlAttachmentCard(card))
             schedule.insert(QStringLiteral("not_offered"), QStringLiteral("placement"));
         ReviewCardSidebarEntry sidebarEntry{id, question, valid ? pages.first() : -1, valid ? pages : QList<int>(),
                                             QCryptographicHash::hash(QJsonDocument(entry).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256),
                                             status == QLatin1String("candidate"), primary.value(QStringLiteral("scope")).toString() == QLatin1String("document"), schedule};
         sidebarEntry.retired = retired;
         sidebarEntry.pdfSha256 = cardPdfSha256;
+        sidebarEntry.onNewestVersion = onNewestVersion;
         entries.append(sidebarEntry);
     }
     std::sort(entries.begin(), entries.end(), [&positions](const auto &a, const auto &b) {
@@ -2083,6 +2420,8 @@ bool Reviews::activateReviewCard(const QModelIndex &index, bool navigate)
     const QJsonArray regions = m_reviewCards.value(id).value(QStringLiteral("sidebar_regions")).toArray();
     if (regions.isEmpty()) {
         clearActiveReviewCard();
+        // On the newest version: the tab shows that version, then the card there.
+        if (source.data(AnnotationModel::ReviewCardOnNewestVersionRole).toBool()) Q_EMIT newestVersionCardRequested(id);
         return true;
     }
     const bool changed = id != m_activeReviewCardId;

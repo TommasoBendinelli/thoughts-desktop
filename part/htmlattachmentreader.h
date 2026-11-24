@@ -44,6 +44,21 @@ public:
     // Shows the page of `target` (served on a fresh loopback origin that lives as long as the page
     // is shown). The same object already shown is kept as it is (its scripts' state too).
     bool open(const HtmlAttachmentTarget &target, const Owner &owner, QString *error);
+    // A live page (thoughts-server protocol/html-live-pages.md): `target` is its stub, and the
+    // view loads `address` instead, in its live mode (no viewer: no cards, highlights or selection
+    // reports; text feedback reads the selection itself, readLiveSelection). With `load` false the
+    // view waits (the reader asks first, loadLiveNow()). The same page at the same address already
+    // shown is kept as it is.
+    bool openLive(const HtmlAttachmentTarget &target, const Owner &owner, const QUrl &address, bool load);
+    void loadLiveNow();
+    bool isLive() const
+    {
+        return m_live;
+    }
+    QUrl liveAddress() const
+    {
+        return m_live ? m_url : QUrl();
+    }
     void close();
     bool isOpen() const
     {
@@ -70,6 +85,9 @@ public:
     {
         return m_pageState;
     }
+    // Once the page is ready: the page state and scroll of @p position (the viewer's getPosition
+    // of the version it replaced).
+    void restorePosition(const QJsonObject &position);
 
     // The owner's cards (the reader sidebar's list); those made in this page are highlighted.
     void setCards(const QJsonArray &cards);
@@ -80,7 +98,8 @@ public:
         return m_placement;
     }
 
-    // The document's feedback records; those made in this page are highlighted.
+    // The document's feedback records; those made in this page are highlighted (not its drawings,
+    // which are on their snapshots).
     void setFeedback(const QList<QJsonObject> &records);
     QList<QJsonObject> pageFeedback() const;
 
@@ -98,6 +117,18 @@ public:
     {
         return m_lastSelection;
     }
+    // A live page's selection (html-live-pages.md §2.1), read by the reader's own script in the
+    // page's isolated script world (part/html-live/selection.js, after the viewer's text.js): @p done
+    // gets it as liveSelection() makes it, empty when nothing readable is selected or the page
+    // could not be asked.
+    void readLiveSelection(std::function<void(const QJsonObject &selection)> done);
+    // That script's answer ({exact, prefix, suffix, hash}) as a viewer selection payload, which
+    // newCardFields takes: {type, text, text_quote {exact, prefix, suffix}, page_state {hash}}.
+    // Empty when it has no selected text.
+    static QJsonObject liveSelection(const QString &scriptResult);
+    // The context around a live selection the script reads (feedback keeps
+    // ReviewCardFeedback::contextLength) and the longest selection it returns.
+    static QJsonObject liveSelectionArguments();
 
     // Review presenter: restores the card's page state and masks its text once it is in the page.
     // "pending" until then; "not_found" when the page settled without it (answerNotFound()).
@@ -160,6 +191,7 @@ private:
 
     QPointer<HtmlDocumentView> m_view;
     QObject *m_serverOwner = nullptr;
+    bool m_live = false;
     QString m_loadError;
     HtmlAttachmentTarget m_target;
     Owner m_owner;

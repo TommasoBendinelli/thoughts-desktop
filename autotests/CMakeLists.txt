@@ -241,7 +241,7 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test Poppler::Qt6 KF6::I18n
     )
 
-    ecm_add_test(commentsoverviewtest.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/developerlog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/reviewstore.cpp ../shell/reviewdocumenttools.cpp
+    ecm_add_test(commentsoverviewtest.cpp ../shell/serverlink.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/developerlog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/reviewstore.cpp ../shell/reviewdocumenttools.cpp
         TEST_NAME "commentsoverviewtest"
         LINK_LIBRARIES Qt6::Widgets Qt6::Sql Qt6::Test Poppler::Qt6 okularcore okulardocscommentsync thoughtsdesktopsync KF6::ConfigCore KF6::I18n KF6::WidgetsAddons thoughtsgitclone
     )
@@ -254,6 +254,13 @@ if(BUILD_DESKTOP)
     ecm_add_test(readaloudtest.cpp
         TEST_NAME "readaloudtest"
         LINK_LIBRARIES Qt6::Core Qt6::Gui Qt6::Network Qt6::Test thoughtsreadaloud
+    )
+
+    # Signing in with a username and password (protocol/app-sign-in.md): connect links, the
+    # server's answers, Sign In and the Server dialog's devices against a fake server.
+    ecm_add_test(appsignintest.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp
+        TEST_NAME "appsignintest"
+        LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n thoughtsplatform
     )
 
     ecm_add_test(agentnotestest.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/developerlog.cpp ../shell/serverlink.cpp
@@ -318,7 +325,7 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Core Qt6::Test okulardocscommentsync
     )
 
-    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
+    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
         TEST_NAME "mainshelltest"
         LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
     )
@@ -335,7 +342,7 @@ if(BUILD_DESKTOP)
     endforeach()
     if(APPLE)
         enable_language(OBJCXX)
-        target_sources(mainshelltest PRIVATE nativeapplicationmenutest.mm ../shell/readerchromemac.mm)
+        target_sources(mainshelltest PRIVATE nativeapplicationmenutest.mm ../shell/readerchromemac.mm ../shell/visualstudiocodemac.mm)
         target_link_libraries(mainshelltest "-framework AppKit")
     else()
         target_sources(mainshelltest PRIVATE ../shell/readerchrome.cpp)
@@ -357,13 +364,13 @@ if(BUILD_DESKTOP)
 endif()
 
 if(BUILD_DESKTOP)
-    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
+    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
         TEST_NAME "annotationtoolbartest"
         LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
     )
 
     if(APPLE)
-        target_sources(annotationtoolbartest PRIVATE ../shell/readerchromemac.mm)
+        target_sources(annotationtoolbartest PRIVATE ../shell/readerchromemac.mm ../shell/visualstudiocodemac.mm)
         target_link_libraries(annotationtoolbartest "-framework AppKit")
     else()
         target_sources(annotationtoolbartest PRIVATE ../shell/readerchrome.cpp)
@@ -412,9 +419,21 @@ ecm_add_test(verifiedartifactcachetest.cpp
     LINK_LIBRARIES Qt6::Core Qt6::Test thoughtsplatform
 )
 
+# Files read again only when they changed (part/fileidentitycache.h).
+ecm_add_test(fileidentitycachetest.cpp
+    TEST_NAME "fileidentitycachetest"
+    LINK_LIBRARIES Qt6::Core Qt6::Test thoughtsplatform
+)
+
 # When Thoughts may start a Sync by itself (shell/automaticsyncpolicy.h).
 ecm_add_test(automaticsyncpolicytest.cpp
     TEST_NAME "automaticsyncpolicytest"
+    LINK_LIBRARIES Qt6::Core Qt6::Test
+)
+
+# When a change made on this computer starts a Sync by itself (shell/localchangesync.h).
+ecm_add_test(localchangesynctest.cpp
+    TEST_NAME "localchangesynctest"
     LINK_LIBRARIES Qt6::Core Qt6::Test
 )
 
@@ -455,6 +474,13 @@ ecm_add_test(htmlattachmenttest.cpp
     LINK_LIBRARIES Qt6::Test Qt6::Network okularcore
 )
 
+# Live HTML pages and snapshots (thoughts-server protocol/html-live-pages.md): stubs, origins,
+# navigation, the snapshot file and pages written here.
+ecm_add_test(htmllivepagetest.cpp
+    TEST_NAME "htmllivepagetest"
+    LINK_LIBRARIES Qt6::Test okularcore
+)
+
 ecm_add_test(documentidentitytest.cpp
     TEST_NAME "documentidentitytest"
     LINK_LIBRARIES Qt6::Core Qt6::Test thoughtsplatform
@@ -478,6 +504,18 @@ ecm_add_test(recallpredictorconfigtest.cpp
     TEST_NAME "recallpredictorconfigtest"
     LINK_LIBRARIES Qt6::Core Qt6::Network Qt6::Test
 )
+
+# Where Open Source in VS Code finds VS Code (shell/visualstudiocode.h).
+if(BUILD_DESKTOP)
+    ecm_add_test(visualstudiocodetest.cpp ../shell/visualstudiocode.cpp
+        TEST_NAME "visualstudiocodetest"
+        LINK_LIBRARIES Qt6::Core Qt6::Test
+    )
+    if(APPLE)
+        target_sources(visualstudiocodetest PRIVATE ../shell/visualstudiocodemac.mm)
+        target_link_libraries(visualstudiocodetest "-framework AppKit")
+    endif()
+endif()
 
 # What the updater requires of an installer before it may run (shell/updatecheck.cpp).
 ecm_add_test(updatechecktest.cpp ../shell/updatecheck.cpp

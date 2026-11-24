@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "reviewinterval.h"
 
@@ -421,6 +422,49 @@ struct ReviewCard {
 // The Project document a card belongs to (protocol/project-document-publication.md §4).
 QString cardDocumentId(const ReviewCard &card, const QString &docsRoot);
 
+/**
+ * Cards Thoughts retired itself (server review_card_auto_retire_v1): when a card's whole passage
+ * was removed from its note, the server writes an ordinary retire event (ReviewRetire) with
+ * origin_id "thoughts-passage-check", reason "passage_removed" and
+ * "passage_removed": {"source_files": [...], "pdf": "<Library PDF>"}; when the passage comes back,
+ * a restore with reason "passage_returned". The Library tells the user once about each such
+ * retirement still in effect; this Mac remembers which ones it told (shownNoticesPath()).
+ */
+namespace ReviewAutoRetire
+{
+QString originId();              // "thoughts-passage-check"
+QString passageRemovedField();   // "passage_removed": the reason, and the field naming the note
+int noticeDays();                // 7: an older retirement is not announced (a fresh Mac syncing history).
+// Whether Thoughts wrote @p event (its origin_id is originId()).
+bool isAutomatic(const QJsonObject &event);
+struct Notice {
+    QString eventId; // The retire event.
+    QString cardId;
+    QString question;
+    QDateTime retiredAt;
+    QString pdf;             // passage_removed.pdf, else the card's Library PDF.
+    QStringList sourceFiles; // passage_removed.source_files (Library paths).
+};
+// The retirement by Thoughts in effect for @p card: its retire event is the one in effect
+// (schedule.retireEventId) and came from originId(). Nothing for a card the user retired again
+// since, or that was restored or deleted.
+std::optional<Notice> retirementOf(const ReviewCard &card);
+// The retirements of @p cards the user was not told about yet: in effect (retirementOf), not
+// in @p shown (event_id -> when it was shown) and made at most noticeDays() before @p now.
+// Oldest first.
+QList<Notice> pendingNotices(const QList<ReviewCard> &cards, const QHash<QString, QDateTime> &shown, const QDateTime &now);
+// The note a notice names: the name of the Library Project document of its PDF (@p projects as
+// LibraryProjectStore::projects gives them), else the file name of its first source, else its PDF.
+QString noteName(const Notice &notice, const QJsonArray &projects);
+// This Mac's record of the notices shown: a JSON file of the application data, never synced.
+QString shownNoticesPath();
+// event_id -> when its notice was shown; empty when the file is missing or unreadable.
+QHash<QString, QDateTime> shownNotices(const QString &path = shownNoticesPath());
+// Adds @p notices to the record as shown at @p now; entries shown more than 30 days before @p now
+// are dropped (their retirements are older than noticeDays() by then).
+bool rememberShown(const QList<Notice> &notices, const QDateTime &now, const QString &path = shownNoticesPath());
+}
+
 // What a reader tab's "Copy for agent" adds about the PDF version on screen (@p pdfSha256): the
 // cards of @p cards answered on that version (their answers given on it, with tags by @p groups
 // and notes, and their answer feedback given on it, from @p answerFeedback), then the document
@@ -431,6 +475,10 @@ QString cardDocumentId(const ReviewCard &card, const QString &docsRoot);
 // there is none.
 QString agentVersionFeedback(const QList<ReviewCard> &cards, const QList<QJsonObject> &answerFeedback, const QList<QJsonObject> &textFeedback,
                              const QList<ReviewTags::TagGroup> &groups, const QString &pdfSha256);
+// "Copy for agent" on an HTML page's tab: the document feedback of @p textFeedback given in the page
+// @p path (its Library path) on its version @p pageSha256, without comments, then what each kind
+// asks of the agent. Empty when there is none.
+QString agentHtmlPageFeedback(const QList<QJsonObject> &textFeedback, const QString &path, const QString &pageSha256);
 
 
 /**

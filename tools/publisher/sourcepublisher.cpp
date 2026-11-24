@@ -1307,6 +1307,10 @@ Json SourcePublisher::sourceApplyMutation(const QString &path, const Json &base,
     Json mutation = newMutation(QStringLiteral("upsert"), path, base, content);
     ensureEmptyBase({mutation});
     mutation.remove(QStringLiteral("action"));
+    // Stored with the apply, so a repeated request carries the same claims.
+    if (const std::optional<Json> claims = applyProposalClaims(*this, path, content)) {
+        mutation.insert(QStringLiteral("proposal_decisions"), *claims);
+    }
     storePendingApply(mutation);
     return mutation;
 }
@@ -1495,7 +1499,9 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     // so it may merge it cleanly; otherwise it preserves the conflict.
     const auto sendAlone = [&](const QString &path, const QByteArray &content, const Json &sentBase, const std::optional<Json> &previousBase) {
         api.uploadObject(content);
-        const Json result = applyMutation(sourceApplyMutation(path, sentBase, content));
+        const Json mutation = sourceApplyMutation(path, sentBase, content);
+        const Json result = applyMutation(mutation);
+        expireApplyProposalClaims(*this, mutation, result);
         if (const std::optional<SettledApply> settled = settleMergedApply(path, content, result, previousBase)) {
             settledBases.insert(path, settled->base);
             if (settled->installed) {

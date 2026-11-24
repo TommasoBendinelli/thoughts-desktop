@@ -25,6 +25,7 @@
 #include "../part/agentconversations.h"
 #include "../part/thoughtsplatform.h"
 #include "reviewfeedbackpanel.h"
+#include "flowlayout.h"
 #include <poppler-qt6.h>
 
 #include <KConfigGroup>
@@ -456,74 +457,8 @@ protected:
     }
 };
 
-// Lays its widgets out left to right at their natural width, wrapping onto the next line (Qt's
-// flow layout); a widget wider than the line is given the line's width.
-class ReviewFlowLayout : public QLayout
-{
-public:
-    explicit ReviewFlowLayout(QWidget *parent, int spacing = 6)
-        : QLayout(parent)
-        , m_spacing(spacing)
-    {
-        setContentsMargins(0, 0, 0, 0);
-    }
-    ~ReviewFlowLayout() override
-    {
-        while (QLayoutItem *item = takeAt(0)) delete item;
-    }
-    void addItem(QLayoutItem *item) override { m_items.append(item); }
-    int count() const override { return int(m_items.size()); }
-    QLayoutItem *itemAt(int index) const override { return m_items.value(index); }
-    QLayoutItem *takeAt(int index) override { return index >= 0 && index < m_items.size() ? m_items.takeAt(index) : nullptr; }
-    Qt::Orientations expandingDirections() const override { return {}; }
-    bool hasHeightForWidth() const override { return true; }
-    int heightForWidth(int width) const override { return arrange(QRect(0, 0, width, 0), true); }
-    void setGeometry(const QRect &rect) override
-    {
-        QLayout::setGeometry(rect);
-        const int height = arrange(rect, false);
-        // A window sizes itself from minimum sizes, which know nothing of wrapping (one line here),
-        // so a dialog could squeeze the wrapped lines under the widgets below them. Ask for them.
-        QWidget *owner = parentWidget();
-        if (owner && height > 0 && owner->minimumHeight() != height) owner->setMinimumHeight(height);
-    }
-    QSize sizeHint() const override
-    {
-        // As wide as the widest widget: a line fits whatever width the parent gives.
-        return minimumSize();
-    }
-    QSize minimumSize() const override
-    {
-        QSize size;
-        for (const QLayoutItem *item : m_items) size = size.expandedTo(item->minimumSize());
-        const QMargins margins = contentsMargins();
-        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom());
-    }
-
-private:
-    int arrange(const QRect &rect, bool measureOnly) const
-    {
-        const QMargins margins = contentsMargins();
-        const QRect area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom());
-        int x = area.x(), y = area.y(), lineHeight = 0;
-        for (QLayoutItem *item : m_items) {
-            if (item->isEmpty()) continue;
-            const QSize hint = item->sizeHint();
-            const int width = std::max(1, std::min(hint.width(), area.width()));
-            if (x > area.x() && x + width > area.right() + 1) {
-                x = area.x();
-                y += lineHeight + m_spacing;
-                lineHeight = 0;
-            }
-            if (!measureOnly) item->setGeometry(QRect(QPoint(x, y), QSize(width, hint.height())));
-            x += width + m_spacing;
-            lineHeight = std::max(lineHeight, hint.height());
-        }
-        return y + lineHeight - rect.y() + margins.bottom();
-    }
-    QList<QLayoutItem *> m_items;
-    int m_spacing = 6;
-};
+// Thoughts::FlowLayout (flowlayout.h): widgets left to right, wrapping onto the next line.
+using ReviewFlowLayout = Thoughts::FlowLayout;
 
 // A tag chip as wide as its text, "Label (count)". The label is cut with "…" only when the
 // whole chip is wider than its line; the count is never cut.
@@ -1164,7 +1099,8 @@ public:
         // The answer's own note, after every group; rebuild() puts the list above it.
         m_layout->insertWidget(0, answerNoteSection());
         // The section, page and document notes, below the answer's note.
-        if (m_context) m_layout->insertWidget(1, contextSection());
+        // "About this…" (contextSection) is not offered since 20 Nov 2026: it went unused. Notes already
+        // written stay in the data.
         if (m_store) m_groups = m_store->tagGroups();
         // A starting tag answered elsewhere since the counts were taken is still offered.
         for (const QString &tag : selected) {
@@ -2658,18 +2594,6 @@ QString cardKindText(const ReviewCard &card)
     return card.isProjectCard() ? i18n("Project card") : i18n("Knowledge card");
 }
 
-// The card menu's kind entries (review-card-kinds.md §5), as {label, kind}: Make project card or
-// Make knowledge card, then Follow the Project when the card has a kind of its own and a Project holds it.
-QList<QPair<QString, QString>> cardKindChoices(const ReviewCard &card)
-{
-    QList<QPair<QString, QString>> choices{card.isProjectCard() ? qMakePair(i18n("Make knowledge card"), ReviewKinds::knowledge())
-                                                                : qMakePair(i18n("Make project card"), ReviewKinds::project())};
-    if (card.reviewKindSource == ReviewKinds::sourceCard() && !card.kindProjectIds.isEmpty())
-        choices.append({card.projectsKind == ReviewKinds::project() ? i18n("Follow the Project (Project)") : i18n("Follow the Project (Knowledge)"),
-                        ReviewKinds::followProject()});
-    return choices;
-}
-
 QString browserDueText(const ReviewBrowserCard &item)
 {
     if (item.card.schedule.retired) return i18n("Retired");
@@ -2755,8 +2679,11 @@ QList<HistoryEntry> reviewHistoryEntries(const ReviewCard &card, const QList<Rev
                 : kind == ReviewKinds::knowledge() ? i18n("Made a knowledge card")
                 : kind == ReviewKinds::followProject() ? i18n("Follows the Project's kind") : QString();
         }
-        else if (action == ReviewRetire::retireAction()) mark = i18n("Retired");
-        else if (action == ReviewRetire::restoreAction()) mark = i18n("Restored to review");
+        // Thoughts retires a card whose whole passage left its note, and restores it when the passage is back.
+        else if (action == ReviewRetire::retireAction())
+            mark = ReviewAutoRetire::isAutomatic(event) ? i18n("Retired by Thoughts: its passage was removed from the note") : i18n("Retired");
+        else if (action == ReviewRetire::restoreAction())
+            mark = ReviewAutoRetire::isAutomatic(event) ? i18n("Restored by Thoughts: its passage is back") : i18n("Restored to review");
         else if (action == ReviewRetire::undoAction()) mark = i18n("Undo retire");
         else if (!event.value(QStringLiteral("retracted_event_id")).toString().isEmpty()) mark = i18n("Undo review");
         else if (rating == QLatin1String("delete")) mark = i18n("Delete");
@@ -3509,13 +3436,17 @@ bool chooseReviewSourceLocation(QWidget *parent, const ReviewCard &card, const Q
 }
 
 // With @p editAreas the dialog offers Edit Areas…, which closes it and sets *areasRequested.
+// With @p kind it offers the card's kind (review-card-kinds.md §5): Knowledge card, Project card,
+// and As its Project when a Project holds the card; *kind is set to the kind chosen when it
+// differs from the card's (ReviewKinds::knowledge(), project() or followProject()), else cleared.
 bool editReviewCardRegion(QWidget *parent,
                               const ReviewCard &card,
                               const ReviewCardsWidget::CardPresenter &presenter,
                               QVariantList *rect,
                               QString *question,
                               const std::function<void()> &editMarkers = {},
-                              bool *areasRequested = nullptr)
+                              bool *areasRequested = nullptr,
+                              QString *kind = nullptr)
 {
     QDialog dialog(parent);
     dialog.setObjectName(QStringLiteral("reviewCardRegionDialog"));
@@ -3538,6 +3469,15 @@ bool editReviewCardRegion(QWidget *parent,
     questionEditor->setObjectName(QStringLiteral("reviewCardRegionQuestion"));
     questionEditor->setMaximumHeight(110);
     form->addRow(i18n("Question:"), questionEditor);
+    // The card's kind (it used to be in the review card's ⋮ menu; the user moved it here, 23 Nov 2026).
+    QComboBox *kindChoice = nullptr;
+    if (kind) {
+        kind->clear();
+        kindChoice = new QComboBox(&dialog);
+        kindChoice->setObjectName(QStringLiteral("reviewCardRegionKind"));
+        fillReviewCardKindChoice(kindChoice, card);
+        form->addRow(i18n("Kind:"), kindChoice);
+    }
 
     // Only a card with source markers is placed in the source. Any other card with
     // several areas (an imported PDF, a whole document) keeps its areas here and
@@ -3653,6 +3593,7 @@ bool editReviewCardRegion(QWidget *parent,
     }
     *rect = sourceRegions || areasOnly ? originalRect : QVariantList{left->value(), top->value(), right->value(), bottom->value()};
     *question = questionEditor->toPlainText().trimmed();
+    if (kind) *kind = chosenReviewCardKind(kindChoice);
     return true;
 }
 
@@ -3914,6 +3855,26 @@ QJsonObject recallPredictionRequest(const ReviewCard &card, const QList<ReviewCa
             {QStringLiteral("now"), now.toUTC().toString(Qt::ISODateWithMs)}};
 }
 
+QString autoRetireNoticeText(const QList<ReviewAutoRetire::Notice> &notices, const QString &noteName)
+{
+    const auto quoted = [](const ReviewAutoRetire::Notice &notice) {
+        QString question = notice.question.simplified();
+        if (question.size() > 100) question = question.left(99).trimmed() + QStringLiteral("…");
+        return QStringLiteral("“%1”").arg(question);
+    };
+    if (notices.isEmpty()) return {};
+    if (notices.size() == 1) {
+        const QString note = noteName.isEmpty() ? ReviewAutoRetire::noteName(notices.constFirst(), {}) : noteName;
+        return i18n("Thoughts retired the card %1: its passage is no longer in %2.", quoted(notices.constFirst()), note);
+    }
+    const int count = int(notices.size());
+    QStringList named;
+    for (int index = 0; index < std::min(3, count); ++index) named.append(quoted(notices.at(index)));
+    const QString names = named.join(QStringLiteral(", "));
+    if (count > 3) return i18n("Thoughts retired %1 cards whose passages are no longer in their notes: %2 and %3 more.", count, names, count - 3);
+    return i18n("Thoughts retired %1 cards whose passages are no longer in their notes: %2.", count, names);
+}
+
 ReviewCardsWidget::ReviewCardsWidget(const QString &docsRoot,
                                      CardPresenter cardPresenter,
                                      CardReviewer cardReviewer,
@@ -3960,6 +3921,11 @@ void ReviewCardsWidget::buildUi()
     layout->addLayout(searchRow);
 
     auto *filters = new QHBoxLayout;
+    // A Project's cards: those of the documents it holds (as the Project column names them).
+    m_browseProjectFilter = new QComboBox(this);
+    m_browseProjectFilter->setObjectName(QStringLiteral("reviewBrowseProjectFilter"));
+    m_browseProjectFilter->setToolTip(i18n("The cards of a Project's documents"));
+    m_browseProjectFilter->addItem(i18n("All projects"), QString());
     m_browseDocumentFilter = new QComboBox(this);
     m_browseDocumentFilter->setObjectName(QStringLiteral("reviewBrowseDocumentFilter"));
     m_browseStateFilter = new QComboBox(this);
@@ -3978,6 +3944,8 @@ void ReviewCardsWidget::buildUi()
     m_browseStateFilter->setCurrentIndex(m_browseStateFilter->findData(QStringLiteral("all")));
     // Clicking a column header sorts; sorts without a column are in the header's right-click menu.
     m_browseSortKey = int(BrowserSort::Due);
+    filters->addWidget(new QLabel(i18n("Project:"), this));
+    filters->addWidget(m_browseProjectFilter, 1);
     filters->addWidget(new QLabel(i18n("Document:"), this));
     filters->addWidget(m_browseDocumentFilter, 1);
     filters->addWidget(new QLabel(i18n("State:"), this));
@@ -4004,14 +3972,7 @@ void ReviewCardsWidget::buildUi()
     compactTagsAction->setObjectName(QStringLiteral("reviewBrowseCompactTagsAction"));
     connect(compactTagsAction, &QAction::triggered, this, &ReviewCardsWidget::compactTags);
     actionsMenu->addSeparator();
-    // Knowledge card or project card (review-card-kinds.md §5); the text and kind follow the card.
-    m_browseKindAction = actionsMenu->addAction(i18n("Make project card"));
-    m_browseKindAction->setObjectName(QStringLiteral("reviewBrowseKindAction"));
-    connect(m_browseKindAction, &QAction::triggered, this, [this] { setBrowseCardKind(m_browseKindAction->data().toString()); });
-    m_browseFollowAction = actionsMenu->addAction(i18n("Follow the Project (Knowledge)"));
-    m_browseFollowAction->setObjectName(QStringLiteral("reviewBrowseFollowProjectAction"));
-    m_browseFollowAction->setVisible(false);
-    connect(m_browseFollowAction, &QAction::triggered, this, [this] { setBrowseCardKind(ReviewKinds::followProject()); });
+    // The card's kind (knowledge or project, review-card-kinds.md §5) is chosen in Edit card since 23 Nov 2026.
     // Retire keeps the card and its history out of review; on a retired card it restores it.
     m_browseRetireAction = actionsMenu->addAction(i18n("Retire card"));
     m_browseRetireAction->setObjectName(QStringLiteral("reviewBrowseRetireAction"));
@@ -4107,7 +4068,7 @@ void ReviewCardsWidget::buildUi()
     auto *actions = new QHBoxLayout;
     m_browseReviewButton = new QPushButton(i18n("Review Card"), detailsWidget);
     m_browseReviewButton->setObjectName(QStringLiteral("reviewBrowseReviewButton"));
-    m_browseEditButton = new QPushButton(i18n("Edit question"), detailsWidget);
+    m_browseEditButton = new QPushButton(i18n("Edit card"), detailsWidget);
     m_browseEditButton->setObjectName(QStringLiteral("reviewBrowseEditButton"));
     m_browseHistoryButton = new QPushButton(i18n("Show history"), detailsWidget);
     m_browseHistoryButton->setObjectName(QStringLiteral("reviewBrowseHistoryButton"));
@@ -4124,7 +4085,7 @@ void ReviewCardsWidget::buildUi()
     m_browseEditorPanel = new QWidget(detailsWidget);
     m_browseEditorPanel->setObjectName(QStringLiteral("reviewBrowseEditorPanel"));
     auto *editorLayout = new QVBoxLayout(m_browseEditorPanel);
-    editorLayout->addWidget(new QLabel(i18n("Edit question"), m_browseEditorPanel));
+    editorLayout->addWidget(new QLabel(i18n("Question"), m_browseEditorPanel));
     m_browseQuestion = new QPlainTextEdit(m_browseEditorPanel);
     m_browseQuestion->setObjectName(QStringLiteral("reviewBrowseQuestion"));
     m_browseQuestion->setAccessibleName(i18n("Question"));
@@ -4139,6 +4100,14 @@ void ReviewCardsWidget::buildUi()
     m_browseQuestionStatus = new QLabel(m_browseEditorPanel);
     m_browseQuestionStatus->setObjectName(QStringLiteral("reviewBrowseQuestionStatus"));
     editorLayout->addWidget(m_browseQuestionStatus);
+    // The card's kind, as in the review's Edit (review-card-kinds.md §5); a choice is recorded at once.
+    auto *kindRow = new QHBoxLayout;
+    kindRow->addWidget(new QLabel(i18n("Kind"), m_browseEditorPanel));
+    m_browseKindChoice = new QComboBox(m_browseEditorPanel);
+    m_browseKindChoice->setObjectName(QStringLiteral("reviewBrowseKind"));
+    kindRow->addWidget(m_browseKindChoice);
+    kindRow->addStretch();
+    editorLayout->addLayout(kindRow);
     auto *placementRow = new QHBoxLayout;
     m_browseSourceButton = new QPushButton(i18n("Edit placement"), m_browseEditorPanel);
     m_browseSourceButton->setObjectName(QStringLiteral("reviewBrowseSourceButton"));
@@ -4192,6 +4161,9 @@ void ReviewCardsWidget::buildUi()
     m_browseMergeButton->hide();
     connect(m_browseSourceButton, &QPushButton::clicked, this, &ReviewCardsWidget::repairBrowseSourceLink);
     connect(m_browseAreasButton, &QPushButton::clicked, this, [this] { placeBrowseCard(false); });
+    connect(m_browseKindChoice, &QComboBox::activated, this, [this] {
+        if (const QString kind = chosenReviewCardKind(m_browseKindChoice); !kind.isEmpty()) setBrowseCardKind(kind);
+    });
     connect(m_browsePlaceAgainButton, &QPushButton::clicked, this, [this] { placeBrowseCard(true); });
     m_browseQuestionSaveTimer = new QTimer(this);
     m_browseQuestionSaveTimer->setSingleShot(true);
@@ -4203,6 +4175,7 @@ void ReviewCardsWidget::buildUi()
     layout->addWidget(splitter, 1);
 
     connect(m_browseSearch, &QLineEdit::textChanged, this, &ReviewCardsWidget::refreshBrowseTable);
+    connect(m_browseProjectFilter, &QComboBox::currentIndexChanged, this, &ReviewCardsWidget::browseProjectChosen);
     connect(m_browseDocumentFilter, &QComboBox::currentIndexChanged, this, &ReviewCardsWidget::refreshBrowseTable);
     connect(m_browseStateFilter, &QComboBox::currentIndexChanged, this, &ReviewCardsWidget::refreshBrowseTable);
     connect(m_browseTypeFilter, &QComboBox::currentIndexChanged, this, &ReviewCardsWidget::refreshBrowseTable);
@@ -4301,6 +4274,7 @@ int ReviewCardsWidget::dueCardCount() const
 void ReviewCardsWidget::setStateFilter(const QString &stateFilter)
 {
     m_browseSearch->clear();
+    m_browseProjectFilter->setCurrentIndex(0);
     m_browseDocumentFilter->setCurrentIndex(0);
     m_browseTypeFilter->setCurrentIndex(0);
     // Free-form tags replaced the fixed good/Skip/wrong marks and their filters, so those open All cards.
@@ -4333,9 +4307,12 @@ void ReviewCardsWidget::selectCard(const QString &cardId)
     saveBrowseQuestion();
     {
         const QSignalBlocker searchBlocker(m_browseSearch);
+        const QSignalBlocker projectBlocker(m_browseProjectFilter);
         const QSignalBlocker documentBlocker(m_browseDocumentFilter);
         const QSignalBlocker stateBlocker(m_browseStateFilter);
         m_browseSearch->clear();
+        m_browseProjectFilter->setCurrentIndex(0);
+        refreshBrowseDocumentChoices();
         m_browseDocumentFilter->setCurrentIndex(0);
         m_browseStateFilter->setCurrentIndex(m_browseStateFilter->findData(QStringLiteral("all")));
     }
@@ -4444,7 +4421,6 @@ void ReviewCardsWidget::startReload()
 
 void ReviewCardsWidget::applyCards(QList<ReviewBrowserCard> cards, const QStringList &errors)
 {
-    const QString selectedDocument = m_browseDocumentFilter->currentData().toString();
     m_browseCards = std::move(cards);
     m_loadedAt = QDateTime::currentDateTimeUtc();
     m_libraryCountsAvailable = errors.isEmpty();
@@ -4471,28 +4447,17 @@ void ReviewCardsWidget::applyCards(QList<ReviewBrowserCard> cards, const QString
     for (const auto &item : std::as_const(m_browseCards))
         if (!item.card.id().isEmpty() && due(item)) m_libraryDueCardIds.insert(item.card.id());
 
-    QSet<QString> documents;
-    for (const ReviewBrowserCard &item : std::as_const(m_browseCards)) {
-        if (!item.card.pdfStem().isEmpty()) {
-            documents.insert(item.card.pdfStem());
-        }
-    }
-    QStringList orderedDocuments = documents.values();
-    orderedDocuments.sort(Qt::CaseInsensitive);
-    m_browseDocumentFilter->blockSignals(true);
-    m_browseDocumentFilter->clear();
-    m_browseDocumentFilter->addItem(i18n("All documents"), QString());
-    for (const QString &document : std::as_const(orderedDocuments)) {
-        m_browseDocumentFilter->addItem(document, document);
-    }
-    const int selectedDocumentIndex = m_browseDocumentFilter->findData(selectedDocument);
-    if (selectedDocumentIndex >= 0) {
-        m_browseDocumentFilter->setCurrentIndex(selectedDocumentIndex);
-    }
-    m_browseDocumentFilter->blockSignals(false);
+    refreshBrowseProjectChoices();
+    refreshBrowseDocumentChoices();
     m_browseCount->setToolTip(errors.join(QLatin1Char('\n')));
     refreshBrowseTable();
     Q_EMIT countsChanged(m_activeCardCount, m_dueCardCount);
+    // Cards Thoughts retired because their passage left the note, not yet told: the Library says so once.
+    QList<ReviewCard> retired;
+    for (const auto &item : std::as_const(m_browseCards))
+        if (item.card.schedule.retired) retired.append(item.card);
+    const QList<ReviewAutoRetire::Notice> notices = ReviewAutoRetire::pendingNotices(retired, ReviewAutoRetire::shownNotices(m_autoRetireNoticesPath), m_loadedAt);
+    if (!notices.isEmpty()) Q_EMIT retiredByThoughts(notices);
 }
 
 void ReviewCardsWidget::populateBrowseContextMenu(QMenu *menu)
@@ -4519,17 +4484,91 @@ void ReviewCardsWidget::populateBrowseContextMenu(QMenu *menu)
     merge->setObjectName(QStringLiteral("reviewBrowseContextMergeAction"));
     merge->setEnabled(m_browseMergeAction && m_browseMergeAction->isEnabled());
     connect(merge, &QAction::triggered, this, &ReviewCardsWidget::mergeBrowseCards);
-    // The card's kind (review-card-kinds.md §5).
-    if (const auto *item = selectedBrowseCard(); item && selected == 1 && !item->card.schedule.deleted) {
-        menu->addSeparator();
-        for (const auto &[label, kind] : cardKindChoices(item->card)) {
-            QAction *choice = menu->addAction(label);
-            choice->setObjectName(kind == ReviewKinds::followProject() ? QStringLiteral("reviewBrowseContextFollowProjectAction")
-                                                                       : QStringLiteral("reviewBrowseContextKindAction"));
-            choice->setEnabled(!m_mutating);
-            connect(choice, &QAction::triggered, this, [this, kind] { setBrowseCardKind(kind); });
+}
+
+namespace
+{
+// The Library filenames of a Project's documents: its target and each document's.
+QSet<QString> projectFilenames(const QJsonObject &project)
+{
+    QSet<QString> filenames;
+    if (const QString target = project.value(QStringLiteral("target")).toString(); !target.isEmpty()) filenames.insert(target);
+    for (const auto &value : project.value(QStringLiteral("documents")).toArray()) {
+        const QString filename = value.toObject().value(QStringLiteral("filename")).toString();
+        if (!filename.isEmpty()) filenames.insert(filename);
+    }
+    return filenames;
+}
+
+QString projectDisplayName(const QJsonObject &project)
+{
+    return project.value(QStringLiteral("name")).toString(project.value(QStringLiteral("id")).toString());
+}
+}
+
+void ReviewCardsWidget::refreshBrowseProjectChoices()
+{
+    const QString selected = m_browseProjectFilter->currentData().toString();
+    QList<QPair<QString, QString>> projects;
+    for (const auto &value : std::as_const(m_browseProjects)) {
+        const QJsonObject project = value.toObject();
+        const QString id = project.value(QStringLiteral("id")).toString();
+        const QString name = projectDisplayName(project);
+        if (!id.isEmpty() && !name.isEmpty()) projects.append({name, id});
+    }
+    std::sort(projects.begin(), projects.end(), [](const auto &left, const auto &right) {
+        const int byName = QString::compare(left.first, right.first, Qt::CaseInsensitive);
+        return byName != 0 ? byName < 0 : left.second < right.second;
+    });
+    const QSignalBlocker blocker(m_browseProjectFilter);
+    m_browseProjectFilter->clear();
+    m_browseProjectFilter->addItem(i18n("All projects"), QString());
+    for (const auto &[name, id] : std::as_const(projects)) m_browseProjectFilter->addItem(name, id);
+    // A Project that is gone: all projects.
+    m_browseProjectFilter->setCurrentIndex(std::max(0, m_browseProjectFilter->findData(selected)));
+}
+
+std::optional<QSet<QString>> ReviewCardsWidget::browseProjectStems() const
+{
+    const QString selected = m_browseProjectFilter->currentData().toString();
+    if (selected.isEmpty()) return std::nullopt;
+    QSet<QString> stems;
+    for (const auto &value : std::as_const(m_browseProjects)) {
+        const QJsonObject project = value.toObject();
+        if (project.value(QStringLiteral("id")).toString() != selected) continue;
+        for (const QString &filename : projectFilenames(project)) {
+            if (filename.endsWith(QLatin1String(".pdf"))) stems.insert(filename.chopped(4));
         }
     }
+    return stems;
+}
+
+void ReviewCardsWidget::refreshBrowseDocumentChoices()
+{
+    const QString selectedDocument = m_browseDocumentFilter->currentData().toString();
+    const auto projectStems = browseProjectStems();
+    QSet<QString> documents;
+    for (const ReviewBrowserCard &item : std::as_const(m_browseCards)) {
+        const QString stem = item.card.pdfStem();
+        if (!stem.isEmpty() && (!projectStems || projectStems->contains(stem))) documents.insert(stem);
+    }
+    QStringList orderedDocuments = documents.values();
+    orderedDocuments.sort(Qt::CaseInsensitive);
+    const QSignalBlocker blocker(m_browseDocumentFilter);
+    m_browseDocumentFilter->clear();
+    // With a Project chosen, "All documents" means all of that Project's.
+    m_browseDocumentFilter->addItem(i18n("All documents"), QString());
+    for (const QString &document : std::as_const(orderedDocuments)) {
+        m_browseDocumentFilter->addItem(document, document);
+    }
+    // A document of another Project: all documents (of this one).
+    m_browseDocumentFilter->setCurrentIndex(std::max(0, m_browseDocumentFilter->findData(selectedDocument)));
+}
+
+void ReviewCardsWidget::browseProjectChosen()
+{
+    refreshBrowseDocumentChoices();
+    refreshBrowseTable();
 }
 
 QStringList ReviewCardsWidget::browseNames(const ReviewCard &card) const
@@ -4538,12 +4577,7 @@ QStringList ReviewCardsWidget::browseNames(const ReviewCard &card) const
     QStringList projects;
     for (const auto &value : m_browseProjects) {
         const auto project = value.toObject();
-        bool member = project.value(QStringLiteral("target")).toString() == filename;
-        for (const auto &docValue : project.value(QStringLiteral("documents")).toArray()) {
-            const auto doc = docValue.toObject();
-            if (doc.value(QStringLiteral("filename")).toString() != filename) continue;
-            member = true;
-        }
+        const bool member = projectFilenames(project).contains(filename);
         if (member) {
             const auto name = project.value(QStringLiteral("name")).toString(project.value(QStringLiteral("id")).toString());
             if (!name.isEmpty()) projects.append(name);
@@ -4644,8 +4678,10 @@ void ReviewCardsWidget::sortBrowseTable()
 void ReviewCardsWidget::refreshBrowseTypeCounts(const QString &selectedDocument)
 {
     QHash<QString, int> types;
+    const auto projectStems = browseProjectStems();
     for (const ReviewBrowserCard &item : std::as_const(m_browseCards)) {
         if (!selectedDocument.isEmpty() && item.card.pdfStem() != selectedDocument) continue;
+        if (projectStems && !projectStems->contains(item.card.pdfStem())) continue;
         ++types[browserCardType(item)];
     }
     const QHash<QString, QString> typeLabels{{QStringLiteral("all"), i18n("All types")}, {QStringLiteral("linked"), i18n("Linked to source")},
@@ -4683,9 +4719,13 @@ void ReviewCardsWidget::refreshBrowseTable()
     const QString topId = topItem ? topItem->data(0, Qt::UserRole).toString() : QString();
     const int scrollValue = m_browseTable->verticalScrollBar()->value();
     m_visibleBrowseCards.clear();
+    const auto projectStems = browseProjectStems();
     int cardsInDocumentScope = 0;
     for (const ReviewBrowserCard &item : std::as_const(m_browseCards)) {
         if (!selectedDocument.isEmpty() && item.card.pdfStem() != selectedDocument) {
+            continue;
+        }
+        if (projectStems && !projectStems->contains(item.card.pdfStem())) {
             continue;
         }
         ++cardsInDocumentScope;
@@ -5008,15 +5048,9 @@ void ReviewCardsWidget::showBrowseCard(const ReviewBrowserCard *item)
     m_browseDeleteAction->setEnabled(available && !multiple);
     m_browseRetireAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
     m_browseRetireAction->setText(available && item->card.schedule.retired ? i18n("Restore to review") : i18n("Retire card"));
-    {
-        const auto choices = available ? cardKindChoices(item->card) : QList<QPair<QString, QString>>{qMakePair(i18n("Make project card"), ReviewKinds::project())};
-        m_browseKindAction->setText(choices.first().first);
-        m_browseKindAction->setData(choices.first().second);
-        m_browseKindAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
-        m_browseFollowAction->setVisible(choices.size() > 1);
-        if (choices.size() > 1) m_browseFollowAction->setText(choices.at(1).first);
-        m_browseFollowAction->setEnabled(available && !multiple && !item->card.schedule.deleted);
-    }
+    // Edit card's Kind row follows the card shown.
+    if (available && !multiple) fillReviewCardKindChoice(m_browseKindChoice, item->card);
+    m_browseKindChoice->setEnabled(available && !multiple && !item->card.schedule.deleted && !m_mutating);
     m_browseDeleteRestoreButton->setVisible(multiple);
     bool mergeable = multiple && !m_syncInProgress;
     for (auto *selectedItem : selected) {
@@ -5648,8 +5682,24 @@ void ReviewCardsWidget::retireOrRestoreBrowseCard()
 {
     const auto *item = selectedBrowseCard();
     if (!item || item->card.schedule.deleted || m_mutating || !saveBrowseQuestion()) return;
-    const QString cardId = item->card.id();
-    const bool restore = item->card.schedule.retired;
+    recordRetireOrRestore(item->card.id(), item->card.schedule.retired);
+}
+
+bool ReviewCardsWidget::restoreRetiredCard(const QString &cardId)
+{
+    const auto card = std::find_if(m_browseCards.cbegin(), m_browseCards.cend(), [&cardId](const ReviewBrowserCard &item) { return item.card.id() == cardId; });
+    if (card == m_browseCards.cend() || !card->card.schedule.retired || card->card.schedule.deleted || m_mutating || !saveBrowseQuestion()) return false;
+    recordRetireOrRestore(cardId, true);
+    return true;
+}
+
+QString ReviewCardsWidget::autoRetireNoteName(const ReviewAutoRetire::Notice &notice) const
+{
+    return ReviewAutoRetire::noteName(notice, m_browseProjects);
+}
+
+void ReviewCardsWidget::recordRetireOrRestore(const QString &cardId, bool restore)
+{
     ++m_revision;
     m_mutating = true;
     setEnabled(false);
@@ -5673,6 +5723,7 @@ void ReviewCardsWidget::retireOrRestoreBrowseCard()
                     if (card.card.id() != cardId) continue;
                     card.card.schedule.retired = !restore;
                     card.card.schedule.retiredAt = restore ? QDateTime() : QDateTime::currentDateTimeUtc();
+                    card.card.schedule.retireEventId.clear(); // The new event's, once the cards are read again.
                     if (!restore) {
                         card.state = ReviewBrowserState::Retired;
                         card.hasIssues = false;
@@ -5868,6 +5919,20 @@ ReviewOverview::ReviewOverview(const QString &docsRoot,
     m_beforeNoteSaveTimer->setSingleShot(true);
     m_beforeNoteSaveTimer->setInterval(300);
     connect(m_beforeNoteSaveTimer, &QTimer::timeout, this, &ReviewOverview::keepBeforeStep);
+    // The before step on the other devices (protocol/review-drafts.md): asked of the server only
+    // once a card with a before step is shown.
+    m_draftSync = new ReviewDraftSync(this);
+    connect(m_draftSync, &ReviewDraftSync::fetched, this, &ReviewOverview::beforeDraftFetched);
+    connect(m_draftSync, &ReviewDraftSync::changed, this, &ReviewOverview::beforeDraftChanged);
+    connect(m_draftSync, &ReviewDraftSync::written, this, &ReviewOverview::beforeDraftWritten);
+    m_beforeDraftTimer = new QTimer(this);
+    m_beforeDraftTimer->setSingleShot(true);
+    m_beforeDraftTimer->setInterval(600);
+    connect(m_beforeDraftTimer, &QTimer::timeout, this, &ReviewOverview::writeBeforeDraft);
+    m_answeredElsewhereTimer = new QTimer(this);
+    m_answeredElsewhereTimer->setSingleShot(true);
+    m_answeredElsewhereTimer->setInterval(10 * 1000);
+    connect(m_answeredElsewhereTimer, &QTimer::timeout, this, &ReviewOverview::syncRequested);
     buildUi();
     m_queueRefreshTimer = new QTimer(this);
     m_queueRefreshTimer->setSingleShot(true);
@@ -5894,6 +5959,8 @@ ReviewOverview::~ReviewOverview()
 
 void ReviewOverview::closeEvent(QCloseEvent *event)
 {
+    // The note typed a moment ago reaches the other devices too.
+    if (m_beforeDraftTimer->isActive()) writeBeforeDraft();
     m_pendingSkip = {};
     m_maskClearer();
     m_currentReview = -1;
@@ -5919,6 +5986,8 @@ bool ReviewOverview::eventFilter(QObject *watched, QEvent *event)
     if (watched == m_ratingPanel && event->type() == QEvent::Hide) closeTagsDialog();
     if (watched == m_conversationLine && event->type() == QEvent::Resize) elideConversationTitle();
     if (watched == m_beforeSummaryRow && event->type() == QEvent::Resize) elideBeforeSummary();
+    // Leaving the before note writes what was typed at once (review-drafts.md §4.1).
+    if (watched == m_beforeNote && event->type() == QEvent::FocusOut && m_beforeDraftTimer->isActive()) writeBeforeDraft();
     if (watched == m_sessionHost
         && (event->type() == QEvent::Resize || event->type() == QEvent::Show || event->type() == QEvent::LayoutRequest)) {
         positionSessionPanel();
@@ -6114,13 +6183,7 @@ void ReviewOverview::buildUi()
     m_agentConversationsMenu = cardMenu->addMenu(i18n("Agent conversations"));
     m_agentConversationsMenu->setObjectName(QStringLiteral("reviewAgentConversationsMenu"));
     m_agentConversationsMenu->menuAction()->setObjectName(QStringLiteral("reviewAgentConversationsAction"));
-    // Knowledge card or project card (review-card-kinds.md §5); the texts follow the card shown.
-    auto *kindAction = cardMenu->addAction(i18n("Make project card"));
-    kindAction->setObjectName(QStringLiteral("reviewKindAction"));
-    connect(kindAction, &QAction::triggered, this, [this, kindAction] { setCurrentCardKind(kindAction->data().toString()); });
-    auto *followAction = cardMenu->addAction(i18n("Follow the Project (Knowledge)"));
-    followAction->setObjectName(QStringLiteral("reviewFollowProjectAction"));
-    connect(followAction, &QAction::triggered, this, [this] { setCurrentCardKind(ReviewKinds::followProject()); });
+    // The card's kind (knowledge or project, review-card-kinds.md §5) is chosen in Edit since 23 Nov 2026.
     // Retire, right above Delete: out of review for good, history kept; Undo brings it back.
     cardMenu->addAction(i18n("Retire card"), this, &ReviewOverview::retireCard)->setObjectName(QStringLiteral("reviewRetireAction"));
     cardMenu->addAction(i18n("Delete card"), this, &ReviewOverview::deleteCard)->setObjectName(QStringLiteral("reviewDeleteAction"));
@@ -6184,9 +6247,15 @@ void ReviewOverview::buildUi()
             // Typing after the answer was shown is not "before": the box is hidden by then.
             if (!m_before.locked()) {
                 m_before.note = text;
+                m_before.draft = BeforeStep::Draft::Unsent;
                 m_beforeNoteSaveTimer->start();
+                // To the other devices a moment after the last keystroke; meanwhile their
+                // changes of this card wait (the last write wins).
+                m_draftSync->setEditing(m_before.cardId);
+                m_beforeDraftTimer->start();
             }
         });
+        m_beforeNote->installEventFilter(this);
         before->addWidget(m_beforeNote);
         // Locked: one line with the picks, as high as its text, and the pencil that opens them again.
         m_beforeSummaryRow = new QWidget(m_beforePanel);
@@ -6563,6 +6632,10 @@ ReviewOverview::BeforeStep ReviewOverview::keptBeforeStep(const ReviewCard &card
     step.note = note;
     step.answerShownAt = QDateTime::fromString(kept.value(QStringLiteral("answer_shown_at")).toString(), Qt::ISODateWithMs);
     step.reopened = step.answerShownAt.isValid() && kept.value(QStringLiteral("reopened")).toBool();
+    const QString draft = kept.value(QStringLiteral("draft")).toString();
+    step.draft = draft == QLatin1String("written") ? BeforeStep::Draft::Written
+        : draft == QLatin1String("unsent")         ? BeforeStep::Draft::Unsent
+                                                   : BeforeStep::Draft::Unknown;
     step.shown = true;
     DeveloperLog::record(QStringLiteral("review.before_step.restored"),
                          {{QStringLiteral("card_id"), card.id()}, {QStringLiteral("locked"), step.locked()}, {QStringLiteral("tags"), int(tags.size())},
@@ -6586,24 +6659,310 @@ void ReviewOverview::keepBeforeStep()
                          {QStringLiteral("saved_at"), beforeStepTime(QDateTime::currentDateTimeUtc())}};
         if (m_before.answerShownAt.isValid()) step.insert(QStringLiteral("answer_shown_at"), beforeStepTime(m_before.answerShownAt));
         if (m_before.reopened) step.insert(QStringLiteral("reopened"), true);
+        if (m_before.draft == BeforeStep::Draft::Written) step.insert(QStringLiteral("draft"), QStringLiteral("written"));
+        else if (m_before.draft == BeforeStep::Draft::Unsent) step.insert(QStringLiteral("draft"), QStringLiteral("unsent"));
         steps.insert(m_before.cardId, step);
     }
     writeBeforeSteps(path, steps);
 }
 
-void ReviewOverview::forgetBeforeSteps(const QStringList &cardIds)
+void ReviewOverview::forgetBeforeSteps(const QStringList &cardIds, const QString &draftReason)
 {
     // A note typed a moment ago must not bring the step of an answered card back.
-    if (cardIds.contains(m_before.cardId)) m_beforeNoteSaveTimer->stop();
+    if (cardIds.contains(m_before.cardId)) {
+        m_beforeNoteSaveTimer->stop();
+        m_beforeDraftTimer->stop();
+    }
     const QString path = beforeStepsPath();
     QJsonObject steps = readBeforeSteps(path);
-    bool changed = false;
+    QStringList kept;
     for (const QString &cardId : cardIds) {
         if (!steps.contains(cardId)) continue;
         steps.remove(cardId);
-        changed = true;
+        kept.append(cardId);
     }
-    if (changed) writeBeforeSteps(path, steps);
+    if (!kept.isEmpty()) writeBeforeSteps(path, steps);
+    if (draftReason.isEmpty()) return;
+    // The other devices hear of it (review-drafts.md §4.1): one showing the card moves on.
+    for (const QString &cardId : cardIds) {
+        if (kept.contains(cardId) || m_draftSync->hasDraft(cardId) || (cardId == m_before.cardId && m_before.shown)) m_draftSync->remove(cardId, draftReason);
+    }
+}
+
+void ReviewOverview::writeBeforeDraft()
+{
+    m_beforeDraftTimer->stop();
+    if (m_before.cardId.isEmpty() || !m_before.shown) return;
+    m_draftSync->write(m_before.cardId, m_before.tags, m_before.note, m_before.answeredAt);
+}
+
+void ReviewOverview::updateDraftWatching()
+{
+    const bool shown = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size()
+        && m_dueCards.at(m_currentReview).id() == m_before.cardId && m_before.shown;
+    m_draftSync->setWatching(shown);
+}
+
+bool ReviewOverview::isBeforeStepShown(const QString &cardId) const
+{
+    return !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size() && m_before.shown
+        && m_before.cardId == m_dueCards.at(m_currentReview).id() && m_before.cardId.compare(cardId, Qt::CaseInsensitive) == 0;
+}
+
+bool ReviewOverview::staleBeforeDraft(const ReviewDraftSync::Draft &draft, const QDateTime &lastAnswer)
+{
+    // Compared to the second: a device may write the answer's time without its milliseconds.
+    if (!lastAnswer.isValid()) return false;
+    return !draft.basedOnAnswerAt.isValid() || draft.basedOnAnswerAt.toSecsSinceEpoch() < lastAnswer.toSecsSinceEpoch();
+}
+
+QStringList ReviewOverview::askedBeforeTags(const QStringList &tags) const
+{
+    QStringList asked;
+    for (const QString &tag : tags) {
+        if (asked.contains(tag)) continue;
+        if (std::any_of(m_barTagGroups.cbegin(), m_barTagGroups.cend(),
+                        [&tag](const ReviewTags::TagGroup &group) { return ReviewTags::askedBefore(group) && group.scale.contains(tag); }))
+            asked.append(tag);
+    }
+    return asked;
+}
+
+void ReviewOverview::beforeDraftFetched(const QString &cardId, bool found, const ReviewDraftSync::Draft &draft)
+{
+    if (!isBeforeStepShown(cardId)) return;
+    const ReviewCard &card = m_dueCards.at(m_currentReview);
+    // Changed here since it was last written (being written, typed a moment ago, or not sent
+    // before): this computer's step stays, and is written (§4.2).
+    const bool changedHere = m_draftSync->busy(card.id()) || m_beforeDraftTimer->isActive() || m_before.draft == BeforeStep::Draft::Unsent;
+    if (!found) {
+        if (!m_before.hasContent()) return;
+        if (m_before.draft == BeforeStep::Draft::Written && !changedHere) {
+            // The server held this very step and holds it no more: cleared, or answered, elsewhere.
+            clearBeforeStepFromElsewhere(QStringLiteral("gone"));
+            return;
+        }
+        writeBeforeDraft();
+        return;
+    }
+    if (staleBeforeDraft(draft, card.schedule.lastReviewedAt)) {
+        // It belongs to an answer given since (§4.3): ignored, and replaced or deleted.
+        DeveloperLog::record(QStringLiteral("review.before_step.draft_stale"), {{QStringLiteral("card_id"), card.id()}});
+        if (m_before.hasContent()) writeBeforeDraft();
+        else m_draftSync->remove(card.id(), ReviewDraftSync::clearedReason());
+        return;
+    }
+    if (askedBeforeTags(draft.tags) == m_before.tags && ReviewTags::cutGroupNote(draft.note) == m_before.note) {
+        if (!changedHere && m_before.draft != BeforeStep::Draft::Written) {
+            m_before.draft = BeforeStep::Draft::Written;
+            keepBeforeStep();
+        }
+        return;
+    }
+    if (changedHere) {
+        writeBeforeDraft();
+        return;
+    }
+    takeBeforeDraft(draft);
+}
+
+void ReviewOverview::beforeDraftChanged(const ReviewDraftSync::Draft &change)
+{
+    if (!isBeforeStepShown(change.cardId)) {
+        keepBeforeDraftOfOtherCard(change);
+        return;
+    }
+    const ReviewCard &card = m_dueCards.at(m_currentReview);
+    if (change.deleted) {
+        const bool answered = change.reason == ReviewDraftSync::answeredReason();
+        const QString cardId = card.id();
+        clearBeforeStepFromElsewhere(answered ? ReviewDraftSync::answeredReason() : ReviewDraftSync::clearedReason());
+        if (answered) {
+            // Sync brings the answer the other device records, once it reached the server; then
+            // the review moves on (reloadFromProjections).
+            m_answeredElsewhereCardId = cardId;
+            m_answeredElsewhereTimer->start();
+        }
+        return;
+    }
+    if (staleBeforeDraft(change, card.schedule.lastReviewedAt)) {
+        DeveloperLog::record(QStringLiteral("review.before_step.draft_stale"), {{QStringLiteral("card_id"), card.id()}});
+        if (m_before.hasContent()) writeBeforeDraft();
+        else m_draftSync->remove(card.id(), ReviewDraftSync::clearedReason());
+        return;
+    }
+    if (askedBeforeTags(change.tags) == m_before.tags && ReviewTags::cutGroupNote(change.note) == m_before.note) {
+        if (m_before.draft != BeforeStep::Draft::Written) {
+            m_before.draft = BeforeStep::Draft::Written;
+            keepBeforeStep();
+        }
+        return;
+    }
+    takeBeforeDraft(change);
+}
+
+void ReviewOverview::beforeDraftWritten(const ReviewDraftSync::Draft &record)
+{
+    if (isBeforeStepShown(record.cardId)) {
+        // Stored as it is now, with no newer edit waiting: the server holds this step.
+        const bool same = record.deleted ? !m_before.hasContent() : record.tags == m_before.tags && record.note == m_before.note;
+        if (!same || m_beforeDraftTimer->isActive() || m_draftSync->busy(record.cardId)) return;
+        const BeforeStep::Draft state = record.deleted ? BeforeStep::Draft::Unknown : BeforeStep::Draft::Written;
+        if (m_before.draft == state) return;
+        m_before.draft = state;
+        keepBeforeStep();
+        return;
+    }
+    // The step of a card that left the review before its write was stored.
+    if (record.deleted) return;
+    const QString path = beforeStepsPath();
+    QJsonObject steps = readBeforeSteps(path);
+    for (auto it = steps.begin(); it != steps.end(); ++it) {
+        if (it.key().compare(record.cardId, Qt::CaseInsensitive) != 0) continue;
+        QJsonObject step = it.value().toObject();
+        QStringList tags;
+        for (const auto &tag : step.value(QStringLiteral("tags")).toArray()) {
+            if (!tag.toString().isEmpty()) tags.append(tag.toString());
+        }
+        if (step.value(QStringLiteral("draft")).toString() == QLatin1String("written") || tags != record.tags
+            || step.value(QStringLiteral("note")).toString() != record.note)
+            return;
+        step.insert(QStringLiteral("draft"), QStringLiteral("written"));
+        it.value() = step;
+        writeBeforeSteps(path, steps);
+        return;
+    }
+}
+
+void ReviewOverview::takeBeforeDraft(const ReviewDraftSync::Draft &draft)
+{
+    m_before.tags = askedBeforeTags(draft.tags);
+    m_before.note = ReviewTags::cutGroupNote(draft.note);
+    // Begun after an answer this computer has not synced yet, it is current (§4.3): the step belongs
+    // to that answer from now on, so that what is written here is current there too.
+    if (draft.basedOnAnswerAt.isValid()
+        && (!m_before.answeredAt.isValid() || draft.basedOnAnswerAt.toSecsSinceEpoch() > m_before.answeredAt.toSecsSinceEpoch()))
+        m_before.answeredAt = draft.basedOnAnswerAt;
+    m_before.draft = BeforeStep::Draft::Written;
+    m_beforeNoteSaveTimer->stop();
+    if (m_beforeNote->toPlainText() != m_before.note) {
+        const QSignalBlocker blocker(m_beforeNote);
+        m_beforeNote->setPlainText(m_before.note);
+        m_beforeNote->moveCursor(QTextCursor::End);
+    }
+    DeveloperLog::record(QStringLiteral("review.before_step.from_other_device"),
+                         {{QStringLiteral("card_id"), m_before.cardId}, {QStringLiteral("tags"), int(m_before.tags.size())},
+                          {QStringLiteral("note"), !m_before.note.trimmed().isEmpty()}, {QStringLiteral("locked"), m_before.locked()}});
+    showBeforePicks();
+}
+
+void ReviewOverview::clearBeforeStepFromElsewhere(const QString &why)
+{
+    DeveloperLog::record(QStringLiteral("review.before_step.cleared_elsewhere"),
+                         {{QStringLiteral("card_id"), m_before.cardId}, {QStringLiteral("reason"), why}, {QStringLiteral("had_content"), m_before.hasContent()}});
+    m_beforeNoteSaveTimer->stop();
+    m_beforeDraftTimer->stop();
+    m_before.tags.clear();
+    m_before.note.clear();
+    m_before.draft = BeforeStep::Draft::Unknown;
+    {
+        const QSignalBlocker blocker(m_beforeNote);
+        m_beforeNote->clear();
+    }
+    forgetBeforeSteps({m_before.cardId});
+    showBeforePicks();
+}
+
+void ReviewOverview::showBeforePicks()
+{
+    QWidget *list = m_beforeGroups ? m_beforeGroups->findChild<QWidget *>(QStringLiteral("reviewBeforeGroupList"), Qt::FindDirectChildrenOnly) : nullptr;
+    if (!list) {
+        rebuildBeforePanel();
+        positionSessionPanel();
+        return;
+    }
+    // The rows stay (and the keyboard where it is): only the steps shown move.
+    m_before.tags = askedBeforeTags(m_before.tags);
+    for (QWidget *widget : list->findChildren<QWidget *>(QStringLiteral("reviewBeforeTagScale"))) {
+        auto *scale = dynamic_cast<ReviewTagScale *>(widget);
+        if (!scale) continue;
+        const QStringList steps = scale->property("reviewTagSteps").toStringList();
+        QList<int> chosen;
+        for (int index = 0; index < steps.size(); ++index) {
+            if (m_before.tags.contains(steps.at(index))) chosen.append(index);
+        }
+        scale->setSelection(chosen);
+    }
+    updateBeforePanel();
+    keepBeforeStep();
+    positionSessionPanel();
+}
+
+void ReviewOverview::keepBeforeDraftOfOtherCard(const ReviewDraftSync::Draft &change)
+{
+    const QString path = beforeStepsPath();
+    QJsonObject steps = readBeforeSteps(path);
+    QString key = change.cardId;
+    bool keptHere = false;
+    for (auto it = steps.constBegin(); it != steps.constEnd(); ++it) {
+        if (it.key().compare(change.cardId, Qt::CaseInsensitive) != 0) continue;
+        key = it.key();
+        keptHere = true;
+        break;
+    }
+    // The card's last answer as this computer knows it, when the card is in this review.
+    std::optional<QDateTime> known;
+    for (const ReviewCard &card : std::as_const(m_dueCards)) {
+        if (card.id().compare(change.cardId, Qt::CaseInsensitive) != 0) continue;
+        known = card.schedule.lastReviewedAt;
+        if (!keptHere) key = card.id();
+        break;
+    }
+    const QJsonObject kept = steps.value(key).toObject();
+    // Changed here since it was last written: this computer's step is written when the card is shown.
+    const bool unsent = kept.value(QStringLiteral("draft")).toString() == QLatin1String("unsent");
+    if (change.deleted) {
+        // Answered elsewhere: done with. Cleared elsewhere: cleared, unless changed here since.
+        if (!keptHere || (unsent && change.reason != ReviewDraftSync::answeredReason())) return;
+        steps.remove(key);
+        writeBeforeSteps(path, steps);
+        DeveloperLog::record(QStringLiteral("review.before_step.cleared_elsewhere"), {{QStringLiteral("card_id"), key}, {QStringLiteral("reason"), change.reason}, {QStringLiteral("shown"), false}});
+        return;
+    }
+    if (unsent) return;
+    if (known && staleBeforeDraft(change, *known)) {
+        DeveloperLog::record(QStringLiteral("review.before_step.draft_stale"), {{QStringLiteral("card_id"), key}});
+        m_draftSync->remove(change.cardId, ReviewDraftSync::clearedReason());
+        return;
+    }
+    // The answer the step belongs to as keptBeforeStep compares it: the card's own last answer
+    // (or the one kept) when the draft names the same one, to the second.
+    const auto sameSecond = [](const QDateTime &a, const QDateTime &b) {
+        return a.isValid() == b.isValid() && (!a.isValid() || a.toSecsSinceEpoch() == b.toSecsSinceEpoch());
+    };
+    QString answeredAt = beforeStepTime(change.basedOnAnswerAt);
+    const QString keptAnsweredAt = kept.value(QStringLiteral("answered_at")).toString();
+    if (known && sameSecond(*known, change.basedOnAnswerAt)) answeredAt = beforeStepTime(*known);
+    else if (keptHere && sameSecond(QDateTime::fromString(keptAnsweredAt, Qt::ISODateWithMs), change.basedOnAnswerAt)) answeredAt = keptAnsweredAt;
+    if (!change.hasContent()) {
+        if (!keptHere) return;
+        steps.remove(key);
+    } else {
+        QJsonObject step{{QStringLiteral("tags"), QJsonArray::fromStringList(change.tags)},
+                         {QStringLiteral("note"), ReviewTags::cutGroupNote(change.note)},
+                         {QStringLiteral("answered_at"), answeredAt},
+                         {QStringLiteral("saved_at"), beforeStepTime(QDateTime::currentDateTimeUtc())},
+                         {QStringLiteral("draft"), QStringLiteral("written")}};
+        // When the answer was shown here, and whether the step was opened again, stay this computer's.
+        if (keptHere && keptAnsweredAt == answeredAt) {
+            for (const QString &field : {QStringLiteral("answer_shown_at"), QStringLiteral("reopened")}) {
+                if (kept.contains(field)) step.insert(field, kept.value(field));
+            }
+        }
+        steps.insert(key, step);
+    }
+    writeBeforeSteps(path, steps);
+    DeveloperLog::record(QStringLiteral("review.before_step.kept_from_other_device"), {{QStringLiteral("card_id"), key}}, true);
 }
 
 void ReviewOverview::saveVerifiedCounts(int newCards, int learningCards, int reviewCards, int unavailable) const
@@ -6739,6 +7098,7 @@ void ReviewOverview::setSessionControlsVisible(bool visible)
         m_sessionPage->hide();
         if (m_reviewVisibilityButton) m_reviewVisibilityButton->hide();
         if (m_conversationStatusTimer) m_conversationStatusTimer->stop();
+        updateDraftWatching();
         return;
     }
     updateCardMenu();
@@ -7097,6 +7457,19 @@ void ReviewOverview::reloadFromProjections()
     const auto same = std::find_if(read.cbegin(), read.cend(), [&currentCardId](const ReviewCard &card) { return card.id() == currentCardId; });
     const bool reviewable = same != read.cend() && same->isApproved() && !same->schedule.deleted
         && (m_singleCardSession ? !same->schedule.retired : !same->schedule.retained && ReviewStore::isDueNow(*same, now));
+    // Answered on another device (its draft said so, review-drafts.md §4.2): once Sync brought
+    // that answer, the review moves on, to the next card, or to this one afresh when it is due again.
+    if (!m_answeredElsewhereCardId.isEmpty() && m_answeredElsewhereCardId == currentCardId && same != read.cend()
+        && same->schedule.lastReviewedAt != m_dueCards.at(m_currentReview).schedule.lastReviewedAt) {
+        m_answeredElsewhereCardId.clear();
+        m_answeredElsewhereTimer->stop();
+        DeveloperLog::record(QStringLiteral("review.current_card.answered_elsewhere"), {{QStringLiteral("card_id"), currentCardId}, {QStringLiteral("due_again"), reviewable}});
+        if (reviewable && !m_singleCardSession) m_dueCards[m_currentReview] = *same;
+        else m_dueCards.removeAt(m_currentReview);
+        showCurrentCard();
+        updateDueSummary();
+        return;
+    }
     if (!reviewable) {
         if (const QString keptId = mergedIntoCard(m_store, &read, currentCardId); !keptId.isEmpty()) {
             // Merged into another card (Merge cards here, thoughtsctl or another device): the review
@@ -7112,11 +7485,13 @@ void ReviewOverview::reloadFromProjections()
                     carried = {keptId, m_before.tags, m_before.note, {}, false};
                     // Kept from now on for the answer the card it became has.
                     carried.answeredAt = kept->schedule.lastReviewedAt;
+                    // The card it became has it now, on the other devices too once shown.
+                    if (carried.hasContent()) carried.draft = BeforeStep::Draft::Unsent;
                 }
                 m_dueCards = std::move(queue);
                 m_currentReview = 0;
                 // The merged card is gone: what it kept is carried, or dropped.
-                forgetBeforeSteps({currentCardId});
+                forgetBeforeSteps({currentCardId}, ReviewDraftSync::clearedReason());
                 DeveloperLog::record(QStringLiteral("review.current_card.merged"),
                                      {{QStringLiteral("card_id"), currentCardId}, {QStringLiteral("kept_card_id"), keptId},
                                       {QStringLiteral("before_carried"), !carried.cardId.isEmpty()}});
@@ -7507,6 +7882,7 @@ void ReviewOverview::showCurrentCard(const BeforeStep &kept)
 {
     // The before step on screen is kept before another one (or the same card's, read back) replaces it.
     if (m_beforeNoteSaveTimer->isActive()) keepBeforeStep();
+    if (m_beforeDraftTimer->isActive()) writeBeforeDraft();
     closeTagsDialog();
     m_lostPresentationCardId.clear();
     m_answerNotFoundCardId.clear();
@@ -7543,6 +7919,13 @@ void ReviewOverview::showCurrentCard(const BeforeStep &kept)
         rebuildBeforePanel();
         // Kept locked (its answer had been shown): the after step starts where Reveal started it.
         if (m_before.locked()) startAfterStepAtPrediction();
+        if (card.id() != m_answeredElsewhereCardId) m_answeredElsewhereCardId.clear();
+        // The step as the other devices have it (review-drafts.md §4.2); one changed here and not
+        // written yet (offline, or carried by a merge) goes first.
+        if (m_before.shown) {
+            if (m_before.draft == BeforeStep::Draft::Unsent) writeBeforeDraft();
+            m_draftSync->fetch(card.id());
+        }
         requestRecallPrediction(card);
         // A new card: its conversation line may appear or go once the bar shows (below).
         m_conversationCardId.clear();
@@ -7889,7 +8272,10 @@ void ReviewOverview::rebuildBeforePanel()
                 }
             }
             m_before.tags = ordered;
+            m_before.draft = BeforeStep::Draft::Unsent;
             keepBeforeStep();
+            // On the other devices at once (review-drafts.md §4.1), the note typed with it.
+            writeBeforeDraft();
         };
         column->addWidget(scale);
     }
@@ -7908,6 +8294,7 @@ void ReviewOverview::updateBeforePanel()
     const bool current = !m_sessionComplete && m_currentReview >= 0 && m_currentReview < m_dueCards.size()
         && m_dueCards.at(m_currentReview).id() == m_before.cardId && m_before.shown;
     m_beforePanel->setVisible(current);
+    updateDraftWatching();
     if (!current) return;
     const bool locked = m_before.locked();
     m_beforeGroups->setVisible(!locked);
@@ -7977,6 +8364,8 @@ void ReviewOverview::lockBeforeStep()
     if (!m_before.answerShownAt.isValid()) m_before.answerShownAt = QDateTime::currentDateTimeUtc();
     m_before.reopened = false;
     keepBeforeStep();
+    // Reveal writes the note typed a moment ago at once (review-drafts.md §4.1).
+    if (m_beforeDraftTimer->isActive()) writeBeforeDraft();
     startAfterStepAtPrediction();
 }
 
@@ -8185,8 +8574,8 @@ void ReviewOverview::rateCurrent(const QString &rating, const QDateTime &schedul
         KMessageBox::error(this, error, i18n("Could Not Record Review"));
         return;
     }
-    // Answered (or deleted): the before step kept for the card is done with.
-    forgetBeforeSteps({cardId});
+    // Answered (or deleted): the before step kept for the card is done with, on every device.
+    forgetBeforeSteps({cardId}, rating == QLatin1String("delete") ? ReviewDraftSync::clearedReason() : ReviewDraftSync::answeredReason());
     if (rating == QLatin1String("delete")) {
         m_reviewHistory.removeIf([&cardId](const auto &entry) { return entry.first == cardId; });
         moveTagUsage(previousTags, {});
@@ -8467,7 +8856,7 @@ void ReviewOverview::rateScoped(const QString &rating, const QDateTime &schedule
         m_barDrafts.remove(id);
     }
     saveBarDrafts();
-    forgetBeforeSteps(targets);
+    forgetBeforeSteps(targets, ReviewDraftSync::answeredReason());
     // Every card it was given to now has these tags, as ReviewStore::reviewTagUsage() counts them.
     const QStringList answered = countedReviewTags(recordedTags, m_tagMerges);
     for (const QStringList &previous : std::as_const(previousTags)) moveTagUsage(previous, answered);
@@ -8615,18 +9004,6 @@ void ReviewOverview::updateCardMenu()
     flip->setText(m_maskFlipped ? i18n("Unflip") : i18n("Flip"));
     flip->setVisible(current && !answerVisible);
     menu->findChild<QAction *>(QStringLiteral("reviewHideAgainAction"))->setVisible(answerVisible);
-    {
-        auto *kind = menu->findChild<QAction *>(QStringLiteral("reviewKindAction"));
-        auto *follow = menu->findChild<QAction *>(QStringLiteral("reviewFollowProjectAction"));
-        const auto choices = current ? cardKindChoices(m_dueCards.at(m_currentReview)) : QList<QPair<QString, QString>>{};
-        kind->setVisible(current);
-        if (current) {
-            kind->setText(choices.first().first);
-            kind->setData(choices.first().second);
-        }
-        follow->setVisible(choices.size() > 1);
-        if (choices.size() > 1) follow->setText(choices.at(1).first);
-    }
     m_cardMenuButton->setVisible(current || !m_reviewHistory.isEmpty() || !m_pendingSkip.id.isEmpty());
 }
 
@@ -8840,19 +9217,25 @@ void ReviewOverview::fillAgentConversationsMenu()
     }
 }
 
-// What the Tag | Interval | Next bar holds for @p card, as the agent texts show it: the tags by
-// group, the interval and the notes typed for this answer. Empty unless the bar is showing for it.
+// The answer being given now for @p card, as the agent texts show it: the before step (its tags
+// and note) once shown, then what the Tag | Interval | Next bar holds (the tags by group, the
+// interval and the notes typed for this answer) once it shows for the card. Empty before either.
+// The phone writes the same lines (ReviewCardAgentDescription.kt, reviewCardCurrentReview).
 QString ReviewOverview::currentReviewText(const ReviewCard &card) const
 {
-    if (!m_ratingPanel || m_ratingPanel->isHidden() || m_barCardId != card.id()) return {};
+    const bool bar = m_ratingPanel && !m_ratingPanel->isHidden() && m_barCardId == card.id();
+    const bool beforeStep = m_before.cardId == card.id() && m_before.shown;
+    if (!bar && !beforeStep) return {};
     QStringList lines{QStringLiteral("Current review (being given now, not saved yet):")};
-    if (m_before.cardId == card.id() && m_before.shown) {
+    if (beforeStep) {
         QStringList before;
         for (const QString &tag : m_before.tags) before.append(reviewTagLabel(tag));
         QString line = QStringLiteral("- Before seeing the answer: %1").arg(before.isEmpty() ? QStringLiteral("no tags") : before.join(QStringLiteral(", ")));
         if (const QString note = m_before.note.simplified(); !note.isEmpty()) line += QStringLiteral(" (note: %1)").arg(note);
         lines.append(line);
     }
+    // Before the answer shows (the before step is asked first): nothing else is given yet.
+    if (!bar) return lines.join(QLatin1Char('\n'));
     QStringList listed;
     for (const auto &group : std::as_const(m_barTagGroups)) {
         QStringList chosen;
@@ -8928,13 +9311,16 @@ void ReviewOverview::editCurrentCard()
         Q_EMIT openSourceRequested(source, line);
     };
     bool editAreas = false;
+    QString kind;
     const QString pdfPath = currentPdfPath(card);
     if (editReviewCardRegion(m_sessionPage, card, m_cardPresenter, &rect, &question, editMarkers,
-                             canPlaceReviewCardByAreas(card) && QFileInfo::exists(pdfPath) ? &editAreas : nullptr)) {
+                             canPlaceReviewCardByAreas(card) && QFileInfo::exists(pdfPath) ? &editAreas : nullptr, &kind)) {
         QString error;
         if (!m_store.updateCardContent(card, rect, question, &error)) {
             KMessageBox::error(m_sessionPage, error, i18n("Cannot Edit Review Card"));
         }
+        if (!kind.isEmpty() && m_currentReview >= 0 && m_currentReview < m_dueCards.size() && m_dueCards.at(m_currentReview).id() == card.id())
+            setCurrentCardKind(kind);
     } else if (editAreas) {
         editReviewCardAreas(m_sessionPage, m_store, m_docsRoot, card, pdfPath, reviewCardNeedsPlacingAgain(card));
     }

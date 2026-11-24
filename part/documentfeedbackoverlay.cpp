@@ -212,6 +212,8 @@ QList<DocumentFeedbackOverlay::Item> DocumentFeedbackOverlay::items(const QSet<i
     if (!hasDocument()) return result;
     for (const QJsonObject &record : std::as_const(m_records)) {
         if (record.value(QStringLiteral("deleted")).toBool() || (!m_showEarlier && !isCurrent(record))) continue;
+        // Made in an HTML attachment: in its page (a drawing on its snapshot), never on the PDF.
+        if (DocumentFeedback::isAttachmentFeedback(record)) continue;
         if (!pages.isEmpty()) {
             // A passage is drawn on its own pages, or found within pageWindow of them.
             const QString id = record.value(QStringLiteral("feedback_id")).toString();

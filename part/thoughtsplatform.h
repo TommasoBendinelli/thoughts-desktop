@@ -45,6 +45,9 @@ bool deleteSecret(const QString &service, const QString &account, QString *error
 QString storeSecretCommand(const QString &service, const QString &account);
 // Account that holds this computer's Fedora device token.
 QString desktopDeviceAccount();
+// This computer's own name as its owner knows it (the macOS computer name, e.g. "Alex's MacBook
+// Pro"; elsewhere the host name), or an empty string.
+QString computerName();
 // origin_id recorded on comments and on review cards and events created
 // here. Informational; "thoughts-mac" and "mac-okular" on macOS as always.
 QString desktopOriginId();

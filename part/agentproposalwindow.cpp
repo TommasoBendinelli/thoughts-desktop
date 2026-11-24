@@ -7,9 +7,17 @@
 #include "agentproposalwindow.h"
 #include "agentconversationopener.h"
 #include "proposalprovenance.h"
+#include "settings.h"
+
+#include <KConfigGroup>
+#include <KSharedConfig>
 
 #include <QCloseEvent>
 #include <QFontDatabase>
+#include <QHideEvent>
+#include <QResizeEvent>
+#include <QKeySequence>
+#include <QShortcut>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QKeyEvent>
@@ -24,6 +32,8 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QVector>
+
+#include <algorithm>
 
 #include <KLocalizedString>
 
@@ -100,10 +110,15 @@ AgentProposalWindow::AgentProposalWindow(QWidget *parent)
 {
     setObjectName(QStringLiteral("AgentProposalWindow"));
     setWindowTitle(i18n("Agent Edit Proposal"));
+    // A window of its own: the reader's ⌘Z and ⇧⌘Z do not reach it (24 Nov).
+    connect(new QShortcut(QKeySequence::Undo, this), &QShortcut::activated, this, &AgentProposalWindow::undoRequested);
+    connect(new QShortcut(QKeySequence::Redo, this), &QShortcut::activated, this, &AgentProposalWindow::redoRequested);
     setAutoFillBackground(true);
     setFrameStyle(QFrame::Panel | QFrame::Raised);
-    setMinimumSize(700, 480);
-    resize(960, 640);
+    // Small, so it shades little of the page beside the passage; a size the user gives it is kept.
+    setMinimumSize(360, 280);
+    const QSize remembered = KConfigGroup(Okular::Settings::self()->sharedConfig(), QStringLiteral("AgentProposalWindow")).readEntry("Size", QSize());
+    resize(remembered.isValid() ? remembered.expandedTo(minimumSize()) : defaultSize());
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
@@ -144,8 +159,8 @@ AgentProposalWindow::AgentProposalWindow(QWidget *parent)
         layout->addWidget(field);
         return field;
     };
-    m_motivation = addField(i18n("Motivation"), QStringLiteral("agentProposalMotivation"), 54);
-    m_motivation->setMaximumHeight(110);
+    m_motivation = addField(i18n("Motivation"), QStringLiteral("agentProposalMotivation"), 40);
+    m_motivation->setMaximumHeight(80);
 
     auto *diffTitle = new QLabel(i18n("Source change"), this);
     QFont diffTitleFont = diffTitle->font();
@@ -155,7 +170,7 @@ AgentProposalWindow::AgentProposalWindow(QWidget *parent)
     m_diff = new ProposalTextEdit(this);
     m_diff->setObjectName(QStringLiteral("agentProposalDiff"));
     m_diff->setReadOnly(true);
-    m_diff->setMinimumHeight(180);
+    m_diff->setMinimumHeight(72);
     m_diff->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     m_diff->setLineWrapMode(QPlainTextEdit::WidgetWidth);
     m_diff->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
@@ -191,6 +206,9 @@ AgentProposalWindow::AgentProposalWindow(QWidget *parent)
     m_status->hide();
     layout->addWidget(m_status);
 
+    // Two rows, so the narrow window keeps every button whole: the source and the conversation,
+    // then the decision.
+    auto *links = new QHBoxLayout;
     auto *actions = new QHBoxLayout;
     m_openSource = new QPushButton(QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Open Source in VS Code"), this);
     m_openSource->setObjectName(QStringLiteral("agentProposalOpenSource"));
@@ -205,11 +223,13 @@ AgentProposalWindow::AgentProposalWindow(QWidget *parent)
     m_accept = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-ok-apply")), i18n("Accept Edit"), this);
     m_accept->setObjectName(QStringLiteral("agentProposalAccept"));
     m_accept->setAutoDefault(false);
-    actions->addWidget(m_openSource);
-    actions->addWidget(m_openConversation);
+    links->addWidget(m_openSource);
+    links->addWidget(m_openConversation);
+    links->addStretch(1);
     actions->addStretch(1);
     actions->addWidget(m_reject);
     actions->addWidget(m_accept);
+    layout->addLayout(links);
     layout->addLayout(actions);
 
     connect(m_closeButton, &QToolButton::clicked, this, &QWidget::close);
@@ -337,6 +357,84 @@ void AgentProposalWindow::closeEvent(QCloseEvent *event)
     if (event->isAccepted()) {
         Q_EMIT closed();
     }
+}
+
+QSize AgentProposalWindow::defaultSize()
+{
+    return QSize(440, 360);
+}
+
+void AgentProposalWindow::resizeEvent(QResizeEvent *event)
+{
+    QFrame::resizeEvent(event);
+    // Only a size given while it is on screen (by the person using it): the first one is Thoughts' own.
+    if (isVisible() && event->oldSize().isValid()) {
+        KConfigGroup(Okular::Settings::self()->sharedConfig(), QStringLiteral("AgentProposalWindow")).writeEntry("Size", event->size());
+    }
+}
+
+void AgentProposalWindow::hideEvent(QHideEvent *event)
+{
+    QFrame::hideEvent(event);
+    Okular::Settings::self()->sharedConfig()->sync();
+}
+
+QSize AgentProposalWindow::placedFrameSize() const
+{
+    // Before the window is first shown its frame is not known yet: about a title bar more.
+    const QSize frame = frameGeometry().size();
+    return isVisible() || frame != size() ? frame : size() + QSize(0, 28);
+}
+
+bool AgentProposalWindow::movedByUser() const
+{
+    // A few pixels are the window manager's (a frame first known, a nudge on the screen).
+    return m_placedAt && (pos() - *m_placedAt).manhattanLength() > 24;
+}
+
+void AgentProposalWindow::placeAt(const QPoint &position)
+{
+    move(position);
+    m_placedAt = position;
+}
+
+QPoint AgentProposalWindow::besidePosition(const QRect &passage, const QRect &page, const QSize &frame, const QRect &screen)
+{
+    constexpr int gap = 12;
+    const int width = frame.width();
+    const int height = frame.height();
+    const auto clampX = [&](int x) { return std::clamp(x, screen.left(), std::max(screen.left(), screen.right() + 1 - width)); };
+    const auto clampY = [&](int y) { return std::clamp(y, screen.top(), std::max(screen.top(), screen.bottom() + 1 - height)); };
+    // Level with the passage's top, a little above it, on the screen.
+    const int besideY = clampY(passage.top() - 24);
+    // Beside the page, then beside the passage (on the page, but off the passage).
+    for (const int left : {page.right() + 1 + gap, page.left() - gap - width, passage.right() + 1 + gap, passage.left() - gap - width}) {
+        if (left >= screen.left() && left + width <= screen.right() + 1) return QPoint(left, besideY);
+    }
+    // Below it, else above it, starting at the passage's left.
+    const int x = clampX(passage.left());
+    const int below = passage.bottom() + 1 + gap;
+    if (below + height <= screen.bottom() + 1) return QPoint(x, below);
+    const int above = passage.top() - gap - height;
+    if (above >= screen.top()) return QPoint(x, above);
+    // Nowhere free: the side with more room, on the screen.
+    return QPoint(x, clampY(screen.bottom() - passage.bottom() >= passage.top() - screen.top() ? below : above));
+}
+
+void AgentProposalWindow::placeBeside(const QRect &passage, const QRect &page, const QRect &screen)
+{
+    if (movedByUser() || !passage.isValid() || !screen.isValid()) return;
+    placeAt(besidePosition(passage, page, placedFrameSize(), screen));
+}
+
+void AgentProposalWindow::placeInCorner(const QRect &view, const QRect &screen)
+{
+    if (movedByUser() || !view.isValid() || !screen.isValid()) return;
+    constexpr int inset = 16;
+    const QSize frame = placedFrameSize();
+    const int x = std::clamp(view.right() + 1 - inset - frame.width(), screen.left(), std::max(screen.left(), screen.right() + 1 - frame.width()));
+    const int y = std::clamp(view.top() + inset, screen.top(), std::max(screen.top(), screen.bottom() + 1 - frame.height()));
+    placeAt(QPoint(x, y));
 }
 
 void AgentProposalWindow::updateActions()

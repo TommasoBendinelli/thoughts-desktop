@@ -201,7 +201,8 @@ QList<AnswerChoice> answerChoices(const ListeningAnswer &answer);
 
 // A source the note's picture links to (server agent_note_links_v1): a rectangle of the picture
 // (normalized x, y, width, height, top-left origin) and where a click goes: a Library PDF page
-// (thoughts-pdf-link:<filename>.pdf?page=<0-based>) or a web page (https).
+// (thoughts-pdf-link:<filename>.pdf?page=<0-based>), a reading overlay
+// (thoughts://open/document?document_id=…&overlay=…, agent_note_overlay_links_v1) or a web page (https).
 struct NoteLink {
     QRectF rect;
     QString href;
@@ -233,6 +234,10 @@ struct Note {
     // A page the user sent to an agent from the phone's reader (or this Mac's): origin.kind
     // "phone_page".
     bool isPhonePage() const;
+    // A reading overlay mark's explanation (origin.kind "overlay_mark", reading-overlays.md "Mark
+    // notes"): opened from its mark, never listed (the server leaves it out of the list; an older
+    // server does not, so the list here drops it too).
+    bool isMarkNote() const;
     // Who sent it: "Claude on thoughts-mac", "Agent via the connector", "You, from the phone",
     // "You, from this Mac".
     QString senderLabel() const;
@@ -241,6 +246,91 @@ struct Note {
 
     static std::optional<Note> fromJson(const QJsonObject &json);
 };
+
+// Send to Agent: a session a reply waker can wake (GET /v1/agent-notes/wakers, endpoint 21), to
+// send the page on screen and Copy for agent's text to (origin.conversation_id; agent-notes.md
+// "Pages sent to one session").
+struct Recipient {
+    QString sessionId;
+    QString title;
+    QString machine;
+    QString state;  // idle, busy or closed
+    bool live = false;  // its waker beat lately
+    QDateTime lastActive;
+    // "<title> · <machine>" (a session without a title by the start of its id).
+    QString label() const;
+    // The label, with what the session is doing when it is not simply waiting: "· busy",
+    // "· closed", "· offline" (its machine's waker is not live).
+    QString choiceText() const;
+};
+// A note's message holds at most this many characters (agent-notes.md, the server refuses more).
+constexpr int MaxMessageCharacters = 4000;
+// Send to Agent's message, Copy for agent's text as is (origin.copy_for_agent; server agent_note_copy_for_agent_v1):
+// a document with much feedback makes it longer than a note's 4000 characters.
+constexpr int MaxCopyForAgentCharacters = 60000;
+
+// The sessions of a wakers answer to choose from, one per session: those of live wakers first, then
+// open sessions (idle, busy) before closed ones, then the most recently active first. A session
+// with wakeable false is left out (its waker cannot wake it).
+QList<Recipient> recipients(const QJsonObject &wakersAnswer);
+// The same as kept between runs (AgentSessionList's cache), and back.
+QJsonArray recipientsJson(const QList<Recipient> &sessions);
+QList<Recipient> recipientsFromJson(const QJsonArray &json);
+
+// Send to Agent's order: the sessions that wrote the most proposals on the document come first.
+// One proposal (pending or decided, any version): the conversation that wrote it (its
+// conversation_id, lowercase) and its source file (Library-relative).
+struct ProposalAuthorship {
+    QString conversationId;
+    QString sourceFile;
+};
+// The document a menu is for: its source file (Library-relative; empty when it has none) and the
+// other documents' sources.
+struct DocumentSources {
+    QString source;
+    QSet<QString> otherDocuments;
+};
+// Whether a proposal in @p sourceFile is on @p document: in its source, or for a LaTeX document in
+// a file of its source's folder (below it) that is no other document's source (an \input part).
+bool belongsTo(const QString &sourceFile, const DocumentSources &document);
+// A session's proposals: on the document, and in the whole Library.
+struct ProposalCounts {
+    int here = 0;
+    int all = 0;
+};
+// By conversation id (lowercase).
+QHash<QString, ProposalCounts> proposalCounts(const QList<ProposalAuthorship> &proposals, const DocumentSources &document);
+// What a session's entry says of its proposals: "— 12 here", else "— 40 in all", else nothing.
+QString countLabel(const ProposalCounts &counts);
+// A session nobody named, which runs without a person: no title, its id, or a name a tool gave it
+// (a lowercase word and a short hexadecimal id, such as "agent-3f").
+bool isAutoNamed(const Recipient &session);
+// Send to Agent's menu shows this many sessions; the rest are under More Sessions.
+constexpr int MenuSessions = 6;
+struct SessionMenu {
+    QList<Recipient> shown;
+    QList<Recipient> more;
+};
+// @p sessions (recipients()' order) as the menu shows them: by their proposals on the document,
+// then in all, then that order; the first MenuSessions shown, auto-named sessions only with
+// proposals on the document, the session sent to last always among them (last, when it ranks
+// lower); the others under More Sessions in recipients()' order.
+SessionMenu sessionMenu(const QList<Recipient> &sessions, const QHash<QString, ProposalCounts> &counts, const QString &lastSession);
+
+// The conversation a reply to a note goes back to: the agent conversation that sent the note
+// (origin.conversation_id, or its conversation_url) when that agent answers its replies, so the
+// reply continues a chat that has the note and its sources open already. Nothing to choose then
+// about what the agent may use; the reply carries the default sources as before.
+struct ContinuedConversation {
+    QString title;  // the session's, when a reply waker names it
+    // "Your reply goes back to the agent's conversation." (with its title when known)
+    QString text() const;
+};
+// The conversation a reply to @p note continues, or nothing when a reply would start a new one
+// (the user's own pages; a note of no conversation; replies the Thoughts reply agent, Agent Study,
+// a topic owner or another conversation answers; nobody listening, so another agent may take it).
+// Before the server says who listens (or when it cannot tell), the note's own conversation.
+std::optional<ContinuedConversation> continuedConversation(const Note &note, const std::optional<ListeningAnswer> &answer);
 
 // The notes of a GET /v1/agent-notes answer ({"notes": [...]}), in the server's order
 // (newest first). Records without note_id are skipped; anything else unreadable is an error.
@@ -362,8 +452,24 @@ public:
     // PUT /v1/agent-notes/{id}/answer-by: the agent that answers replies to the note, or none
     // for automatic. The answer's json is the note's listening answer as it is then.
     void setAnswerBy(const QString &noteId, const std::optional<Agent> &agent, QObject *context, std::function<void(const WriteResult &)> done);
+    // GET /v1/agent-notes/changes (agent_note_changes_v1): waits up to @p waitSeconds (at most 30) until
+    // any device adds a note or a reply, then answers its new cursor; without @p after it answers the
+    // current cursor at once. It records nothing on the server: this Mac does not count as a phone
+    // listening and marks nothing delivered. A server without it answers Unsupported (404).
+    struct ChangesResult {
+        Failure failure = Failure::None;
+        QString cursor;
+        bool changed = false;
+    };
+    void changes(const QString &after, int waitSeconds, QObject *context, std::function<void(const ChangesResult &)> done);
     // What the server can do (GET /v1/health). @p ok is false when it did not say.
     void capabilities(QObject *context, std::function<void(bool ok, const QStringList &capabilities)> done);
+    // GET /v1/agent-notes/wakers: every reply waker seen lately, with the sessions it can wake
+    // (recipients() reads it). Nothing, and why, when the server did not answer it.
+    void wakers(QObject *context, std::function<void(const std::optional<QJsonObject> &answer, const QString &error)> done);
+    // GET /v1/agent-notes/{id}: one note with its replies (a mark note too, which no list has).
+    // A deleted note fails as one the server does not have (Unsupported, "This note was deleted.").
+    void note(const QString &noteId, QObject *context, std::function<void(const std::optional<Note> &note, Failure failure, const QString &error)> done);
     // A note's or reply's picture (image_url of a record), from the cache when present.
     void image(const QString &url, const QString &sha256, const QString &mediaType, QObject *context,
                std::function<void(const QImage &, const QString &error)> done);
@@ -385,7 +491,9 @@ private:
 
 // The notes of this process (one for all windows): polls the list, counts unread notes and
 // announces new ones that nobody opened within the grace period (the phone usually shows a
-// note within seconds; the Mac speaks up only when it did not).
+// note within seconds; the Mac speaks up only when it did not). While the server offers it, a
+// waiting request (Client::changes) asks for the list the moment any device adds a note or a
+// reply, so a note shows here as fast as on the phone; the timed polls stay as they were.
 class Center : public QObject
 {
     Q_OBJECT
@@ -401,7 +509,12 @@ public:
     ReadState &readState() { return m_state; }
 
     QList<Note> notes() const { return m_notes; }
+    // A listed note, or one fetched by its id that no list holds (fetchNote: a mark note).
     std::optional<Note> note(const QString &noteId) const;
+    // Asks the server for one note (GET /v1/agent-notes/{id}) and keeps it: a mark note, which
+    // no list has, apart from the list (note() finds it, notes() never has it); a listed note in
+    // its place. notesChanged follows when it is new or changed. @p done gets it, or why not.
+    void fetchNote(const QString &noteId, std::function<void(const std::optional<Note> &note, const QString &error)> done = {});
     int unreadCount() const;
     bool isUnread(const Note &note) const { return AgentNotes::isUnread(note, m_state); }
     void markSeen(const QString &noteId);
@@ -431,6 +544,8 @@ public:
     void pollNow();
     // Asks the server now (the window's Refresh, or the window opening).
     void refresh();
+    // The waiting request for changes runs and the server answered it (agent_note_changes_v1).
+    bool isLive() const { return m_live; }
 
     // A notification was clicked: windows show this note.
     void requestOpen(const QString &noteId);
@@ -506,6 +621,12 @@ public:
         int pages = 0;
         QImage image;
         AnnotationDocument drawing;
+        // More of the note's origin, besides what every page has (kind, device, page, pages,
+        // document_name, stroke_count): a reading overlay mark's Ask About This adds its
+        // conversation_id and reading_overlay (agent-notes.md, "Pages sent to one session").
+        QJsonObject origin;
+        // The message goes exactly as it is (Send to Agent: Copy for agent's text), not trimmed.
+        bool verbatim = false;
     };
     void sendPage(const Page &page, std::function<void(bool ok, const QString &error)> done = {});
 
@@ -522,7 +643,10 @@ public:
     // documents, each once a minute).
     void fetchDocuments(const QStringList &documentIds);
 
-    static constexpr int GracePeriodSeconds = 30;
+    // A new note is announced this long after it was sent unless it was opened (on the phone) by then.
+    static constexpr int GracePeriodSeconds = 5;
+    // How long one waiting request for changes waits (the server allows 30 s).
+    static constexpr int ChangesWaitSeconds = 25;
     static constexpr int NotifyWithinSeconds = 10 * 60;
     static constexpr int IdleIntervalMs = 60 * 1000;
     static constexpr int WatchingIntervalMs = 15 * 1000;
@@ -565,8 +689,12 @@ private:
     int pollInterval() const;
     void finished(const Client::Result &result);
     void decideNotifications();
+    void waitForChanges();
+    void changesFinished(const Client::ChangesResult &result);
     void emitUnreadIfChanged();
     void replaceNote(const Note &note);
+    // The note kept here, listed or not; null when none.
+    Note *knownNote(const QString &noteId);
     void postReply(const QString &noteId, const QByteArray &image, const QString &mediaType, const QSize &size);
     void finishReply(const QString &noteId, bool ok, const QString &error);
 
@@ -574,6 +702,16 @@ private:
     ReadState m_state;
     Clock m_clock;
     QTimer *m_timer = nullptr;
+    // The waiting request for changes: its cursor ("" before the first answer), its retry timer.
+    QTimer *m_changesTimer = nullptr;
+    QString m_changesCursor;
+    bool m_changesInFlight = false;
+    bool m_live = false;
+    int m_changesFailures = 0;
+    // The wait starts over after a failure: changes may have been missed meanwhile.
+    bool m_changesRestart = false;
+    // Decides again when a new note's grace period is over (nothing else may ask for the list by then).
+    QTimer *m_decideTimer = nullptr;
     QList<Note> m_notes;
     bool m_started = false;
     bool m_watching = false;
@@ -592,6 +730,8 @@ private:
     QByteArray m_signature;
     QSet<QString> m_openedPosted;
     QHash<QString, qint64> m_documentFetched;  // document id -> msecs since epoch
+    // Notes fetched by their id that no list holds (mark notes), by id.
+    QHash<QString, Note> m_unlisted;
     QHash<QString, std::shared_ptr<Draft>> m_drafts;
     QHash<QString, std::function<void(bool, const QString &)>> m_replyCallbacks;
     QHash<QString, QString> m_sentStatus;  // note id -> sentStatus()

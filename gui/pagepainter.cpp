@@ -22,6 +22,7 @@
 // system includes
 #include <math.h>
 #include <memory>
+#include <utility>
 
 // local includes
 #include "core/annotations.h"
@@ -44,6 +45,25 @@ inline QPen buildPen(const Okular::Annotation *ann, double width, const QColor &
     c.setAlphaF(ann->style().opacity());
     QPen p(QBrush(c), width, ann->style().lineStyle() == Okular::Annotation::Dashed ? Qt::DashLine : Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin);
     return p;
+}
+
+namespace
+{
+PagePainter::Underlay &currentUnderlay()
+{
+    static PagePainter::Underlay underlay;
+    return underlay;
+}
+}
+
+PagePainter::UnderlayScope::UnderlayScope(Underlay underlay)
+    : m_previous(std::exchange(currentUnderlay(), std::move(underlay)))
+{
+}
+
+PagePainter::UnderlayScope::~UnderlayScope()
+{
+    currentUnderlay() = std::move(m_previous);
 }
 
 void PagePainter::paintPageOnPainter(QPainter *destPainter, const Okular::Page *page, Okular::DocumentObserver *observer, int flags, int scaledWidth, int scaledHeight, const QRect limits)
@@ -255,6 +275,17 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
             destPainter->drawPixmap(limits, pixmap.scaled(dScaledWidth, dScaledHeight), dLimitsInPixmap);
         }
 
+        // 4A.1. the view's underlay, on the page image
+        if (const Underlay &underlay = currentUnderlay()) {
+            destPainter->save();
+            destPainter->setClipRect(limits, Qt::IntersectClip);
+            underlay(destPainter, page, [&](const QRectF &normalized) {
+                return QRectF(normalized.left() * scaledWidth - scaledCrop.left(), normalized.top() * scaledHeight - scaledCrop.top(), normalized.width() * scaledWidth,
+                              normalized.height() * scaledHeight);
+            });
+            destPainter->restore();
+        }
+
         // 4A.2. active painter is the one passed to this method
         mixedPainter = destPainter;
     }
@@ -325,6 +356,15 @@ void PagePainter::paintCroppedPageOnPainter(QPainter *destPainter,
                 hueShiftNegative(&backImage);
                 break;
             }
+        }
+
+        // 4B.2b. the view's underlay, on the page image, under highlights and annotations
+        if (const Underlay &underlay = currentUnderlay()) {
+            QPainter painter(&backImage);
+            underlay(&painter, page, [&](const QRectF &normalized) {
+                return QRectF(normalized.left() * scaledWidth - scaledCrop.left() - limits.left(), normalized.top() * scaledHeight - scaledCrop.top() - limits.top(),
+                              normalized.width() * scaledWidth, normalized.height() * scaledHeight);
+            });
         }
 
         // 4B.3. highlight rects in page
