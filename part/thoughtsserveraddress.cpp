@@ -390,4 +390,9 @@ QString tokenWithheldMessage(const QString &account, const QString &issuedFor, c
     return message;
 }
 
+QString notSignedInMessage()
+{
+    return QStringLiteral("This computer is not signed in to the server.");
+}
+
 }

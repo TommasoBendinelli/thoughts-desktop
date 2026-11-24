@@ -222,3 +222,8 @@ QAction *ActivePartToolbarController::action(const QString &name) const
 {
     return d->proxies.value(name);
 }
+
+bool ActivePartToolbarController::isStandIn(const QAction *action) const
+{
+    return action && d->proxies.value(action->objectName()) == action;
+}

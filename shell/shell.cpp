@@ -174,6 +174,7 @@
 #include <poppler-qt6.h>
 
 #include <algorithm>
+#include <functional>
 #include <optional>
 #include <tuple>
 #include <QScopeGuard>
@@ -2895,6 +2896,12 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
         setupActions();
         applyReaderIcons(actionCollection());
         m_activePartToolbar = std::make_unique<ActivePartToolbarController>(actionCollection(), firstPart->actionCollection());
+        // KXMLGUI builds the menus again whenever a part comes or goes, or the toolbars are configured.
+        connect(guiFactory(), &KXMLGUIFactory::makingChanges, this, [this](bool changing) {
+            if (!changing) {
+                removeMenuDuplicates();
+            }
+        });
         connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, &QObject::deleteLater);
         // and integrate the part's GUI with the shell's
         setupGUI(Keys | ToolBar | Save);
@@ -4575,6 +4582,11 @@ void Shell::setupActions()
     m_pdfSyncDetailMenuAction->setEnabled(false);
     m_pdfSyncNowMenuAction = m_pdfLibraryMenu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Sync now"));
     connect(m_pdfSyncNowMenuAction, &QAction::triggered, this, [this] { triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync")); });
+    // Offered while the last Sync failed because this computer is not signed in.
+    m_pdfSignInMenuAction = m_pdfLibraryMenu->addAction(QIcon::fromTheme(QStringLiteral("user-identity")), i18n("Sign In…"));
+    m_pdfSignInMenuAction->setObjectName(QStringLiteral("pdf_sync_sign_in"));
+    m_pdfSignInMenuAction->setVisible(false);
+    connect(m_pdfSignInMenuAction, &QAction::triggered, this, [] { showSignIn(); });
     m_pdfLibraryMenu->addSeparator();
     m_pdfLibraryMenu->addSection(i18n("This PDF"));
     m_pdfStatusMenuAction = m_pdfLibraryMenu->addAction(QIcon::fromTheme(QStringLiteral("dialog-information")), i18n("Checking…"));
@@ -7897,6 +7909,43 @@ void Shell::scheduleCommentsOverviewDocumentSyncPresentationUpdate()
 void Shell::startCommentsOverviewSync()
 {
     triggerFedoraSyncWithInitiationControl(QStringLiteral("comments_overview_sync"));
+}
+
+void Shell::removeMenuDuplicates()
+{
+    if (!m_activePartToolbar || !menuBar()) {
+        return;
+    }
+    std::function<void(QMenu *)> clean = [&](QMenu *menu) {
+        for (QAction *action : menu->actions()) {
+            if (m_activePartToolbar->isStandIn(action)) {
+                menu->removeAction(action);
+            } else if (action->menu() && !m_activePartToolbar->isStandIn(action->menu()->menuAction())) {
+                clean(action->menu());
+            }
+        }
+    };
+    QMenu *fileMenu = nullptr;
+    for (QAction *entry : menuBar()->actions()) {
+        if (QMenu *menu = entry->menu()) {
+            clean(menu);
+            if (menu->objectName() == QLatin1String("file")) {
+                fileMenu = menu;
+            }
+        }
+    }
+#ifndef Q_OS_MACOS
+    // The part's Logs… opens the same window as the window's own, which File lists with Server… (on
+    // macOS the window's own is in the Thoughts menu).
+    QAction *logs = actionCollection()->action(QStringLiteral("thoughts_logs"));
+    if (fileMenu && logs && fileMenu->actions().contains(logs)) {
+        for (QAction *action : fileMenu->actions()) {
+            if (action->objectName() == QLatin1String("sync_operations")) {
+                fileMenu->removeAction(action);
+            }
+        }
+    }
+#endif
 }
 
 void Shell::addLibraryMenuBar(Thoughts::CommentsOverview *overview)
@@ -12260,6 +12309,7 @@ void Shell::setActiveTab(int tab)
             }
         }
     }
+    removeMenuDuplicates();
     if (fileMenu && openFromUrlAction) {
         fileMenu->removeAction(openFromUrlAction);
         QAction *const fileOpenAction = actionCollection()->action(KStandardAction::name(KStandardAction::Open));
@@ -12728,6 +12778,11 @@ void Shell::updatePdfSyncStatus()
     m_pdfSyncDetailMenuAction->setVisible(!detail.isEmpty());
     m_pdfSyncNowMenuAction->setText(failed ? i18n("Try again") : i18n("Sync now"));
     m_pdfSyncNowMenuAction->setEnabled(!running);
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+    if (m_pdfSignInMenuAction) {
+        m_pdfSignInMenuAction->setVisible(failed && Thoughts::syncOperationFailureMessage(operation).startsWith(Thoughts::ServerAddress::notSignedInMessage()));
+    }
+#endif
     m_pdfBuildStatusText = label;
     m_pdfBuildStatusAccessibleName = i18n("Sync with the server. %1", summary);
     m_pdfLibraryWidgetAction->setToolTip(QStringLiteral("%1 (%2)").arg(m_pdfBuildStatusAccessibleName, m_pdfLibraryWidgetAction->shortcut().toString(QKeySequence::NativeText)));

@@ -5381,7 +5381,7 @@ void FedoraRepository::requestSourceConflictResolutionBundle(const QString &path
         return;
     }
     if (!ensureClient()) {
-        Q_EMIT sourceConflictResolutionBundleReady({}, QStringLiteral("The server is not configured or its credentials are unavailable."));
+        Q_EMIT sourceConflictResolutionBundleReady({}, Thoughts::ServerAddress::notSignedInMessage());
         return;
     }
 
@@ -6787,14 +6787,20 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
         }
         if (!m_tokenWithheld.isEmpty()) {
             // The address changed to another server: its token is needed, the old one stays here.
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+            failManualSync(Thoughts::ServerAddress::notSignedInMessage(),
+                           QStringLiteral("Its device token is for another server. Choose Sign In… to sign in to this one."), QStringLiteral("needs_user"));
+#else
             failManualSync(QStringLiteral("This computer's device token belongs to another server."), m_tokenWithheld);
+#endif
             return;
         }
-#ifdef Q_OS_WIN
-        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."),
-                       QStringLiteral("Store this computer's device token with: %1").arg(Thoughts::Platform::storeSecretCommand(QStringLiteral("thoughts-server"), Thoughts::Platform::desktopDeviceAccount())));
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+        failManualSync(Thoughts::ServerAddress::notSignedInMessage(),
+                       QStringLiteral("Choose Sign In… and use your Thoughts username and password."), QStringLiteral("needs_user"));
 #else
-        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."));
+        failManualSync(Thoughts::ServerAddress::notSignedInMessage(),
+                       QStringLiteral("Start Thoughts with THOUGHTS_TOKEN set to this computer's device token."), QStringLiteral("needs_user"));
 #endif
         return;
     }
@@ -9789,7 +9795,7 @@ void FedoraRepository::processNextManualLibraryMutation()
 void FedoraRepository::recoverManualDeviceSequence()
 {
     if (!ensureClient()) {
-        failManualSync(QStringLiteral("The server is not configured or its credentials are unavailable."));
+        failManualSync(Thoughts::ServerAddress::notSignedInMessage());
         return;
     }
     ++m_deviceSequenceRecoveryAttempts;
@@ -13629,7 +13635,7 @@ void FedoraRepository::downloadTargetedPublicationPdf()
     }
 
     if (!ensureClient()) {
-        failTargetedBuildActivation(QStringLiteral("The server is not configured or its credentials are unavailable."), target);
+        failTargetedBuildActivation(Thoughts::ServerAddress::notSignedInMessage(), target);
         return;
     }
     m_targetPdfDownloading = true;
@@ -15290,7 +15296,7 @@ void FedoraRepository::startPendingSourcePublication()
             Q_EMIT connectionStateChanged(true, QString());
             if (!requestedTarget.isEmpty()) {
                 if (!ensureClient()) {
-                    failPermanently(QStringLiteral("The server is not configured or its credentials are unavailable."));
+                    failPermanently(Thoughts::ServerAddress::notSignedInMessage());
                 } else {
                     pollBuilds();
                 }

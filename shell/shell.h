@@ -525,6 +525,9 @@ private:
     static QString newestArchivedSidecar(const QString &docsRoot, const QString &stem);
     static bool restoreArchivedSidecar(const QString &archivedSidecar, const QString &destinationSidecar, QString *error);
     void updatePdfLibraryAction();
+    // Each menu entry once: the toolbar stand-ins of the part's actions are taken out of the menus,
+    // where KDE's standard layout puts some of them (Print Preview, Configure…) beside the part's own.
+    void removeMenuDuplicates();
     KParts::ReadWritePart *fedoraGatewayPart() const;
     QJsonObject effectiveFedoraProjections() const;
     static bool requestFedoraBuildForTarget(QObject *gateway, const QString &target, const QString &traceId = QString());
@@ -732,6 +735,7 @@ private:
     QAction *m_pdfSyncSummaryMenuAction = nullptr;
     QAction *m_pdfSyncDetailMenuAction = nullptr;
     QAction *m_pdfSyncNowMenuAction = nullptr;
+    QAction *m_pdfSignInMenuAction = nullptr;
     QAction *m_pdfStatusMenuAction = nullptr;
     QAction *m_pdfStatusDetailMenuAction = nullptr;
     QAction *m_pdfPrimaryMenuAction = nullptr;

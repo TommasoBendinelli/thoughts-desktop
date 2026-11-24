@@ -97,6 +97,10 @@ bool tokenMayBeSentTo(const QString &account, const QByteArray &token, const QSt
 // The token stored for `account` if it may be sent to `address`, else an
 // empty array; *issuedFor is then the origin of the server it belongs to
 // (empty when no token is stored at all).
+// Why a Sync, a build or a merge cannot reach the server: this computer has no device token for it.
+// The Sync menu offers Sign In… with a failure that starts with it.
+QString notSignedInMessage();
+
 QByteArray storedToken(const QString &account, const QString &address, QString *issuedFor = nullptr);
 // What to tell the owner when a stored token is not sent to `address`.
 QString tokenWithheldMessage(const QString &account, const QString &issuedFor, const QString &address);

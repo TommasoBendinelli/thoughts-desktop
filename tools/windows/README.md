@@ -224,7 +224,7 @@ To run all of `parttest` on the PC (it takes a while): `ctest -R parttest --outp
 
 ## Troubleshooting
 
-- **"The Thoughts server is not configured or its credentials are unavailable":** a token is missing. Repeat step 3.5.
+- **"This computer is not signed in to the server":** choose **Sign In…** in the Sync menu (or File → Server…) and use your Thoughts username and password. Without sign-in on the server, repeat step 3.5 for a device token.
 - **Sync says the source publisher is unavailable:** `thoughts-publish-sources.exe` is missing next to `thoughts.exe`. Run `build.ps1` again, which checks for it.
 - **"current_pdfs is in use":** `current_pdfs` existed as an ordinary folder before the first Sync. Close the PDFs opened from it and Sync again. Thoughts sets the old folder aside as `.thoughts-library-legacy-*`; it deletes nothing.
 - **Logs:**

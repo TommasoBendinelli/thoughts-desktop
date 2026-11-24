@@ -45,6 +45,7 @@
 #include <KRecentFilesAction>
 #include <KSharedConfig>
 #include <KStandardAction>
+#include <KToolBar>
 
 #if HAVE_DBUS
 #include <QDBusConnection>
@@ -553,6 +554,7 @@ private Q_SLOTS:
     void testPencilButtonMenu();
     void testCopyForAgentInTheFileMenu();
     void testLibraryWindowHasTheApplicationMenus();
+    void testMenusListEachEntryOnce();
     void testTabRevealInFinderAction();
     void testKeptEarlierVersionInCopyForAgentAndHistory();
     void testTabCopyDocumentNameAction();
@@ -2030,6 +2032,53 @@ void MainShellTest::testPencilButtonMenu()
 // 2026-11-24: on Windows the Library window is often the only one (no PDF open), and it had no menu bar, so
 // Help > Check for Updates…, Server…, Logs… and Configure were out of reach. Windows and Linux give it its
 // own File, Settings and Help menus, whose entries run the main window's actions.
+// Each entry of the PDF window's menus is there once: the part's Logs… and Configure
+// Thoughts… are not repeated by the window's own, and no action is plugged twice.
+void MainShellTest::testMenusListEachEntryOnce()
+{
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    QVERIFY(s->factory());
+    for (const QString &name : {QStringLiteral("file"), QStringLiteral("settings"), QStringLiteral("help"), QStringLiteral("edit"), QStringLiteral("view")}) {
+        auto *menu = qobject_cast<QMenu *>(s->factory()->container(name, s));
+        if (!menu) {
+            continue;
+        }
+        QStringList texts;
+        QList<QAction *> seen;
+        for (QAction *action : menu->actions()) {
+            if (action->isSeparator() || !action->isVisible()) {
+                continue;
+            }
+#ifdef Q_OS_MACOS
+            // macOS shows these in the Thoughts menu instead.
+            if (action->menuRole() != QAction::NoRole && action->menuRole() != QAction::TextHeuristicRole) {
+                continue;
+            }
+#endif
+            const QString text = KLocalizedString::removeAcceleratorMarker(action->text());
+            QVERIFY2(!seen.contains(action), qPrintable(name + QStringLiteral(": ") + text + QStringLiteral(" plugged twice")));
+            QVERIFY2(!texts.contains(text), qPrintable(name + QStringLiteral(": ") + text + QStringLiteral(" twice: ") + texts.join(QStringLiteral(" | "))));
+            seen << action;
+            texts << text;
+        }
+    }
+    // The PDF's own actions stay in the menus, and the toolbar keeps its entries.
+    auto *settings = qobject_cast<QMenu *>(s->factory()->container(QStringLiteral("settings"), s));
+    QVERIFY(settings);
+    int configure = 0;
+    for (QAction *action : settings->actions()) {
+        configure += action->text() == QStringLiteral("Configure Thoughts…") ? 1 : 0;
+    }
+    QCOMPARE(configure, 1);
+    KToolBar *toolBar = s->toolBar(QStringLiteral("mainToolBar"));
+    QVERIFY(toolBar);
+    QVERIFY(!toolBar->actions().isEmpty());
+}
+
 void MainShellTest::testLibraryWindowHasTheApplicationMenus()
 {
     const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
@@ -8003,6 +8052,29 @@ void MainShellTest::testAutomaticSyncWaitsAfterFailures()
         QCOMPARE(initiationOf(shell->m_activeManualSyncOperationId), QStringLiteral("remote_change"));
         shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
         shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+
+        // A Sync that fails because this computer is not signed in offers Sign In… in the Sync menu,
+        // until a Sync succeeds.
+        QVERIFY(shell->m_pdfSignInMenuAction);
+        shell->updatePdfSyncStatus();
+        QVERIFY(!shell->m_pdfSignInMenuAction->isVisible());
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 4);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(3, Thoughts::ServerAddress::notSignedInMessage(), QStringLiteral("Choose Sign In… and use your Thoughts username and password."));
+        shell->updatePdfSyncStatus();
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+        QVERIFY(shell->m_pdfSignInMenuAction->isVisible());
+        QVERIFY(shell->m_pdfLibraryMenu->actions().contains(shell->m_pdfSignInMenuAction));
+#else
+        QVERIFY(!shell->m_pdfSignInMenuAction->isVisible());
+#endif
+        shell->triggerFedoraSyncWithInitiationControl(QStringLiteral("pdf_toolbar_sync"));
+        QTRY_COMPARE(probe.conditionalFullSyncs, 5);
+        shell->updateCommentsOverviewManualSyncState(1, QString(), QString());
+        shell->updateCommentsOverviewManualSyncState(2, QString(), QString());
+        shell->updatePdfSyncStatus();
+        QVERIFY(!shell->m_pdfSignInMenuAction->isVisible());
     }
     delete Shell::s_commentsOverview.data();
     delete shell;
