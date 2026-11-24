@@ -414,7 +414,7 @@ bool Note::isPhonePage() const
 
 QString Note::senderLabel() const
 {
-    if (isPhonePage()) return senderDeviceId == Platform::desktopDeviceAccount() ? i18n("You, from this Mac") : i18n("You, from the phone");
+    if (isPhonePage()) return senderDeviceId == Platform::desktopDeviceAccount() ? i18n("You, from this computer") : i18n("You, from the phone");
     const QString conversationAgent = origin.value(QLatin1String("conversation_agent")).toString().trimmed();
     QString agent;
     if (conversationAgent.compare(QLatin1String("claude"), Qt::CaseInsensitive) == 0) agent = QStringLiteral("Claude");
@@ -655,7 +655,7 @@ QString describe(Client::Failure failure, QNetworkReply *reply)
 {
     switch (failure) {
     case Client::Failure::Unauthorized:
-        return i18n("The Thoughts server refused this Mac's device token.");
+        return i18n("The Thoughts server refused this computer's device token.");
     case Client::Failure::Unsupported:
         return i18n("This Thoughts server has no agent notes.");
     case Client::Failure::Unreachable:

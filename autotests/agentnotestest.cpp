@@ -2,6 +2,7 @@
 #include "../shell/agentnotes.h"
 #include "../shell/agentnotecomposer.h"
 #include "../shell/agentnoteswindow.h"
+#include "../part/thoughtsplatform.h"
 
 #include <QBuffer>
 #include <QCryptographicHash>
@@ -231,7 +232,8 @@ public:
     int putStatus = 0;  // set: every PUT answers it
     // GET /v1/health: {"status": "ok", "capabilities": [...]}.
     QStringList capabilities;
-    QString device = QStringLiteral("thoughts-mac");
+    // This computer's device account, so pages it sends are its own on every system.
+    QString device = Thoughts::Platform::desktopDeviceAccount();
 
     QJsonObject *noteRecordOf(const QString &id)
     {
@@ -643,7 +645,8 @@ void AgentNotesTest::clientReportsFailures()
     refused.list(5, this, [&](const Client::Result &answer) { result = answer; });
     QVERIFY(waitFor([&] { return result.has_value(); }));
     QCOMPARE(result->failure, Client::Failure::Unauthorized);
-    QVERIFY(!result->error.isEmpty());
+    // Said the same way on every system.
+    QCOMPARE(result->error, QStringLiteral("The Thoughts server refused this computer's device token."));
 
     server.listStatus = 404;  // a server without agent notes
     Client old(cachePath());
@@ -1940,7 +1943,7 @@ void AgentNotesTest::pageGoesToTheAgent()
     QVERIFY(waitFor([&] { return center.notes().size() == 1; }));
     const Note page = center.notes().first();
     QVERIFY(page.isPhonePage());
-    QCOMPARE(page.senderLabel(), QStringLiteral("You, from this Mac"));
+    QCOMPARE(page.senderLabel(), QStringLiteral("You, from this computer"));
     QCOMPARE(center.unreadCount(), 0);
     sidebar.selectNote(page.id);
     QVERIFY(!sidebar.findChild<QWidget *>(QStringLiteral("agentNoteReplyBox"))->isVisible());
