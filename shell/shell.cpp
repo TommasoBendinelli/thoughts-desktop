@@ -7290,6 +7290,66 @@ void Shell::startCommentsOverviewSync()
     triggerFedoraSyncWithInitiationControl(QStringLiteral("comments_overview_sync"));
 }
 
+void Shell::addLibraryMenuBar(Thoughts::CommentsOverview *overview)
+{
+    if (!overview || !overview->layout() || overview->findChild<QMenuBar *>(QStringLiteral("libraryMenuBar"))) {
+        return;
+    }
+    // An action of the window that serves the Library now, found when chosen: that window may change, and
+    // the Library window outlives any one of them.
+    const auto actionNamed = [](const QString &name) -> QAction * {
+        Shell *shell = shellForCommentsOverview();
+        if (!shell) {
+            return nullptr;
+        }
+        if (QAction *action = shell->actionCollection()->action(name)) {
+            return action;
+        }
+        for (const TabState &tab : std::as_const(shell->m_tabs)) {
+            if (tab.part) {
+                if (QAction *action = tab.part->actionCollection()->action(name)) {
+                    return action;
+                }
+            }
+        }
+        return nullptr;
+    };
+    auto *bar = new QMenuBar(overview);
+    bar->setObjectName(QStringLiteral("libraryMenuBar"));
+    const auto add = [&](QMenu *menu, const QString &name, const QString &text, const QString &icon) {
+        QAction *entry = menu->addAction(QIcon::fromTheme(icon), text);
+        entry->setObjectName(QStringLiteral("library_") + name);
+        connect(entry, &QAction::triggered, overview, [actionNamed, name] {
+            if (QAction *action = actionNamed(name)) {
+                action->trigger();
+            }
+        });
+        // Offered only while a window that can do it is there.
+        connect(menu, &QMenu::aboutToShow, entry, [entry, actionNamed, name] { entry->setEnabled(actionNamed(name) != nullptr); });
+    };
+    QMenu *file = bar->addMenu(i18n("&File"));
+    file->setObjectName(QStringLiteral("libraryFileMenu"));
+    add(file, QStringLiteral("thoughts_storage"), i18n("Server…"), QStringLiteral("network-server"));
+    add(file, QStringLiteral("thoughts_logs"), i18n("Logs…"), QStringLiteral("view-history"));
+    add(file, QStringLiteral("thoughts_developer_logs"), i18n("Developer logs…"), QStringLiteral("utilities-terminal"));
+    file->addSeparator();
+    add(file, KStandardAction::name(KStandardAction::Quit), i18n("&Quit"), QStringLiteral("application-exit"));
+    QMenu *settings = bar->addMenu(i18n("&Settings"));
+    settings->setObjectName(QStringLiteral("librarySettingsMenu"));
+    add(settings, KStandardAction::name(KStandardAction::Preferences), i18n("Configure Thoughts…"), QStringLiteral("configure"));
+    QMenu *help = bar->addMenu(i18n("&Help"));
+    help->setObjectName(QStringLiteral("libraryHelpMenu"));
+    if (Thoughts::Updates::available()) {
+        // Its dialogs belong to the Library window, which is the one on screen.
+        QAction *updates = help->addAction(QIcon::fromTheme(QStringLiteral("system-software-update")), i18n("Check for Updates…"));
+        updates->setObjectName(QStringLiteral("library_thoughts_check_updates"));
+        connect(updates, &QAction::triggered, overview, [overview] { Thoughts::Updates::checkInteractively(overview); });
+        help->addSeparator();
+    }
+    add(help, KStandardAction::name(KStandardAction::AboutApp), i18n("About Thoughts"), QStringLiteral("help-about"));
+    overview->layout()->setMenuBar(bar);
+}
+
 Thoughts::CommentsOverview *Shell::commentsOverview()
 {
     if (s_commentsOverview) {
@@ -7325,6 +7385,9 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
             return QJsonObject();
         });
     s_commentsOverview = overview;
+#ifndef Q_OS_MACOS
+    addLibraryMenuBar(overview);
+#endif
     connect(overview, &Thoughts::CommentsOverview::noteAttachmentOpenRequested, overview, [overview](const QVariantMap &attachment) {
         if (Shell *shell = shellForCommentsOverview()) {
             if (KParts::ReadWritePart *part = shell->fedoraGatewayPart()) {

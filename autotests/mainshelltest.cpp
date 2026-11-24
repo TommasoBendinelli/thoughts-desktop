@@ -138,6 +138,7 @@
 #include "../shell/activeparttoolbarcontroller.h"
 #include "../shell/buildterminallauncher.h"
 #include "../shell/commentsoverview.h"
+#include "../shell/updatecheck.h"
 #include "../shell/documentsyncpresentation.h"
 #include "../shell/okular_main.h"
 #include "../shell/reviewoverview.h"
@@ -520,6 +521,7 @@ private Q_SLOTS:
     void testDocumentTitleOpensTheTabMenu();
     void testPencilButtonMenu();
     void testCopyForAgentInTheFileMenu();
+    void testLibraryWindowHasTheApplicationMenus();
     void testTabRevealInFinderAction();
     void testTabCopyDocumentNameAction();
     void testLibraryProjectNameForPdf();
@@ -1917,6 +1919,50 @@ void MainShellTest::testPencilButtonMenu()
     pencil->trigger();
     QVERIFY(!pencil->isChecked());
     shell->closeUrl();
+}
+
+// 2026-11-24: on Windows the Library window is often the only one (no PDF open), and it had no menu bar, so
+// Help > Check for Updates…, Server…, Logs… and Configure were out of reach. Windows and Linux give it its
+// own File, Settings and Help menus, whose entries run the main window's actions.
+void MainShellTest::testLibraryWindowHasTheApplicationMenus()
+{
+    const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    Thoughts::CommentsOverview *overview = Shell::commentsOverview();
+    QVERIFY(overview);
+    Shell::addLibraryMenuBar(overview); // the Mac's build does not add it by itself
+    Shell::addLibraryMenuBar(overview); // only once
+    QCOMPARE(overview->findChildren<QMenuBar *>(QStringLiteral("libraryMenuBar")).size(), 1);
+    auto *bar = overview->findChild<QMenuBar *>(QStringLiteral("libraryMenuBar"));
+    QStringList titles;
+    for (QAction *menu : bar->actions()) titles << menu->text();
+    QCOMPARE(titles, QStringList({QStringLiteral("&File"), QStringLiteral("&Settings"), QStringLiteral("&Help")}));
+    auto *file = bar->findChild<QMenu *>(QStringLiteral("libraryFileMenu"));
+    auto *settings = bar->findChild<QMenu *>(QStringLiteral("librarySettingsMenu"));
+    auto *help = bar->findChild<QMenu *>(QStringLiteral("libraryHelpMenu"));
+    QVERIFY(file && settings && help);
+    // Each entry runs the main window's action of that name.
+    QAction *logs = s->actionCollection()->action(QStringLiteral("thoughts_logs"));
+    QVERIFY(logs);
+    QSignalSpy ran(logs, &QAction::triggered); // Logs… opens a window that is not modal
+    QAction *logsEntry = nullptr;
+    for (QAction *action : file->actions()) if (action->objectName() == QLatin1String("library_thoughts_logs")) logsEntry = action;
+    QVERIFY(logsEntry);
+    logsEntry->trigger();
+    QCOMPARE(ran.count(), 1);
+    Q_EMIT settings->aboutToShow();
+    QAction *configure = nullptr;
+    for (QAction *action : settings->actions()) if (action->objectName().startsWith(QLatin1String("library_"))) configure = action;
+    QVERIFY(configure && configure->isEnabled()); // the part's Configure Thoughts…
+    QStringList helpEntries;
+    for (QAction *action : help->actions()) if (!action->isSeparator()) helpEntries << action->text();
+    QVERIFY(helpEntries.contains(QStringLiteral("About Thoughts")));
+    // A build without a release version has no Check for Updates… (Thoughts::Updates::available()).
+    QCOMPARE(helpEntries.contains(QStringLiteral("Check for Updates…")), Thoughts::Updates::available());
+    s->closeUrl();
 }
 
 void MainShellTest::testCopyForAgentInTheFileMenu()

@@ -480,6 +480,10 @@ private:
     QVariantMap activeFedoraRenderStatus();
     void updatePdfLibraryWidget(bool sourceLinked, const QString &status = {}, const QString &reason = {}, Thoughts::DocumentSyncStatus syncState = Thoughts::DocumentSyncStatus::SyncNeeded);
     static Thoughts::CommentsOverview *commentsOverview();
+    // Windows and Linux: the Library window's own menu bar (File, Settings, Help). Without a PDF open it is
+    // often Thoughts' only window, and the main window's menus (Server…, Logs…, Configure, Check for Updates…,
+    // About) are out of reach. The Mac has one menu bar for every window, so it is not added there.
+    static void addLibraryMenuBar(Thoughts::CommentsOverview *overview);
     // Cards changed kind or were retired here: every window's review, Cards lists and the Library's cards read them again.
     static void refreshReviewCardsEverywhere();
     static Thoughts::AgentNotesWindow *agentNotesWindow();
