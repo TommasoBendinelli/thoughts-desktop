@@ -796,7 +796,7 @@ Part::Part(QObject *parent, const QVariantList &args)
     // a link to a place in a Library PDF.
     // A web link of the PDF: a place in a Library PDF, a Thoughts server page, else the page itself in a
     // Thoughts window (25 Nov 2026), where there is a web view; the browser otherwise.
-    Thoughts::setWebLinkHandler(m_document, this, [this](const QUrl &link) { return openPdfPlaceLink(link) || openServerPageLink(link) || openWebPageWindow(link); });
+    Thoughts::setWebLinkHandler(m_document, this, [this](const QUrl &link) { return openPdfPlaceLink(link) || openServerPageLink(link) || openWebLink(link); });
     connect(m_pageView, &PageView::agentProposalOverlaysReloaded, this, &Part::locateOpenAgentProposal);
     connect(m_pageView, &PageView::agentProposalWindowClosed, this, [this](const QString &proposalId) {
         if (m_reviewsWidget) {
@@ -2194,6 +2194,20 @@ QString Part::selectedText() const
     return m_pageView ? m_pageView->selectedText() : QString();
 }
 
+bool Part::openWebLink(const QUrl &url)
+{
+    const QString scheme = url.scheme().toLower();
+    if (!webTabsAvailable() || (scheme != QLatin1String("https") && scheme != QLatin1String("http")) || !url.isValid()) {
+        return false;
+    }
+    // In the app: a tab next to the document, which the page's feedback goes to (Shell::openWebTabOfPart).
+    if (isSignalConnected(QMetaMethod::fromSignal(&Part::requestWebTab))) {
+        Q_EMIT requestWebTab(url);
+        return true;
+    }
+    return openWebPageWindow(url);
+}
+
 bool Part::openWebPageWindow(const QUrl &url)
 {
     const QString scheme = url.scheme().toLower();
@@ -2235,6 +2249,11 @@ bool Part::openWebPageWindow(const QUrl &url)
     };
     show(url);
     connect(reload, &QPushButton::clicked, view, &Thoughts::HtmlDocumentView::reloadLive);
+    // Not reached, or not answering: why, with Retry.
+    connect(view, &Thoughts::HtmlDocumentView::liveLoadFailed, window, [view, current](const QString &error) {
+        view->showMessage(error.isEmpty() ? i18n("%1 could not be loaded.", current->toDisplayString()) : i18n("%1 could not be loaded.\n%2", current->toDisplayString(), error), i18n("Retry"));
+    });
+    connect(view, &Thoughts::HtmlDocumentView::messageActionClicked, view, &Thoughts::HtmlDocumentView::reloadLive);
     connect(browser, &QPushButton::clicked, window, [current] { QDesktopServices::openUrl(*current); });
     // A link to another site, clicked by the reader: here too; mail and other schemes outside.
     connect(view, &Thoughts::HtmlDocumentView::externalLinkRequested, window, [view, show](const QUrl &target, bool userGesture) {
@@ -10647,9 +10666,10 @@ void Part::clearReviewMask()
     if (m_attachmentReader && (m_attachmentReviewShown || !m_attachmentReader->reviewCardId().isEmpty())) {
         m_attachmentReviewShown = false;
         m_attachmentReader->clearReview();
-        // A newer version that came during the review shows now.
+        // A newer version that came during the review is offered now.
         if (m_attachmentFollowPending) m_attachmentFollowTimer->start();
         m_attachmentView->setNotice(QString(), QString());
+        updateNewerPageNotice();
         updateAttachmentSelectionAction();
         // A page opened for the review goes when the review moves on to a card elsewhere (the next
         // card is presented right after this clear: the same page stays without a flicker).

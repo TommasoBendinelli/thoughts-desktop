@@ -378,6 +378,24 @@ bool isBrowserLink(const QUrl &target)
     return target.isValid() && (scheme == QLatin1String("http") || scheme == QLatin1String("https") || scheme == QLatin1String("mailto"));
 }
 
+QString webPagePath(const QUrl &address)
+{
+    const QString scheme = address.scheme().toLower();
+    if (!address.isValid() || address.host().isEmpty() || (scheme != QLatin1String("http") && scheme != QLatin1String("https"))) return {};
+    const QString path = address.adjusted(QUrl::RemoveFragment).toString(QUrl::FullyEncoded);
+    return path.size() <= 1024 ? path : QString();
+}
+
+bool isWebPagePath(const QString &path)
+{
+    return path.startsWith(QLatin1String("http://"), Qt::CaseInsensitive) || path.startsWith(QLatin1String("https://"), Qt::CaseInsensitive);
+}
+
+QString webPageSha256(const QString &path)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(path.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
 QByteArray stubHtml(const QUrl &address, const QString &title)
 {
     const QUrl url = validAddress(address.toString(QUrl::FullyEncoded));

@@ -21,6 +21,13 @@
 #include <QWebView>
 #include <QWebViewLoadingInfo>
 #include <QWebViewSettings>
+#define THOUGHTS_PAGE_VIEW 1
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+// Windows, where Qt WebView has no backend: a WebView2 of Thoughts' own with QWebView's interface.
+#include "htmlpagewebview_win.h"
+#define THOUGHTS_PAGE_VIEW 1
+#else
+#define THOUGHTS_PAGE_VIEW 0
 #endif
 
 namespace Thoughts
@@ -41,9 +48,17 @@ QString jsString(const QString &text)
 }
 
 #if THOUGHTS_HAVE_QTWEBVIEW
-QWebView *asWebView(QWindow *window)
+using PageWebView = QWebView;
+using PageLoadingInfo = QWebViewLoadingInfo;
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+using PageWebView = HtmlPageWebView;
+using PageLoadingInfo = HtmlPageLoading;
+#endif
+
+#if THOUGHTS_PAGE_VIEW
+PageWebView *asWebView(QWindow *window)
 {
-    return static_cast<QWebView *>(window);
+    return static_cast<PageWebView *>(window);
 }
 #endif
 }
@@ -158,6 +173,16 @@ HtmlDocumentView::HtmlDocumentView(QWidget *parent)
     m_stack->addWidget(m_messagePage);
     m_holdTimer.setSingleShot(true);
     m_holdTimer.setInterval(120);
+    // A live page that never shows (an address that takes the connection and never answers):
+    // stopped and said, as a failure would be.
+    m_liveTimeout.setSingleShot(true);
+    m_liveTimeout.setInterval(liveLoadTimeoutMilliseconds);
+    connect(&m_liveTimeout, &QTimer::timeout, this, [this] {
+        if (!m_live || !m_liveWeb) return;
+        m_liveWeb->stop();
+        m_liveLoaded = false;
+        Q_EMIT liveLoadFailed(tr("The page did not answer within %1 seconds.").arg(liveLoadTimeoutMilliseconds / 1000));
+    });
     connect(&m_holdTimer, &QTimer::timeout, this, [this] { flushHeld(true); });
     // The polling transport of attachment pages (no native message handler).
     m_pollTimer.setInterval(100);
@@ -206,6 +231,9 @@ bool HtmlDocumentView::webViewAvailable()
     // Native web views need a real window system (not the offscreen platform of tests).
     const QString platform = QGuiApplication::platformName();
     return platform != QLatin1String("offscreen") && platform != QLatin1String("minimal");
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    // The same, and the WebView2 runtime installed.
+    return HtmlPageWebView::available();
 #else
     return false;
 #endif
@@ -262,6 +290,11 @@ void HtmlDocumentView::snapshotPage(std::function<void(const QImage &)> done)
         HtmlMacNative::snapshot(m_web, std::move(done));
         return;
     }
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    if (m_web) {
+        asWebView(m_web)->snapshot(std::move(done));
+        return;
+    }
 #endif
     done(QImage());
 }
@@ -273,23 +306,46 @@ QString HtmlDocumentView::loadedBundleDir() const
 
 void HtmlDocumentView::ensureWebView()
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (m_web) {
         return;
     }
-    auto *web = new QWebView();
+    auto *web = new PageWebView();
 #ifdef Q_OS_MACOS
     HtmlMacNative::watchUserInput();
 #endif
+#if THOUGHTS_HAVE_QTWEBVIEW
     web->settings()->setAttribute(QWebViewSettings::WebAttribute::LocalStorageEnabled, false);
     web->settings()->setAttribute(QWebViewSettings::WebAttribute::AllowFileAccess, false);
     web->settings()->setAttribute(QWebViewSettings::WebAttribute::LocalContentCanAccessFileUrls, false);
+#else
+    // The WebView2 has these fixed (InPrivate, no file access). Decided before the page goes
+    // anywhere, WebView2 saying whether the reader clicked: an attachment page keeps the view and
+    // its web links (target=_blank too) open outside, as the Started case below does for Qt
+    // WebView; an edition's go where they lead, as with Qt WebView.
+    web->setNavigationFilter([this](const QUrl &url, bool userGesture, bool newWindow) {
+        if (!m_attachment || !m_pageUrl.isValid() || (!newWindow && isLoadedPage(url))) {
+            return true;
+        }
+        const bool loopback = url.host() == QLatin1String("127.0.0.1") || url.host() == QLatin1String("localhost");
+        if ((url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("mailto")) && !loopback) {
+            // After WebView2's call returns: the receiver may ask the reader.
+            QMetaObject::invokeMethod(
+                this,
+                [this, url, userGesture] {
+                    Q_EMIT externalLinkRequested(url, userGesture);
+                },
+                Qt::QueuedConnection);
+        }
+        return false;
+    });
+#endif
     m_web = web;
     m_container = QWidget::createWindowContainer(web, m_stackHost);
     m_container->setObjectName(QStringLiteral("thoughtsHtmlViewContainer"));
     m_container->setFocusPolicy(Qt::StrongFocus);
     m_stack->addWidget(m_container);
-    connect(web, &QWebView::loadingChanged, this, [this](const QWebViewLoadingInfo &info) {
+    connect(web, &PageWebView::loadingChanged, this, [this](const PageLoadingInfo &info) {
         // Nothing shown (unload()): about:blank gets no viewer.
         if (!m_pageUrl.isValid()) {
             return;
@@ -297,7 +353,7 @@ void HtmlDocumentView::ensureWebView()
         // An attachment page keeps the view: a navigation away is stopped (web links open
         // outside), and a foreign page that loaded anyway is replaced by the attachment again.
         if (m_attachment && !isLoadedPage(info.url())) {
-            if (info.status() == QWebViewLoadingInfo::LoadStatus::Started) {
+            if (info.status() == PageLoadingInfo::LoadStatus::Started) {
                 asWebView(m_web)->stop();
                 const QUrl url = info.url();
                 const bool loopback = url.host() == QLatin1String("127.0.0.1") || url.host() == QLatin1String("localhost");
@@ -310,17 +366,17 @@ void HtmlDocumentView::ensureWebView()
 #endif
                     Q_EMIT externalLinkRequested(url, userGesture);
                 }
-            } else if (info.status() == QWebViewLoadingInfo::LoadStatus::Succeeded) {
+            } else if (info.status() == PageLoadingInfo::LoadStatus::Succeeded) {
                 asWebView(m_web)->setUrl(m_pageUrl);
             }
             return;
         }
-        if (info.status() == QWebViewLoadingInfo::LoadStatus::Started && m_attachment) {
+        if (info.status() == PageLoadingInfo::LoadStatus::Started && m_attachment) {
             installNativeTransport();
         }
-        if (info.status() == QWebViewLoadingInfo::LoadStatus::Succeeded) {
+        if (info.status() == PageLoadingInfo::LoadStatus::Succeeded) {
             injectViewer();
-        } else if (info.status() == QWebViewLoadingInfo::LoadStatus::Failed) {
+        } else if (info.status() == PageLoadingInfo::LoadStatus::Failed) {
             m_ready = false;
             Q_EMIT loadFailed(info.errorString());
         }
@@ -332,7 +388,7 @@ void HtmlDocumentView::ensureWebView()
 
 void HtmlDocumentView::loadEdition(const QString &bundleDir, const QString &entry, const QJsonObject &options)
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (!webViewAvailable()) {
         Q_EMIT loadFailed(tr("there is no web view here"));
         return;
@@ -377,7 +433,7 @@ void HtmlDocumentView::loadAttachment(const QUrl &url, const QJsonObject &option
     m_pageUrl = url;
     destroyLive();
     m_pollTimer.stop();
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (!webViewAvailable()) {
         Q_EMIT loadFailed(tr("there is no web view here"));
         return;
@@ -402,7 +458,7 @@ void HtmlDocumentView::unload()
     m_pageUrl = QUrl();
     m_transportKind.clear();
     destroyLive();
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (m_web) {
         asWebView(m_web)->setUrl(QUrl(QStringLiteral("about:blank")));
     }
@@ -424,14 +480,17 @@ void HtmlDocumentView::loadLive(const QUrl &url)
     }
     m_liveWeb = new HtmlLiveWebView(this);
     connect(m_liveWeb, &HtmlLiveWebView::loadCommitted, this, [this] {
+        m_liveTimeout.stop();
         if (m_liveContainer) m_stack->setCurrentWidget(m_liveContainer);
     });
     connect(m_liveWeb, &HtmlLiveWebView::loadFinished, this, [this](const QUrl &loaded) {
+        m_liveTimeout.stop();
         m_liveLoaded = true;
         if (m_liveContainer) m_stack->setCurrentWidget(m_liveContainer);
         Q_EMIT liveLoaded(loaded);
     });
     connect(m_liveWeb, &HtmlLiveWebView::loadFailed, this, [this](const QString &error) {
+        m_liveTimeout.stop();
         m_liveLoaded = false;
         Q_EMIT liveLoadFailed(error);
     });
@@ -446,7 +505,13 @@ void HtmlDocumentView::loadLive(const QUrl &url)
         m_stack->addWidget(m_liveContainer);
     }
     showMessage(tr("Loading %1\u2026").arg(url.toDisplayString()));
+    startLiveLoad();
     m_liveWeb->load(url);
+}
+
+void HtmlDocumentView::startLiveLoad()
+{
+    m_liveTimeout.start();
 }
 
 void HtmlDocumentView::reloadLive()
@@ -463,6 +528,7 @@ void HtmlDocumentView::reloadLive()
         showMessage(tr("Loading %1\u2026").arg(m_liveUrl.toDisplayString()));
     }
     m_liveLoaded = false;
+    startLiveLoad();
     m_liveWeb->reload();
 }
 
@@ -490,6 +556,7 @@ void HtmlDocumentView::copyLiveSelection()
 
 void HtmlDocumentView::destroyLive()
 {
+    m_liveTimeout.stop();
     m_live = false;
     m_liveLoaded = false;
     m_liveUrl = QUrl();
@@ -521,6 +588,19 @@ void HtmlDocumentView::installNativeTransport()
             self->onRawMessage(body);
         }
     });
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    if (m_nativeHandler || !m_web) {
+        return;
+    }
+    // window.chrome.webview.postMessage: no network, so it works under the attachment CSP.
+    QPointer<HtmlDocumentView> self(this);
+    asWebView(m_web)->setMessageHandler([self](const QByteArray &body, const QUrl &source) {
+        // From the attachment's own document only.
+        if (self && self->m_attachment && self->isLoadedPage(source)) {
+            self->onRawMessage(body);
+        }
+    });
+    m_nativeHandler = m_web;
 #endif
 }
 
@@ -531,12 +611,17 @@ void HtmlDocumentView::removeNativeTransport()
         HtmlMacNative::removeMessageHandler(m_nativeHandler, m_web, QStringLiteral("thoughts"));
         m_nativeHandler = nullptr;
     }
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    if (m_nativeHandler) {
+        if (m_web) asWebView(m_web)->setMessageHandler({});
+        m_nativeHandler = nullptr;
+    }
 #endif
 }
 
 void HtmlDocumentView::pollQueue()
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (!m_web || !m_attachment || m_polling) {
         return;
     }
@@ -563,7 +648,7 @@ void HtmlDocumentView::pollQueue()
 
 void HtmlDocumentView::injectViewer()
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (!m_attachment) {
         startViewer();
         return;
@@ -582,7 +667,7 @@ void HtmlDocumentView::injectViewer()
 
 void HtmlDocumentView::startViewer()
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     // A new document context: its messages count from 1 again.
     m_ready = false;
     m_nextSeq = 1;
@@ -597,9 +682,14 @@ void HtmlDocumentView::startViewer()
     } else {
         // No network for attachments: the native message handler, else the queue polled by Qt.
         installNativeTransport();
+#if defined(THOUGHTS_HAVE_WEBVIEW2)
+        m_transportKind = m_nativeHandler ? QStringLiteral("webview2") : QStringLiteral("queue");
+        options.insert(QStringLiteral("transport"), QJsonObject{{QStringLiteral("kind"), m_transportKind}});
+#else
         m_transportKind = m_nativeHandler ? QStringLiteral("webkit") : QStringLiteral("queue");
         options.insert(QStringLiteral("transport"), m_nativeHandler ? QJsonObject{{QStringLiteral("kind"), QStringLiteral("webkit")}, {QStringLiteral("handler"), QStringLiteral("thoughts")}}
                                                                     : QJsonObject{{QStringLiteral("kind"), QStringLiteral("queue")}});
+#endif
         if (m_nativeHandler) {
             m_pollTimer.stop();
         } else {
@@ -627,7 +717,7 @@ void HtmlDocumentView::startViewer()
 
 void HtmlDocumentView::call(const QString &name, const QJsonArray &args, CallCallback callback)
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (!webViewAvailable()) {
         if (callback) {
             callback(false, QJsonValue(), QStringLiteral("no web view"));
@@ -664,7 +754,7 @@ void HtmlDocumentView::call(const QString &name, const QJsonArray &args, CallCal
 
 void HtmlDocumentView::runScript(const QString &script, std::function<void(const QVariant &)> callback)
 {
-#if THOUGHTS_HAVE_QTWEBVIEW
+#if THOUGHTS_PAGE_VIEW
     if (m_web) {
         asWebView(m_web)->runJavaScript(script, callback ? callback : std::function<void(const QVariant &)>());
         return;
@@ -765,6 +855,10 @@ void HtmlDocumentView::setTheme(const QString &theme)
     if (m_web && !m_attachment) {
         HtmlMacNative::setAppearance(m_web, currentTheme() == QLatin1String("dark") ? 2 : 1);
     }
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    if (m_web && !m_attachment) {
+        asWebView(m_web)->setAppearance(currentTheme() == QLatin1String("dark") ? 2 : 1);
+    }
 #endif
     if (m_ready) {
         call(QStringLiteral("setTheme"), QJsonArray{currentTheme()});
@@ -848,13 +942,13 @@ QString HtmlDocumentView::selectionActionToolTip() const
     return m_selectionAction->toolTip();
 }
 
-void HtmlDocumentView::setLiveBar(const QString &text)
+void HtmlDocumentView::setLiveBar(const QString &text, bool takeSnapshot)
 {
     m_liveLabel->setText(text);
     m_liveLabel->setToolTip(text);
     m_liveLabel->setVisible(!text.isEmpty());
     m_reload->setVisible(!text.isEmpty());
-    m_takeSnapshot->setVisible(!text.isEmpty());
+    m_takeSnapshot->setVisible(!text.isEmpty() && takeSnapshot);
 }
 
 QString HtmlDocumentView::liveBarText() const

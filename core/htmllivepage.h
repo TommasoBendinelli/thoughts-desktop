@@ -51,6 +51,15 @@ OKULARCORE_EXPORT bool navigationStays(const QUrl &address, const QUrl &target, 
 // Whether a stopped navigation to @p target may go to the system browser at all.
 OKULARCORE_EXPORT bool isBrowserLink(const QUrl &target);
 
+// A web page a link opened in a reader tab (a web link of a PDF or of an agent note), shown as a
+// live page that is not in the Library. Its page path is its address without the fragment, an http
+// or https address, which no Library page path is; empty when the address is not one or is longer
+// than a page path may be (1024). Feedback given in it names that path and webPageSha256 of it in
+// anchor.html_attachment, as feedback in a live page names its stub.
+OKULARCORE_EXPORT QString webPagePath(const QUrl &address);
+OKULARCORE_EXPORT bool isWebPagePath(const QString &path);
+OKULARCORE_EXPORT QString webPageSha256(const QString &path);
+
 // The stub of §1 for @p address, titled @p title (the page's name in lists and tabs).
 OKULARCORE_EXPORT QByteArray stubHtml(const QUrl &address, const QString &title);
 // §3: the page the live page's serializer returned (@p serialized, the outer HTML of its root

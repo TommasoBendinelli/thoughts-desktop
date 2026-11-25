@@ -15,7 +15,7 @@
   "use strict";
   if (root.ThoughtsViewer && root.ThoughtsViewer.version) { return; }
 
-  const VERSION = "0.3.1";
+  const VERSION = "0.3.2";
   const PROTOCOL = 1;
   const G = root.ThoughtsViewerGeometry;
   const T = root.ThoughtsViewerText;
@@ -1572,12 +1572,68 @@
     const a = t && t.closest ? t.closest("a[href], [data-thoughts-link]") : null;
     const payload = { point: [ev.clientX, ev.clientY], selection: selectionPayload(), items: itemsAtPoint(ev.clientX, ev.clientY, t) };
     if (a && !isUi(a)) { payload.link = linkInfo(a); }
-    if (attachment() && state.options.selectionMenu === "app" && !(t && t.closest && t.closest(INTERACTIVE))
-        && (payload.selection || payload.items.some(function (item) { return item.kind === "feedback"; }))) {
-      ev.preventDefault();
-      payload.app_menu = true;
+    if (attachment() && state.options.selectionMenu === "app" && !(t && t.closest && t.closest(INTERACTIVE))) {
+      // Nothing selected and no highlight under the pointer: the line or paragraph of text there
+      // is selected, so the app's menu gives feedback on it. Over the page's text the app's menu
+      // always replaces the platform's (whose Back would leave the page).
+      // A word WebKit selected for this very click (nothing was selected when the button went
+      // down) counts as nothing selected.
+      const platformWord = selectedBeforeMenuPress === false;
+      if ((!payload.selection || platformWord) && !payload.items.some(function (item) { return item.kind === "feedback"; })
+          && selectBlockAt(t, ev.clientX, ev.clientY)) {
+        payload.selection = selectionPayload();
+      }
+      if (payload.selection || payload.items.some(function (item) { return item.kind === "feedback"; })) {
+        ev.preventDefault();
+        payload.app_menu = true;
+      }
     }
+    selectedBeforeMenuPress = null;
     send("contextmenu", payload);
+  }
+
+  // Whether text was selected when the button of a context menu went down (right button, or
+  // Control with the left one on macOS); null for a menu from the keyboard.
+  let selectedBeforeMenuPress = null;
+  function onMenuPress(ev) {
+    if (ev.button !== 2 && !(ev.button === 0 && ev.ctrlKey)) { selectedBeforeMenuPress = null; return; }
+    const sel = root.getSelection();
+    selectedBeforeMenuPress = !!(sel && !sel.isCollapsed && sel.toString().trim());
+  }
+
+  // The smallest block of text (a line, paragraph, list item or cell) under the point, selected;
+  // false over no text, the viewer's own UI, a page control, or a block too long to be a passage.
+  const SELECTED_BLOCK_MAX = 2000;
+  function selectBlockAt(target, x, y) {
+    let node = null;
+    if (doc.caretRangeFromPoint) {
+      const r = doc.caretRangeFromPoint(x, y);
+      node = r && r.startContainer;
+    } else if (doc.caretPositionFromPoint) {
+      const p = doc.caretPositionFromPoint(x, y);
+      node = p && p.offsetNode;
+    }
+    if (!node || node.nodeType !== 3 || !/\S/.test(node.nodeValue || "")) { return false; }
+    let el = node.parentElement;
+    if (!el || isUi(el) || (el.closest && el.closest(INTERACTIVE))) { return false; }
+    while (el && el !== doc.body && el !== doc.documentElement) {
+      const display = root.getComputedStyle(el).display;
+      if (display && display.indexOf("inline") !== 0 && display !== "contents") { break; }
+      el = el.parentElement;
+    }
+    if (!el || el === doc.body || el === doc.documentElement) { return false; }
+    // The point must be on that block, not in the margin beside the nearest text.
+    const b = el.getBoundingClientRect();
+    if (x < b.left || x > b.right || y < b.top || y > b.bottom) { return false; }
+    const text = (el.innerText || el.textContent || "").trim();
+    if (!text || text.length > SELECTED_BLOCK_MAX) { return false; }
+    const range = doc.createRange();
+    range.selectNodeContents(el);
+    const sel = root.getSelection();
+    if (!sel) { return false; }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return !sel.isCollapsed;
   }
 
   // A text field of the page (or the browser's editing host): its keys are never taken.
@@ -1676,6 +1732,7 @@
     state.listeners = true;
     doc.addEventListener("click", guarded("click", onClick), true);
     doc.addEventListener("auxclick", guarded("auxclick", onAuxClick), true);
+    doc.addEventListener("mousedown", guarded("menupress", onMenuPress), true);
     doc.addEventListener("contextmenu", guarded("contextmenu", onContextMenu), true);
     doc.addEventListener("dragstart", function (ev) {
       if (attachment()) { return; }

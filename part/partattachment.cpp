@@ -51,9 +51,12 @@
 #include <QMenu>
 #include <QMetaMethod>
 #include <QPainter>
+#include <QPointer>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
 #include <QStackedWidget>
+#include <QStandardPaths>
 #include <QTextDocumentFragment>
 #include <QTimer>
 
@@ -135,9 +138,15 @@ void Part::setupHtmlAttachmentView()
     // A live page: its bar (Reload, Take Snapshot), its load, and the questions in its place.
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::reloadRequested, this, &Part::reloadLivePage);
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::takeSnapshotRequested, this, &Part::takeLiveSnapshot);
-    connect(m_attachmentView, &Thoughts::HtmlDocumentView::liveLoaded, this, [this](const QUrl &) {
+    connect(m_attachmentView, &Thoughts::HtmlDocumentView::liveLoaded, this, [this](const QUrl &loaded) {
         if (!m_attachmentReader->isLive()) return;
         m_liveState = LiveLoaded;
+        m_liveError.clear();
+        // A web tab follows the page (a link within the site) and names itself after it.
+        if (m_webTab) {
+            if (loaded.isValid()) m_webTabShown = loaded;
+            readWebPageTitle();
+        }
         // Each load (opening, Reload, a navigation of the page) is a version of the live page: the
         // feedback given on the previous one is now from an earlier version (html-live-pages.md §2.1).
         m_liveLoadedAt = Thoughts::ReviewCardFeedback::timestamp(QDateTime::currentDateTimeUtc());
@@ -149,6 +158,7 @@ void Part::setupHtmlAttachmentView()
         if (!m_attachmentReader->isLive()) return;
         qWarning().noquote() << "Live page" << m_attachmentReader->liveAddress().toDisplayString() << "could not be loaded:" << error;
         m_liveState = LiveUnreachable;
+        m_liveError = error;
         showLiveMessage();
         updateLivePageBar();
     });
@@ -176,6 +186,8 @@ void Part::setupHtmlAttachmentView()
         m_attachmentFeedbackUndo = {};
         m_attachmentFeedbackUndoTimer->stop();
         m_attachmentView->setNotice(QString(), QString());
+        // A newer version that waits is offered again.
+        updateNewerPageNotice();
     };
     connect(m_attachmentFeedbackUndoTimer, &QTimer::timeout, this, endUndo);
     connect(m_pageView.data(), &PageView::feedbackUndoOffered, this, [this](const std::function<bool(QString *error)> &undo, bool *taken) {
@@ -187,7 +199,10 @@ void Part::setupHtmlAttachmentView()
     });
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::noticeClicked, this, [this, endUndo] {
         const auto undo = m_attachmentFeedbackUndo;
-        if (!undo) return;
+        if (!undo) {
+            showNewestPageVersion();
+            return;
+        }
         endUndo();
         QString error;
         if (!undo(&error)) displayInfoMessage(i18n("The feedback could not be restored: %1", error), KMessageWidget::Warning, 5000);
@@ -223,7 +238,7 @@ void Part::watchHtmlAttachmentSource()
     if (!m_attachmentWatcher) return;
     // The pointers of this PDF's source bundles, which say which version of the page it links.
     QStringList files;
-    if (m_attachmentReader->isOpen() && url().isLocalFile()) {
+    if (m_attachmentReader->isOpen() && url().isLocalFile() && !m_webTab) {
         const QString pointer = QStringLiteral("documents/") + QFileInfo(localFilePath()).fileName() + QStringLiteral(".json");
         for (const QString &root : Thoughts::htmlAttachmentBundleRoots(localFilePath())) files.append(QDir::cleanPath(QDir(root).filePath(pointer)));
     }
@@ -250,10 +265,24 @@ void Part::followHtmlAttachmentSource()
     QString error;
     const auto newest = resolveHtmlPage(shown.path, &error);
     // No longer in the bundle (it stays as it is), or the version shown (also from another copy).
-    if (!newest.isValid() || (newest.sha256.isEmpty() ? newest.file == shown.file : newest.sha256 == shown.sha256)) return;
+    if (!newest.isValid() || (newest.sha256.isEmpty() ? newest.file == shown.file : newest.sha256 == shown.sha256)) {
+        setNewerPageVersion(nullptr);
+        return;
+    }
+    // A live page shows its address, not a version to read: it follows at once.
+    if (m_attachmentReader->isLive() || Thoughts::LivePage::stubAddressOfFile(newest.file).isValid()) {
+        replaceShownPage(newest, true);
+        return;
+    }
+    // As a PDF: the version on screen stays, its tab is marked, the bar offers the newest.
+    setNewerPageVersion(&newest);
+}
+
+void Part::replaceShownPage(const Thoughts::HtmlAttachmentTarget &newest, bool announce)
+{
     const int generation = ++m_attachmentFollowGeneration;
     QPointer<Part> self(this);
-    const auto replace = [self, generation, newest](const QJsonObject &position) {
+    const auto replace = [self, generation, newest, announce](const QJsonObject &position) {
         if (!self || generation != self->m_attachmentFollowGeneration || !self->m_attachmentShown || !self->m_attachmentReader->isOpen()) return;
         self->m_attachmentVersions.remove(newest.path);
         QString error;
@@ -262,6 +291,7 @@ void Part::followHtmlAttachmentSource()
             return;
         }
         if (!self->m_attachmentReader->isLive()) self->m_attachmentReader->restorePosition(position);
+        if (!announce) return;
         const QString notice = i18n("This page was updated to its newest version.");
         self->m_attachmentView->setNotice(notice, QString());
         QTimer::singleShot(5000, self, [self, notice] {
@@ -276,6 +306,48 @@ void Part::followHtmlAttachmentSource()
     m_attachmentView->call(QStringLiteral("getPosition"), {}, [replace](bool ok, const QJsonValue &result, const QString &) {
         replace(ok ? result.toObject() : QJsonObject());
     });
+}
+
+void Part::setNewerPageVersion(const Thoughts::HtmlAttachmentTarget *newest)
+{
+    const bool before = !m_newerPageFile.isEmpty();
+    m_newerPagePath = newest ? newest->path : QString();
+    m_newerPageFile = newest ? newest->file : QString();
+    m_newerPageSha256 = newest ? newest->sha256 : QString();
+    updateNewerPageNotice();
+    if (before != !m_newerPageFile.isEmpty()) Q_EMIT keptVersionChanged(!m_newerPageFile.isEmpty());
+}
+
+void Part::updateNewerPageNotice()
+{
+    if (!m_attachmentView) return;
+    const QString notice = i18n("A newer version of this page is ready.");
+    // The Undo of a deleted feedback and a review's notices come first.
+    if (m_attachmentFeedbackUndo || m_attachmentReviewShown) return;
+    if (!m_newerPageFile.isEmpty() && m_attachmentShown) {
+        m_attachmentView->setNotice(notice, i18n("Show Newest Version"));
+    } else if (m_attachmentView->notice() == notice) {
+        m_attachmentView->setNotice(QString(), QString());
+    }
+}
+
+bool Part::keepsEarlierPageVersion() const
+{
+    return m_attachmentShown && !m_newerPageFile.isEmpty();
+}
+
+bool Part::showNewestPageVersion()
+{
+    if (!keepsEarlierPageVersion()) return false;
+    Thoughts::HtmlAttachmentTarget newest;
+    newest.path = m_newerPagePath;
+    newest.file = m_newerPageFile;
+    newest.sha256 = m_newerPageSha256;
+    // The newest again: another Sync may have brought a later one since.
+    QString error;
+    const auto latest = resolveHtmlPage(newest.path, &error);
+    replaceShownPage(latest.isValid() ? latest : newest, false);
+    return true;
 }
 
 namespace
@@ -297,6 +369,11 @@ Thoughts::HtmlAttachmentReader::Owner attachmentOwner(const QString &pdfPath, co
     }
     return owner;
 }
+}
+
+bool Part::webTabsAvailable() const
+{
+    return Thoughts::HtmlLiveWebView::available() || s_withoutWebViewForTesting;
 }
 
 void Part::setHtmlAttachmentsWithoutWebViewForTesting(bool inside)
@@ -366,12 +443,18 @@ bool Part::openHtmlAttachmentLink(const QUrl &link)
 
 bool Part::openHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request)
 {
-    if (!m_attachmentReader || m_document->isOpened() || str(request, QStringLiteral("path")).isEmpty()) return false;
+    const QString path = str(request, QStringLiteral("path"));
+    if (!m_attachmentReader || m_document->isOpened() || path.isEmpty()) return false;
+    // A web tab: a web address a link opened, of the document the link was in (an agent note's
+    // link has none).
+    const bool web = Thoughts::LivePage::isWebPagePath(path);
+    if (web && !webTabsAvailable()) return false;
     // Before the PDF opens: a page's tab never loads the document's HTML edition.
     m_attachmentTab = true;
-    m_attachmentTabPath = str(request, QStringLiteral("path"));
-    m_attachmentView->setAttachmentBar(i18n("Close"), i18n("Close this page and go back to the document"));
-    if (!openUrl(pdf) || !showInHtmlAttachmentTab(request)) {
+    m_webTab = web;
+    m_attachmentTabPath = path;
+    m_attachmentView->setAttachmentBar(i18n("Close"), web ? i18n("Close this web page") : i18n("Close this page and go back to the document"));
+    if (((!web || !pdf.isEmpty()) && !openUrl(pdf)) || !showInHtmlAttachmentTab(request)) {
         leaveHtmlAttachmentTab();
         return false;
     }
@@ -380,7 +463,23 @@ bool Part::openHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request)
 
 bool Part::showInHtmlAttachmentTab(const QJsonObject &request)
 {
-    if (!m_attachmentTab || !m_document->isOpened()) return false;
+    if (!m_attachmentTab || (!m_document->isOpened() && !m_webTab)) return false;
+    if (m_webTab) {
+        // The address asked for (a text fragment too), else the page's own.
+        QUrl address(str(request, QStringLiteral("address")));
+        if (Thoughts::LivePage::webPagePath(address) != str(request, QStringLiteral("path"))) address = QUrl(str(request, QStringLiteral("path")));
+        QString error;
+        if (!showWebPage(address, &error)) {
+            displayInfoMessage(error, KMessageWidget::Warning, 6000);
+            return false;
+        }
+        const QString feedbackId = str(request, QStringLiteral("feedback_id"));
+        if (!feedbackId.isEmpty()) {
+            if (m_pageView->documentFeedback()->record(feedbackId).isEmpty()) refreshDocumentFeedback();
+            if (!m_pageView->documentFeedback()->record(feedbackId).isEmpty()) showFeedback(feedbackId, request.value(QStringLiteral("edit")).toBool());
+        }
+        return true;
+    }
     const QJsonObject card = request.value(QStringLiteral("card")).toObject();
     if (!card.isEmpty()) return showHtmlAttachmentCard(card);
     const QString feedbackId = str(request, QStringLiteral("feedback_id"));
@@ -406,6 +505,8 @@ void Part::leaveHtmlAttachmentTab()
     if (!m_attachmentTab) return;
     m_attachmentTab = false;
     m_attachmentTabPath.clear();
+    m_webTab = false;
+    m_webTabShown.clear();
     m_attachmentView->setAttachmentBar(i18n("Back"), i18n("Back to the document"));
     closeHtmlAttachment();
     if (m_htmlReader && m_document->isOpened() && url().isLocalFile()) m_htmlReader->setDocument(localFilePath());
@@ -416,6 +517,69 @@ void Part::openHtmlAttachmentInBrowser()
     openAttachmentInBrowser();
 }
 
+Thoughts::HtmlAttachmentTarget Part::webPageTarget(const QUrl &address, QString *error) const
+{
+    Thoughts::HtmlAttachmentTarget target;
+    const QString path = Thoughts::LivePage::webPagePath(address);
+    const QByteArray stub = path.isEmpty() ? QByteArray() : Thoughts::LivePage::stubHtml(address, address.host());
+    if (stub.isEmpty()) {
+        if (error) *error = i18n("Thoughts cannot show %1 in a tab.", address.toDisplayString());
+        return target;
+    }
+    // The stub a Library live page of this address would have, in the cache (never in the Library):
+    // it names the address, a text fragment too.
+    const QString folder = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/web-pages");
+    const QString file = folder + QLatin1Char('/') + QString::fromLatin1(QCryptographicHash::hash(stub, QCryptographicHash::Sha256).toHex()) + QStringLiteral(".html");
+    if (!QFileInfo::exists(file)) {
+        QDir().mkpath(folder);
+        QSaveFile out(file);
+        if (!out.open(QIODevice::WriteOnly) || out.write(stub) != stub.size() || !out.commit()) {
+            if (error) *error = i18n("The web page could not be prepared: %1", out.errorString());
+            return target;
+        }
+    }
+    target.path = path;
+    target.file = file;
+    // Its page version is its address (each load a version of it, as for live pages).
+    target.sha256 = Thoughts::LivePage::webPageSha256(path);
+    return target;
+}
+
+bool Part::showWebPage(const QUrl &address, QString *error)
+{
+    if (!m_webTab) return false;
+    const auto target = webPageTarget(address, error);
+    if (!target.isValid()) return false;
+    const QString before = m_attachmentTabPath;
+    const QString title = m_attachmentTitle;
+    if (!showHtmlAttachment(target, false, error)) return false;
+    // The same page keeps the title it learnt.
+    if (before == target.path && !title.isEmpty()) m_attachmentTitle = title;
+    m_webTabShown = address;
+    m_attachmentTabPath = target.path;
+    // The tab is this page's now (a link followed in it): the shell finds it, and reopens it, by it.
+    if (!property("thoughtsHtmlAttachmentTab").toString().isEmpty()) setProperty("thoughtsHtmlAttachmentTab", target.path);
+    updateLivePageBar();
+    if (before != target.path || m_attachmentTitle.isEmpty()) Q_EMIT htmlAttachmentTitleChanged();
+    return true;
+}
+
+void Part::readWebPageTitle()
+{
+    if (!m_webTab || !m_attachmentReader->isLive()) return;
+    const QString path = m_attachmentReader->target().path;
+    QPointer<Part> self(this);
+    m_attachmentView->callLive(QStringLiteral("return document.title || '';"), {}, [self, path](bool ok, const QString &result, const QString &) {
+        if (!self || !self->m_webTab || self->m_attachmentReader->target().path != path) return;
+        const QString shown = self->m_webTabShown.isValid() ? self->m_webTabShown.host() : QUrl(path).host();
+        const QString title = ok ? result.simplified().left(200) : QString();
+        const QString name = title.isEmpty() ? shown : title;
+        if (name == self->m_attachmentTitle) return;
+        self->m_attachmentTitle = name;
+        Q_EMIT self->htmlAttachmentTitleChanged();
+    });
+}
+
 bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool forReview, QString *error)
 {
     if (!m_attachmentReader || !m_documentStack) return false;
@@ -424,7 +588,8 @@ bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool
     const QUrl live = target.isValid() ? Thoughts::LivePage::stubAddressOfFile(target.file) : QUrl();
     if (live.isValid()) {
         const bool canShow = Thoughts::HtmlLiveWebView::available() || s_withoutWebViewForTesting;
-        const bool allowed = Thoughts::LivePage::originAllowed(Thoughts::LivePage::origin(live));
+        // A web page a link opened: the reader's click was the consent.
+        const bool allowed = (m_webTab && Thoughts::LivePage::isWebPagePath(target.path)) || Thoughts::LivePage::originAllowed(Thoughts::LivePage::origin(live));
         const bool same = m_attachmentReader->isLive() && m_attachmentReader->target().path == target.path && m_attachmentReader->liveAddress() == live;
         // Before the view loads: a load that fails at once reports it.
         if (!same || (m_liveState == LiveConsent && allowed)) m_liveState = !canShow ? LiveUnavailable : allowed ? LiveLoading : LiveConsent;
@@ -452,6 +617,8 @@ bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool
         // Opened by the user: it stays when the review ends.
         m_attachmentForReview = false;
     }
+    // The version shown now is the newest there is (or another page).
+    setNewerPageVersion(nullptr);
     if (!m_attachmentReviewShown) m_attachmentView->setNotice(QString(), QString());
     updateToolsForShownView();
     // New cards only where the server keeps them (asked once per run, last answer offline).
@@ -479,7 +646,11 @@ void Part::showLiveMessage()
         m_attachmentView->showMessage(i18n("This page loads %1 from the network. Open it?", QUrl(Thoughts::LivePage::origin(address)).toDisplayString()), i18n("Open"),
                                       i18n("Cancel"));
     } else if (m_liveState == LiveUnreachable) {
-        m_attachmentView->showMessage(i18n("This live page is at %1, which this device cannot reach.", address.toDisplayString()), i18n("Retry"));
+        // What the web view said (refused, timed out, no such host…), under it.
+        const QString why = m_liveError.isEmpty() ? QString() : QLatin1Char('\n') + m_liveError;
+        m_attachmentView->showMessage(m_webTab ? i18n("%1 could not be loaded.", address.toDisplayString()) + why
+                                               : i18n("This live page is at %1, which this device cannot reach.", address.toDisplayString()) + why,
+                                      i18n("Retry"));
     } else if (m_liveState == LiveUnavailable) {
         m_attachmentView->showMessage(i18n("This live page is at %1. Thoughts cannot show live pages on this computer.", address.toDisplayString()), i18n("Open in Browser"));
     }
@@ -516,6 +687,7 @@ void Part::reloadLivePage()
         return;
     }
     m_liveState = LiveLoading;
+    m_liveError.clear();
     updateLivePageBar();
     m_attachmentView->reloadLive();
 }
@@ -524,6 +696,13 @@ void Part::updateLivePageBar()
 {
     if (!m_attachmentView) return;
     const bool live = m_attachmentReader && m_attachmentReader->isLive();
+    // A web tab: the address it shows, Reload; no Library page to replace with a snapshot.
+    if (live && m_webTab) {
+        const QUrl shown = m_webTabShown.isValid() ? m_webTabShown : m_attachmentReader->liveAddress();
+        m_attachmentView->setLiveBar(shown.toDisplayString(QUrl::RemoveFragment), false);
+        m_attachmentView->setTakeSnapshotAction(false, QString());
+        return;
+    }
     m_attachmentView->setLiveBar(live ? i18nc("@info the bar of a live HTML page", "Live \u00b7 %1", m_attachmentReader->liveAddress().toDisplayString()) : QString());
     if (!live) return;
     // Saved as the page's file in its folder, which Sync publishes: only where that folder is.
@@ -566,6 +745,7 @@ void Part::closeHtmlAttachment()
     if (!m_attachmentReader) return;
     hideHtmlAttachment();
     m_attachmentReviewShown = false;
+    setNewerPageVersion(nullptr);
     m_attachmentReader->close();
     m_liveState.clear();
     updateLivePageBar();
@@ -623,13 +803,24 @@ void Part::openAttachmentLink(const QUrl &url, bool userGesture)
     // any site just by being opened.
     if (userGesture) {
         // This computer's server's page of a Library document opens the document here.
-        if (!openServerPageLink(url)) QDesktopServices::openUrl(url);
+        if (openServerPageLink(url)) return;
+        // A web tab is a browser's tab: another site's page in it, mail outside.
+        const QString scheme = url.scheme().toLower();
+        if (m_webTab && (scheme == QLatin1String("http") || scheme == QLatin1String("https"))) {
+            QString error;
+            if (!showWebPage(url, &error)) displayInfoMessage(error, KMessageWidget::Warning, 6000);
+            return;
+        }
+        QDesktopServices::openUrl(url);
         return;
     }
 #ifdef Q_OS_MACOS
     const bool clicksSeen = true;
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    // WebView2 says which links the reader clicked, in embedded pages as in live ones.
+    const bool clicksSeen = Thoughts::HtmlDocumentView::webViewAvailable();
 #else
-    // A live page's own web view sees them too (WebView2 on Windows).
+    // A live page's own web view sees them too.
     const bool clicksSeen = m_attachmentReader && m_attachmentReader->isLive() && Thoughts::HtmlLiveWebView::available();
 #endif
     if (clicksSeen) {
@@ -656,7 +847,8 @@ void Part::openAttachmentInBrowser()
     if (!m_attachmentReader || !m_attachmentReader->isOpen()) return;
     // A live page is at its address.
     if (m_attachmentReader->isLive()) {
-        if (!QDesktopServices::openUrl(m_attachmentReader->liveAddress())) displayInfoMessage(i18n("Could not open the default browser."), KMessageWidget::Warning, 5000);
+        const QUrl address = m_webTab && m_webTabShown.isValid() ? m_webTabShown : m_attachmentReader->liveAddress();
+        if (!QDesktopServices::openUrl(address)) displayInfoMessage(i18n("Could not open the default browser."), KMessageWidget::Warning, 5000);
         return;
     }
     QUrl url = Thoughts::serveHtmlAttachmentFile(m_attachmentReader->target().file);
@@ -1131,6 +1323,8 @@ QString Part::attachmentVersion(const QString &path)
     QString sha256;
     if (known != m_attachmentVersions.cend()) {
         sha256 = *known;
+    } else if (Thoughts::LivePage::isWebPagePath(path)) {
+        sha256 = Thoughts::LivePage::webPageSha256(path);
     } else {
         QString error;
         sha256 = resolveHtmlPage(path, &error).sha256;
@@ -1159,8 +1353,27 @@ void Part::showFeedback(const QString &feedbackId, bool edit)
         m_pageView->showDocumentFeedback(feedbackId, edit);
         return;
     }
+    // Given in a web page a link of this document opened: that page, in its web tab.
+    const QJsonObject anchor = record.value(QStringLiteral("anchor")).toObject();
+    const QString webPath = str(anchor.value(QStringLiteral("html_attachment")).toObject(), QStringLiteral("path"));
+    if (Thoughts::LivePage::isWebPagePath(webPath)) {
+        if (m_webTab && m_attachmentShown && m_attachmentReader->target().path == webPath) {
+            if (edit) m_pageView->openDocumentFeedbackEditor(feedbackId, QRect(QCursor::pos(), QSize(1, 1)));
+            return;
+        }
+        const QUrl address(str(anchor.value(QStringLiteral("live")).toObject(), QStringLiteral("address")));
+        if (!webTabsAvailable() || !isSignalConnected(QMetaMethod::fromSignal(&Part::requestHtmlAttachmentTab))) {
+            displayInfoMessage(i18n("This feedback was given in the web page %1.", webPath), KMessageWidget::Information, 6000);
+            return;
+        }
+        Q_EMIT requestHtmlAttachmentTab({{QStringLiteral("path"), webPath},
+                                         {QStringLiteral("address"), Thoughts::LivePage::webPagePath(address) == webPath ? address.toString() : webPath},
+                                         {QStringLiteral("feedback_id"), feedbackId},
+                                         {QStringLiteral("edit"), edit}});
+        return;
+    }
     QString error;
-    const auto target = namedAttachment(record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject(), localFilePath(), m_docsRenderRoot, &error);
+    const auto target = namedAttachment(anchor.value(QStringLiteral("html_attachment")).toObject(), localFilePath(), m_docsRenderRoot, &error);
     // Not during a review of this document (its page is in this tab): the page's own tab.
     if (target.isValid() && !m_attachmentReviewShown && wantsHtmlAttachmentTab(target.path)) {
         Q_EMIT requestHtmlAttachmentTab({{QStringLiteral("path"), target.path}, {QStringLiteral("feedback_id"), feedbackId}, {QStringLiteral("edit"), edit}});
@@ -1236,6 +1449,9 @@ QVariantMap Part::htmlAttachmentState() const
             {QStringLiteral("new_card_tip"), m_attachmentView->selectionActionToolTip()},
             {QStringLiteral("live"), m_attachmentReader->isLive()},
             {QStringLiteral("live_url"), m_attachmentReader->liveAddress().toString()},
+            {QStringLiteral("web"), m_webTab},
+            {QStringLiteral("web_url"), m_webTabShown.toString()},
+            {QStringLiteral("live_error"), m_liveError},
             {QStringLiteral("live_state"), m_liveState},
             {QStringLiteral("live_bar"), m_attachmentView->liveBarText()},
             {QStringLiteral("snapshot_enabled"), m_attachmentView->takeSnapshotEnabled()},
@@ -1247,7 +1463,7 @@ QVariantMap Part::htmlAttachmentState() const
 
 void Part::takeLiveSnapshot()
 {
-    if (!m_attachmentReader || !m_attachmentReader->isLive() || m_liveState != LiveLoaded || m_liveSnapshotBusy) return;
+    if (!m_attachmentReader || !m_attachmentReader->isLive() || m_webTab || m_liveState != LiveLoaded || m_liveSnapshotBusy) return;
     QFile resource(QStringLiteral(":/thoughts/html-live/snapshot.js"));
     if (!resource.open(QIODevice::ReadOnly)) return;
     const QString script = QString::fromUtf8(resource.readAll());

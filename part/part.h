@@ -220,6 +220,11 @@ public:
     Q_INVOKABLE QString shownFilePath() const;
     // Whether this tab keeps an earlier version on screen while a newer one is ready.
     Q_INVOKABLE bool keepsEarlierVersion() const;
+    // Whether the HTML page shown keeps its version on screen while Sync brought a newer one
+    // (the bar over it offers Show Newest Version); keptVersionChanged says when this changes.
+    Q_INVOKABLE bool keepsEarlierPageVersion() const;
+    // Show Newest Version of that page, where the reader is in it; false when none waits.
+    Q_INVOKABLE bool showNewestPageVersion();
     // Show Newest Version: the reload that keeps the page; false when no newer version waits.
     Q_INVOKABLE bool showNewestVersion();
     Q_INVOKABLE void updateFromFedora(const QString &traceId = QString());
@@ -366,7 +371,9 @@ public:
     Q_INVOKABLE bool showHtmlAttachmentCard(const QJsonObject &card);
     // A page's tab (Shell::showHtmlAttachmentTab): this new Part opens @p pdf and shows only the
     // page @p request names ("path"), with Close (requestCloseHtmlAttachmentTab) in place of Back.
-    // False when the page cannot be shown.
+    // A web tab's path is a web address (LivePage::isWebPagePath; its "address" may add a
+    // fragment): the page shows as a live page of the document whose link opened it, @p pdf, or
+    // of none (an agent note's link, @p pdf empty). False when the page cannot be shown.
     Q_INVOKABLE bool openHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request);
     // In a page's tab: its page again, at the feedback ("feedback_id", "edit") or the card
     // ("card") @p request names.
@@ -376,11 +383,22 @@ public:
     {
         return m_attachmentTab;
     }
-    // The page's own title (its <title>, else its file name), for the tab that shows it.
+    // The page's own title (its <title>, else its file name; a web page's title, else its host),
+    // for the tab that shows it; htmlAttachmentTitleChanged when a web tab learns it.
     Q_INVOKABLE QString htmlAttachmentTitle() const
     {
         return m_attachmentTitle;
     }
+    // A web tab's page is a web address a link opened (no page of the Library).
+    Q_INVOKABLE bool isWebTab() const
+    {
+        return m_webTab;
+    }
+    // Whether web links can open in a tab here (a web view for live pages).
+    Q_INVOKABLE bool webTabsAvailable() const;
+    // A web link of this document's PDF: in a web tab next to the document (requestWebTab), or
+    // without a shell in a window of its own (openWebPageWindow). False where there is no web view.
+    bool openWebLink(const QUrl &url);
     // The last tab of a window was a page's: its Part stays for the next document, as an
     // ordinary one.
     Q_INVOKABLE void leaveHtmlAttachmentTab();
@@ -510,6 +528,10 @@ Q_SIGNALS:
     void requestHtmlAttachmentTab(const QJsonObject &request);
     // Close in a page's tab.
     void requestCloseHtmlAttachmentTab();
+    // A web link of this document: a web tab of it next to its tab (Shell::openWebTabOfPart).
+    void requestWebTab(const QUrl &address);
+    // A web tab's page has its title, or its tab's page path changed (a link followed in it).
+    void htmlAttachmentTitleChanged();
     // Feedback on the PDF chosen in a page's tab: shown in the document's tab (Shell::openTrackedFeedback).
     void requestOpenDocumentFeedback(const QString &pdfPath, const QString &feedbackId);
     void requestEditReviewCard(const QString &cardId);
@@ -931,6 +953,13 @@ private:
     // This Part is the tab of the page m_attachmentTabPath (openHtmlAttachmentTab).
     bool m_attachmentTab = false;
     QString m_attachmentTabPath;
+    // ... a web tab: the page is a web address (showWebPage), what it shows now m_webTabShown.
+    bool m_webTab = false;
+    QUrl m_webTabShown;
+    // A web address as a live page (its stub in the cache, never in the Library), in this tab.
+    bool showWebPage(const QUrl &address, QString *error);
+    Thoughts::HtmlAttachmentTarget webPageTarget(const QUrl &address, QString *error) const;
+    void readWebPageTitle();
     QString m_attachmentTitle;
     // The page @p path shows in a tab of its own (the app) rather than in place (a Part alone, or
     // a page's tab for its own page).
@@ -987,6 +1016,8 @@ private:
     QString m_liveState;
     // When the live page shown last loaded (RFC 3339 UTC, ms): the version its feedback is given on.
     QString m_liveLoadedAt;
+    // Why it could not be loaded, as the web view said (said with the unreachable message).
+    QString m_liveError;
     bool m_liveSnapshotBusy = false;
     void showLiveMessage();
     void updateLivePageBar();
@@ -1003,16 +1034,25 @@ private:
     void showFeedback(const QString &feedbackId, bool edit);
     std::function<bool(QString *error)> m_attachmentFeedbackUndo;
     QTimer *m_attachmentFeedbackUndoTimer = nullptr;
-    // A shown page follows the newest version Sync brings: Sync replaces the pointer of the PDF's
-    // source bundle (documents/<pdf>.json) when the page changes, and the page shows again where it
-    // was (its page state and scroll). Not during a review of one of its cards: after it.
+    // A shown page learns of the newest version Sync brings: Sync replaces the pointer of the PDF's
+    // source bundle (documents/<pdf>.json) when the page changes. As a PDF does, an embedded page
+    // keeps the version on screen, its tab is marked and the bar offers Show Newest Version, which
+    // shows it where the reader was (its page state and scroll); a live page follows at once. Not
+    // during a review of one of its cards: after it.
     KDirWatch *m_attachmentWatcher = nullptr;
     QTimer *m_attachmentFollowTimer = nullptr;
     QStringList m_attachmentWatchedFiles;
     bool m_attachmentFollowPending = false;
     int m_attachmentFollowGeneration = 0;
+    // The newer version waiting (its path, file and digest); empty when none.
+    QString m_newerPagePath;
+    QString m_newerPageFile;
+    QString m_newerPageSha256;
     void watchHtmlAttachmentSource();
     void followHtmlAttachmentSource();
+    void replaceShownPage(const Thoughts::HtmlAttachmentTarget &newest, bool announce);
+    void setNewerPageVersion(const Thoughts::HtmlAttachmentTarget *newest);
+    void updateNewerPageNotice();
     // Draw on This Page (document-feedback.md 10.1): the pencil on an HTML attachment page takes a
     // snapshot of the page as the user sees it and opens it to draw on; Save keeps the picture on
     // this computer and queues the drawing, which the next Sync uploads after its picture. A

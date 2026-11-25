@@ -272,6 +272,9 @@ private:
     QToolButton *m_penTool = nullptr;
     QToolButton *m_eraseTool = nullptr;
     QToolButton *m_undoTool = nullptr;
+    QToolButton *m_numberTool = nullptr;
+    QToolButton *m_redoTool = nullptr;
+    QToolButton *m_clearTool = nullptr;
     class AgentNoteCanvas *m_canvas = nullptr;
     // The draft drawn on in place or shown over the note: kept alive while it is.
     std::shared_ptr<AgentNotes::Center::Draft> m_drawnDraft;
@@ -288,7 +291,6 @@ private:
     // Asks every minute who listens, while an agent's note is on screen and Thoughts is in front.
     QTimer *m_listeningTimer = nullptr;
     QPlainTextEdit *m_replyField = nullptr;
-    QPushButton *m_drawButton = nullptr;
     QLabel *m_replyStatus = nullptr;
     QPushButton *m_sendReply = nullptr;
     // What the agent may use when it answers (AgentNotes::ReplySources), sent with every reply.

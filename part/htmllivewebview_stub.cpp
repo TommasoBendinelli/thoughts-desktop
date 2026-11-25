@@ -30,6 +30,10 @@ void HtmlLiveWebView::reload()
     load(m_url);
 }
 
+void HtmlLiveWebView::stop()
+{
+}
+
 void HtmlLiveWebView::callAsync(const QString &body, const QJsonObject &args, std::function<void(bool, const QString &, const QString &)> done)
 {
     Q_UNUSED(body)
@@ -61,8 +65,11 @@ void HtmlLiveWebView::nativeStarted()
     Q_EMIT loadStarted();
 }
 
-void HtmlLiveWebView::nativeCommitted()
+void HtmlLiveWebView::nativeCommitted(const QUrl &redirectedTo)
 {
+    // A load that a server sent elsewhere (a DOI to its publisher): the page's own navigations
+    // stay within where it arrived.
+    if (redirectedTo.isValid()) m_url = redirectedTo;
     Q_EMIT loadCommitted();
 }
 

@@ -360,6 +360,8 @@ Q_SIGNALS:
     void syncRequested();
     void reviewOverviewRequested();
     void agentNotesRequested();
+    // Viewer: the reader windows with the documents open in them.
+    void viewerRequested();
     void sourceMonitoringInformationRequested(const QString &pdfPath);
     void syncOperationsRequested();
     void syncOperationLogsRequested(const QString &operationId);
@@ -736,6 +738,7 @@ private:
     QComboBox *m_typeFilter = nullptr;
     QPushButton *m_reviewCardsButton = nullptr;
     QPushButton *m_agentNotesButton = nullptr;
+    QPushButton *m_viewerButton = nullptr;
     QPushButton *m_syncButton = nullptr;
     QPushButton *m_fedoraDetailsButton = nullptr;
     QLabel *m_pdfSyncStatus = nullptr;

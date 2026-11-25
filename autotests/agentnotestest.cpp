@@ -2107,6 +2107,9 @@ void AgentNotesTest::highlightOnTheNoteItself()
 
     auto *highlight = view.findChild<QToolButton *>(QStringLiteral("agentNoteInlineHighlight"));
     QVERIFY(highlight && highlight->isVisible());
+    // The tools are with the reply, in view wherever the note is scrolled; no button opens a window.
+    QVERIFY(replyBox->isAncestorOf(highlight));
+    QVERIFY(!view.findChild<QPushButton *>(QStringLiteral("agentNoteDraw")));
     highlight->click();
     auto *canvas = view.findChild<AgentNoteCanvas *>(QStringLiteral("agentNoteCanvas"));
     QVERIFY(highlight->isChecked() && canvas->isVisible() && !image->isVisible());
@@ -2121,7 +2124,7 @@ void AgentNotesTest::highlightOnTheNoteItself()
     QVERIFY(!highlight->isChecked() && !canvas->isVisible() && image->isVisible());
     auto *undo = view.findChild<QToolButton *>(QStringLiteral("agentNoteInlineUndo"));
     QVERIFY(undo->isEnabled());
-    QVERIFY(waitFor([&] { return view.findChild<QPushButton *>(QStringLiteral("agentNoteDraw"))->text().contains(QStringLiteral("Edit")); }));
+    QVERIFY(waitFor([&] { return view.findChild<QLabel *>(QStringLiteral("agentNoteReplyStatus"))->text().contains(QStringLiteral("With your drawing")); }));
     QImage shown(image->size(), QImage::Format_ARGB32);
     image->render(&shown);
     QVERIFY2(shown.pixelColor(image->width() / 2, int(image->height() * 0.5)) != QColor(Qt::white), "the highlight is drawn over the note");
@@ -2147,7 +2150,7 @@ void AgentNotesTest::drawnReplySendsTheComposite()
     Client client(cachePath());
     client.setServer(server.url(), "secret");
     Center center(&client, statePath());
-    // In the sidebar too: the drawing opens in its own window.
+    // In the sidebar too: the drawing happens on the note itself, with the tools by the reply.
     AgentNotesView sidebar(AgentNotesView::Layout::Sidebar, &center, {}, {}, {});
     sidebar.resize(300, 800);
     sidebar.show();
@@ -2155,69 +2158,67 @@ void AgentNotesTest::drawnReplySendsTheComposite()
     QVERIFY(waitFor([&] { return center.hasListed(); }));
     sidebar.selectNote(QStringLiteral("n1"));
     QCOMPARE(sidebar.shownNoteId(), QStringLiteral("n1"));
+    auto *image = sidebar.findChild<AgentNoteImageView *>();
+    QVERIFY(waitFor([&] { return !image->image().isNull(); }));
     auto *field = sidebar.findChild<QPlainTextEdit *>(QStringLiteral("agentNoteReplyField"));
     field->setPlainText(QStringLiteral("1: here"));
-    sidebar.findChild<QPushButton *>(QStringLiteral("agentNoteDraw"))->click();
-    AgentNoteComposer *composer = nullptr;
-    QVERIFY(waitFor([&] { return (composer = openComposer()) != nullptr; }));
-    QVERIFY(QTest::qWaitForWindowExposed(composer));
-    AgentNoteCanvas *canvas = composer->canvas();
+    const auto tool = [&sidebar](const char *name) { return sidebar.findChild<QToolButton *>(QString::fromLatin1(name)); };
+    tool("agentNoteInlinePen")->click();
+    auto *canvas = sidebar.findChild<AgentNoteCanvas *>(QStringLiteral("agentNoteCanvas"));
+    QVERIFY(canvas->isVisible());
     QVERIFY(waitFor([&] { return !canvas->image().isNull() && canvas->width() > 100; }));
-    // The comment typed under the note came along.
-    QCOMPARE(composer->findChild<QPlainTextEdit *>(QStringLiteral("agentNoteComposerComment"))->toPlainText(), QStringLiteral("1: here"));
-    auto *sendButton = composer->findChild<QPushButton *>(QStringLiteral("agentNoteComposerSend"));
-    QVERIFY(sendButton->isEnabled());
+    auto draft = center.existingDraft(QStringLiteral("n1"));
+    QVERIFY(draft);
+    const auto strokes = [&center] { return center.existingDraft(QStringLiteral("n1"))->drawing.strokes().size(); };
 
     // A pen stroke across the middle, a marker, an extra stroke erased again.
     const qreal toCanvas = canvas->width() / 400.0;
     drag(canvas, {QPointF(50, 300) * toCanvas, QPointF(200, 300) * toCanvas, QPointF(350, 300) * toCanvas});
-    QCOMPARE(composer->document()->strokes().size(), 1);
-    composer->findChild<QToolButton *>(QStringLiteral("agentNoteNumber"))->click();
+    QCOMPARE(strokes(), 1);
+    tool("agentNoteInlineNumber")->click();
+    QVERIFY(tool("agentNoteInlineNumber")->isChecked() && !tool("agentNoteInlinePen")->isChecked());
     drag(canvas, {QPointF(200, 100) * toCanvas});
-    QCOMPARE(composer->document()->markers().size(), 1);
-    composer->findChild<QToolButton *>(QStringLiteral("agentNotePen"))->click();
+    QCOMPARE(center.existingDraft(QStringLiteral("n1"))->drawing.markers().size(), 1);
+    tool("agentNoteInlinePen")->click();
     drag(canvas, {QPointF(50, 500) * toCanvas, QPointF(350, 500) * toCanvas});
-    QCOMPARE(composer->document()->strokes().size(), 2);
-    composer->findChild<QToolButton *>(QStringLiteral("agentNoteEraser"))->click();
+    QCOMPARE(strokes(), 2);
+    tool("agentNoteInlineErase")->click();
     drag(canvas, {QPointF(200, 480) * toCanvas, QPointF(200, 520) * toCanvas});
-    QCOMPARE(composer->document()->strokes().size(), 1);
-    composer->findChild<QToolButton *>(QStringLiteral("agentNoteUndo"))->click();
-    QCOMPARE(composer->document()->strokes().size(), 2);
-    composer->findChild<QToolButton *>(QStringLiteral("agentNoteRedo"))->click();
-    QCOMPARE(composer->document()->strokes().size(), 1);
+    QCOMPARE(strokes(), 1);
+    QVERIFY(waitFor([&] { return tool("agentNoteInlineUndo")->isEnabled(); }));
+    tool("agentNoteInlineUndo")->click();
+    QCOMPARE(strokes(), 2);
+    QVERIFY(waitFor([&] { return tool("agentNoteInlineRedo")->isEnabled(); }));
+    tool("agentNoteInlineRedo")->click();
+    QCOMPARE(strokes(), 1);
+    // Clear takes every mark away, and Undo brings them back.
+    QVERIFY(waitFor([&] { return tool("agentNoteInlineClear")->isEnabled(); }));
+    tool("agentNoteInlineClear")->click();
+    QVERIFY(center.existingDraft(QStringLiteral("n1"))->drawing.isEmpty());
+    tool("agentNoteInlineUndo")->click();
+    QCOMPARE(strokes(), 1);
+    QCOMPARE(center.existingDraft(QStringLiteral("n1"))->drawing.markers().size(), 1);
     // The note's reply box knows about the drawing.
-    QVERIFY(waitFor([&] { return sidebar.findChild<QPushButton *>(QStringLiteral("agentNoteDraw"))->text().contains(QStringLiteral("Edit")); }));
+    QVERIFY(waitFor([&] { return sidebar.findChild<QLabel *>(QStringLiteral("agentNoteReplyStatus"))->text().contains(QStringLiteral("With your drawing")); }));
 
-    QPointer<AgentNoteComposer> guard(composer);
-    sendButton->click();
-    QVERIFY(waitFor([&] { return !guard || !guard->isVisible(); }));
+    sidebar.findChild<QPushButton *>(QStringLiteral("agentNoteSend"))->click();
+    QVERIFY(waitFor([&] { return center.note(QStringLiteral("n1"))->replies.size() == 1; }));
     const QJsonObject body = server.bodies.last();
     QCOMPARE(body.value(QStringLiteral("message")).toString(), QStringLiteral("1: here"));
-    const QJsonObject strokes = body.value(QStringLiteral("strokes")).toObject();
-    QCOMPARE(strokes.value(QStringLiteral("strokes")).toArray().size(), 1);
-    QCOMPARE(strokes.value(QStringLiteral("markers")).toArray().size(), 1);
-    QCOMPARE(strokes.value(QStringLiteral("image_width")).toInt(), 400);
-    const QJsonObject image = body.value(QStringLiteral("image")).toObject();
-    QCOMPARE(image.value(QStringLiteral("media_type")).toString(), QStringLiteral("image/png"));
-    const QImage sent = QImage::fromData(QByteArray::fromBase64(image.value(QStringLiteral("data_base64")).toString().toLatin1()));
+    const QJsonObject sentStrokes = body.value(QStringLiteral("strokes")).toObject();
+    QCOMPARE(sentStrokes.value(QStringLiteral("strokes")).toArray().size(), 1);
+    QCOMPARE(sentStrokes.value(QStringLiteral("markers")).toArray().size(), 1);
+    QCOMPARE(sentStrokes.value(QStringLiteral("image_width")).toInt(), 400);
+    const QJsonObject sentImage = body.value(QStringLiteral("image")).toObject();
+    QCOMPARE(sentImage.value(QStringLiteral("media_type")).toString(), QStringLiteral("image/png"));
+    const QImage sent = QImage::fromData(QByteArray::fromBase64(sentImage.value(QStringLiteral("data_base64")).toString().toLatin1()));
     QCOMPARE(sent.size(), QSize(400, 600));
     QCOMPARE(sent.pixelColor(200, 300), QColor(Qt::black));
     QCOMPARE(sent.pixelColor(200, 500), QColor(Qt::white));
-    QVERIFY(waitFor([&] { return center.note(QStringLiteral("n1"))->replies.size() == 1; }));
     QCOMPARE(center.note(QStringLiteral("n1"))->replies.first().strokeCount, 1);
     QVERIFY(field->toPlainText().isEmpty());
-
-    // Drawing open, the reply sent from the box under the note: the drawing went with it, its window closes.
-    sidebar.findChild<QPushButton *>(QStringLiteral("agentNoteDraw"))->click();
-    QVERIFY(waitFor([&] { return (composer = openComposer()) != nullptr && !composer->canvas()->image().isNull(); }));
-    guard = composer;
-    QVERIFY(waitFor([&] { return composer->canvas()->width() > 100; }));
-    drag(composer->canvas(), {QPointF(50, 100) * toCanvas, QPointF(350, 100) * toCanvas});
-    field->setPlainText(QStringLiteral("2: and here"));
-    sidebar.findChild<QPushButton *>(QStringLiteral("agentNoteSend"))->click();
-    QVERIFY(waitFor([&] { return !guard || !guard->isVisible(); }));
-    QCOMPARE(server.bodies.last().value(QStringLiteral("strokes")).toObject().value(QStringLiteral("strokes")).toArray().size(), 1);
-    QCOMPARE(server.bodies.last().value(QStringLiteral("message")).toString(), QStringLiteral("2: and here"));
+    // Sent: the marks leave the note, and the note shows its picture again.
+    QVERIFY(waitFor([&] { return !tool("agentNoteInlineUndo")->isEnabled() && image->isVisible() && !canvas->isVisible(); }));
 }
 
 // Send Page to Agent: the page on screen, drawn on or as it is, goes as the phone's study mode

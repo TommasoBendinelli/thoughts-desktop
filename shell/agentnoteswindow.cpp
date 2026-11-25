@@ -594,7 +594,6 @@ AgentNotesView::AgentNotesView(Layout layout, AgentNotes::Center *center, Docume
         if (m_settingReply || !m_center || m_shownNoteId.isEmpty()) return;
         m_center->setDraftMessage(m_shownNoteId, m_replyField->toPlainText());
     });
-    connect(m_drawButton, &QPushButton::clicked, this, [this] { openComposer(m_shownNoteId); });
     const auto showSources = [this] {
         const QString value = m_center ? m_center->replySources() : AgentNotes::ReplySources::defaultValue();
         const QSignalBlocker blocker(m_sourcesBox);
@@ -716,9 +715,6 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     replyLayout->addWidget(m_replyField);
     auto *replyButtons = new QBoxLayout(sidebar ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
     replyButtons->setSpacing(6);
-    m_drawButton = new QPushButton(QIcon::fromTheme(QStringLiteral("draw-freehand")), i18n("Draw on the Picture…"), m_replyBox);
-    m_drawButton->setObjectName(QStringLiteral("agentNoteDraw"));
-    m_drawButton->setToolTip(i18n("Draw on the note's picture with the pen, highlighter, eraser and numbered markers, then send it"));
     m_replyStatus = new QLabel(m_replyBox);
     m_replyStatus->setObjectName(QStringLiteral("agentNoteReplyStatus"));
     m_replyStatus->setWordWrap(true);
@@ -757,13 +753,11 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
         replyButtons->addLayout(sourcesRow);
         replyButtons->addWidget(m_continuesConversation);
         auto *row = new QHBoxLayout;
-        row->addWidget(m_drawButton);
         row->addStretch(1);
         row->addWidget(m_sendReply);
         replyButtons->addLayout(row);
         replyButtons->addWidget(m_replyStatus);
     } else {
-        replyButtons->addWidget(m_drawButton);
         replyButtons->addWidget(m_replyStatus, 1);
         replyButtons->addWidget(m_sourcesLabel);
         replyButtons->addWidget(m_sourcesBox);
@@ -784,14 +778,25 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     m_repliesLayout->setContentsMargins(0, 0, 0, 0);
     m_repliesLayout->setSpacing(10);
 
-    // Highlight, Pen, Erase and Undo at the top of the note: drawing happens on the note itself
-    // (24 Nov 2026: Draw on the Picture… was at the end of the note and opened a window).
-    m_drawTools = new QWidget(m_detail);
+    // The drawing tools are with the reply, always in view under the note: drawing happens on the
+    // note itself, where the reader is (25 Nov 2026: "Draw on the Picture…" opened a window, and
+    // the tools at the top of the note were out of sight at its end).
+    m_drawTools = new QWidget(m_replyBox);
     m_drawTools->setObjectName(QStringLiteral("agentNoteDrawTools"));
-    auto *tools = new QHBoxLayout(m_drawTools);
-    tools->setContentsMargins(0, 0, 0, 0);
+    // One row; in the reader's narrow sidebar the drawing tools, then Undo, Redo and Clear under them.
+    auto *toolRows = new QVBoxLayout(m_drawTools);
+    toolRows->setContentsMargins(0, 0, 0, 0);
+    toolRows->setSpacing(2);
+    auto *tools = new QHBoxLayout;
     tools->setSpacing(4);
-    const auto tool = [this, tools](QToolButton *&button, const QString &name, const QString &icon, const QString &text, const QString &tip, int which) {
+    toolRows->addLayout(tools);
+    auto *editTools = tools;
+    if (sidebar) {
+        editTools = new QHBoxLayout;
+        editTools->setSpacing(4);
+        toolRows->addLayout(editTools);
+    }
+    const auto tool = [this, tools, editTools](QToolButton *&button, const QString &name, const QString &icon, const QString &text, const QString &tip, int which) {
         button = new QToolButton(m_drawTools);
         button->setObjectName(name);
         button->setIcon(QIcon::fromTheme(icon));
@@ -804,7 +809,7 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
             // A second click on the chosen tool goes back to reading the note.
             connect(button, &QToolButton::clicked, this, [this, which](bool checked) { setDrawTool(checked ? which : int(AgentNoteCanvas::Tool::None)); });
         }
-        tools->addWidget(button);
+        (which >= 0 ? tools : editTools)->addWidget(button);
     };
     tool(m_highlightTool, QStringLiteral("agentNoteInlineHighlight"), QStringLiteral("draw-highlight"), i18n("Highlight"),
          i18n("Highlight on the note; it goes with your reply"), int(AgentNoteCanvas::Tool::Highlighter));
@@ -812,15 +817,29 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
          int(AgentNoteCanvas::Tool::Pen));
     tool(m_eraseTool, QStringLiteral("agentNoteInlineErase"), QStringLiteral("draw-eraser"), i18n("Erase"), i18n("Remove marks you made"),
          int(AgentNoteCanvas::Tool::Eraser));
+    tool(m_numberTool, QStringLiteral("agentNoteInlineNumber"), QStringLiteral("format-list-ordered"), i18n("Number"),
+         i18n("Put the next number on the note, to refer to it in your reply"), int(AgentNoteCanvas::Tool::Number));
     tool(m_undoTool, QStringLiteral("agentNoteInlineUndo"), QStringLiteral("edit-undo"), i18n("Undo"), i18n("Undo the last mark"), -1);
-    connect(m_undoTool, &QToolButton::clicked, this, [this] {
+    tool(m_redoTool, QStringLiteral("agentNoteInlineRedo"), QStringLiteral("edit-redo"), i18n("Redo"), i18n("Redo the mark undone"), -1);
+    tool(m_clearTool, QStringLiteral("agentNoteInlineClear"), QStringLiteral("edit-clear"), i18n("Clear"), i18n("Remove every mark (Undo brings them back)"), -1);
+    const auto edit = [this](void (AgentNotes::AnnotationDocument::*change)(), bool (AgentNotes::AnnotationDocument::*possible)() const) {
         auto draft = m_center ? m_center->existingDraft(m_shownNoteId) : nullptr;
-        if (!draft || !draft->drawing.canUndo()) return;
-        draft->drawing.undo();
+        if (!draft || !(draft->drawing.*possible)()) return;
+        (draft->drawing.*change)();
+        if (m_canvas) m_canvas->update();
+        m_center->draftDrawingChanged(m_shownNoteId);
+    };
+    connect(m_undoTool, &QToolButton::clicked, this, [edit] { edit(&AgentNotes::AnnotationDocument::undo, &AgentNotes::AnnotationDocument::canUndo); });
+    connect(m_redoTool, &QToolButton::clicked, this, [edit] { edit(&AgentNotes::AnnotationDocument::redo, &AgentNotes::AnnotationDocument::canRedo); });
+    connect(m_clearTool, &QToolButton::clicked, this, [this] {
+        auto draft = m_center ? m_center->existingDraft(m_shownNoteId) : nullptr;
+        if (!draft || draft->drawing.isEmpty()) return;
+        draft->drawing.clear();
         if (m_canvas) m_canvas->update();
         m_center->draftDrawingChanged(m_shownNoteId);
     });
     tools->addStretch(1);
+    if (editTools != tools) editTools->addStretch(1);
     m_canvas = new AgentNoteCanvas(m_detail);
     m_canvas->setObjectName(QStringLiteral("agentNoteCanvas"));
     m_canvas->hide();
@@ -831,7 +850,7 @@ QWidget *AgentNotesView::createDetail(QWidget *parent)
     detailLayout->addWidget(m_title);
     detailLayout->addWidget(m_meta);
     detailLayout->addLayout(links);
-    detailLayout->addWidget(m_drawTools);
+    replyLayout->insertWidget(0, m_drawTools);
     detailLayout->addWidget(m_question);
     detailLayout->addWidget(m_message);
     detailLayout->addSpacing(4);
@@ -1451,7 +1470,7 @@ void AgentNotesView::setDrawTool(int which)
     const QImage image = m_image->image();
     const bool drawing = m_center && !m_shownNoteId.isEmpty() && tool != AgentNoteCanvas::Tool::None && !image.isNull();
     for (const auto &[button, value] : {std::pair {m_highlightTool, AgentNoteCanvas::Tool::Highlighter}, std::pair {m_penTool, AgentNoteCanvas::Tool::Pen},
-                                        std::pair {m_eraseTool, AgentNoteCanvas::Tool::Eraser}}) {
+                                        std::pair {m_eraseTool, AgentNoteCanvas::Tool::Eraser}, std::pair {m_numberTool, AgentNoteCanvas::Tool::Number}}) {
         const QSignalBlocker blocker(button);
         button->setChecked(drawing && value == tool);
     }
@@ -1485,6 +1504,8 @@ void AgentNotesView::syncDrawing()
     m_drawnDraft = draft;
     m_image->setDrawing(draft && !draft->drawing.isNull() ? &draft->drawing : nullptr);
     if (m_undoTool) m_undoTool->setEnabled(draft && draft->drawing.canUndo() && !draft->sending);
+    if (m_redoTool) m_redoTool->setEnabled(draft && draft->drawing.canRedo() && !draft->sending);
+    if (m_clearTool) m_clearTool->setEnabled(draft && !draft->drawing.isEmpty() && !draft->sending);
     if (m_canvas && drawingNow) m_canvas->update();
 }
 
@@ -1501,7 +1522,6 @@ void AgentNotesView::updateReplyBox()
     }
     const bool drawn = draft && !draft->drawing.isNull() && !draft->drawing.isEmpty();
     const bool sending = draft && draft->sending;
-    m_drawButton->setText(drawn ? i18n("Edit the Drawing…") : i18n("Draw on the Picture…"));
     QString status;
     if (sending) status = i18n("Sending…");
     else if (draft && !draft->error.isEmpty()) status = i18n("Not sent: %1", draft->error);
@@ -1702,7 +1722,10 @@ void AgentNotesView::showListMenu(const QPoint &position)
         menu.addSeparator();
     }
     if (!note->isPhonePage()) {
-        menu.addAction(QIcon::fromTheme(QStringLiteral("draw-freehand")), i18n("Reply with a Drawing…"), this, [this, id = note->id] { openComposer(id); });
+        menu.addAction(QIcon::fromTheme(QStringLiteral("draw-freehand")), i18n("Reply with a Drawing"), this, [this, id = note->id] {
+            selectNote(id);
+            setDrawTool(int(AgentNoteCanvas::Tool::Pen));
+        });
         menu.addSeparator();
     }
     menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")), i18n("Delete Note…"), this, [this, id = note->id] { deleteNote(id); });

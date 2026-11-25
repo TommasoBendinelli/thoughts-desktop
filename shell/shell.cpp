@@ -25,6 +25,7 @@
 
 #include "shell.h"
 #include "../core/htmlattachment.h"
+#include "../core/htmllivepage.h"
 #include "agentdocumentdescription.h"
 #include "agentnotecomposer.h"
 #include "agentnotes.h"
@@ -1606,7 +1607,7 @@ static void removeNamedActions(QDomElement &container, const QString &name)
 
 static void installAuthoritativeMainToolbarConfig()
 {
-    constexpr int layoutVersion = 49;
+    constexpr int layoutVersion = 50;
     KConfigGroup migrationState = KSharedConfig::openConfig()->group(QStringLiteral("ThoughtsToolbar"));
     const int previousLayoutVersion = migrationState.readEntry(QStringLiteral("LayoutVersion"), 0);
     if (previousLayoutVersion >= layoutVersion) {
@@ -1847,6 +1848,30 @@ static void installAuthoritativeMainToolbarConfig()
             }
             // v46: the "A/B testing" button goes; the rating page it opened is no longer used.
             if (previousLayoutVersion < 46) removeNamedActions(toolbar, QStringLiteral("ab_testing"));
+            // v50: Zoom Out and Zoom In beside the zoom field (the zoom could only change
+            // through its dropdown).
+            if (previousLayoutVersion < 50) {
+                QDomElement zoom;
+                bool hasOut = false, hasIn = false;
+                for (QDomElement action = toolbar.firstChildElement(QStringLiteral("Action")); !action.isNull(); action = action.nextSiblingElement(QStringLiteral("Action"))) {
+                    const QString name = action.attribute(QStringLiteral("name"));
+                    if (name == QLatin1String("zoom_to")) zoom = action;
+                    if (name == QLatin1String("view_zoom_out")) hasOut = true;
+                    if (name == QLatin1String("view_zoom_in")) hasIn = true;
+                }
+                if (!zoom.isNull()) {
+                    if (!hasOut) {
+                        QDomElement out = document.createElement(QStringLiteral("Action"));
+                        out.setAttribute(QStringLiteral("name"), QStringLiteral("view_zoom_out"));
+                        toolbar.insertBefore(out, zoom);
+                    }
+                    if (!hasIn) {
+                        QDomElement in = document.createElement(QStringLiteral("Action"));
+                        in.setAttribute(QStringLiteral("name"), QStringLiteral("view_zoom_in"));
+                        toolbar.insertAfter(in, zoom);
+                    }
+                }
+            }
             // v49: Edit Source in VS Code follows the document title (else it ends the bar).
             if (previousLayoutVersion < 49) {
                 QDomElement after;
@@ -3389,6 +3414,9 @@ bool Shell::eventFilter(QObject *obj, QEvent *event)
 {
     if (obj == toolBar(QStringLiteral("mainToolBar"))) {
         const QEvent::Type eventType = event->type();
+        if (eventType == QEvent::Resize) {
+            QMetaObject::invokeMethod(this, &Shell::fitZoomButtons, Qt::QueuedConnection);
+        }
         // The document title stands for the tab: its right-click menu is the tab's (Copy for agent,
         // Send to Agent…), not the toolbar's, also while the tab bar is hidden.
         if (eventType == QEvent::ContextMenu && m_documentTitle && m_documentTitle->isVisible() && m_tabWidget && m_tabWidget->currentIndex() >= 0) {
@@ -3552,9 +3580,13 @@ QString Shell::agentTextOfTab(int tab)
         if (part) QMetaObject::invokeMethod(part, "htmlAttachmentState", Qt::DirectConnection, Q_RETURN_ARG(QVariantMap, page));
         const QString path = page.value(QStringLiteral("path")).toString();
         QString text = Thoughts::agentDocumentDescription(root, projects, pdfPath, documentName, QString());
-        text += Thoughts::agentHtmlPageDescription(root, path, page.value(QStringLiteral("title")).toString(),
-                                                   page.value(QStringLiteral("page_state")).toMap().value(QStringLiteral("hash")).toString(), selection,
-                                                   page.value(QStringLiteral("live")).toBool() ? page.value(QStringLiteral("live_url")).toString() : QString());
+        if (page.value(QStringLiteral("web")).toBool()) {
+            text += Thoughts::agentWebPageDescription(page.value(QStringLiteral("title")).toString(), page.value(QStringLiteral("web_url")).toString(), selection);
+        } else {
+            text += Thoughts::agentHtmlPageDescription(root, path, page.value(QStringLiteral("title")).toString(),
+                                                       page.value(QStringLiteral("page_state")).toMap().value(QStringLiteral("hash")).toString(), selection,
+                                                       page.value(QStringLiteral("live")).toBool() ? page.value(QStringLiteral("live_url")).toString() : QString());
+        }
         const QString documentId = Thoughts::agentProjectDocument(projects, QFileInfo(pdfPath).fileName()).second.value(QStringLiteral("document_id")).toString();
         if (!documentId.isEmpty() && !projections.isEmpty()) {
             const Thoughts::ReviewStore store(root, [projections] { return projections; });
@@ -3991,22 +4023,45 @@ void Shell::addHtmlAttachmentTabMenuActions(QMenu *menu, int tab)
 {
     const QPointer<KParts::ReadWritePart> part = m_tabs.at(tab).part;
     const QUrl pdf = part->url();
+    // A page that keeps its version while a newer one is ready: the newest, as the bar offers it.
+    bool keptPage = false;
+    if (part) QMetaObject::invokeMethod(part, "keepsEarlierPageVersion", Qt::DirectConnection, Q_RETURN_ARG(bool, keptPage));
+    if (keptPage) {
+        QAction *newest = menu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Show Newest Version"));
+        newest->setObjectName(QStringLiteral("showNewestPageVersionTabAction"));
+        connect(newest, &QAction::triggered, this, [part] {
+            if (part) QMetaObject::invokeMethod(part, "showNewestPageVersion", Qt::DirectConnection);
+        });
+        menu->addSeparator();
+    }
     QAction *browserAction = menu->addAction(QIcon::fromTheme(QStringLiteral("internet-services")), i18n("Open in Browser"));
     browserAction->setObjectName(QStringLiteral("htmlPageOpenInBrowserAction"));
     connect(browserAction, &QAction::triggered, this, [part]() {
         if (part) QMetaObject::invokeMethod(part, "openHtmlAttachmentInBrowser", Qt::DirectConnection);
     });
-    // Its document's tab, opened again when it was closed.
-    QAction *documentAction = menu->addAction(QIcon::fromTheme(QStringLiteral("application-pdf")), i18n("Show Document"));
-    documentAction->setObjectName(QStringLiteral("htmlPageShowDocumentAction"));
-    connect(documentAction, &QAction::triggered, this, [this, pdf]() {
-        const int document = findTabIndex(pdf);
-        if (document >= 0) {
-            setActiveTab(document);
-        } else {
-            openNewTab(pdf, QString());
-        }
-    });
+    // A web tab: its address, as the bar shows it.
+    if (isWebTab(tab)) {
+        QVariantMap shownPage;
+        if (part) QMetaObject::invokeMethod(part, "htmlAttachmentState", Qt::DirectConnection, Q_RETURN_ARG(QVariantMap, shownPage));
+        const QString address = shownPage.value(QStringLiteral("web_url")).toString();
+        QAction *copyAddress = menu->addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy Address"));
+        copyAddress->setObjectName(QStringLiteral("webTabCopyAddressAction"));
+        copyAddress->setEnabled(!address.isEmpty());
+        connect(copyAddress, &QAction::triggered, this, [address]() { QApplication::clipboard()->setText(address); });
+    }
+    // Its document's tab, opened again when it was closed (a web tab of no document has none).
+    if (!pdf.isEmpty()) {
+        QAction *documentAction = menu->addAction(QIcon::fromTheme(QStringLiteral("application-pdf")), i18n("Show Document"));
+        documentAction->setObjectName(QStringLiteral("htmlPageShowDocumentAction"));
+        connect(documentAction, &QAction::triggered, this, [this, pdf]() {
+            const int document = findTabIndex(pdf);
+            if (document >= 0) {
+                setActiveTab(document);
+            } else {
+                openNewTab(pdf, QString());
+            }
+        });
+    }
     const QString name = KLocalizedString::removeAcceleratorMarker(m_tabWidget->tabText(tab));
     QAction *copyNameAction = menu->addAction(QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy page name"));
     copyNameAction->setObjectName(QStringLiteral("htmlPageCopyNameAction"));
@@ -4125,7 +4180,8 @@ void Shell::updateTabControls()
 
 void Shell::removeEmptyPlaceholderPart()
 {
-    if (m_tabs.size() != 1 || !m_tabs.constFirst().part->url().isEmpty()) {
+    // A web tab of no document has no document either, and is no placeholder.
+    if (m_tabs.size() != 1 || !m_tabs.constFirst().part->url().isEmpty() || isHtmlAttachmentTab(0)) {
         return;
     }
 
@@ -4439,7 +4495,8 @@ void Shell::openUrl(const QUrl &url, const QString &serializedOptions)
 
     const int activeTab = m_tabWidget->currentIndex();
     KParts::ReadWritePart *const activePart = m_tabs[activeTab].part;
-    if (!activePart->url().isEmpty()) {
+    // A page's tab (a web tab of no document too) is never reused for a document.
+    if (!activePart->url().isEmpty() || isHtmlAttachmentTab(activeTab)) {
         if (m_unique && !isHtmlAttachmentTab(activeTab)) {
             applyOptionsToPart(activePart, serializedOptions);
             activePart->openUrl(url);
@@ -8115,6 +8172,7 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
         }
     });
     connect(overview, &Thoughts::CommentsOverview::agentNotesRequested, overview, [] { Shell::showAgentNotes(); });
+    connect(overview, &Thoughts::CommentsOverview::viewerRequested, overview, [] { Shell::showViewer(); });
     connect(overview, &Thoughts::CommentsOverview::serverConnectionChanged, overview, [] { Shell::reconnectToServer(); });
     {
         Thoughts::AgentNotes::Center *agentNotes = Thoughts::AgentNotes::Center::instance();
@@ -10425,12 +10483,56 @@ void Shell::openAgentNoteLink(const QString &href)
 
 bool Shell::openWebPage(const QUrl &url)
 {
-    // The web view is the live pages' (in the PDF part): any window's part opens it.
+    // A web tab of no document (an agent note is none) in the reader window, after its tab in front.
     Shell *shell = shellForCommentsOverview();
-    KParts::ReadWritePart *part = shell && !shell->m_tabs.isEmpty() ? shell->m_tabs.constFirst().part : nullptr;
-    bool opened = false;
-    if (part) QMetaObject::invokeMethod(part, "openWebPageWindow", Qt::DirectConnection, Q_RETURN_ARG(bool, opened), Q_ARG(QUrl, url));
-    return opened;
+    if (!shell || !shell->m_isValid) return false;
+    if (!shell->openWebTab(url, QUrl(), shell->m_tabWidget->currentIndex())) return false;
+    shell->presentWindow();
+    return true;
+}
+
+bool Shell::isWebTab(int tab) const
+{
+    return isHtmlAttachmentTab(tab) && Thoughts::LivePage::isWebPagePath(m_tabs[tab].part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString());
+}
+
+KParts::ReadWritePart *Shell::openWebTab(const QUrl &address, const QUrl &pdf, int besideTab)
+{
+    const QString path = Thoughts::LivePage::webPagePath(address);
+    if (path.isEmpty() || m_tabs.isEmpty()) return nullptr;
+    // The web view is the live pages' (in the PDF part).
+    bool available = false;
+    QMetaObject::invokeMethod(m_tabs.constFirst().part, "webTabsAvailable", Qt::DirectConnection, Q_RETURN_ARG(bool, available));
+    if (!available) return nullptr;
+    return showHtmlAttachmentTab(pdf, {{QStringLiteral("path"), path}, {QStringLiteral("address"), address.toString(QUrl::FullyEncoded)}}, besideTab);
+}
+
+void Shell::openWebTabOfPart(const QUrl &address)
+{
+    const int source = findTabIndex(sender());
+    if (source < 0) return;
+    KParts::ReadWritePart *const sourcePart = m_tabs[source].part;
+    // After the document's tab and the page tabs already opened from it, as a browser opens links.
+    int beside = source;
+    while (beside + 1 < m_tabs.size() && isHtmlAttachmentTab(beside + 1) && m_tabs[beside + 1].part->url() == sourcePart->url()) ++beside;
+    KParts::ReadWritePart *const part = openWebTab(address, sourcePart->url(), beside);
+    if (!part) {
+        // No web view after all: the browser, as without one.
+        QDesktopServices::openUrl(address);
+        return;
+    }
+    if (part != sourcePart) {
+        for (const char *name : {"thoughtsTitleDocumentId", "thoughtsTitleProjectId", "thoughtsTitleFallback", "thoughtsTitleUrl", "thoughtsTitlePdfId"}) {
+            if (!part->property(name).isValid()) part->setProperty(name, sourcePart->property(name));
+        }
+        refreshReaderTabTitles();
+    }
+}
+
+void Shell::webTabTitleChanged()
+{
+    refreshReaderTabTitles();
+    scheduleOpenSessionSave();
 }
 
 void Shell::openAgentNoteDocument(const QString &documentId, const QString &path)
@@ -11952,6 +12054,16 @@ namespace
 // any change and every few seconds, and when the application is asked to quit, before its windows
 // close; a window the person closes leaves it. A quit, an update or a crash keeps it.
 const QString openSessionConfig = QStringLiteral("thoughts-open-tabsrc");
+// The documents of the reader window the person closed last, for the Library's Viewer.
+const QString closedWindowGroup = QStringLiteral("Closed Window");
+
+// The open windows' groups ("Window N"), in order.
+QStringList openSessionWindowGroups(const KConfig &config)
+{
+    QStringList groups = config.groupList().filter(QRegularExpression(QStringLiteral("^Window \\d+$")));
+    std::sort(groups.begin(), groups.end(), [](const QString &a, const QString &b) { return a.mid(7).toInt() < b.mid(7).toInt(); });
+    return groups;
+}
 bool s_openSessionFrozen = false;  // quitting, or reopening: nothing is written
 
 class OpenSessionQuitWatcher : public QObject
@@ -11995,47 +12107,52 @@ void Shell::scheduleOpenSessionSave()
     debounce->start();
 }
 
+bool Shell::writeOpenWindow(KConfigGroup &group) const
+{
+    QStringList urls, documentIds, projectIds, titles, pages, currentPages;
+    int active = 0;
+    for (int tab = 0; tab < m_tabs.size(); ++tab) {
+        KParts::ReadWritePart *part = m_tabs.at(tab).part;
+        if (!part || part->url().isEmpty()) continue;
+        if (tab == m_tabWidget->currentIndex()) active = urls.size();
+        uint page = 0;
+        QMetaObject::invokeMethod(part, "currentPage", Qt::DirectConnection, Q_RETURN_ARG(uint, page));
+        urls.append(part->url().url());
+        documentIds.append(part->property("thoughtsTitleDocumentId").toString());
+        projectIds.append(part->property("thoughtsTitleProjectId").toString());
+        titles.append(part->property("thoughtsTitleFallback").toString());
+        pages.append(part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString());
+        currentPages.append(QString::number(page));
+    }
+    if (urls.isEmpty()) {
+        return false;
+    }
+    group.writePathEntry(SESSION_URL_KEY, urls);
+    group.writeEntry(SESSION_TAB_KEY, active);
+    group.writeEntry(SESSION_HTML_PAGES_KEY, pages);
+    group.writeEntry("TitleDocumentIds", documentIds);
+    group.writeEntry("TitleProjectIds", projectIds);
+    group.writeEntry("DisplayTitles", titles);
+    group.writeEntry("CurrentPages", currentPages);
+    return true;
+}
+
 void Shell::saveOpenSession()
 {
     if (s_openSessionFrozen || QCoreApplication::closingDown()) {
         return;
     }
     KConfig config(openSessionConfig, KConfig::SimpleConfig);
+    // The window closed last (closedWindowGroup) stays: only the open ones are rewritten.
+    for (const QString &group : openSessionWindowGroups(config)) config.deleteGroup(group);
     int index = 0;
-    struct Window {
-        QStringList urls, documentIds, projectIds, titles, pages, currentPages;
-        int active = 0;
-    };
-    QList<Window> open;
     for (KMainWindow *mainWindow : KMainWindow::memberList()) {
         auto *shell = qobject_cast<Shell *>(mainWindow);
         if (!shell || !shell->m_isValid || shell->m_windowClosing) continue;
-        Window window;
-        for (int tab = 0; tab < shell->m_tabs.size(); ++tab) {
-            KParts::ReadWritePart *part = shell->m_tabs.at(tab).part;
-            if (!part || part->url().isEmpty()) continue;
-            if (tab == shell->m_tabWidget->currentIndex()) window.active = window.urls.size();
-            uint page = 0;
-            QMetaObject::invokeMethod(part, "currentPage", Qt::DirectConnection, Q_RETURN_ARG(uint, page));
-            window.urls.append(part->url().url());
-            window.documentIds.append(part->property("thoughtsTitleDocumentId").toString());
-            window.projectIds.append(part->property("thoughtsTitleProjectId").toString());
-            window.titles.append(part->property("thoughtsTitleFallback").toString());
-            window.pages.append(part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString());
-            window.currentPages.append(QString::number(page));
+        KConfigGroup group(&config, QStringLiteral("Window %1").arg(index));
+        if (shell->writeOpenWindow(group)) {
+            ++index;
         }
-        if (!window.urls.isEmpty()) open.append(window);
-    }
-    for (const QString &group : config.groupList()) config.deleteGroup(group);
-    for (const Window &window : std::as_const(open)) {
-        KConfigGroup group(&config, QStringLiteral("Window %1").arg(index++));
-        group.writePathEntry(SESSION_URL_KEY, window.urls);
-        group.writeEntry(SESSION_TAB_KEY, window.active);
-        group.writeEntry(SESSION_HTML_PAGES_KEY, window.pages);
-        group.writeEntry("TitleDocumentIds", window.documentIds);
-        group.writeEntry("TitleProjectIds", window.projectIds);
-        group.writeEntry("DisplayTitles", window.titles);
-        group.writeEntry("CurrentPages", window.currentPages);
     }
     config.sync();
 }
@@ -12055,12 +12172,16 @@ bool Shell::reopenLastSession()
     if (!enabled) {
         return false;
     }
-    KConfig config(openSessionConfig, KConfig::SimpleConfig);
-    QStringList groups = config.groupList().filter(QRegularExpression(QStringLiteral("^Window \\d+$")));
-    std::sort(groups.begin(), groups.end(), [](const QString &a, const QString &b) { return a.mid(7).toInt() < b.mid(7).toInt(); });
+    const KConfig config(openSessionConfig, KConfig::SimpleConfig);
+    return reopenSessionGroups(config, openSessionWindowGroups(config));
+}
+
+bool Shell::reopenSessionGroups(const KConfig &config, const QStringList &groups)
+{
     if (groups.isEmpty()) {
         return false;
     }
+    watchOpenSession();
     s_openSessionFrozen = true;
     const auto unfreeze = qScopeGuard([] {
         s_openSessionFrozen = false;
@@ -12070,7 +12191,7 @@ bool Shell::reopenLastSession()
     Shell *empty = nullptr;
     for (KMainWindow *mainWindow : KMainWindow::memberList()) {
         auto *shell = qobject_cast<Shell *>(mainWindow);
-        if (shell && shell->m_isValid && !shell->hasOpenDocument()) {
+        if (shell && shell->m_isValid && !shell->m_windowClosing && !shell->hasOpenDocument()) {
             empty = shell;
             break;
         }
@@ -12118,6 +12239,39 @@ bool Shell::reopenLastSession()
         reopened = reopened || shell->hasOpenDocument();
     }
     return reopened;
+}
+
+void Shell::showViewer()
+{
+    const auto withDocuments = [] {
+        QList<Shell *> shells;
+        for (KMainWindow *mainWindow : KMainWindow::memberList()) {
+            auto *shell = qobject_cast<Shell *>(mainWindow);
+            if (shell && shell->m_isValid && !shell->m_windowClosing && shell->hasOpenDocument()) shells.append(shell);
+        }
+        // The one the Library used last ends in front.
+        if (s_commentsOverviewShell && shells.removeOne(s_commentsOverviewShell.data())) shells.append(s_commentsOverviewShell.data());
+        return shells;
+    };
+    QList<Shell *> shells = withDocuments();
+    if (shells.isEmpty()) {
+        // None open (the Library alone at start, or every reader closed): what was open when
+        // Thoughts last closed, else the window the person closed last. Asked for here, so
+        // whatever Configure Thoughts says about reopening at start.
+        const KConfig config(openSessionConfig, KConfig::SimpleConfig);
+        if (!reopenSessionGroups(config, openSessionWindowGroups(config)) && config.hasGroup(closedWindowGroup)) {
+            reopenSessionGroups(config, {closedWindowGroup});
+        }
+        shells = withDocuments();
+    }
+    if (shells.isEmpty()) {
+        if (Shell *shell = shellForCommentsOverview()) {
+            shells.append(shell);
+        }
+    }
+    for (Shell *shell : std::as_const(shells)) {
+        shell->presentWindow();
+    }
 }
 
 void Shell::saveProperties(KConfigGroup &group)
@@ -12376,12 +12530,23 @@ void Shell::refreshReaderTabTitles()
                 part->property("thoughtsTitleProjectId").toString(), fallback)
             : fallback.isEmpty() ? part->url().fileName() : fallback;
         if (isHtmlAttachmentTab(index)) {
-            // A page's tab: the page, from its document.
+            // A page's tab: the page, from its document. A web tab: its page's title, else its host.
+            const QString path = part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString();
+            const bool web = Thoughts::LivePage::isWebPagePath(path);
             QString page;
             QMetaObject::invokeMethod(part, "htmlAttachmentTitle", Qt::DirectConnection, Q_RETURN_ARG(QString, page));
-            if (page.isEmpty()) page = QFileInfo(part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString()).completeBaseName();
+            if (page.isEmpty()) page = web ? QUrl(path).host() : QFileInfo(path).completeBaseName();
             m_tabWidget->setTabText(index, page);
-            m_tabWidget->setTabToolTip(index, title.isEmpty() ? page : i18nc("tab tooltip: page title, document title", "%1\nA page of %2", page, title));
+            const QString address = QUrl(path).toDisplayString();
+            QString tip = web ? (part->url().isEmpty() ? i18nc("tab tooltip: page title, address", "%1\n%2", page, address)
+                                                       : i18nc("tab tooltip: page title, address, document title", "%1\n%2\nOpened from %3", page, address, title))
+                : title.isEmpty() ? page
+                                  : i18nc("tab tooltip: page title, document title", "%1\nA page of %2", page, title);
+            bool keptPage = false;
+            QMetaObject::invokeMethod(part, "keepsEarlierPageVersion", Qt::DirectConnection, Q_RETURN_ARG(bool, keptPage));
+            if (keptPage) tip += QLatin1Char('\n') + i18n("A newer version is ready — click the bar or choose Show Newest Version");
+            m_tabWidget->setTabToolTip(index, tip);
+            m_tabWidget->setTabIcon(index, readerTabIcon(index));
             if (index == m_tabWidget->currentIndex()) KParts::MainWindow::setCaption(page, false);
             continue;
         }
@@ -12490,7 +12655,19 @@ bool Shell::queryClose()
             return false;
         }
     }
-    // Closed by the person (not by quitting): left out of the documents reopened at the next start.
+    // Closed by the person (not by quitting): left out of the documents reopened at the next start,
+    // and kept as the window closed last, which the Library's Viewer brings back.
+    if (!s_openSessionFrozen && !QCoreApplication::closingDown() && m_isValid) {
+        KConfig config(openSessionConfig, KConfig::SimpleConfig);
+        KConfig memory(QString(), KConfig::SimpleConfig);
+        KConfigGroup closing(&memory, closedWindowGroup);
+        if (writeOpenWindow(closing)) {
+            config.deleteGroup(closedWindowGroup);
+            KConfigGroup kept(&config, closedWindowGroup);
+            closing.copyTo(&kept);
+            config.sync();
+        }
+    }
     m_windowClosing = true;
     scheduleOpenSessionSave();
     return true;
@@ -12747,6 +12924,29 @@ void Shell::scheduleMainToolBarMaterialization()
             }
         }
     });
+}
+
+void Shell::fitZoomButtons()
+{
+    // Zoom Out and Zoom In give way first when the bar is short of room: the zoom field does the
+    // same, and the Library's buttons after them stay on the bar.
+    KToolBar *bar = toolBar(QStringLiteral("mainToolBar"));
+    if (!bar) return;
+    QList<QAction *> buttons;
+    int hidden = 0;
+    for (QAction *action : bar->actions()) {
+        if (action->objectName() != QLatin1String("view_zoom_in") && action->objectName() != QLatin1String("view_zoom_out")) continue;
+        buttons.append(action);
+        if (!action->isVisible()) {
+            QWidget *widget = bar->widgetForAction(action);
+            hidden += (widget ? widget->sizeHint().width() : bar->iconSize().width() + 8) + bar->layout()->spacing();
+        }
+    }
+    if (buttons.isEmpty()) return;
+    const bool room = bar->sizeHint().width() + hidden <= bar->width();
+    for (QAction *action : std::as_const(buttons)) {
+        if (action->isVisible() != room) action->setVisible(room);
+    }
 }
 
 void Shell::styleMainToolBarActions()
@@ -13370,7 +13570,9 @@ void Shell::openHtmlAttachmentTab(const QJsonObject &request)
 KParts::ReadWritePart *Shell::showHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request, int besideTab)
 {
     const QString path = request.value(QStringLiteral("path")).toString();
-    if (path.isEmpty() || !pdf.isLocalFile()) {
+    // A web tab of no document is only ever made for a link just followed (or Undo Close Tab).
+    const bool web = Thoughts::LivePage::isWebPagePath(path);
+    if (path.isEmpty() || (!pdf.isLocalFile() && !(web && pdf.isEmpty() && request.contains(QStringLiteral("address"))))) {
         return nullptr;
     }
     const int existing = findHtmlAttachmentTab(pdf, path);
@@ -13392,7 +13594,7 @@ KParts::ReadWritePart *Shell::showHtmlAttachmentTab(const QUrl &pdf, const QJson
     {
         const QSignalBlocker blocker(m_tabWidget);
         m_tabs.insert(index, TabState(part));
-        m_tabWidget->insertTab(index, part->widget(), QFileInfo(path).completeBaseName());
+        m_tabWidget->insertTab(index, part->widget(), web ? QUrl(path).host() : QFileInfo(path).completeBaseName());
     }
     connectPart(part);
     m_centralStackedWidget->setCurrentWidget(m_tabWidget);
@@ -13512,6 +13714,8 @@ void Shell::connectPart(const KParts::ReadWritePart *part)
     // stops keeping it when it closes, also while it is destroyed.
     connect(part, SIGNAL(keptVersionChanged(bool)), this, SLOT(refreshTabVersionMarks()), Qt::QueuedConnection); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestHtmlAttachmentTab(QJsonObject)), this, SLOT(openHtmlAttachmentTab(QJsonObject))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestWebTab(QUrl)), this, SLOT(openWebTabOfPart(QUrl))); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(htmlAttachmentTitleChanged()), this, SLOT(webTabTitleChanged())); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestCloseHtmlAttachmentTab()), this, SLOT(closeHtmlAttachmentTab())); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestOpenDocumentFeedback(QString, QString)), this, SLOT(openTrackedFeedback(QString, QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(navigationViewportChanged(bool)), this, SLOT(recordNavigationViewport(bool))); // clazy:exclude=old-style-connect
@@ -13648,6 +13852,11 @@ void Shell::undoCloseTab()
 
     // A page's tab again, next to its document's when that is open.
     if (!page.isEmpty()) {
+        // A web tab of no document: its address again.
+        if (lastTabUrl.isEmpty() && Thoughts::LivePage::isWebPagePath(page)) {
+            openWebTab(QUrl(page), QUrl(), m_tabWidget->currentIndex());
+            return;
+        }
         showHtmlAttachmentTab(lastTabUrl, {{QStringLiteral("path"), page}}, findTabIndex(lastTabUrl));
         return;
     }
@@ -13689,8 +13898,14 @@ QIcon Shell::readerTabIcon(int tab) const
 {
     if (tab < 0 || tab >= m_tabs.size() || !m_tabs.at(tab).part) return {};
     KParts::ReadWritePart *part = m_tabs.at(tab).part;
-    // A page's tab shows a page, whatever its document is, and no version of the PDF.
-    if (isHtmlAttachmentTab(tab)) return Thoughts::ReaderChrome::mergesTitleBar() ? QIcon() : QIcon::fromTheme(QStringLiteral("text-html"));
+    // A page's tab shows a page, whatever its document is, and no version of the PDF: the dot
+    // when the page keeps its version while Sync brought a newer one.
+    if (isHtmlAttachmentTab(tab)) {
+        bool keptPage = false;
+        QMetaObject::invokeMethod(part, "keepsEarlierPageVersion", Qt::DirectConnection, Q_RETURN_ARG(bool, keptPage));
+        if (keptPage) return keptVersionTabIcon();
+        return Thoughts::ReaderChrome::mergesTitleBar() ? QIcon() : QIcon::fromTheme(isWebTab(tab) ? QStringLiteral("internet-web-browser") : QStringLiteral("text-html"));
+    }
     bool kept = false;
     QMetaObject::invokeMethod(part, "keepsEarlierVersion", Qt::DirectConnection, Q_RETURN_ARG(bool, kept));
     if (kept) return keptVersionTabIcon();

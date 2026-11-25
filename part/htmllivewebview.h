@@ -53,6 +53,8 @@ public:
     // Loads @p url; its origin is the page's own from now on.
     void load(const QUrl &url);
     void reload();
+    // Stops the load under way (what shows stays); nothing is reported for it.
+    void stop();
     QUrl url() const
     {
         return m_url;
@@ -71,7 +73,8 @@ public:
 
     // Called by the native delegate (main thread).
     void nativeStarted();
-    void nativeCommitted();
+    // Shown; `redirectedTo`: where an allowed load's redirects ended, its address from now on.
+    void nativeCommitted(const QUrl &redirectedTo = QUrl());
     void nativeFinished(const QUrl &url);
     void nativeFailed(const QString &error);
     void nativeLinkRequested(const QUrl &url);

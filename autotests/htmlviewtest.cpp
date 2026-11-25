@@ -5,6 +5,7 @@
 // the web view: highlights, review mask, reveal, selection menu, answer feedback, new cards and
 // comments from a selection. THOUGHTS_HTML_SHOTS=<dir> saves screenshots of each step.
 #include "../part/htmldocumentview.h"
+#include "../part/htmllivewebview.h"
 #include "../part/htmledition.h"
 #include "../part/fedorarepository.h"
 #include "../part/htmlreader.h"
@@ -51,6 +52,8 @@
 #include <QShortcut>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTest>
 #include <cstdio>
 #include <QTimer>
@@ -118,8 +121,10 @@ private Q_SLOTS:
     void webViewAttachmentCardsAndReview();
     void webViewAttachmentFeedback();
     void livePageAsksThenLoadsWithoutTheBridge();
+    void liveViewFollowsAServersRedirectElsewhere();
     void liveSnapshotAndGoLiveAgain();
     void livePageTextFeedback();
+    void webTabsOfADocumentAndOfNone();
 
 private:
     // A Library PDF (copy of data/file1.pdf) whose generation lists `state` for its edition.
@@ -582,25 +587,43 @@ void HtmlViewTest::attachmentFollowsItsNewestVersion()
     QCOMPARE(sha256(), first.sha256);
     const QString firstUrl = url();
     QVERIFY(page.m_attachmentWatchedFiles.size() >= 1);
+    QVERIFY(!page.keepsEarlierPageVersion());
+    QSignalSpy kept(&page, &Part::keptVersionChanged);
     QTest::qWait(1000); // The file system's notifications start (FSEvents on macOS).
+    const QString ready = QStringLiteral("A newer version of this page is ready.");
 
-    // Sync brings a newer version: the PDF's bundle pointer is rewritten, and the tab shows it.
+    // Sync brings a newer version (the PDF's bundle pointer is rewritten): as a PDF, the page keeps
+    // the version on screen, the tab is marked and the bar offers the newest.
     const auto second = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The second version, with the judge.</p>"));
     QVERIFY(second.isValid() && second.sha256 != first.sha256);
+    QTRY_VERIFY_WITH_TIMEOUT(page.keepsEarlierPageVersion(), 10000);
+    QCOMPARE(kept.size(), 1);
+    QCOMPARE(kept.constLast().constFirst().toBool(), true);
+    QCOMPARE(sha256(), first.sha256);
+    QCOMPARE(page.m_attachmentView->notice(), ready);
+    // Show Newest Version on the bar: the newest, where the reader was.
+    Q_EMIT page.m_attachmentView->noticeClicked();
     QTRY_COMPARE_WITH_TIMEOUT(sha256(), second.sha256, 10000);
     QVERIFY(url() != firstUrl);
-    QCOMPARE(page.m_attachmentView->notice(), QStringLiteral("This page was updated to its newest version."));
+    QVERIFY(!page.keepsEarlierPageVersion());
+    QCOMPARE(kept.size(), 2);
+    QCOMPARE(kept.constLast().constFirst().toBool(), false);
+    QVERIFY(page.m_attachmentView->notice() != ready);
     QVERIFY(page.isHtmlAttachmentTab());
     QCOMPARE(page.m_documentStack->currentWidget(), page.m_attachmentView);
 
-    // Replaced by a rename (written beside it first), as an atomic save does.
+    // Replaced by a rename (written beside it first), as an atomic save does. A version that goes
+    // back to the one on screen leaves nothing waiting.
     const QString pointer = page.m_attachmentWatchedFiles.constLast();
     QVERIFY(QFileInfo::exists(pointer));
     const auto third = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The third version.</p>"));
     QVERIFY(third.isValid());
     const QByteArray thirdPointer = readFile(pointer);
+    QTRY_VERIFY_WITH_TIMEOUT(page.keepsEarlierPageVersion(), 10000);
+    QTest::qWait(1200); // Apart from the last write: the file system's notifications merge close ones.
     QVERIFY(addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The second version, with the judge.</p>")).isValid());
-    QTRY_COMPARE_WITH_TIMEOUT(sha256(), second.sha256, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(!page.keepsEarlierPageVersion(), 10000);
+    QCOMPARE(sha256(), second.sha256);
     QTest::qWait(1200);
     {
         QFile beside(pointer + QStringLiteral(".part"));
@@ -608,21 +631,31 @@ void HtmlViewTest::attachmentFollowsItsNewestVersion()
         QCOMPARE(beside.write(thirdPointer), thirdPointer.size());
     }
     QCOMPARE(std::rename(QFile::encodeName(pointer + QStringLiteral(".part")).constData(), QFile::encodeName(pointer).constData()), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(page.keepsEarlierPageVersion(), 10000);
+    QCOMPARE(sha256(), second.sha256);
+    QVERIFY(page.showNewestPageVersion());
     QTRY_COMPARE_WITH_TIMEOUT(sha256(), third.sha256, 10000);
+    QVERIFY(!page.showNewestPageVersion());
 
-    // While one of its cards is reviewed the page stays; it follows once the review moves on.
+    // While one of its cards is reviewed nothing changes; once the review moves on the newest is offered.
+    QTest::qWait(1200);
     page.m_attachmentReviewShown = true;
     const auto fourth = addAttachment(path, QByteArrayLiteral("<!doctype html><title>Answers</title><p>The fourth version.</p>"));
     QVERIFY(fourth.isValid());
     QTRY_VERIFY_WITH_TIMEOUT(page.m_attachmentFollowPending, 10000);
-    QCOMPARE(sha256(), third.sha256);
+    QVERIFY(!page.keepsEarlierPageVersion());
     page.clearReviewMask();
-    QTRY_COMPARE_WITH_TIMEOUT(sha256(), fourth.sha256, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(page.keepsEarlierPageVersion(), 10000);
     QVERIFY(!page.m_attachmentFollowPending);
+    QCOMPARE(sha256(), third.sha256);
+    QCOMPARE(page.m_attachmentView->notice(), ready);
+    QVERIFY(page.showNewestPageVersion());
+    QTRY_COMPARE_WITH_TIMEOUT(sha256(), fourth.sha256, 10000);
 
-    // Closed: nothing is watched any more.
+    // Closed: nothing is watched any more, nothing waits.
     page.closeHtmlAttachment();
     QVERIFY(page.m_attachmentWatchedFiles.isEmpty());
+    QVERIFY(!page.keepsEarlierPageVersion());
 }
 
 void HtmlViewTest::attachmentCardFromASelection()
@@ -1311,8 +1344,13 @@ void HtmlViewTest::webViewAttachmentCardsAndReview()
     // A thoughts-html: link of the PDF opens the page here.
     QVERIFY(part.openHtmlAttachmentLink(QUrl(QStringLiteral("thoughts-html:") + AttachmentPath)));
     QTRY_VERIFY_WITH_TIMEOUT(part.htmlAttachmentState().value(QStringLiteral("ready")).toBool(), 20000);
-    // No network for the page: WKScriptMessageHandler carries the viewer's messages.
+    // No network for the page: WKScriptMessageHandler (WebView2's postMessage on Windows) carries
+    // the viewer's messages.
+#ifdef Q_OS_WIN
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("transport")).toString(), QStringLiteral("webview2"));
+#else
     QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("transport")).toString(), QStringLiteral("webkit"));
+#endif
     const QJsonObject info = callAttachment(part, QStringLiteral("info")).toObject();
     QCOMPARE(info.value(QStringLiteral("mode")).toString(), QStringLiteral("attachment"));
     QCOMPARE(info.value(QStringLiteral("version")).toString(), QStringLiteral("0.3.0"));
@@ -1901,6 +1939,72 @@ void HtmlViewTest::webViewReviewSelectionAndCards()
     QCOMPARE(part.m_documentStack->currentWidget(), part.m_pageView.data());
 }
 
+// A site that sends a new reader through another address and back (Springer: idp.springer.com
+// sets a cookie, then the book), or a DOI that redirects to its publisher: the live view follows
+// a server's redirects of a load it allowed until the page shows, and then stays where it arrived.
+// Before, the hop elsewhere was refused as a navigation of the page's own, and the page never showed.
+void HtmlViewTest::liveViewFollowsAServersRedirectElsewhere()
+{
+    if (!Thoughts::HtmlLiveWebView::available() || qEnvironmentVariable("THOUGHTS_HTML_GUI_TEST") != QLatin1String("1")) {
+        QSKIP("needs a real web view: THOUGHTS_HTML_GUI_TEST=1 on the cocoa or windows platform");
+    }
+    // Two origins (two ports): /book on the first sends to /authorize on the second, which sends
+    // back; /doi on the first ends on the second's /article.
+    QTcpServer first, second;
+    QVERIFY(first.listen(QHostAddress::LocalHost) && second.listen(QHostAddress::LocalHost));
+    const QString firstOrigin = QStringLiteral("http://127.0.0.1:%1").arg(first.serverPort());
+    const QString secondOrigin = QStringLiteral("http://127.0.0.1:%1").arg(second.serverPort());
+    const auto serve = [](QTcpServer *server, std::function<QByteArray(const QByteArray &path)> answer) {
+        QObject::connect(server, &QTcpServer::newConnection, server, [server, answer] {
+            while (QTcpSocket *socket = server->nextPendingConnection()) {
+                QObject::connect(socket, &QTcpSocket::readyRead, socket, [socket, answer] {
+                    const QByteArray request = socket->readAll();
+                    const QByteArray path = request.split(' ').value(1);
+                    socket->write(answer(path));
+                    socket->disconnectFromHost();
+                });
+            }
+        });
+    };
+    const auto redirect = [](const QString &to) -> QByteArray { return QByteArray("HTTP/1.1 302 Found\r\nLocation: ") + to.toUtf8() + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; };
+    const auto page = [](const QByteArray &title) -> QByteArray {
+        const QByteArray body = "<!doctype html><title>" + title + "</title><p>" + title + "</p>";
+        return QByteArray("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ") + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    };
+    serve(&first, [&](const QByteArray &path) -> QByteArray {
+        if (path.startsWith("/book?cookie=set")) return page("The book");
+        if (path == "/book") return redirect(secondOrigin + QStringLiteral("/authorize"));
+        if (path == "/doi") return redirect(secondOrigin + QStringLiteral("/article"));
+        return page("Elsewhere on the first");
+    });
+    serve(&second, [&](const QByteArray &path) -> QByteArray {
+        if (path == "/authorize") return redirect(firstOrigin + QStringLiteral("/book?cookie=set"));
+        return page("The article");
+    });
+
+    Thoughts::HtmlLiveWebView view;
+    QSignalSpy committed(&view, &Thoughts::HtmlLiveWebView::loadCommitted);
+    QSignalSpy finished(&view, &Thoughts::HtmlLiveWebView::loadFinished);
+    QSignalSpy elsewhere(&view, &Thoughts::HtmlLiveWebView::linkRequested);
+    QSignalSpy failed(&view, &Thoughts::HtmlLiveWebView::loadFailed);
+    view.load(QUrl(firstOrigin + QStringLiteral("/book")));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.size() >= 1, 15000);
+    QCOMPARE(finished.last().at(0).toUrl(), QUrl(firstOrigin + QStringLiteral("/book?cookie=set")));
+    QVERIFY(committed.size() >= 1);
+    QCOMPARE(elsewhere.size(), 0);
+    QCOMPARE(failed.size(), 0);
+    // The page itself still cannot leave for another site on its own.
+    QVERIFY(!view.nativeAllows(QUrl(secondOrigin + QStringLiteral("/other")), true));
+
+    // A DOI-like redirect that ends elsewhere: the page shows there, and its own site is now the second.
+    finished.clear();
+    view.load(QUrl(firstOrigin + QStringLiteral("/doi")));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.size() >= 1, 15000);
+    QCOMPARE(finished.last().at(0).toUrl(), QUrl(secondOrigin + QStringLiteral("/article")));
+    QCOMPARE(elsewhere.size(), 0);
+    QVERIFY(view.nativeAllows(QUrl(secondOrigin + QStringLiteral("/other")), true));
+}
+
 void HtmlViewTest::livePageAsksThenLoadsWithoutTheBridge()
 {
     // A live page (19 November: pages are embedded or live): its stub names an
@@ -1972,7 +2076,9 @@ void HtmlViewTest::livePageAsksThenLoadsWithoutTheBridge()
     QCOMPARE(part.m_attachmentView->transportKind(), QStringLiteral("live"));
     state = part.htmlAttachmentState();
     QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
-    QCOMPARE(state.value(QStringLiteral("message")).toString(), QStringLiteral("This live page is at http://localhost:18770/, which this device cannot reach."));
+    // Why, as the web view said it (here: there is none).
+    QCOMPARE(state.value(QStringLiteral("message")).toString(),
+             QStringLiteral("This live page is at http://localhost:18770/, which this device cannot reach.\nthere is no web view for live pages here"));
     QCOMPARE(state.value(QStringLiteral("message_action")).toString(), QStringLiteral("Retry"));
     QVERIFY(!state.value(QStringLiteral("snapshot_enabled")).toBool());
     QCOMPARE(state.value(QStringLiteral("snapshot_tip")).toString(), QStringLiteral("Works once the page is shown."));
@@ -2415,6 +2521,132 @@ void HtmlViewTest::livePageTextFeedback()
     QVERIFY(Thoughts::DocumentFeedback::shownOn(note, pdfSha, reloadedVersion));
     // An embedded page has no load: its version is the page itself.
     QCOMPARE(Thoughts::DocumentFeedback::attachmentVersionOf(embedded.sha256), embedded.sha256);
+}
+
+void HtmlViewTest::webTabsOfADocumentAndOfNone()
+{
+    // Web tabs (a site opened from a link belongs in a tab, and its selection gets the PDF's
+    // feedback): a web address as a live page of the document whose link
+    // opened it, with no stub in the Library and no question for its origin; its feedback names
+    // its address as the page. An agent note's link has no document: no feedback.
+    QCOMPARE(Thoughts::LivePage::webPagePath(QUrl(QStringLiteral("https://logs.example.org/run/7?x=1#:~:text=loss"))), QStringLiteral("https://logs.example.org/run/7?x=1"));
+    QVERIFY(Thoughts::LivePage::webPagePath(QUrl(QStringLiteral("ftp://logs.example.org/"))).isEmpty());
+    QVERIFY(Thoughts::LivePage::webPagePath(QUrl(QString(QStringLiteral("https://logs.example.org/") + QString(1100, QLatin1Char('a'))))).isEmpty());
+    QVERIFY(Thoughts::LivePage::isWebPagePath(QStringLiteral("http://localhost:8000/")));
+    QVERIFY(!Thoughts::LivePage::isWebPagePath(AttachmentPath));
+    if (Thoughts::HtmlDocumentView::webViewAvailable()) {
+        QSKIP("drives the web tab's load by hand: offscreen only");
+    }
+    const QString path = addLibraryPdf(QStringLiteral("runs-web"), QStringLiteral("source_linked"), {});
+    Thoughts::LivePage::forgetOrigins();
+    Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    OpenedLinks opened;
+    for (const char *scheme : {"https", "http", "mailto"}) QDesktopServices::setUrlHandler(QString::fromLatin1(scheme), &opened, "open");
+    const auto restore = qScopeGuard([] {
+        Part::setHtmlAttachmentsWithoutWebViewForTesting(false);
+        Part::setLivePagePictureForTesting(QImage());
+        for (const char *scheme : {"https", "http", "mailto"}) QDesktopServices::unsetUrlHandler(QString::fromLatin1(scheme));
+    });
+    const QUrl address(QStringLiteral("http://localhost:8000/report?page=7#:~:text=results"));
+    const QString webPath = QStringLiteral("http://localhost:8000/report?page=7");
+    Part part(nullptr, {});
+    part.setProperty("thoughtsHtmlAttachmentTab", webPath);
+    QVERIFY(part.openHtmlAttachmentTab(QUrl::fromLocalFile(path), {{QStringLiteral("path"), webPath}, {QStringLiteral("address"), address.toString()}}));
+    QVERIFY(part.m_document->isOpened());
+    QVERIFY(part.isWebTab());
+    QVariantMap state = part.htmlAttachmentState();
+    QVERIFY(state.value(QStringLiteral("web")).toBool());
+    QVERIFY(state.value(QStringLiteral("live")).toBool());
+    QCOMPARE(state.value(QStringLiteral("path")).toString(), webPath);
+    QCOMPARE(state.value(QStringLiteral("sha256")).toString(), Thoughts::LivePage::webPageSha256(webPath));
+    // The address itself, its text fragment too, and nothing asked: the reader clicked the link.
+    QCOMPARE(state.value(QStringLiteral("live_url")).toString(), address.toString());
+    QVERIFY(!Thoughts::LivePage::originAllowed(QStringLiteral("http://localhost:8000")));
+    // Offscreen it is not reached: why, and Retry.
+    QCOMPARE(state.value(QStringLiteral("live_state")).toString(), QStringLiteral("unreachable"));
+    QCOMPARE(state.value(QStringLiteral("message")).toString(), address.toDisplayString() + QStringLiteral(" could not be loaded.\nthere is no web view for live pages here"));
+    QCOMPARE(state.value(QStringLiteral("message_action")).toString(), QStringLiteral("Retry"));
+    // Its bar: the address, Reload, Open in Browser and Close; no Take Snapshot (no Library page).
+    QCOMPARE(state.value(QStringLiteral("live_bar")).toString(), webPath);
+    const auto button = [&part](const char *name) { return part.m_attachmentView->findChild<QToolButton *>(QString::fromLatin1(name)); };
+    QVERIFY(!button("thoughtsHtmlLiveReload")->isHidden());
+    QVERIFY(button("thoughtsHtmlLiveTakeSnapshot")->isHidden());
+    QCOMPARE(button("thoughtsHtmlShowPdf")->text(), QStringLiteral("Close"));
+    QCOMPARE(part.htmlAttachmentTitle(), QStringLiteral("localhost"));
+
+    // Loaded: named after the page (offscreen its title cannot be read: its host).
+    Q_EMIT part.m_attachmentView->liveLoaded(address);
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_state")).toString(), QStringLiteral("loaded"));
+    QCOMPARE(part.htmlAttachmentTitle(), QStringLiteral("localhost"));
+
+    // The PDF's feedback on its selection, in the document the link was in.
+    auto *overlay = part.m_pageView->documentFeedback();
+    overlay->clear();
+    QList<QJsonObject> written;
+    overlay->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    const QString pdfSha = sha(readFile(path));
+    overlay->setDocument(DocumentId, pdfSha);
+    overlay->setReviewVersion({{QStringLiteral("pdf_sha256"), pdfSha}, {QStringLiteral("source_built"), false}});
+    QVERIFY(part.liveSelectionFeedbackOffered());
+    const QJsonObject selection = Thoughts::HtmlAttachmentReader::liveSelection(QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("exact"), QStringLiteral("watchdog reset at 12:04")}, {QStringLiteral("prefix"), QStringLiteral("log 7: ")}, {QStringLiteral("suffix"), QStringLiteral(" then")},
+        {QStringLiteral("hash"), QString()}}).toJson(QJsonDocument::Compact)));
+    QMenu menu;
+    part.addLiveSelectionMenuActions(&menu, selection);
+    QStringList names;
+    for (const QAction *action : menu.actions()) names.append(action->isSeparator() ? QStringLiteral("|") : action->objectName());
+    QCOMPARE(names, QStringList({QStringLiteral("attachmentFeedbackLike"), QStringLiteral("attachmentFeedbackDislike"), QStringLiteral("attachmentFeedbackQuestion"),
+                                 QStringLiteral("attachmentFeedbackComment"), QStringLiteral("|"), QStringLiteral("attachmentCopy")}));
+    QImage shown(400, 300, QImage::Format_RGB32);
+    shown.fill(Qt::white);
+    Part::setLivePagePictureForTesting(shown);
+    for (QAction *action : menu.actions()) {
+        if (action->objectName() == QLatin1String("attachmentFeedbackLike")) action->trigger();
+    }
+    QCOMPARE(written.size(), 1);
+    const QJsonObject liked = written.constLast();
+    QVERIFY2(Thoughts::DocumentFeedback::validationError(liked).isEmpty(), qPrintable(Thoughts::DocumentFeedback::validationError(liked)));
+    QCOMPARE(liked.value(QStringLiteral("view")).toString(), QStringLiteral("html_attachment"));
+    const QJsonObject anchor = liked.value(QStringLiteral("anchor")).toObject();
+    QCOMPARE(anchor.value(QStringLiteral("html_attachment")).toObject(),
+             QJsonObject({{QStringLiteral("path"), webPath}, {QStringLiteral("sha256"), Thoughts::LivePage::webPageSha256(webPath)}}));
+    QCOMPARE(anchor.value(QStringLiteral("live")).toObject().value(QStringLiteral("address")).toString(), address.toString());
+    QCOMPARE(anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("document_id")).toString(), DocumentId);
+    QCOMPARE(anchor.value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString(), QStringLiteral("watchdog reset at 12:04"));
+    // On this load of the page, as feedback on a live page.
+    QVERIFY(Thoughts::DocumentFeedback::shownOn(liked, pdfSha, part.attachmentVersion(webPath)));
+    // Its row is this page, already shown.
+    part.showFeedback(liked.value(QStringLiteral("feedback_id")).toString(), false);
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("path")).toString(), webPath);
+
+    // A link the reader clicks stays in the tab, the page's own and another site's; mail goes
+    // outside; one the page follows by itself is refused.
+    const QUrl other(QStringLiteral("https://wiki.example.org/watchdog"));
+    part.openAttachmentLink(other, true);
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_url")).toString(), other.toString());
+    QCOMPARE(part.property("thoughtsHtmlAttachmentTab").toString(), other.toString());
+    QCOMPARE(part.htmlAttachmentTitle(), QStringLiteral("wiki.example.org"));
+    QVERIFY(opened.urls.isEmpty());
+    part.openAttachmentLink(QUrl(QStringLiteral("mailto:ops@example.org")), true);
+    QCOMPARE(opened.urls, QList<QUrl>{QUrl(QStringLiteral("mailto:ops@example.org"))});
+    part.openAttachmentLink(QUrl(QStringLiteral("https://collector.example.org/?x")), false);
+    QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_url")).toString(), other.toString());
+    QCOMPARE(opened.urls.size(), 1);
+    // Open in Browser: what the tab shows now.
+    button("thoughtsHtmlOpenInBrowser")->click();
+    QCOMPARE(opened.urls.constLast(), other);
+
+    // An agent note's link: a web tab of no document, without feedback.
+    Part note(nullptr, {});
+    QVERIFY(note.openHtmlAttachmentTab(QUrl(), {{QStringLiteral("path"), webPath}, {QStringLiteral("address"), address.toString()}}));
+    QVERIFY(!note.m_document->isOpened());
+    QVERIFY(note.isWebTab());
+    QVERIFY(note.htmlAttachmentState().value(QStringLiteral("live")).toBool());
+    Q_EMIT note.m_attachmentView->liveLoaded(address);
+    QVERIFY(!note.liveSelectionFeedbackOffered());
 }
 }
 

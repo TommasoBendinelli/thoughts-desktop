@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
-// The HTML view of a document (spec "Desktop"): a lazily created Qt WebView QWebView (WKWebView /
-// WebView2) in a window container, showing an HTML edition served by HtmlEditionServer, with the
+// The HTML view of a document (spec "Desktop"): a lazily created Qt WebView QWebView (WKWebView;
+// on Windows HtmlPageWebView, a WebView2 of Thoughts' own with the same interface) in a window
+// container, showing an HTML edition served by HtmlEditionServer, with the
 // shared viewer (part/html-viewer) injected by runJavaScript. App -> viewer: call(); viewer -> app:
 // viewerMessage() (HTTP POST /<token>/msg, delivered in the viewer's seq order).
 //
@@ -37,7 +38,8 @@ public:
     explicit HtmlDocumentView(QWidget *parent = nullptr);
     ~HtmlDocumentView() override;
 
-    // False when this build has no Qt WebView (THOUGHTS_HTML_VIEW off).
+    // False when this build has no web view for pages (Qt WebView, THOUGHTS_HTML_VIEW, or on
+    // Windows WebView2 with its runtime), and on the offscreen and minimal platforms.
     static bool webViewAvailable();
 
     // Replaces the page by a centred message ("HTML is being built", "HTML not available: …"),
@@ -53,15 +55,17 @@ public:
     QString loadedBundleDir() const;
     // An HTML attachment (a standalone page that runs its own scripts), already served at `url`
     // with the attachment sandbox CSP (connect-src 'none'): the viewer runs in attachment mode
-    // and talks over WKScriptMessageHandler on macOS, else by polling ThoughtsViewer.drain()
+    // and talks over WKScriptMessageHandler on macOS (WebView2's postMessage on Windows), else by
+    // polling ThoughtsViewer.drain()
     // (the http transport would need connect-src). Navigation away from the page is stopped:
     // web links go to externalLinkRequested().
     void loadAttachment(const QUrl &url, const QJsonObject &options);
     // A live page (thoughts-server protocol/html-live-pages.md §2): `url` in a web view of its
     // own (HtmlLiveWebView: the network and the page's scripts, a non-persistent data store, no
     // viewer and no message handler), never in the one of embedded pages, which shows nothing
-    // meanwhile. "Loading…" until the page shows; then liveLoaded, or liveLoadFailed. Links to
-    // other origins arrive as externalLinkRequested.
+    // meanwhile. "Loading…" until the page shows; then liveLoaded, or liveLoadFailed (also when
+    // nothing showed within liveLoadTimeoutMilliseconds: a tunnel that takes the connection and
+    // never answers). Links to other origins arrive as externalLinkRequested.
     Q_INVOKABLE void loadLive(const QUrl &url);
     bool isLive() const
     {
@@ -77,6 +81,7 @@ public:
     }
     // Reload (and Retry): the page again, or its address after a failure.
     Q_INVOKABLE void reloadLive();
+    static constexpr int liveLoadTimeoutMilliseconds = 30000;
     // Runs `body`, an async function body with the argument argsJson (@p args), in the live page's
     // isolated script world (Take Snapshot, reading the selection).
     void callLive(const QString &body, const QJsonObject &args, std::function<void(bool ok, const QString &result, const QString &error)> done);
@@ -95,7 +100,8 @@ public:
     {
         return m_pageUrl;
     }
-    // "webkit", "queue" (polling) or "http" (an edition); empty before a page was loaded.
+    // "webkit" (macOS), "webview2" (Windows), "queue" (polling) or "http" (an edition); empty
+    // before a page was loaded.
     QString transportKind() const
     {
         return m_transportKind;
@@ -136,8 +142,8 @@ public:
     bool selectionActionEnabled() const;
     QString selectionActionToolTip() const;
     // A live page's bar: `text` ("Live · <address>") with Reload and Take Snapshot (enabled as
-    // set by setTakeSnapshotAction); an empty text hides them.
-    void setLiveBar(const QString &text);
+    // set by setTakeSnapshotAction; not at all without @p takeSnapshot); an empty text hides them.
+    void setLiveBar(const QString &text, bool takeSnapshot = true);
     QString liveBarText() const;
     void setTakeSnapshotAction(bool enabled, const QString &toolTip);
     bool takeSnapshotEnabled() const;
@@ -232,8 +238,11 @@ private:
     bool m_live = false;
     bool m_liveLoaded = false;
     QUrl m_liveUrl;
+    // Started with each load of the live page, stopped when it shows or fails.
+    QTimer m_liveTimeout;
+    void startLiveLoad();
     QWidget *m_container = nullptr;
-    QWindow *m_web = nullptr; // QWebView (a QWindow) when Qt WebView is available
+    QWindow *m_web = nullptr; // QWebView, or HtmlPageWebView on Windows (a QWindow), when there is a web view
     HtmlEditionServer *m_server = nullptr;
     QJsonObject m_loadOptions;
     QString m_bundleDir;

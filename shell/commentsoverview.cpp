@@ -4122,7 +4122,12 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
     m_syncButton->setObjectName(QStringLiteral("commentsOverviewSync"));
     m_syncButton->setToolTip(i18n("Publish source edits, synchronize changes, and update only PDFs whose build inputs changed"));
     m_syncButton->setAutoDefault(false);
+    m_viewerButton = new QPushButton(QIcon::fromTheme(QStringLiteral("document-preview")), i18n("Viewer"), this);
+    m_viewerButton->setObjectName(QStringLiteral("commentsOverviewViewer"));
+    m_viewerButton->setToolTip(i18n("Show the reader with the documents open in it, or the ones open when it was last closed"));
+    m_viewerButton->setAutoDefault(false);
     headingLayout->addWidget(m_syncButton);
+    headingLayout->addWidget(m_viewerButton);
     headingLayout->addWidget(m_agentNotesButton);
     headingLayout->addWidget(m_reviewCardsButton);
     layout->addLayout(headingLayout);
@@ -4904,6 +4909,7 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
     });
     connect(m_reviewCardsButton, &QPushButton::clicked, this, &CommentsOverview::reviewOverviewRequested);
     connect(m_agentNotesButton, &QPushButton::clicked, this, &CommentsOverview::agentNotesRequested);
+    connect(m_viewerButton, &QPushButton::clicked, this, &CommentsOverview::viewerRequested);
     connect(m_syncButton, &QPushButton::clicked, this, &CommentsOverview::syncRequested);
     // As in the reader; a disabled button ignores it, so a running Sync is not started again.
     auto *syncShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_S), this);

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!DOCTYPE gui SYSTEM "kpartgui.dtd">
-<gui version="49" name="okular_shell" >
+<gui version="50" name="okular_shell" >
  <MenuBar>
   <Menu name="file" >
    <text>&amp;File</text>
@@ -50,7 +50,9 @@
   <Action name="page_number"/>
   <Action name="go_document_forward"/>
   <Spacer/>
+  <Action name="view_zoom_out"/>
   <Action name="zoom_to"/>
+  <Action name="view_zoom_in"/>
   <Action name="pdf_library_status"/>
   <Action name="comments_overview"/>
   <Action name="review_overview"/>

@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QStringList>
+#include <QUrl>
 
 namespace Thoughts
 {
@@ -92,6 +93,20 @@ inline QString agentDocumentDescription(const QString &docsRoot, const QJsonArra
     }
     const QString documentId = document.value(QStringLiteral("document_id")).toString();
     if (!documentId.isEmpty()) lines.append(QStringLiteral("Document ID: %1").arg(documentId));
+    QString selection = selectedText;
+    selection.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
+    selection = selection.trimmed();
+    if (!selection.isEmpty()) lines.append(QStringLiteral("Selected text: \"%1\"").arg(selection));
+    return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
+}
+
+// "Copy for agent" on a web tab, after the description of the document whose link opened it: the
+// web page (its title, its address now) and the text selected in it. Its feedback names its
+// address as its page path.
+inline QString agentWebPageDescription(const QString &title, const QString &address, const QString &selectedText)
+{
+    QStringList lines{QStringLiteral("Web page: \"%1\"").arg(title.isEmpty() ? QUrl(address).host() : title)};
+    lines.append(QStringLiteral("Address: %1 (a link of the document opened it in Thoughts; loaded from the network on this device, not kept in the Library)").arg(address));
     QString selection = selectedText;
     selection.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
     selection = selection.trimmed();

@@ -12,6 +12,8 @@
 #include <QPointer>
 #include <QWindow>
 
+#include <utility>
+
 #import <AppKit/AppKit.h>
 #import <WebKit/WebKit.h>
 
@@ -19,6 +21,10 @@
 {
 @public
     QPointer<Thoughts::HtmlLiveWebView> owner;
+    // A load this view allowed is under way and has not shown yet: the site's own hops on the way
+    // (a sign-in or cookie redirect, a DOI to its publisher) are followed.
+    BOOL hopping;
+    QUrl lastHop;
 }
 @end
 
@@ -86,7 +92,18 @@ bool ignoredError(NSError *error)
         return;
     }
     const bool mainFrame = action.targetFrame.isMainFrame;
+    // A server's redirect of an allowed load (navigation type "other" before anything shows):
+    // Springer, for one, sends every new reader through idp.springer.com and back.
+    if (mainFrame && hopping && action.navigationType == WKNavigationTypeOther) {
+        lastHop = target;
+        decisionHandler(WKNavigationActionPolicyAllow);
+        return;
+    }
     if (view->nativeAllows(target, mainFrame)) {
+        if (mainFrame) {
+            hopping = YES;
+            lastHop = QUrl();
+        }
         decisionHandler(WKNavigationActionPolicyAllow);
         return;
     }
@@ -114,7 +131,9 @@ bool ignoredError(NSError *error)
 {
     Q_UNUSED(webView)
     Q_UNUSED(navigation)
-    later(owner.data(), [](Thoughts::HtmlLiveWebView *self) { self->nativeCommitted(); });
+    hopping = NO;
+    const QUrl arrived = std::exchange(lastHop, QUrl());
+    later(owner.data(), [arrived](Thoughts::HtmlLiveWebView *self) { self->nativeCommitted(arrived); });
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
@@ -128,6 +147,7 @@ bool ignoredError(NSError *error)
 {
     Q_UNUSED(webView)
     Q_UNUSED(navigation)
+    hopping = NO;
     if (ignoredError(error)) {
         return;
     }
@@ -339,6 +359,14 @@ void HtmlLiveWebView::reload()
     [state->web reload];
 }
 
+void HtmlLiveWebView::stop()
+{
+    Native *state = native(m_native);
+    if (state) {
+        [state->web stopLoading];
+    }
+}
+
 void HtmlLiveWebView::callAsync(const QString &body, const QJsonObject &args, std::function<void(bool, const QString &, const QString &)> done)
 {
     Native *state = native(m_native);
@@ -411,8 +439,11 @@ void HtmlLiveWebView::nativeStarted()
     Q_EMIT loadStarted();
 }
 
-void HtmlLiveWebView::nativeCommitted()
+void HtmlLiveWebView::nativeCommitted(const QUrl &redirectedTo)
 {
+    // A load that a server sent elsewhere (a DOI to its publisher): the page's own navigations
+    // stay within where it arrived.
+    if (redirectedTo.isValid()) m_url = redirectedTo;
     Q_EMIT loadCommitted();
 }
 

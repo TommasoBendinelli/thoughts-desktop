@@ -647,10 +647,10 @@ if(BUILD_DESKTOP)
   find_package(Qt6WebView ${QT_REQUIRED_VERSION} CONFIG QUIET)
   option(THOUGHTS_HTML_VIEW "Build the HTML view with Qt WebView" ${Qt6WebView_FOUND})
   if(WIN32)
-    # Live HTML pages on Windows (part/htmllivewebview_win.cpp): Microsoft Edge WebView2, from the
-    # build/native folder of Microsoft's Microsoft.Web.WebView2 NuGet package (include/, x64/).
-    # Without it live pages open in the browser.
-    set(THOUGHTS_WEBVIEW2_SDK "" CACHE PATH "build/native folder of the Microsoft.Web.WebView2 NuGet package (live HTML pages)")
+    # Live pages, embedded pages and HTML editions on Windows (part/*_win.cpp): Microsoft Edge
+    # WebView2, from the build/native folder of Microsoft's Microsoft.Web.WebView2 NuGet package
+    # (include/, x64/). Without it they open in the browser.
+    set(THOUGHTS_WEBVIEW2_SDK "" CACHE PATH "build/native folder of the Microsoft.Web.WebView2 NuGet package (HTML pages)")
   endif()
   add_library(thoughtshtmlview STATIC
     part/htmledition.cpp
@@ -807,7 +807,9 @@ if(THOUGHTS_HTML_VIEW AND APPLE)
     target_sources(okularpart PRIVATE part/htmlmacnative.mm part/htmllivewebview_mac.mm)
     target_link_libraries(okularpart "-framework WebKit" "-framework AppKit")
 elseif(WIN32 AND THOUGHTS_WEBVIEW2_SDK)
-    # A WebView2, with Microsoft's loader linked in (no WebView2Loader.dll to ship).
+    # A WebView2, with Microsoft's loader linked in (no WebView2Loader.dll to ship). Embedded
+    # pages and HTML editions get one too (part/htmlpagewebview_win.cpp, QWebView's interface for
+    # HtmlDocumentView), since Qt WebView has no backend here.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
         set(_webview2_arch arm64)
     elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -819,7 +821,9 @@ elseif(WIN32 AND THOUGHTS_WEBVIEW2_SDK)
     if(NOT EXISTS "${THOUGHTS_WEBVIEW2_SDK}/include/WebView2.h" OR NOT EXISTS "${_webview2_loader}")
         message(FATAL_ERROR "THOUGHTS_WEBVIEW2_SDK (${THOUGHTS_WEBVIEW2_SDK}) has no include/WebView2.h or ${_webview2_arch}/WebView2LoaderStatic.lib")
     endif()
-    target_sources(okularpart PRIVATE part/htmllivewebview_win.cpp)
+    target_sources(okularpart PRIVATE part/webview2host_win.cpp part/webview2host_win.h part/htmllivewebview_win.cpp
+        part/htmlpagewebview_win.cpp part/htmlpagewebview_win.h)
+    target_compile_definitions(okularpart PRIVATE THOUGHTS_HAVE_WEBVIEW2=1)
     target_include_directories(okularpart SYSTEM PRIVATE "${THOUGHTS_WEBVIEW2_SDK}/include")
     target_link_libraries(okularpart "${_webview2_loader}" advapi32 ole32 user32)
 else()

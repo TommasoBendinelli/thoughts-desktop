@@ -38,6 +38,7 @@
 
 #include <KActionCollection>
 #include <KActionMenu>
+#include <KSelectAction>
 #include <KConfigGroup>
 #include <KEditToolBar>
 #include <KLineEdit>
@@ -557,6 +558,7 @@ private Q_SLOTS:
     void testMenusListEachEntryOnce();
     void testNoteWebLinkFallsBackToTheBrowser();
     void testReopensTheDocumentsOpenWhenItLastClosed();
+    void testLibraryViewerShowsTheReader();
     void testEditSourceAndAMinimizedWindowComesBack();
     void testTabRevealInFinderAction();
     void testKeptEarlierVersionInCopyForAgentAndHistory();
@@ -724,6 +726,7 @@ private Q_SLOTS:
     void testDocumentTabsShareTheBarEvenly();
     // Last: pages of HTML attachments in tabs of their own (a Library PDF of the test home).
     void testHtmlAttachmentLinkOpensItsOwnTab();
+    void testHtmlPageTabMarksANewerVersion();
     void testHtmlAttachmentCardAndFeedbackOpenInItsTab();
     void testHtmlLivePageTabAndGoLiveAgain();
 
@@ -2196,6 +2199,59 @@ void MainShellTest::testReopensTheDocumentsOpenWhenItLastClosed()
     Okular::Settings::self()->setReopenLastSession(true);
 }
 
+// The Library's Viewer, between Sync and Agent notes: the reader with the documents open in it,
+// even minimized or hidden; with none open, the window the person closed last, with its documents.
+void MainShellTest::testLibraryViewerShowsTheReader()
+{
+    const QString first = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    const QString second = QStringLiteral(KDESRCDIR "data/simple-multipage.pdf");
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({first, second}, options), Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    QTRY_COMPARE(s->m_tabs.size(), 2);
+    s->setActiveTab(1);
+
+    s->showCommentsOverview(false);
+    QVERIFY(Shell::s_commentsOverview);
+    auto *const viewer = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewViewer"));
+    auto *const sync = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewSync"));
+    auto *const notes = Shell::s_commentsOverview->findChild<QPushButton *>(QStringLiteral("commentsOverviewAgentNotes"));
+    QVERIFY(viewer && sync && notes);
+    QCOMPARE(viewer->text(), QStringLiteral("Viewer"));
+    QTRY_VERIFY(viewer->isVisible());
+    QVERIFY(sync->x() < viewer->x());
+    QVERIFY(viewer->x() < notes->x());
+
+    // Minimized, then hidden: the same window comes back with both tabs.
+    s->setWindowState(s->windowState() | Qt::WindowMinimized);
+    QTRY_VERIFY(s->isMinimized());
+    QTest::mouseClick(viewer, Qt::LeftButton);
+    QTRY_VERIFY(!s->isMinimized());
+    QVERIFY(s->isVisible());
+    s->hide();
+    QTest::mouseClick(viewer, Qt::LeftButton);
+    QTRY_VERIFY(s->isVisible());
+    QCOMPARE(findShell(), s);
+    QCOMPARE(s->m_tabs.size(), 2);
+
+    // Closed by the person: the Viewer reopens its documents, the second tab in front.
+    QVERIFY(s->queryClose());
+    delete s;
+    QVERIFY(!findShell());
+    // The record of open windows has none now; the closed one is kept apart.
+    Shell::saveOpenSession();
+    QTest::mouseClick(viewer, Qt::LeftButton);
+    Shell *back = nullptr;
+    QTRY_VERIFY((back = findShell()));
+    QTRY_COMPARE(back->m_tabs.size(), 2);
+    QVERIFY(back->isVisible());
+    QCOMPARE(QFileInfo(back->m_tabs.at(0).part->url().toLocalFile()).canonicalFilePath(), QFileInfo(first).canonicalFilePath());
+    QCOMPARE(QFileInfo(back->m_tabs.at(1).part->url().toLocalFile()).canonicalFilePath(), QFileInfo(second).canonicalFilePath());
+    QCOMPARE(back->m_tabWidget->currentIndex(), 1);
+}
+
 namespace
 {
 class UrlCatcher : public QObject
@@ -2312,8 +2368,12 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     QVERIFY(oldMenu.contains("<Action name=\"edit_source\"/>"));
     oldMenu.replace("  <Action name=\"edit_source\"/>\n", "");
     oldMenu.replace("   <Action name=\"edit_source\" append=\"open_merge\" />\n", "");
-    QVERIFY(oldMenu.contains("<gui version=\"49\""));
-    oldMenu.replace("<gui version=\"49\"", "<gui version=\"42\"");
+    QVERIFY(oldMenu.contains("<Action name=\"view_zoom_out\"/>"));
+    oldMenu.replace("  <Action name=\"view_zoom_out\"/>\n", "");
+    QVERIFY(oldMenu.contains("<Action name=\"view_zoom_in\"/>"));
+    oldMenu.replace("  <Action name=\"view_zoom_in\"/>\n", "");
+    QVERIFY(oldMenu.contains("<gui version=\"50\""));
+    oldMenu.replace("<gui version=\"50\"", "<gui version=\"42\"");
     // A layout saved while "A/B testing" existed (v36-v45) has it in the toolbar and the File menu.
     QVERIFY(!oldMenu.contains("ab_testing"));
     oldMenu.replace("  <Action name=\"review_overview\"/>\n", "  <Action name=\"review_overview\"/>\n  <Action name=\"ab_testing\"/>\n");
@@ -2341,7 +2401,12 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     savedMenu.close();
     QVERIFY(migrated.contains("name=\"copy_for_agent\""));
     QVERIFY(migrated.indexOf("copy_for_agent") > migrated.indexOf("review_overview"));
-    QVERIFY(migrated.contains("version=\"49\""));
+    QVERIFY(migrated.contains("version=\"50\""));
+    // v50: Zoom Out before the zoom field, Zoom In after it.
+    QCOMPARE(migrated.count("name=\"view_zoom_out\""), 1);
+    QCOMPARE(migrated.count("name=\"view_zoom_in\""), 1);
+    QVERIFY(migrated.indexOf("view_zoom_out") < migrated.indexOf("\"zoom_to\""));
+    QVERIFY(migrated.indexOf("view_zoom_in") > migrated.indexOf("\"zoom_to\""));
     // v49: Edit Source in VS Code after the document title and in File.
     QCOMPARE(migrated.count("name=\"edit_source\""), 2);
     QVERIFY(migrated.indexOf("name=\"edit_source\"", migrated.indexOf("document_title")) > migrated.indexOf("document_title"));
@@ -6125,8 +6190,32 @@ void MainShellTest::testReaderBarHoldsTitleAndTools()
     QCOMPARE(indexOf(QStringLiteral("mouse_draw")), indexOf(QStringLiteral("mouse_select")) + 1);
     QCOMPARE(indexOf(QStringLiteral("mouse_text_box")), indexOf(QStringLiteral("mouse_draw")) + 1);
     QCOMPARE(indexOf(QStringLiteral("document_title")), indexOf(QStringLiteral("mouse_text_box")) + 1);
-    QCOMPARE(indexOf(QStringLiteral("zoom_to")), indexOf(QStringLiteral("pdf_library_status")) - 1);
+    // Zoom Out, the zoom field, Zoom In, then the Library's status.
+    QCOMPARE(indexOf(QStringLiteral("view_zoom_out")), indexOf(QStringLiteral("zoom_to")) - 1);
+    QCOMPARE(indexOf(QStringLiteral("view_zoom_in")), indexOf(QStringLiteral("zoom_to")) + 1);
+    QCOMPARE(indexOf(QStringLiteral("view_zoom_in")), indexOf(QStringLiteral("pdf_library_status")) - 1);
     QVERIFY(indexOf(QStringLiteral("zoom_to")) > indexOf(QStringLiteral("page_number")));
+    {
+        // The buttons change the zoom of the page.
+        auto *zoomPart = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+        QVERIFY(zoomPart);
+        QAction *zoomIn = toolbar->actions().at(indexOf(QStringLiteral("view_zoom_in")));
+        QAction *zoomOut = toolbar->actions().at(indexOf(QStringLiteral("view_zoom_out")));
+        QVERIFY(zoomIn->isVisible() && zoomOut->isVisible());
+        auto *field = qobject_cast<KSelectAction *>(zoomPart->actionCollection()->action(QStringLiteral("zoom_to")));
+        QVERIFY(field);
+        // Each press changes the zoom the field shows (a percentage after the first one).
+        const auto shown = [field] { return QString(field->currentText()).remove(QLatin1Char('&')).trimmed(); };
+        const QString before = shown();
+        zoomIn->trigger();
+        QTRY_VERIFY(shown() != before);
+        const QString larger = shown();
+        QVERIFY2(larger.endsWith(QLatin1Char('%')), qPrintable(larger));
+        zoomOut->trigger();
+        QTRY_VERIFY(shown() != larger);
+        const auto value = [](const QString &text) { return QString(text).remove(QLatin1Char('%')).trimmed().toDouble(); };
+        QVERIFY2(value(shown()) < value(larger), qPrintable(shown() + QStringLiteral(" after ") + larger));
+    }
 
     // Only a window whose title bar is merged leaves room for the window buttons.
     QCOMPARE(toolbar->actions().at(0)->isVisible(), Thoughts::ReaderChrome::mergesTitleBar());
@@ -17797,6 +17886,51 @@ QToolButton *pageBackButton(KParts::ReadWritePart *part)
     auto *view = part->widget()->findChild<QWidget *>(QStringLiteral("thoughtsHtmlAttachmentView"));
     return view ? view->findChild<QToolButton *>(QStringLiteral("thoughtsHtmlShowPdf")) : nullptr;
 }
+}
+
+// A page's tab, as a PDF's: when Sync brings a newer version of the page, the version on screen
+// stays, the tab gets the blue dot and its menu Show Newest Version, which shows it.
+void MainShellTest::testHtmlPageTabMarksANewerVersion()
+{
+    const QString pdfPath = addLibraryPdfWithPage(QStringLiteral("irt"));
+    QVERIFY(!pdfPath.isEmpty());
+    Okular::Part::setHtmlAttachmentsWithoutWebViewForTesting(true);
+    const auto restoreWebView = qScopeGuard([] { Okular::Part::setHtmlAttachmentsWithoutWebViewForTesting(false); });
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({pdfPath}, options), Okular::Success);
+    Shell *shell = findShell();
+    QVERIFY(shell);
+    QVERIFY(QTest::qWaitForWindowExposed(shell));
+    auto *document = qobject_cast<Okular::Part *>(shell->m_tabs.at(0).part);
+    QVERIFY(document);
+    QVERIFY(document->openHtmlAttachmentLink(QUrl(QStringLiteral("thoughts-html:") + PageTabPath)));
+    QCOMPARE(shell->m_tabs.size(), 2);
+    QVERIFY(shell->isHtmlAttachmentTab(1));
+    QPointer<Okular::Part> page = qobject_cast<Okular::Part *>(shell->m_tabs.at(1).part);
+    QVERIFY(page);
+    const auto shownSha = [&page] { return page->htmlAttachmentState().value(QStringLiteral("sha256")).toString(); };
+    const QString first = shownSha();
+    QVERIFY(!first.isEmpty());
+    const qint64 dot = Shell::keptVersionTabIcon().cacheKey();
+    QVERIFY(shell->m_tabWidget->tabIcon(1).cacheKey() != dot);
+    QTest::qWait(1000); // The file system's notifications start (FSEvents on macOS).
+
+    // Sync brings a newer version of the page.
+    const QByteArray newer = "<!doctype html><title>Agent paywall (test attachment)</title><p>The newer version.</p>";
+    QVERIFY(!addLibraryPdfWithPage(QStringLiteral("irt"), newer).isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(page->keepsEarlierPageVersion(), 10000);
+    QCOMPARE(shownSha(), first);
+    QTRY_COMPARE(shell->m_tabWidget->tabIcon(1).cacheKey(), dot);
+    QVERIFY2(shell->m_tabWidget->tabToolTip(1).contains(QStringLiteral("A newer version is ready")), qPrintable(shell->m_tabWidget->tabToolTip(1)));
+    QMenu menu;
+    shell->addTabContextMenuActions(&menu, 1);
+    QCOMPARE(menu.actions().value(0)->objectName(), QStringLiteral("showNewestPageVersionTabAction"));
+    menu.actions().value(0)->trigger();
+    QTRY_COMPARE(shownSha(), sha256Hex(newer));
+    QVERIFY(!page->keepsEarlierPageVersion());
+    QTRY_VERIFY(shell->m_tabWidget->tabIcon(1).cacheKey() != dot);
+    QVERIFY(!shell->m_tabWidget->tabToolTip(1).contains(QStringLiteral("A newer version is ready")));
 }
 
 void MainShellTest::testHtmlAttachmentLinkOpensItsOwnTab()

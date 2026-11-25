@@ -142,8 +142,12 @@ public:
     // At a start without documents to open: the windows, tabs and pages open when Thoughts last
     // closed (quit, update or crash), when Configure Thoughts says so. True when one opened.
     static bool reopenLastSession();
-    // A web page (a link of an agent note) in a Thoughts window, at the passage its text fragment
-    // names; false where Thoughts has no web view.
+    // The Library's Viewer: the reader windows with documents, brought to the front; with none,
+    // the documents open when Thoughts last closed, else those of the window closed last, else
+    // an empty reader.
+    static void showViewer();
+    // A web page (a link of an agent note) in a web tab of a reader window, at the passage its text
+    // fragment names; false where Thoughts has no web view.
     static bool openWebPage(const QUrl &url);
     // At start, when no device token is stored for the configured server: Sign In over the
     // Library instead of staying unconnected. Not under THOUGHTS_TOKEN, in tests, or where the
@@ -368,6 +372,10 @@ private Q_SLOTS:
     // A page of an HTML attachment of the sender's document (Part::requestHtmlAttachmentTab): in
     // a tab of its own next to the document's, or in the tab that already shows it.
     void openHtmlAttachmentTab(const QJsonObject &request);
+    // A web link of the sender's document (Part::requestWebTab): a web tab of that document.
+    void openWebTabOfPart(const QUrl &address);
+    // A web tab's page learnt its title (Part::htmlAttachmentTitleChanged).
+    void webTabTitleChanged();
     // Close in a page's tab: the tab closes and its document's tab shows again.
     void closeHtmlAttachmentTab();
     void openTrackedLogicalComment(const QString &pdfPath, const QString &commentId, int page, const QVariantMap &location);
@@ -424,6 +432,12 @@ private:
     // The page tab of @p request ("path", what to show) for @p pdf, made after @p besideTab
     // (-1: at the end) when there is none; null when the page cannot be shown.
     KParts::ReadWritePart *showHtmlAttachmentTab(const QUrl &pdf, const QJsonObject &request, int besideTab);
+    // Web tabs: a page tab whose page is a web address (LivePage::isWebPagePath), a live page of
+    // the document whose link opened it (@p pdf), or of none (an agent note's link). Placed after
+    // @p besideTab; the same address's tab is reused. Those of a document are kept with the open
+    // windows (thoughts-open-tabsrc) as its page tabs are; those of none are not.
+    bool isWebTab(int tab) const;
+    KParts::ReadWritePart *openWebTab(const QUrl &address, const QUrl &pdf, int besideTab);
     void readRecentFilesSettings();
     void addTabContextMenuActions(QMenu *menu, int tab);
     // A page's tab menu: Open in Browser, its document, Copy page name, Copy for agent, Send to Agent
@@ -551,6 +565,10 @@ private:
     void scheduleCommentsOverviewDocumentSyncPresentationUpdate();
     void startCommentsOverviewSync();
     bool hasOpenDocument() const;
+    // This window's documents, active tab and pages into `group`; false, writing nothing, without any.
+    bool writeOpenWindow(KConfigGroup &group) const;
+    // The windows recorded in these groups of the open-session record; true when one opened.
+    static bool reopenSessionGroups(const KConfig &config, const QStringList &groups);
     void showOverviewHome();
     static QDateTime lastSuccessfulGlobalSyncAt();
     static QJsonObject latestGlobalSyncOperationSummary();
@@ -673,6 +691,8 @@ private:
     void scheduleMainToolBarCentering();
     void centerMainToolBarPageSelector();
     void styleMainToolBarActions();
+    // Zoom Out and Zoom In are left out of a main toolbar too narrow for every button.
+    void fitZoomButtons();
     void styleDocumentTabs();
     void updateDocumentTitle();
     void applyReaderIcons(KActionCollection *actions);

@@ -8,6 +8,7 @@
 */
 
 #include "side_reviews.h"
+#include "core/htmllivepage.h"
 #include "docschangemonitor.h"
 
 // qt/kde includes
@@ -2334,9 +2335,11 @@ void Reviews::setDocumentFeedback(const QList<QJsonObject> &records)
         // A drawing or a text box in its place on the page, not at the top of its whole-page region.
         const QRectF place = Thoughts::DocumentFeedback::isPageMark(record) ? Thoughts::DocumentFeedback::pageMarkBounds(record) : regions.isEmpty() ? QRectF() : regions.first().second;
         if (!regions.isEmpty()) positions.insert(id, {place.top(), place.left()});
+        const QString pagePath = record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject().value(QStringLiteral("path")).toString();
+        // A page by its name; a web page (a link's, LivePage::isWebPagePath) by its host.
         const QString attachment = !Thoughts::DocumentFeedback::isAttachmentFeedback(record) ? QString()
-            : QFileInfo(record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("html_attachment")).toObject().value(QStringLiteral("path")).toString())
-                  .completeBaseName().replace(QLatin1Char('_'), QLatin1Char(' ')).replace(QLatin1Char('-'), QLatin1Char(' '));
+            : Thoughts::LivePage::isWebPagePath(pagePath) ? QUrl(pagePath).host()
+                                                          : QFileInfo(pagePath).completeBaseName().replace(QLatin1Char('_'), QLatin1Char(' ')).replace(QLatin1Char('-'), QLatin1Char(' '));
         // Under the text: the passage under a comment, and what the row is not any more.
         QStringList notes;
         if (!comment.isEmpty()) notes.append(passage);
