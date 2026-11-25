@@ -751,7 +751,8 @@ void AppSignInTest::projectShareDialog()
     server.shares = QJsonObject {{QStringLiteral("name"), QStringLiteral("Notes")},
                                  {QStringLiteral("shares"), QJsonArray {QJsonObject {{QStringLiteral("link_id"), QStringLiteral("link-1")}, {QStringLiteral("username"), QStringLiteral("laura")}}}},
                                  {QStringLiteral("invitations"), QJsonArray {QJsonObject {{QStringLiteral("invitation_id"), QStringLiteral("inv-1")}, {QStringLiteral("email"), QStringLiteral("b@example.org")}}}},
-                                 {QStringLiteral("spare_libraries"), 1000}};
+                                 {QStringLiteral("spare_libraries"), 1000},
+                                 {QStringLiteral("people"), QJsonArray {QJsonObject {{QStringLiteral("username"), QStringLiteral("sam")}, {QStringLiteral("email"), QStringLiteral("sam@example.org")}}}}};
     Secrets secrets;
     secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
     QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
@@ -762,6 +763,15 @@ void AppSignInTest::projectShareDialog()
     QCOMPARE(server.lastQuery, QStringLiteral("project_id=new:f5cb"));
     QCOMPARE(server.authorizations.constLast(), QByteArray("Bearer app-token"));
     QCOMPARE(child<QLabel>(dialog, QStringLiteral("projectShareStatus"))->text(), QStringLiteral("Shared with:"));
+
+    // Someone shared with before: one tap.
+    server.shareAnswer = QJsonObject {{QStringLiteral("state"), QStringLiteral("shared")}, {QStringLiteral("username"), QStringLiteral("sam")}};
+    auto *known = dialog.findChild<QPushButton *>(QStringLiteral("projectShareKnownPerson"));
+    QVERIFY(known && known->text() == QStringLiteral("sam"));
+    known->click();
+    QTRY_COMPARE(server.bodies.size(), 1);
+    QCOMPARE(server.bodies.constLast().value(QStringLiteral("username")).toString(), QStringLiteral("sam"));
+    server.bodies.clear();
 
     // A username: shared at once.
     server.shareAnswer = QJsonObject {{QStringLiteral("state"), QStringLiteral("shared")}, {QStringLiteral("username"), QStringLiteral("sam")}};

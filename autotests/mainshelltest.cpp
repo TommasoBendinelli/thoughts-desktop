@@ -555,6 +555,7 @@ private Q_SLOTS:
     void testCopyForAgentInTheFileMenu();
     void testLibraryWindowHasTheApplicationMenus();
     void testMenusListEachEntryOnce();
+    void testNoteWebLinkFallsBackToTheBrowser();
     void testReopensTheDocumentsOpenWhenItLastClosed();
     void testEditSourceAndAMinimizedWindowComesBack();
     void testTabRevealInFinderAction();
@@ -2193,6 +2194,38 @@ void MainShellTest::testReopensTheDocumentsOpenWhenItLastClosed()
     QVERIFY(!Shell::reopenLastSession());
     delete off;
     Okular::Settings::self()->setReopenLastSession(true);
+}
+
+namespace
+{
+class UrlCatcher : public QObject
+{
+    Q_OBJECT
+public:
+    QList<QUrl> urls;
+public Q_SLOTS:
+    void handle(const QUrl &url)
+    {
+        urls.append(url);
+    }
+};
+}
+
+// A web link of an agent note opens in a Thoughts window where there is a web view (25 Nov 2026);
+// without one (offscreen here) it goes to the browser, its text fragment kept.
+void MainShellTest::testNoteWebLinkFallsBackToTheBrowser()
+{
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({QStringLiteral(KDESRCDIR "data/file1.pdf")}, options), Okular::Success);
+    QVERIFY(findShell());
+    UrlCatcher catcher;
+    QDesktopServices::setUrlHandler(QStringLiteral("https"), &catcher, "handle");
+    const auto restore = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
+    const QUrl link(QStringLiteral("https://example.org/blog/post/#:~:text=the%20harness%20gives"));
+    QVERIFY(!Shell::openWebPage(link));
+    Shell::openAgentNoteLink(link.toString());
+    QCOMPARE(catcher.urls, QList<QUrl>{link});
+    QVERIFY(!qApp->findChild<QWidget *>(QStringLiteral("thoughtsWebPageWindow")));
 }
 
 void MainShellTest::testLibraryWindowHasTheApplicationMenus()

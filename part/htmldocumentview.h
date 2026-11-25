@@ -62,7 +62,7 @@ public:
     // viewer and no message handler), never in the one of embedded pages, which shows nothing
     // meanwhile. "Loading…" until the page shows; then liveLoaded, or liveLoadFailed. Links to
     // other origins arrive as externalLinkRequested.
-    void loadLive(const QUrl &url);
+    Q_INVOKABLE void loadLive(const QUrl &url);
     bool isLive() const
     {
         return m_live;
@@ -76,7 +76,7 @@ public:
         return m_liveUrl;
     }
     // Reload (and Retry): the page again, or its address after a failure.
-    void reloadLive();
+    Q_INVOKABLE void reloadLive();
     // Runs `body`, an async function body with the argument argsJson (@p args), in the live page's
     // isolated script world (Take Snapshot, reading the selection).
     void callLive(const QString &body, const QJsonObject &args, std::function<void(bool ok, const QString &result, const QString &error)> done);

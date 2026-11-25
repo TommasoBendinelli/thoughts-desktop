@@ -160,7 +160,11 @@ private:
     // file changed after Desktop froze it: false then.
     bool activateMergedResult(const QString &path, const QString &frozenSha256, const Py::Json &canonicalSha256, const Py::Json &canonicalObject,
                               std::optional<QByteArray> *installed = nullptr);
-    void recordBases(const std::optional<Py::Json> &snapshot = std::nullopt);
+    // Each path's base from `snapshot` (Fedora's tree now when none). `held`:
+    // the heads the files are known to hold (what this run published, or the
+    // head a file was found equal to); a path whose head in `snapshot` has
+    // moved past its held one keeps the held one as its base.
+    void recordBases(const std::optional<Py::Json> &snapshot = std::nullopt, const QHash<QString, Py::Json> &held = {});
     qint64 pruneRetiredManifestPaths();
     Py::Json newMutation(const QString &action, const QString &path, const Py::Json &current, const std::optional<QByteArray> &content);
     // Fedora's next free sequence for this device when [error] refused a request

@@ -142,6 +142,9 @@ public:
     // At a start without documents to open: the windows, tabs and pages open when Thoughts last
     // closed (quit, update or crash), when Configure Thoughts says so. True when one opened.
     static bool reopenLastSession();
+    // A web page (a link of an agent note) in a Thoughts window, at the passage its text fragment
+    // names; false where Thoughts has no web view.
+    static bool openWebPage(const QUrl &url);
     // At start, when no device token is stored for the configured server: Sign In over the
     // Library instead of staying unconnected. Not under THOUGHTS_TOKEN, in tests, or where the
     // system has no secret store for the tokens.

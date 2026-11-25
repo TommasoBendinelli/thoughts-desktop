@@ -52,6 +52,12 @@ Listing listing(const QJsonObject &answer)
         }
     }
     result.spareLibraries = answer.value(QStringLiteral("spare_libraries")).toInt(0);
+    for (const QJsonValue &value : answer.value(QStringLiteral("people")).toArray()) {
+        const QJsonObject person = value.toObject();
+        if (!text(person, QStringLiteral("username")).isEmpty()) {
+            result.people.append({text(person, QStringLiteral("username")), text(person, QStringLiteral("email"))});
+        }
+    }
     return result;
 }
 
@@ -132,6 +138,13 @@ ProjectShareDialog::ProjectShareDialog(const QJsonObject &project, const AppSign
     m_note->setWordWrap(true);
     m_note->setVisible(false);
     layout->addWidget(m_note);
+    // The people shared with before: one tap shares with them (no name to remember).
+    m_known = new QWidget(this);
+    m_known->setObjectName(QStringLiteral("projectShareKnownPeople"));
+    m_knownLayout = new QHBoxLayout(m_known);
+    m_knownLayout->setContentsMargins(0, 0, 0, 0);
+    m_known->setVisible(false);
+    layout->addWidget(m_known);
     m_input = new QLineEdit(this);
     m_input->setObjectName(QStringLiteral("projectShareInput"));
     m_input->setPlaceholderText(i18n("Username or email address"));
@@ -254,6 +267,22 @@ void ProjectShareDialog::render(const ProjectShares::Listing &listing)
         });
         line->addWidget(withdraw);
     }
+    while (QLayoutItem *item = m_knownLayout->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+    if (!listing.people.isEmpty()) {
+        m_knownLayout->addWidget(new QLabel(i18n("Share with:"), m_known));
+        for (const ProjectShares::Person &person : listing.people) {
+            auto *button = new QPushButton(person.username, m_known);
+            button->setObjectName(QStringLiteral("projectShareKnownPerson"));
+            button->setToolTip(person.email.isEmpty() ? i18n("Share with %1", person.username) : i18n("Share with %1 (%2)", person.username, person.email));
+            connect(button, &QPushButton::clicked, this, [this, name = person.username] { shareWith(name); });
+            m_knownLayout->addWidget(button);
+        }
+        m_knownLayout->addStretch();
+    }
+    m_known->setVisible(!listing.people.isEmpty());
     const bool noRoom = !listing.invitations.isEmpty() && listing.spareLibraries <= 0;
     m_note->setText(noRoom ? i18n("The server has no room prepared for a new account. The invited person can open the link, but can make "
                                   "their account only after the server's admin prepares one.")
@@ -274,9 +303,15 @@ void ProjectShareDialog::share()
         invite(target->value);
         return;
     }
+    shareWith(target->value);
+}
+
+void ProjectShareDialog::shareWith(const QString &username)
+{
+    m_error->setVisible(false);
     setSharing(false);
-    const QJsonObject body {{QStringLiteral("project_id"), m_projectId}, {QStringLiteral("username"), target->value}};
-    request("POST", QStringLiteral("/v1/project-shares"), &body, [this, name = target->value](int status, const QJsonObject &answer) {
+    const QJsonObject body {{QStringLiteral("project_id"), m_projectId}, {QStringLiteral("username"), username}};
+    request("POST", QStringLiteral("/v1/project-shares"), &body, [this, name = username](int status, const QJsonObject &answer) {
         setSharing(true);
         if (status != 200) {
             m_error->setText(ProjectShares::refusal(status, answer));

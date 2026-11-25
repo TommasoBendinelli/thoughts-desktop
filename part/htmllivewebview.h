@@ -17,8 +17,10 @@
 // (html-live-pages.md §2.1) is the reader's: the web view's own right-click menu of selected text
 // shows Thoughts' Like, Dislike, Question… and Comment… with the web view's own Copy (one menu,
 // no Services), and the item chosen comes as selectionChoice; every other menu (a link, an image,
-// no selection) stays the web view's. Elsewhere (no WebKit) available() is false and the platform
-// menu stays.
+// no selection) stays the web view's. On Windows the same class is a Microsoft Edge WebView2
+// (htmllivewebview_win.cpp: InPrivate under a profile of its own, Thoughts' scripts in an isolated
+// world of the DevTools protocol). Elsewhere, and without the WebView2 runtime, available() is
+// false and the platform menu stays.
 #include "okularpart_export.h"
 
 #include <QImage>
@@ -39,7 +41,8 @@ public:
     explicit HtmlLiveWebView(QObject *parent = nullptr);
     ~HtmlLiveWebView() override;
 
-    // Whether this build can show live pages (WebKit on macOS, a real window system).
+    // Whether this build can show live pages (WebKit on macOS, the WebView2 runtime on Windows, a
+    // real window system).
     static bool available();
 
     // The web view as a foreign QWindow, for QWidget::createWindowContainer (which then owns it).
@@ -106,7 +109,7 @@ Q_SIGNALS:
 
 private:
     std::function<bool()> m_selectionFeedback;
-    void *m_native = nullptr; // the WKWebView (ThoughtsLiveWKWebView) and its delegate (htmllivewebview_mac.mm)
+    void *m_native = nullptr; // the WKWebView (ThoughtsLiveWKWebView) and its delegate (htmllivewebview_mac.mm), the WebView2 (_win.cpp)
     QPointer<QWindow> m_window;
     QUrl m_url;
 };

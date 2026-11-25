@@ -10414,10 +10414,23 @@ void Shell::openAgentNoteLink(const QString &href)
         return;
     }
     if ((url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("http")) && url.isValid()) {
+        // In Thoughts, at the passage a text fragment names (25 Nov 2026); the browser where
+        // there is no web view.
+        if (openWebPage(url)) return;
         if (!QDesktopServices::openUrl(url)) KMessageBox::error(parent, i18n("The link could not be opened: %1", href), i18n("Open Link"));
         return;
     }
     KMessageBox::error(parent, i18n("Thoughts cannot open this link: %1", href), i18n("Open Link"));
+}
+
+bool Shell::openWebPage(const QUrl &url)
+{
+    // The web view is the live pages' (in the PDF part): any window's part opens it.
+    Shell *shell = shellForCommentsOverview();
+    KParts::ReadWritePart *part = shell && !shell->m_tabs.isEmpty() ? shell->m_tabs.constFirst().part : nullptr;
+    bool opened = false;
+    if (part) QMetaObject::invokeMethod(part, "openWebPageWindow", Qt::DirectConnection, Q_RETURN_ARG(bool, opened), Q_ARG(QUrl, url));
+    return opened;
 }
 
 void Shell::openAgentNoteDocument(const QString &documentId, const QString &path)

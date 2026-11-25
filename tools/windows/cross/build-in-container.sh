@@ -9,6 +9,9 @@
 set -euo pipefail
 SRC=$1 SDK=$2 BUILD=$3 STAGE=$4 VERSION=$5 REPOSITORY=$6 SERVER_URL=$7 LEGACY_SERVER_URL=${8:-} JOBS=${JOBS:-16}
 : "${WINCROSS:?}"
+# Microsoft's WebView2 SDK (live HTML pages), from the NuGet package setup-builder.sh unpacks.
+WEBVIEW2_SDK=${WEBVIEW2_SDK:-$WINCROSS/webview2-sdk/1.0.4314.35/build/native}
+[ -f "$WEBVIEW2_SDK/include/WebView2.h" ] || { echo "no WebView2 SDK in $WEBVIEW2_SDK (see tools/windows/cross/README.md)" >&2; exit 2; }
 export LD_LIBRARY_PATH="$WINCROSS/craft-host/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # Only the Windows libraries' pkg-config files, never the container's own.
 export PKG_CONFIG_LIBDIR="$WINCROSS/craft-win/lib/pkgconfig" PKG_CONFIG_PATH=
@@ -34,6 +37,7 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -DBUILD_TESTING=OFF -DBUILD_DESKTOP=ON \
         -DKDE_INSTALL_PLUGINDIR=plugins -DKDE_INSTALL_QTPLUGINDIR=plugins \
         -DTHOUGHTS_SERVER_SDK_ROOT="$SDK" \
+        -DTHOUGHTS_WEBVIEW2_SDK="$WEBVIEW2_SDK" \
         -DFORCE_NOT_REQUIRED_DEPENDENCIES=Discount \
         -DCMAKE_DISABLE_FIND_PACKAGE_KF6DocTools=ON \
         -DTHOUGHTS_RELEASE_VERSION="$VERSION" \
@@ -43,7 +47,7 @@ if [ ! -f "$BUILD/build.ninja" ]; then
 else
     cmake "$BUILD" "-DCMAKE_C_FLAGS_RELEASE=$RELEASE_FLAGS" "-DCMAKE_CXX_FLAGS_RELEASE=$RELEASE_FLAGS" \
         -DTHOUGHTS_RELEASE_VERSION="$VERSION" -DTHOUGHTS_UPDATE_REPOSITORY="$REPOSITORY" \
-        -DTHOUGHTS_DEFAULT_SERVER_URL="$SERVER_URL" -DTHOUGHTS_LEGACY_SERVER_URL="$LEGACY_SERVER_URL" >/dev/null
+        -DTHOUGHTS_DEFAULT_SERVER_URL="$SERVER_URL" -DTHOUGHTS_LEGACY_SERVER_URL="$LEGACY_SERVER_URL" -DTHOUGHTS_WEBVIEW2_SDK="$WEBVIEW2_SDK" >/dev/null
 fi
 nice -n 10 ninja -C "$BUILD" -j "$JOBS"
 rm -rf "$STAGE"

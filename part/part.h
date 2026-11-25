@@ -423,6 +423,10 @@ public Q_SLOTS: // dbus
     Q_SCRIPTABLE uint currentPage();
     // Configure Thoughts › Reopen the documents that were open when Thoughts last closed.
     Q_INVOKABLE bool reopenLastSessionEnabled() const;
+    // A web page in a Thoughts window (a web link of a PDF or of an agent note): the live pages'
+    // web view with Reload and Open in Browser; a text fragment (#:~:text=…) scrolls to the
+    // passage and highlights it. False where there is no web view (the browser opens it instead).
+    Q_INVOKABLE bool openWebPageWindow(const QUrl &url);
     // The reader's current text selection, for "Copy for agent".
     Q_INVOKABLE QString selectedText() const;
     Q_SCRIPTABLE QString currentDocument();

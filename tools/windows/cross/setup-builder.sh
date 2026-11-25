@@ -94,4 +94,16 @@ rm -rf craft-host && mkdir craft-host
 $PODMAN run --rm --network none -v "$W:$W" -w "$W/craft-host" localhost/thoughts-wincross:20261015 \
     bash -c 'for p in $(cat ../host-pkgs/list); do 7z x -so "../$p" | tar x; done'
 rm -f craft-include-overlay.json
+
+# 5. Microsoft's WebView2 SDK, for live HTML pages (part/htmllivewebview_win.cpp): the
+# Microsoft.Web.WebView2 NuGet package from nuget.org, unpacked. Its loader is linked in
+# statically (build/native/x64/WebView2LoaderStatic.lib), so no WebView2Loader.dll ships.
+wv=1.0.4314.35
+wv_sha256=90778deb1b77e36292828b4b5833c9255c27533f40e0ddd55891ae718944edc4
+mkdir -p pkgs
+nupkg=pkgs/microsoft.web.webview2.$wv.nupkg
+[ -f "$nupkg" ] || curl -sSfL --retry 3 -o "$nupkg" "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$wv/microsoft.web.webview2.$wv.nupkg"
+echo "$wv_sha256  $nupkg" | sha256sum -c --quiet -
+rm -rf "webview2-sdk/$wv" && mkdir -p "webview2-sdk/$wv"
+python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$nupkg" "webview2-sdk/$wv"
 echo "Builder ready in $W"

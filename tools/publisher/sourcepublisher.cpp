@@ -112,6 +112,26 @@ Json baseOf(const Json &item)
                          {QStringLiteral("object_sha256"), Py::subscript(item, QStringLiteral("object_sha256"))}});
 }
 
+// The heads a publication's results left their files on: applied, or Fedora's merge.
+QHash<QString, Json> publishedHeads(const Json &result)
+{
+    QHash<QString, Json> heads;
+    for (const Json &item : Py::iterate(Py::get(result, QStringLiteral("results"), Json::array()))) {
+        if (!item.isObject() || !item.value(QStringLiteral("path")).isString()) {
+            continue;
+        }
+        const Json outcome = item.value(QStringLiteral("outcome"));
+        const Json revision = item.value(QStringLiteral("revision"));
+        if ((outcome != Json(QStringLiteral("applied")) && outcome != Json(QStringLiteral("merged")))
+            || (revision.type() != Json::Type::Int && revision.type() != Json::Type::BigInt) || !item.value(QStringLiteral("sha256")).isString()
+            || !item.value(QStringLiteral("object_sha256")).isString()) {
+            continue;
+        }
+        heads.insert(item.value(QStringLiteral("path")).toString(), baseOf(item));
+    }
+    return heads;
+}
+
 qsizetype localIndex(const SourcePublisher::LocalSources &local, const QString &path)
 {
     for (qsizetype index = 0; index < local.size(); ++index) {
@@ -842,14 +862,28 @@ Json SourcePublisher::laggingFrozenBase(const QString &path, const QByteArray &c
                          {QStringLiteral("object_sha256"), Json(desktopBase)}});
 }
 
-void SourcePublisher::recordBases(const std::optional<Json> &givenSnapshot)
+void SourcePublisher::recordBases(const std::optional<Json> &givenSnapshot, const QHash<QString, Json> &held)
 {
     const Json snapshot = givenSnapshot ? *givenSnapshot : api.sourceTree();
     const SourceHeads current(Py::iterate(Py::get(snapshot, QStringLiteral("sources"), Json::array())));
     Json bases = m_includePaths ? Py::get(state, QStringLiteral("bases"), Json::object()) : Json::object();
     for (const QString &path : paths()) {
         const std::optional<Json> item = current.get(path);
-        if (item && !Py::truthy(Py::get(*item, QStringLiteral("deleted"), Json(false)))) {
+        const bool present = item && !Py::truthy(Py::get(*item, QStringLiteral("deleted"), Json(false)));
+        const auto kept = held.constFind(path);
+        if (kept != held.cend() && !(present && Py::get(*item, QStringLiteral("sha256")) == kept->value(QStringLiteral("sha256")))) {
+            // Fedora changed the file again after this run saw it (a card move
+            // settling on the proposal just accepted here, before the tree was
+            // read back). The file still holds the held revision, so
+            // that stays its base: the installer brings the later one in, where
+            // recording it would have the next publication send the file back
+            // over it.
+            report(QStringLiteral("The server changed %1 again after this run (revision %2); the next Sync installs it.")
+                       .arg(path, present ? Py::pythonStr(Py::get(*item, QStringLiteral("revision"))) : QStringLiteral("deleted")));
+            bases.insert(path, *kept);
+            continue;
+        }
+        if (present) {
             bases.insert(path, baseOf(*item));
         } else {
             bases.remove(path);
@@ -1427,7 +1461,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
         state.remove(QStringLiteral("pending_frozen_activations"));
         expireProposalClaims(*this, result);
         state.insert(QStringLiteral("last_publication"), result);
-        recordBases();
+        recordBases(std::nullopt, publishedHeads(result));
         pruneRetiredManifestPaths();
         writeState();
         return report;
@@ -1728,6 +1762,28 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     for (const auto &[path, contents] : std::as_const(remoteActivations)) {
         activateFrozenRemoteSha(path, sha256Hex(contents.first), contents.second, true);
     }
+    // The heads the files hold once this run is done: what `result` published,
+    // or the head of `snapshot` a file was found equal to (or activated from).
+    // Fedora may move a path past it before the tree is read back.
+    const auto heldHeads = [&](const Json &result) {
+        QHash<QString, Json> held = publishedHeads(result);
+        const auto holds = [&](const QString &path, const QByteArray &bytes) {
+            const std::optional<Json> head = current.get(path);
+            if (!held.contains(path) && head && !Py::truthy(Py::get(*head, QStringLiteral("deleted"), Json(false)))
+                && Py::get(*head, QStringLiteral("sha256")) == Json(sha256Hex(bytes))) {
+                held.insert(path, baseOf(*head));
+            }
+        };
+        for (const auto &[path, content] : std::as_const(local)) {
+            if (content) {
+                holds(path, *content);
+            }
+        }
+        for (const auto &[path, contents] : std::as_const(remoteActivations)) {
+            holds(path, contents.second);
+        }
+        return held;
+    };
     const qint64 mergedAlone = settledBases.size();
     if (mutations.isEmpty()) {
         prepareProposalClaims(*this, local, mutations);
@@ -1748,7 +1804,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
         } else {
             this->report(QStringLiteral("No source changes need publication."));
         }
-        recordBases(heads);
+        recordBases(heads, heldHeads(Json::object()));
         finishSettledApplies();
         pruneRetiredManifestPaths();
         writeState();
@@ -1796,7 +1852,7 @@ SourcePublisher::Report SourcePublisher::publishOnce()
     // it again only to see what was just sent.
     const Json after = api.sourceTree();
     keepSourceTree(after);
-    recordBases(after);
+    recordBases(after, heldHeads(result));
     if (!mergedAlone && onlyOwnChanges(snapshot, after, mutations, result)) {
         const Json before = Py::get(snapshot, QStringLiteral("source_frontier"));
         const Json through = Py::get(after, QStringLiteral("source_frontier"));

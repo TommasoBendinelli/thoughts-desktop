@@ -646,6 +646,12 @@ if(BUILD_DESKTOP)
   # macOS, WebView2 on Windows) is optional: without it the HTML view says it is not available.
   find_package(Qt6WebView ${QT_REQUIRED_VERSION} CONFIG QUIET)
   option(THOUGHTS_HTML_VIEW "Build the HTML view with Qt WebView" ${Qt6WebView_FOUND})
+  if(WIN32)
+    # Live HTML pages on Windows (part/htmllivewebview_win.cpp): Microsoft Edge WebView2, from the
+    # build/native folder of Microsoft's Microsoft.Web.WebView2 NuGet package (include/, x64/).
+    # Without it live pages open in the browser.
+    set(THOUGHTS_WEBVIEW2_SDK "" CACHE PATH "build/native folder of the Microsoft.Web.WebView2 NuGet package (live HTML pages)")
+  endif()
   add_library(thoughtshtmlview STATIC
     part/htmledition.cpp
     part/htmleditionserver.cpp
@@ -723,7 +729,7 @@ if(BUILD_DESKTOP)
     part/readingoverlaylayer.cpp
     part/readingoverlaylist.cpp
     part/htmldocumentview.cpp
-    # Its sources are per platform (htmllivewebview_mac.mm, _stub.cpp): listed for AUTOMOC.
+    # Its sources are per platform (htmllivewebview_mac.mm, _win.cpp, _stub.cpp): listed for AUTOMOC.
     part/htmllivewebview.h
     part/htmlreader.cpp
     part/htmlattachmentreader.cpp
@@ -791,16 +797,32 @@ endif()
 if(THOUGHTS_HTML_VIEW)
     target_link_libraries(okularpart Qt6::WebView)
     target_compile_definitions(okularpart PRIVATE THOUGHTS_HAVE_QTWEBVIEW=1)
-    if(APPLE)
-        enable_language(OBJCXX)
-        # Live HTML pages: a WKWebView of their own (part/htmllivewebview.h).
-        target_sources(okularpart PRIVATE part/htmlmacnative.mm part/htmllivewebview_mac.mm)
-        target_link_libraries(okularpart "-framework WebKit" "-framework AppKit")
-    else()
-        target_sources(okularpart PRIVATE part/htmllivewebview_stub.cpp)
-    endif()
 else()
     target_compile_definitions(okularpart PRIVATE THOUGHTS_HAVE_QTWEBVIEW=0)
+endif()
+# Live HTML pages: a web view of their own (part/htmllivewebview.h), apart from Qt WebView's.
+if(THOUGHTS_HTML_VIEW AND APPLE)
+    enable_language(OBJCXX)
+    # A WKWebView.
+    target_sources(okularpart PRIVATE part/htmlmacnative.mm part/htmllivewebview_mac.mm)
+    target_link_libraries(okularpart "-framework WebKit" "-framework AppKit")
+elseif(WIN32 AND THOUGHTS_WEBVIEW2_SDK)
+    # A WebView2, with Microsoft's loader linked in (no WebView2Loader.dll to ship).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+        set(_webview2_arch arm64)
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(_webview2_arch x86)
+    else()
+        set(_webview2_arch x64)
+    endif()
+    set(_webview2_loader "${THOUGHTS_WEBVIEW2_SDK}/${_webview2_arch}/WebView2LoaderStatic.lib")
+    if(NOT EXISTS "${THOUGHTS_WEBVIEW2_SDK}/include/WebView2.h" OR NOT EXISTS "${_webview2_loader}")
+        message(FATAL_ERROR "THOUGHTS_WEBVIEW2_SDK (${THOUGHTS_WEBVIEW2_SDK}) has no include/WebView2.h or ${_webview2_arch}/WebView2LoaderStatic.lib")
+    endif()
+    target_sources(okularpart PRIVATE part/htmllivewebview_win.cpp)
+    target_include_directories(okularpart SYSTEM PRIVATE "${THOUGHTS_WEBVIEW2_SDK}/include")
+    target_link_libraries(okularpart "${_webview2_loader}" advapi32 ole32 user32)
+else()
     target_sources(okularpart PRIVATE part/htmllivewebview_stub.cpp)
 endif()
 if(Poppler_Qt6_FOUND)

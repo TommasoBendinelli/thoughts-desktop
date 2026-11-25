@@ -14,6 +14,7 @@
 
 #include <optional>
 
+class QHBoxLayout;
 class QLabel;
 class QLineEdit;
 class QNetworkAccessManager;
@@ -32,7 +33,13 @@ struct Invitation {
     QString id;
     QString email;
 };
+struct Person {
+    QString username;
+    QString email;
+};
 struct Listing {
+    // Shared with before (or joined from an invitation), without this project now: one tap shares.
+    QList<Person> people;
     QString name;
     QString sharedWithYouBy;
     QList<Share> shares;
@@ -73,6 +80,7 @@ private:
     void load();
     void render(const ProjectShares::Listing &listing);
     void share();
+    void shareWith(const QString &username);
     void invite(const QString &email);
     void act(const QByteArray &method, const QString &path);
     void chooseHowToSend(const ProjectShares::Mail &mail);
@@ -87,6 +95,8 @@ private:
     QLabel *m_status;
     QVBoxLayout *m_people;
     QLabel *m_note;
+    QWidget *m_known;
+    QHBoxLayout *m_knownLayout;
     QLineEdit *m_input;
     QLabel *m_error;
     QPushButton *m_share;

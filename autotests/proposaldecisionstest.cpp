@@ -128,6 +128,8 @@ public:
     int loseNextApplyAnswers = 0;
     // Runs while Fedora merges, before it answers.
     std::function<void()> whileApplying;
+    // Runs once a publication is committed, before Fedora answers it.
+    std::function<void()> afterPublication;
     QList<QJsonObject> applies;
 
     // A new revision of `file` written on Fedora (another device or an agent).
@@ -229,6 +231,7 @@ private:
                                                {QStringLiteral("sha256"), digest}, {QStringLiteral("object_sha256"), digest}});
                 }
                 ++frontier;
+                if (afterPublication) afterPublication();
                 QJsonArray decisions;
                 for (const QJsonValue &value : publication.value(QStringLiteral("proposal_decisions")).toArray()) {
                     const QJsonObject claim = value.toObject();
@@ -391,6 +394,7 @@ private Q_SLOTS:
     void testEditDuringFedoraMergeKeepsItsBase();
     void testFrozenCopyOnDesktopsEarlierBase_data();
     void testFrozenCopyOnDesktopsEarlierBase();
+    void testFedoraChangesAFileRightAfterItsPublication();
     void testDecisionOnFedorasMergeBeforeDesktopRecordedIt_data();
     void testDecisionOnFedorasMergeBeforeDesktopRecordedIt();
     void testClaimsAgainstServer();
@@ -1293,6 +1297,51 @@ void ProposalDecisionsTest::testFrozenCopyOnDesktopsEarlierBase()
     QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
     QCOMPARE(server.publications.size(), 2);
     QVERIFY(!workspace.state().value(QStringLiteral("superseded_bases")).toObject().contains(Relative));
+}
+
+// A proposal accepted here was published, and Fedora at once added a
+// review card's marker lines to it (a card move waiting for that acceptance)
+// before the publisher read the tree back. The publisher took that later
+// revision as the file's base although the file did not hold it, and every
+// Sync after was refused; with a matching base it would have sent the file
+// back over the markers. The base stays the published revision, and the
+// installer brings the markers in.
+void ProposalDecisionsTest::testFedoraChangesAFileRightAfterItsPublication()
+{
+    Workspace workspace;
+    QVERIFY(workspace.prepare(QStringLiteral("a\nb\nc\nd\n")));
+    FakeSourceServer server;
+    QString failure;
+    QVERIFY2(workspace.publish(server, &failure), qPrintable(failure));
+    const QByteArray accepted = "a\nB\nc\nd\n";
+    const QByteArray marked = "a\nB\n%start\nc\n%end\nd\n";
+    QVERIFY(write(workspace.source(), accepted));
+    bool changed = false;
+    server.afterPublication = [&server, &changed, marked] {
+        if (!std::exchange(changed, true)) server.commit(Relative, marked);
+    };
+    QStringList messages;
+    QVERIFY2(workspace.publishFrozen(server, &failure, &messages), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("sha256")).toString(), sha(marked));
+    const auto base = [&workspace] {
+        return workspace.state().value(QStringLiteral("bases")).toObject().value(Relative).toObject().value(QStringLiteral("sha256")).toString();
+    };
+    QCOMPARE(base(), sha(accepted));
+    QVERIFY2(messages.join(QLatin1Char('\n')).contains(QStringLiteral("The server changed ") + Relative + QStringLiteral(" again after this run")),
+             qPrintable(messages.join(QLatin1Char('\n'))));
+
+    // Sync before the installer ran: the file is on its base, nothing to send.
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
+    QCOMPARE(server.heads.value(Relative).value(QStringLiteral("sha256")).toString(), sha(marked));
+
+    // The installer brings the markers in; then nothing more to send.
+    QVERIFY2(workspace.install(server, &failure), qPrintable(failure));
+    QCOMPARE(read(workspace.source()), marked);
+    QCOMPARE(base(), sha(marked));
+    QVERIFY2(workspace.publishFrozen(server, &failure), qPrintable(failure));
+    QCOMPARE(server.publications.size(), 2);
 }
 
 void ProposalDecisionsTest::testDecisionOnFedorasMergeBeforeDesktopRecordedIt_data()

@@ -335,7 +335,11 @@ bool Part::openHtmlAttachmentLink(const QUrl &link)
         return false;
     }
     QString error;
-    if ((!Thoughts::HtmlDocumentView::webViewAvailable() && !s_withoutWebViewForTesting) || !m_attachmentReader) {
+    const bool webView = Thoughts::HtmlDocumentView::webViewAvailable() || s_withoutWebViewForTesting;
+    // A live page needs only a web view of its own (HtmlLiveWebView): Windows has that without Qt WebView.
+    const auto live = m_attachmentReader && !webView && Thoughts::HtmlLiveWebView::available() ? resolveHtmlPage(path, &error) : Thoughts::HtmlAttachmentTarget();
+    const bool liveOnly = live.isValid() && Thoughts::LivePage::stubAddressOfFile(live.file).isValid();
+    if ((!webView && !liveOnly) || !m_attachmentReader) {
         // No web view in this build: the browser, as before.
         if (!Thoughts::openHtmlAttachment(link, QUrl::fromLocalFile(localFilePath()), &error)) {
             displayInfoMessage(error, KMessageWidget::Warning, 6000);
@@ -343,7 +347,7 @@ bool Part::openHtmlAttachmentLink(const QUrl &link)
         }
         return true;
     }
-    const auto target = resolveHtmlPage(path, &error);
+    const auto target = liveOnly ? live : resolveHtmlPage(path, &error);
     if (!target.isValid()) {
         displayInfoMessage(error, KMessageWidget::Warning, 6000);
         return false;
@@ -440,8 +444,9 @@ bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool
         m_attachmentShown = true;
         m_attachmentForReview = forReview;
         m_documentStack->setCurrentWidget(m_attachmentView);
-        // The review panel floats over a native web view (see htmlViewActiveChanged).
-        widget()->setProperty("thoughtsNativeDocumentView", Thoughts::HtmlDocumentView::webViewAvailable());
+        // The review panel floats over a native web view (see htmlViewActiveChanged); a live page's
+        // is one too.
+        widget()->setProperty("thoughtsNativeDocumentView", Thoughts::HtmlDocumentView::webViewAvailable() || (live.isValid() && Thoughts::HtmlLiveWebView::available()));
         if (QWidget *container = widget()->findChild<QWidget *>(QStringLiteral("thoughtsPageSplitter"))) container->parentWidget()->setFocusProxy(m_attachmentView);
     } else if (!forReview) {
         // Opened by the user: it stays when the review ends.
@@ -622,8 +627,16 @@ void Part::openAttachmentLink(const QUrl &url, bool userGesture)
         return;
     }
 #ifdef Q_OS_MACOS
-    displayInfoMessage(i18n("The page tried to open %1 by itself. It was not opened.", url.toDisplayString(QUrl::RemoveQuery | QUrl::RemoveFragment)), KMessageWidget::Warning, 5000);
+    const bool clicksSeen = true;
 #else
+    // A live page's own web view sees them too (WebView2 on Windows).
+    const bool clicksSeen = m_attachmentReader && m_attachmentReader->isLive() && Thoughts::HtmlLiveWebView::available();
+#endif
+    if (clicksSeen) {
+        displayInfoMessage(i18n("The page tried to open %1 by itself. It was not opened.", url.toDisplayString(QUrl::RemoveQuery | QUrl::RemoveFragment)), KMessageWidget::Warning, 5000);
+        return;
+    }
+#ifndef Q_OS_MACOS
     // Thoughts cannot see the page's clicks here: the reader decides, one question at a time.
     if (m_attachmentLinkQuestion) {
         return;

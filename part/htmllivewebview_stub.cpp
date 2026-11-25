@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Live HTML pages need WebKit (htmllivewebview_mac.mm): elsewhere the reader says so and opens
-// the address in the browser instead.
+// Live HTML pages need WebKit (htmllivewebview_mac.mm) or WebView2 (htmllivewebview_win.cpp):
+// elsewhere the reader says so and opens the address in the browser instead.
 #include "htmllivewebview.h"
 
 #include "core/htmllivepage.h"

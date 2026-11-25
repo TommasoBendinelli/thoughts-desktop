@@ -83,6 +83,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QDesktopServices>
 #include <QLayout>
 #include <QMenu>
 #include <QMenuBar>
@@ -189,6 +192,7 @@
 #include "core/htmlattachment.h"
 #include "htmlattachmentreader.h"
 #include "htmldocumentview.h"
+#include "htmllivewebview.h"
 #include "htmledition.h"
 #include "htmlreader.h"
 #include "pageview.h"
@@ -790,7 +794,9 @@ Part::Part(QObject *parent, const QVariantList &args)
     // A web link of the PDF to this computer's server's "Open in Thoughts" page opens the
     // document here (core asks before the browser, for every way a link is followed), and so does
     // a link to a place in a Library PDF.
-    Thoughts::setWebLinkHandler(m_document, this, [this](const QUrl &link) { return openPdfPlaceLink(link) || openServerPageLink(link); });
+    // A web link of the PDF: a place in a Library PDF, a Thoughts server page, else the page itself in a
+    // Thoughts window (25 Nov 2026), where there is a web view; the browser otherwise.
+    Thoughts::setWebLinkHandler(m_document, this, [this](const QUrl &link) { return openPdfPlaceLink(link) || openServerPageLink(link) || openWebPageWindow(link); });
     connect(m_pageView, &PageView::agentProposalOverlaysReloaded, this, &Part::locateOpenAgentProposal);
     connect(m_pageView, &PageView::agentProposalWindowClosed, this, [this](const QString &proposalId) {
         if (m_reviewsWidget) {
@@ -2186,6 +2192,67 @@ QString Part::selectedText() const
     if (m_attachmentShown && m_attachmentReader) return m_attachmentReader->lastSelection().value(QStringLiteral("text")).toString();
     if (htmlViewActive()) return m_htmlReader->lastSelection().value(QStringLiteral("text")).toString();
     return m_pageView ? m_pageView->selectedText() : QString();
+}
+
+bool Part::openWebPageWindow(const QUrl &url)
+{
+    const QString scheme = url.scheme().toLower();
+    if (!Thoughts::HtmlLiveWebView::available() || (scheme != QLatin1String("https") && scheme != QLatin1String("http")) || !url.isValid()) {
+        return false;
+    }
+    // A window of the reader's window: it goes when that window closes.
+    QWidget *owner = widget() ? widget()->window() : nullptr;
+    auto *window = new QWidget(owner, Qt::Window);
+    window->setObjectName(QStringLiteral("thoughtsWebPageWindow"));
+    window->setAttribute(Qt::WA_DeleteOnClose);
+    auto *view = new Thoughts::HtmlDocumentView(window);
+    view->setObjectName(QStringLiteral("thoughtsWebPageView"));
+    auto *layout = new QVBoxLayout(window);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    auto *bar = new QWidget(window);
+    auto *barLayout = new QHBoxLayout(bar);
+    barLayout->setContentsMargins(8, 4, 8, 4);
+    auto *address = new QLabel(bar);
+    address->setObjectName(QStringLiteral("thoughtsWebPageAddress"));
+    address->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    barLayout->addWidget(address, 1);
+    auto *reload = new QPushButton(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Reload"), bar);
+    barLayout->addWidget(reload);
+    auto *browser = new QPushButton(QIcon::fromTheme(QStringLiteral("internet-web-browser")), i18n("Open in Browser"), bar);
+    browser->setObjectName(QStringLiteral("thoughtsWebPageOpenInBrowser"));
+    barLayout->addWidget(browser);
+    layout->addWidget(bar);
+    layout->addWidget(view, 1);
+    // What the window shows now (a link followed inside it changes it).
+    auto current = std::make_shared<QUrl>(url);
+    const auto show = [window, address, current](const QUrl &shown) {
+        *current = shown;
+        const QString text = shown.toDisplayString(QUrl::RemoveFragment);
+        address->setText(address->fontMetrics().elidedText(text, Qt::ElideMiddle, 900));
+        address->setToolTip(shown.toDisplayString());
+        window->setWindowTitle(shown.host().isEmpty() ? text : shown.host() + QStringLiteral(" — ") + shown.path());
+    };
+    show(url);
+    connect(reload, &QPushButton::clicked, view, &Thoughts::HtmlDocumentView::reloadLive);
+    connect(browser, &QPushButton::clicked, window, [current] { QDesktopServices::openUrl(*current); });
+    // A link to another site, clicked by the reader: here too; mail and other schemes outside.
+    connect(view, &Thoughts::HtmlDocumentView::externalLinkRequested, window, [view, show](const QUrl &target, bool userGesture) {
+        if (!userGesture) return;
+        const QString scheme = target.scheme().toLower();
+        if (scheme == QLatin1String("https") || scheme == QLatin1String("http")) {
+            show(target);
+            view->loadLive(target);
+        } else {
+            QDesktopServices::openUrl(target);
+        }
+    });
+    view->loadLive(url);
+    window->resize(1100, 900);
+    window->show();
+    window->raise();
+    window->activateWindow();
+    return true;
 }
 
 bool Part::reopenLastSessionEnabled() const
