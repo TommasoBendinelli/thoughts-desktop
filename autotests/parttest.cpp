@@ -813,6 +813,7 @@ private Q_SLOTS:
     void testeRectSelectionStartingOnLinks();
     void testRectSelectionCreatesManualReviewRequest();
     void testRectangleGivesFeedback();
+    void testTextDragOverNoTextGivesAreaFeedback();
     void testFeedbackInAnnotations();
     void testDrawingWithThePencil();
     void testPencilColoursAndEraser();
@@ -22342,6 +22343,80 @@ void PartTest::testFeedbackInAnnotations()
     QCOMPARE(part.m_sidebar->currentItem(), reviews);
     QCOMPARE(view->currentIndex().data(AnnotationModel::ItemTypeRole).toInt(), int(AnnotationModel::Comment));
     qDeleteAll(part.m_pageView->findChildren<AnnotWindow *>());
+}
+
+// A figure drawn without text (25 Nov 2026: a plot whose labels are outlines): the text tool's drag
+// over it catches no text, so it selects the rectangle it covers and offers the area's feedback.
+void PartTest::testTextDragOverNoTextGivesAreaFeedback()
+{
+    Okular::Part part(nullptr, {});
+    QVERIFY(openDocument(&part, QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    part.widget()->resize(900, 800);
+    part.widget()->show();
+    if (qgetenv("KDECI_CANNOT_CREATE_WINDOWS") == "1") {
+        QSKIP("KDE CI can't create a window on this platform, skipping some gui tests");
+    }
+    QVERIFY(QTest::qWaitForWindowExposed(part.widget()));
+    part.m_document->setViewportPage(0);
+    QTRY_VERIFY(part.m_document->page(0)->hasPixmap(part.m_pageView));
+    part.m_document->requestTextPage(0);
+    QTRY_VERIFY(!part.m_document->page(0)->text().isEmpty());
+    QVERIFY(QMetaObject::invokeMethod(part.m_pageView, "slotSetMouseTextSelect"));
+
+    const QSignalBlocker quietRepository(part.m_fedoraRepository);
+    PageView *view = part.m_pageView;
+    auto *feedback = view->documentFeedback();
+    QList<QJsonObject> written;
+    feedback->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    const QString shownSha = Thoughts::FeedbackVersion::cachedFileSha256(part.localFilePath());
+    feedback->setDocument(kDocumentFeedbackDocument, shownSha);
+    feedback->setReviewVersion(QJsonObject{{QStringLiteral("pdf_sha256"), shownSha}, {QStringLiteral("source_built"), false}});
+
+    QStringList names;
+    bool done = false;
+    QTimer menuWatcher;
+    menuWatcher.setInterval(50);
+    QObject::connect(&menuWatcher, &QTimer::timeout, view, [&] {
+        auto *menu = view->findChild<QMenu *>(QStringLiteral("AreaFeedbackMenu"));
+        if (!menu || !menu->isVisible()) return;
+        menuWatcher.stop();
+        for (const QAction *action : menu->actions()) names.append(action->isSeparator() ? QStringLiteral("|") : action->objectName());
+        if (QAction *like = menu->findChild<QAction *>(QStringLiteral("DocumentFeedbackLike"))) {
+            menu->setActiveAction(like);
+            QTest::keyClick(menu, Qt::Key_Return);
+        }
+        if (menu->isVisible()) menu->close();
+        done = true;
+    });
+    menuWatcher.start();
+    const int width = view->viewport()->width();
+    const int height = view->viewport()->height();
+    // Blank paper at the top left of the page, larger than a drag that starts beside a line.
+    simulateMouseSelection(width * 0.02, height * 0.02, width * 0.12, height * 0.10, view->viewport());
+    QVERIFY(QTest::qWaitFor([&done] { return done; }, 5000));
+    QVERIFY2(names.contains(QStringLiteral("DocumentFeedbackLike")) && names.contains(QStringLiteral("DocumentFeedbackComment")), qPrintable(names.join(QLatin1Char(','))));
+    QTRY_COMPARE(written.size(), 1);
+    const QJsonObject liked = written.last();
+    QCOMPARE(Thoughts::DocumentFeedback::validationError(liked), QString());
+    const QJsonObject anchor = liked.value(QStringLiteral("anchor")).toObject();
+    QCOMPARE(anchor.value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString(), QStringLiteral("Area on page 1"));
+    const QJsonArray rect = anchor.value(QStringLiteral("pdf")).toObject().value(QStringLiteral("regions")).toArray().first().toObject().value(QStringLiteral("rect")).toArray();
+    QVERIFY(rect.at(2).toDouble() - rect.at(0).toDouble() > 0.05 && rect.at(3).toDouble() - rect.at(1).toDouble() > 0.03);
+    // The rectangle is gone once the menu closed.
+    QTRY_VERIFY(!view->findChild<QMenu *>(QStringLiteral("AreaFeedbackMenu")) || !view->findChild<QMenu *>(QStringLiteral("AreaFeedbackMenu"))->isVisible());
+
+    // A drag over text still selects the text, with no area menu.
+    names.clear();
+    done = false;
+    menuWatcher.start();
+    simulateMouseSelection(width * 0.1, height * 0.1, width * 0.8, height * 0.5, view->viewport());
+    QTest::qWait(400);
+    menuWatcher.stop();
+    QVERIFY(!done);
+    QVERIFY(part.m_document->page(0)->textSelection() && !part.m_document->page(0)->textSelection()->isEmpty());
 }
 
 void PartTest::testRectangleGivesFeedback()

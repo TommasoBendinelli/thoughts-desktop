@@ -3,6 +3,7 @@
 #include "../part/thoughtsserveraddress.h"
 #include "../shell/appsignin.h"
 #include "../shell/signindialog.h"
+#include "../shell/projectsharedialog.h"
 
 #include <QFile>
 #include <QJsonArray>
@@ -17,6 +18,9 @@
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTcpServer>
+#include <QTimer>
+#include <QApplication>
+#include <QClipboard>
 #include <QTcpSocket>
 #include <QTest>
 #include <QTimeZone>
@@ -76,9 +80,14 @@ public:
     // GET /v1/apps/devices and sign-out, for this token.
     QByteArray token = "app-token";
     QJsonArray devices;
+    // Share… of a project (project-links.md 14): what GET /v1/project-shares answers, and the answer of
+    // POST /v1/project-shares (the body is recorded in bodies).
+    QJsonObject shares;
+    QJsonObject shareAnswer;
     QStringList requests;  // "GET /v1/ready"
     QList<QJsonObject> bodies;  // of the POSTs, in order
     QList<QByteArray> authorizations;  // of every request
+    QString lastQuery;  // of the last GET /v1/project-shares
 
 private:
     void reply(QTcpSocket *socket, int code, const QByteArray &body, const QByteArray &headers = {})
@@ -143,6 +152,19 @@ private:
         }
         if (!authorized) {
             reply(socket, 401, R"({"detail":"invalid token"})");
+            return;
+        }
+        if (method == QLatin1String("GET") && path == QLatin1String("/v1/project-shares")) {
+            lastQuery = QUrl(QString::fromLatin1(words.value(1))).query(QUrl::FullyDecoded);
+            reply(socket, 200, QJsonDocument(shares).toJson());
+            return;
+        }
+        if (method == QLatin1String("POST") && path == QLatin1String("/v1/project-shares")) {
+            reply(socket, 200, QJsonDocument(shareAnswer).toJson());
+            return;
+        }
+        if (method == QLatin1String("DELETE") && (path.startsWith(QLatin1String("/v1/project-shares/")) || path.startsWith(QLatin1String("/v1/project-invitations/")))) {
+            reply(socket, 200, R"({"state":"stopped"})");
             return;
         }
         if (method == QLatin1String("GET") && path == QLatin1String("/v1/apps/devices")) {
@@ -231,6 +253,7 @@ private Q_SLOTS:
     void connectLinks();
     void connectLinks_data();
     void serverChecks();
+    void projectShareDialog();
     void signInAnswers();
     void devicesAnswer();
     void deviceNames();
@@ -711,6 +734,69 @@ void AppSignInTest::linkFillsTheDialog()
     QCOMPARE(server.requests, QStringList {QStringLiteral("GET /v1/ready")});
     QCOMPARE(signedIn.size(), 0);
     QVERIFY(secrets.tokens.isEmpty());
+}
+
+// Share… of a Library project: the people and invitations the server lists, a share by username, and an
+// invitation whose link is copied (the server sends no email).
+void AppSignInTest::projectShareDialog()
+{
+    using namespace Thoughts::ProjectShares;
+    QVERIFY(target(QStringLiteral("  Sam ")) && !target(QStringLiteral("  Sam "))->email && target(QStringLiteral("  Sam "))->value == QStringLiteral("sam"));
+    QVERIFY(target(QStringLiteral("d@example.org"))->email);
+    QVERIFY(!target(QStringLiteral("not an address@")) && !target(QStringLiteral("x")));
+    QCOMPARE(refusal(404, QJsonObject {{QStringLiteral("error_code"), QStringLiteral("project_link_unknown_member")}}),
+             QStringLiteral("No Thoughts account has this username. To invite someone new, type their email address."));
+
+    FakeServer server;
+    server.shares = QJsonObject {{QStringLiteral("name"), QStringLiteral("Notes")},
+                                 {QStringLiteral("shares"), QJsonArray {QJsonObject {{QStringLiteral("link_id"), QStringLiteral("link-1")}, {QStringLiteral("username"), QStringLiteral("laura")}}}},
+                                 {QStringLiteral("invitations"), QJsonArray {QJsonObject {{QStringLiteral("invitation_id"), QStringLiteral("inv-1")}, {QStringLiteral("email"), QStringLiteral("b@example.org")}}}},
+                                 {QStringLiteral("spare_libraries"), 1000}};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    ProjectShareDialog dialog(QJsonObject {{QStringLiteral("id"), QStringLiteral("new:f5cb")}, {QStringLiteral("name"), QStringLiteral("Notes")}}, secrets.hooks(server));
+    dialog.show();
+    QTRY_COMPARE(dialog.findChildren<QWidget *>(QStringLiteral("projectShareRow")).size(), 1);
+    QCOMPARE(dialog.findChildren<QWidget *>(QStringLiteral("projectShareInvitationRow")).size(), 1);
+    QCOMPARE(server.lastQuery, QStringLiteral("project_id=new:f5cb"));
+    QCOMPARE(server.authorizations.constLast(), QByteArray("Bearer app-token"));
+    QCOMPARE(child<QLabel>(dialog, QStringLiteral("projectShareStatus"))->text(), QStringLiteral("Shared with:"));
+
+    // A username: shared at once.
+    server.shareAnswer = QJsonObject {{QStringLiteral("state"), QStringLiteral("shared")}, {QStringLiteral("username"), QStringLiteral("sam")}};
+    child<QLineEdit>(dialog, QStringLiteral("projectShareInput"))->setText(QStringLiteral("Sam"));
+    child<QPushButton>(dialog, QStringLiteral("projectShareButton"))->click();
+    QTRY_COMPARE(server.bodies.size(), 1);
+    QCOMPARE(server.bodies.constLast(), (QJsonObject {{QStringLiteral("project_id"), QStringLiteral("new:f5cb")}, {QStringLiteral("username"), QStringLiteral("sam")}}));
+
+    // An email address: the invitation's link goes to the clipboard.
+    server.shareAnswer = QJsonObject {{QStringLiteral("state"), QStringLiteral("invited")},
+                                      {QStringLiteral("invite_url"), QStringLiteral("https://thoughts.example.org/app/join.html#secret")},
+                                      {QStringLiteral("email"), QJsonObject {{QStringLiteral("to"), QStringLiteral("c@example.org")}, {QStringLiteral("subject"), QStringLiteral("S")}, {QStringLiteral("body"), QStringLiteral("B")}}}};
+    bool copied = false;
+    QTimer poll;
+    connect(&poll, &QTimer::timeout, &dialog, [&] {
+        for (QWidget *widget : QApplication::topLevelWidgets()) {
+            if (widget->objectName() == QLatin1String("projectShareSendInvitation") && widget->isVisible()) {
+                if (auto *copy = widget->findChild<QPushButton *>(QStringLiteral("projectShareCopyLink"))) {
+                    copy->click();
+                    copied = true;
+                }
+            }
+        }
+    });
+    poll.start(20);
+    child<QLineEdit>(dialog, QStringLiteral("projectShareInput"))->setText(QStringLiteral("c@example.org"));
+    child<QPushButton>(dialog, QStringLiteral("projectShareButton"))->click();
+    QTRY_VERIFY(copied);
+    poll.stop();
+    QCOMPARE(server.bodies.constLast().value(QStringLiteral("email")).toString(), QStringLiteral("c@example.org"));
+    QTRY_COMPARE(QApplication::clipboard()->text(), QStringLiteral("https://thoughts.example.org/app/join.html#secret"));
+
+    // Withdraw: the invitation by its id.
+    dialog.findChild<QPushButton *>(QStringLiteral("projectShareWithdraw"))->click();
+    QTRY_VERIFY(server.requests.contains(QStringLiteral("DELETE /v1/project-invitations/inv-1")));
 }
 
 void AppSignInTest::serverDialogListsDevices()

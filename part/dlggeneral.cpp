@@ -130,6 +130,12 @@ DlgGeneral::DlgGeneral(QWidget *parent, Okular::EmbedMode embedMode)
         useTabs->setChecked(false);
         switchToTab->setEnabled(false);
         connect(useTabs, &QCheckBox::toggled, switchToTab, &QWidget::setEnabled);
+
+        QCheckBox *reopen = new QCheckBox(this);
+        reopen->setText(i18nc("@option:check Config dialog, general page", "Reopen the documents that were open when Thoughts last closed"));
+        reopen->setToolTip(i18nc("@info:tooltip", "After quitting, an update, or a crash, Thoughts opens the same windows, tabs and pages again."));
+        reopen->setObjectName(QStringLiteral("kcfg_ReopenLastSession"));
+        layout->addRow(QString(), reopen);
     }
 
 #if !OKULAR_FORCE_DRM

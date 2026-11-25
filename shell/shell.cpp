@@ -1606,7 +1606,7 @@ static void removeNamedActions(QDomElement &container, const QString &name)
 
 static void installAuthoritativeMainToolbarConfig()
 {
-    constexpr int layoutVersion = 48;
+    constexpr int layoutVersion = 49;
     KConfigGroup migrationState = KSharedConfig::openConfig()->group(QStringLiteral("ThoughtsToolbar"));
     const int previousLayoutVersion = migrationState.readEntry(QStringLiteral("LayoutVersion"), 0);
     if (previousLayoutVersion >= layoutVersion) {
@@ -1847,6 +1847,22 @@ static void installAuthoritativeMainToolbarConfig()
             }
             // v46: the "A/B testing" button goes; the rating page it opened is no longer used.
             if (previousLayoutVersion < 46) removeNamedActions(toolbar, QStringLiteral("ab_testing"));
+            // v49: Edit Source in VS Code follows the document title (else it ends the bar).
+            if (previousLayoutVersion < 49) {
+                QDomElement after;
+                bool hasEdit = false;
+                for (QDomElement action = toolbar.firstChildElement(QStringLiteral("Action")); !action.isNull(); action = action.nextSiblingElement(QStringLiteral("Action"))) {
+                    const QString name = action.attribute(QStringLiteral("name"));
+                    if (name == QLatin1String("edit_source")) hasEdit = true;
+                    if (name == QLatin1String("document_title")) after = action;
+                }
+                if (!hasEdit) {
+                    QDomElement edit = document.createElement(QStringLiteral("Action"));
+                    edit.setAttribute(QStringLiteral("name"), QStringLiteral("edit_source"));
+                    if (after.isNull()) toolbar.appendChild(edit);
+                    else toolbar.insertAfter(edit, after);
+                }
+            }
         }
     }
     const QDomElement menuBar = document.documentElement().firstChildElement(QStringLiteral("MenuBar"));
@@ -1908,6 +1924,23 @@ static void installAuthoritativeMainToolbarConfig()
                     send.setAttribute(QStringLiteral("append"), after.isNull() ? QStringLiteral("open_merge") : after.attribute(QStringLiteral("append")));
                 if (after.isNull()) menu.appendChild(send);
                 else menu.insertAfter(send, after);
+            }
+        }
+        // v49: File > Edit Source in VS Code, after Manage Current PDF.
+        if (previousLayoutVersion < 49) {
+            QDomElement after;
+            bool hasEdit = false;
+            for (QDomElement action = menu.firstChildElement(QStringLiteral("Action")); !action.isNull(); action = action.nextSiblingElement(QStringLiteral("Action"))) {
+                const QString name = action.attribute(QStringLiteral("name"));
+                if (name == QLatin1String("edit_source")) hasEdit = true;
+                if (name == QLatin1String("render_linked_pdf")) after = action;
+            }
+            if (!hasEdit) {
+                QDomElement edit = document.createElement(QStringLiteral("Action"));
+                edit.setAttribute(QStringLiteral("name"), QStringLiteral("edit_source"));
+                edit.setAttribute(QStringLiteral("append"), after.isNull() ? QStringLiteral("open_merge") : after.attribute(QStringLiteral("append"), QStringLiteral("open_merge")));
+                if (after.isNull()) menu.appendChild(edit);
+                else menu.insertAfter(edit, after);
             }
         }
         // v48: File > Send to Agent is a submenu of the sessions; Send to Last Agent after it.
@@ -3799,7 +3832,6 @@ void Shell::addTabContextMenuActions(QMenu *menu, int tab)
     if (!menu || tab < 0 || tab >= m_tabs.size()) {
         return;
     }
-
     const QPointer<KParts::ReadWritePart> part = m_tabs.at(tab).part;
     const QPointer<QWidget> tabPage = m_tabWidget->widget(tab);
     const QUrl url = part->url();
@@ -3808,6 +3840,13 @@ void Shell::addTabContextMenuActions(QMenu *menu, int tab)
         addHtmlAttachmentTabMenuActions(menu, tab);
         addTabWindowMenuActions(menu, tabPage);
         return;
+    }
+    // The source of the PDF in front, in the editor.
+    if (part && tab == m_tabWidget->currentIndex()) {
+        if (QAction *editSource = actionCollection()->action(QStringLiteral("edit_source"))) {
+            menu->addAction(editSource);
+            menu->addSeparator();
+        }
     }
 #ifdef Q_OS_WIN
     QAction *revealInFinderAction = menu->addAction(QIcon::fromTheme(QStringLiteral("document-open-folder")), i18n("Show in Explorer"));
@@ -4621,6 +4660,14 @@ void Shell::setupActions()
     agentNotesAction->setIconText(i18n("Agent Notes"));
     actionCollection()->setDefaultShortcut(agentNotesAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N));
     connect(agentNotesAction, &QAction::triggered, this, [] { Shell::showAgentNotes(); });
+    // The source of the PDF in front, in the editor at once (25 Nov 2026: "there should be a button").
+    QAction *editSourceAction = actionCollection()->addAction(QStringLiteral("edit_source"));
+    editSourceAction->setText(i18n("Edit Source in VS Code"));
+    editSourceAction->setIconText(i18n("Edit"));
+    editSourceAction->setIcon(QIcon::fromTheme(QStringLiteral("document-edit")));
+    editSourceAction->setToolTip(i18n("Open this PDF's source in VS Code"));
+    actionCollection()->setDefaultShortcut(editSourceAction, QKeySequence(Qt::CTRL | Qt::Key_E));
+    connect(editSourceAction, &QAction::triggered, this, &Shell::editCurrentSource);
 
     auto *windowButtonsSpace = new QWidget;
     windowButtonsSpace->setFixedSize(68, 1);
@@ -7784,9 +7831,7 @@ void Shell::showReviewCardPdfWindow(bool restoreCardBrowser)
     if (restoreCardBrowser && s_commentsOverview) {
         s_commentsOverview->show();
     }
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
 }
 
 void Shell::clearReviewMasks()
@@ -8196,9 +8241,7 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
             if (page > 0) {
                 QMetaObject::invokeMethod(part, "goToPage", Qt::QueuedConnection, Q_ARG(uint, uint(page)));
             }
-            shell->show();
-            shell->raise();
-            shell->activateWindow();
+            shell->presentWindow();
         }
     });
     connect(overview, &Thoughts::CommentsOverview::librarySearchPageActivated, overview, [](const QString &pdfPath, int page, const QString &query) {
@@ -8214,9 +8257,7 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
                 QMetaObject::invokeMethod(part, "goToPage", Qt::QueuedConnection, Q_ARG(uint, uint(page)));
             }
             QMetaObject::invokeMethod(part, "showLibrarySearch", Qt::QueuedConnection, Q_ARG(QString, query), Q_ARG(int, page));
-            shell->show();
-            shell->raise();
-            shell->activateWindow();
+            shell->presentWindow();
         }
     });
     connect(overview, &Thoughts::CommentsOverview::commentActivated, overview, [](const QString &pdfPath, const QString &annotationId, int page) {
@@ -10390,9 +10431,7 @@ void Shell::openAgentNoteDocument(const QString &documentId, const QString &path
         return;
     }
     shell->selectReaderTitle(part, documentId, QString(), QString());
-    shell->show();
-    shell->raise();
-    shell->activateWindow();
+    shell->presentWindow();
 }
 
 namespace
@@ -10736,6 +10775,28 @@ void Shell::openCommentChatGpt(const QString &url)
     if (!QDesktopServices::openUrl(QUrl(normalized))) {
         KMessageBox::error(this, i18n("The ChatGPT link could not be opened."), i18n("Open ChatGPT"));
     }
+}
+
+QString Shell::currentSourcePath() const
+{
+    const int tab = m_tabWidget ? m_tabWidget->currentIndex() : -1;
+    const QString relative = documentSourcesOfTab(tab).source;
+    if (relative.isEmpty()) {
+        return {};
+    }
+    return QDir(ShellUtils::docsRoot()).filePath(relative);
+}
+
+void Shell::editCurrentSource()
+{
+    const QString source = currentSourcePath();
+    if (source.isEmpty() || !QFileInfo(source).isFile()) {
+        KMessageBox::information(this, source.isEmpty() ? i18n("This PDF has no LaTeX or Markdown source in the Library.")
+                                                         : i18n("The source “%1” is not on this computer yet. Sync, then try again.", QDir::toNativeSeparators(source)),
+                                 i18n("Edit Source"));
+        return;
+    }
+    openCommentSource(source, 1);
 }
 
 void Shell::openCommentSource(const QString &sourcePath, int line)
@@ -11379,9 +11440,7 @@ void Shell::showWindowOnReactivation()
     for (KMainWindow *window : KMainWindow::memberList()) {
         auto *shell = qobject_cast<Shell *>(window);
         if (shell && shell->hasOpenDocument()) {
-            shell->show();
-            shell->raise();
-            shell->activateWindow();
+            shell->presentWindow();
             return;
         }
     }
@@ -11429,6 +11488,19 @@ KParts::ReadWritePart *Shell::trackedCommentPart(const QString &pdfPath, bool al
     return m_tabs.at(tab).part;
 }
 
+void Shell::presentWindow()
+{
+    // raise() and activateWindow() leave a window minimized to the Dock where it is: the Library's
+    // double-click then seemed to do nothing (25 Nov 2026).
+    if (isMinimized()) {
+        showNormal();
+    } else {
+        show();
+    }
+    raise();
+    activateWindow();
+}
+
 void Shell::openTrackedDocument(const QString &pdfPath)
 {
     QString error;
@@ -11436,9 +11508,7 @@ void Shell::openTrackedDocument(const QString &pdfPath)
         KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, error);
         return;
     }
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
 }
 
 KParts::ReadWritePart *Shell::trackedOpenPart(const QString &kind, const QString &pdfPath, QString *error)
@@ -11467,9 +11537,7 @@ void Shell::openTrackedComment(const QString &pdfPath, const QString &annotation
         return;
     }
 
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
     const quint64 requestGeneration = ++m_trackedCommentOpenGeneration;
     tryOpenTrackedComment(pdfPath, annotationId, page, requestGeneration, 0);
 }
@@ -11481,9 +11549,7 @@ void Shell::openTrackedFeedback(const QString &pdfPath, const QString &feedbackI
         KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, error);
         return;
     }
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
     tryOpenTrackedFeedback(pdfPath, feedbackId, ++m_trackedCommentOpenGeneration, 0);
 }
 
@@ -11514,9 +11580,7 @@ void Shell::openTrackedLogicalComment(const QString &pdfPath, const QString &com
         KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : this, error);
         return;
     }
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
     const quint64 requestGeneration = ++m_trackedCommentOpenGeneration;
     tryOpenTrackedLogicalComment(pdfPath, commentId, page, location, requestGeneration, 0);
 }
@@ -11533,9 +11597,7 @@ void Shell::openTrackedAgentProposal(const QString &pdfPath, const QString &prop
         return;
     }
 
-    show();
-    raise();
-    activateWindow();
+    presentWindow();
     const quint64 requestGeneration = ++m_trackedCommentOpenGeneration;
     tryOpenTrackedAgentProposal(pdfPath, proposalId, sourcePath, sourceLine, requestGeneration, 0);
 }
@@ -11868,6 +11930,181 @@ void Shell::redoTrackedCommentChange(const QString &pdfPath)
 void Shell::redoTrackedCommentChanges(const QList<Thoughts::TrackedCommentTarget> &targets)
 {
     runCommentDeletionHistory(targets, false);
+}
+
+namespace
+{
+// The windows, tabs and pages open now, kept so that the next start opens them again (Configure
+// Thoughts › Reopen the documents that were open when Thoughts last closed). Written shortly after
+// any change and every few seconds, and when the application is asked to quit, before its windows
+// close; a window the person closes leaves it. A quit, an update or a crash keeps it.
+const QString openSessionConfig = QStringLiteral("thoughts-open-tabsrc");
+bool s_openSessionFrozen = false;  // quitting, or reopening: nothing is written
+
+class OpenSessionQuitWatcher : public QObject
+{
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == QCoreApplication::instance() && event->type() == QEvent::Quit && !s_openSessionFrozen) {
+            Shell::saveOpenSession();
+            s_openSessionFrozen = true;
+        }
+        return false;
+    }
+};
+
+void watchOpenSession()
+{
+    static bool installed = false;
+    if (installed || !QCoreApplication::instance()) return;
+    installed = true;
+    QCoreApplication::instance()->installEventFilter(new OpenSessionQuitWatcher);
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, qApp, [] { s_openSessionFrozen = true; });
+    // The pages people read on: written every 15 s when they changed.
+    auto *periodic = new QTimer(qApp);
+    periodic->setInterval(15000);
+    QObject::connect(periodic, &QTimer::timeout, qApp, [] { Shell::saveOpenSession(); });
+    periodic->start();
+}
+}
+
+void Shell::scheduleOpenSessionSave()
+{
+    watchOpenSession();
+    static QTimer *debounce = nullptr;
+    if (!debounce) {
+        debounce = new QTimer(qApp);
+        debounce->setSingleShot(true);
+        debounce->setInterval(500);
+        QObject::connect(debounce, &QTimer::timeout, qApp, [] { Shell::saveOpenSession(); });
+    }
+    debounce->start();
+}
+
+void Shell::saveOpenSession()
+{
+    if (s_openSessionFrozen || QCoreApplication::closingDown()) {
+        return;
+    }
+    KConfig config(openSessionConfig, KConfig::SimpleConfig);
+    int index = 0;
+    struct Window {
+        QStringList urls, documentIds, projectIds, titles, pages, currentPages;
+        int active = 0;
+    };
+    QList<Window> open;
+    for (KMainWindow *mainWindow : KMainWindow::memberList()) {
+        auto *shell = qobject_cast<Shell *>(mainWindow);
+        if (!shell || !shell->m_isValid || shell->m_windowClosing) continue;
+        Window window;
+        for (int tab = 0; tab < shell->m_tabs.size(); ++tab) {
+            KParts::ReadWritePart *part = shell->m_tabs.at(tab).part;
+            if (!part || part->url().isEmpty()) continue;
+            if (tab == shell->m_tabWidget->currentIndex()) window.active = window.urls.size();
+            uint page = 0;
+            QMetaObject::invokeMethod(part, "currentPage", Qt::DirectConnection, Q_RETURN_ARG(uint, page));
+            window.urls.append(part->url().url());
+            window.documentIds.append(part->property("thoughtsTitleDocumentId").toString());
+            window.projectIds.append(part->property("thoughtsTitleProjectId").toString());
+            window.titles.append(part->property("thoughtsTitleFallback").toString());
+            window.pages.append(part->property(HTML_ATTACHMENT_TAB_PROPERTY).toString());
+            window.currentPages.append(QString::number(page));
+        }
+        if (!window.urls.isEmpty()) open.append(window);
+    }
+    for (const QString &group : config.groupList()) config.deleteGroup(group);
+    for (const Window &window : std::as_const(open)) {
+        KConfigGroup group(&config, QStringLiteral("Window %1").arg(index++));
+        group.writePathEntry(SESSION_URL_KEY, window.urls);
+        group.writeEntry(SESSION_TAB_KEY, window.active);
+        group.writeEntry(SESSION_HTML_PAGES_KEY, window.pages);
+        group.writeEntry("TitleDocumentIds", window.documentIds);
+        group.writeEntry("TitleProjectIds", window.projectIds);
+        group.writeEntry("DisplayTitles", window.titles);
+        group.writeEntry("CurrentPages", window.currentPages);
+    }
+    config.sync();
+}
+
+bool Shell::reopenLastSession()
+{
+    watchOpenSession();
+    // The setting is the part's (Configure Thoughts): any window's part answers.
+    bool enabled = false;
+    for (KMainWindow *mainWindow : KMainWindow::memberList()) {
+        auto *shell = qobject_cast<Shell *>(mainWindow);
+        if (shell && shell->m_isValid && !shell->m_tabs.isEmpty() && shell->m_tabs.constFirst().part) {
+            QMetaObject::invokeMethod(shell->m_tabs.constFirst().part, "reopenLastSessionEnabled", Qt::DirectConnection, Q_RETURN_ARG(bool, enabled));
+            break;
+        }
+    }
+    if (!enabled) {
+        return false;
+    }
+    KConfig config(openSessionConfig, KConfig::SimpleConfig);
+    QStringList groups = config.groupList().filter(QRegularExpression(QStringLiteral("^Window \\d+$")));
+    std::sort(groups.begin(), groups.end(), [](const QString &a, const QString &b) { return a.mid(7).toInt() < b.mid(7).toInt(); });
+    if (groups.isEmpty()) {
+        return false;
+    }
+    s_openSessionFrozen = true;
+    const auto unfreeze = qScopeGuard([] {
+        s_openSessionFrozen = false;
+        scheduleOpenSessionSave();
+    });
+    // The empty window the start made takes the first one.
+    Shell *empty = nullptr;
+    for (KMainWindow *mainWindow : KMainWindow::memberList()) {
+        auto *shell = qobject_cast<Shell *>(mainWindow);
+        if (shell && shell->m_isValid && !shell->hasOpenDocument()) {
+            empty = shell;
+            break;
+        }
+    }
+    bool reopened = false;
+    for (const QString &name : std::as_const(groups)) {
+        const KConfigGroup saved = config.group(name);
+        // Only what is still there: a file removed since would open an error.
+        const QStringList urls = saved.readPathEntry(SESSION_URL_KEY, QStringList());
+        KConfig memory(QString(), KConfig::SimpleConfig);
+        KConfigGroup group(&memory, QStringLiteral("Window"));
+        QStringList keptUrls, documentIds, projectIds, titles, pages, currentPages;
+        for (int i = 0; i < urls.size(); ++i) {
+            const QUrl url(urls.at(i));
+            if (url.isLocalFile() && !QFileInfo::exists(url.toLocalFile())) continue;
+            keptUrls.append(urls.at(i));
+            documentIds.append(saved.readEntry("TitleDocumentIds", QStringList()).value(i));
+            projectIds.append(saved.readEntry("TitleProjectIds", QStringList()).value(i));
+            titles.append(saved.readEntry("DisplayTitles", QStringList()).value(i));
+            pages.append(saved.readEntry(SESSION_HTML_PAGES_KEY, QStringList()).value(i));
+            currentPages.append(saved.readEntry("CurrentPages", QStringList()).value(i));
+        }
+        if (keptUrls.isEmpty()) continue;
+        group.writePathEntry(SESSION_URL_KEY, keptUrls);
+        group.writeEntry(SESSION_TAB_KEY, std::min<int>(saved.readEntry(SESSION_TAB_KEY, 0), keptUrls.size() - 1));
+        group.writeEntry(SESSION_HTML_PAGES_KEY, pages);
+        group.writeEntry("TitleDocumentIds", documentIds);
+        group.writeEntry("TitleProjectIds", projectIds);
+        group.writeEntry("DisplayTitles", titles);
+        Shell *shell = std::exchange(empty, nullptr);
+        if (!shell) {
+            shell = new Shell();
+            if (!shell->isValid()) continue;
+        }
+        shell->show();
+        shell->readProperties(group);
+        // Each document at the page it was on.
+        for (int i = 0; i < keptUrls.size(); ++i) {
+            const uint page = currentPages.value(i).toUInt();
+            const int tab = pages.value(i).isEmpty() ? shell->findTabIndex(QUrl(keptUrls.at(i))) : -1;
+            if (page > 0 && tab >= 0 && shell->m_tabs.at(tab).part) {
+                QMetaObject::invokeMethod(shell->m_tabs.at(tab).part, "goToPage", Qt::QueuedConnection, Q_ARG(uint, page));
+            }
+        }
+        reopened = reopened || shell->hasOpenDocument();
+    }
+    return reopened;
 }
 
 void Shell::saveProperties(KConfigGroup &group)
@@ -12240,6 +12477,9 @@ bool Shell::queryClose()
             return false;
         }
     }
+    // Closed by the person (not by quitting): left out of the documents reopened at the next start.
+    m_windowClosing = true;
+    scheduleOpenSessionSave();
     return true;
 }
 
@@ -12250,6 +12490,7 @@ void Shell::setActiveTab(int tab)
     if (m_activatingTab == tab) {
         return;
     }
+    scheduleOpenSessionSave();
     const int previousActivation = std::exchange(m_activatingTab, tab);
     const auto finishActivation = qScopeGuard([this, previousActivation] { m_activatingTab = previousActivation; });
     // Developer log: each rebuild of the window for a tab (menus, toolbar, sidebar).
@@ -12891,6 +13132,7 @@ bool Shell::closeTabInternal(int tab, bool promptToSave)
     const bool closeSuccess = part->closeUrl(promptToSave);
     if (closeSuccess) {
         forgetNavigationHistory(part);
+        scheduleOpenSessionSave();
     }
     if (closeSuccess && m_tabs.count() > 1) {
         if (part->factory()) {

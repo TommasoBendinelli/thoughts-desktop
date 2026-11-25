@@ -421,6 +421,8 @@ public Q_SLOTS: // dbus
     Q_SCRIPTABLE Q_NOREPLY void openDocument(const QString &doc);
     Q_SCRIPTABLE uint pages();
     Q_SCRIPTABLE uint currentPage();
+    // Configure Thoughts › Reopen the documents that were open when Thoughts last closed.
+    Q_INVOKABLE bool reopenLastSessionEnabled() const;
     // The reader's current text selection, for "Copy for agent".
     Q_INVOKABLE QString selectedText() const;
     Q_SCRIPTABLE QString currentDocument();

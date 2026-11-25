@@ -190,6 +190,10 @@
   <entry key="SwitchToTabIfOpen" type="Bool">
     <default>true</default>
   </entry>
+  <!-- Thoughts: reopen the windows, tabs and pages that were open when it last quit or stopped. -->
+  <entry key="ReopenLastSession" type="Bool">
+    <default>true</default>
+  </entry>
   <entry key="ShowOSD" type="Bool" >
     <default>true</default>
   </entry>

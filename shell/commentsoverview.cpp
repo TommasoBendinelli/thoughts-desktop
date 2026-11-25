@@ -42,6 +42,7 @@
 #include <QClipboard>
 #include "websiteimportdialog.h"
 #include "signindialog.h"
+#include "projectsharedialog.h"
 #include "agentproposalparser.h"
 #include "developerlog.h"
 #include "librarysearch.h"
@@ -5135,6 +5136,34 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
 
     }
 
+    // ⌘E (Ctrl+E): the selected row's source in VS Code, as Edit Source in VS Code in the reader.
+    auto *editSourceShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_E), m_libraryTree);
+    editSourceShortcut->setObjectName(QStringLiteral("libraryEditSourceShortcut"));
+    editSourceShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(editSourceShortcut, &QShortcut::activated, this, [this] {
+        QTreeWidgetItem *item = m_libraryTree->currentItem();
+        if (!item) {
+            return;
+        }
+        QString path = item->data(0, Qt::UserRole + 1).toString();
+        if (path.isEmpty()) {
+            path = item->data(0, Qt::UserRole + 141).value<QJsonObject>().value(QStringLiteral("source_file")).toString();
+        }
+        if (path.isEmpty() && !item->parent()) {
+            for (const auto &value : item->data(0, Qt::UserRole + 140).value<QJsonObject>().value(QStringLiteral("source_folders")).toArray()) {
+                const QString folder = value.toObject().value(QStringLiteral("project")).toString();
+                if (!folder.isEmpty() && QFileInfo(QDir(m_docsRoot).filePath(folder)).isDir()) {
+                    path = folder;
+                    break;
+                }
+            }
+        }
+        const QString absolute = path.isEmpty() ? QString() : QDir(m_docsRoot).filePath(path);
+        if (absolute.isEmpty() || !QFileInfo::exists(absolute) || absolute.endsWith(QLatin1String(".pdf"), Qt::CaseInsensitive)) {
+            return;
+        }
+        Q_EMIT openSourceRequested(absolute, QFileInfo(absolute).isDir() ? 0 : 1);
+    });
     connect(m_libraryTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
         if (!item) {
             return;
@@ -9335,6 +9364,34 @@ void CommentsOverview::showLibraryItemContextMenu(QTreeWidgetItem *item, QTreeWi
         const QString relative = QDir(m_docsRoot).relativeFilePath(absolute);
         auto *openWith = menu.addMenu(i18n("Open With…"));
         openWith->setObjectName(QStringLiteral("libraryOpenWithMenu"));
+        // A LaTeX or Markdown file of a Library project that is not a document yet: Add as Document…
+        // opens Manage documents with it ticked (25 Nov 2026: a new website.tex had no way to get a PDF).
+        auto *root = item;
+        while (root && root->parent()) root = root->parent();
+        const auto project = root ? root->data(0, Qt::UserRole + 140).value<QJsonObject>() : QJsonObject();
+        const QString suffix = QFileInfo(absolute).suffix().toLower();
+        if (!project.isEmpty() && (suffix == QLatin1String("tex") || suffix == QLatin1String("md") || suffix == QLatin1String("markdown"))) {
+            bool isDocument = false;
+            for (const auto &value : project.value(QStringLiteral("documents")).toArray()) {
+                const QString document = value.toObject().value(QStringLiteral("source_file")).toString();
+                isDocument = isDocument || (!document.isEmpty() && QFileInfo(QDir(m_docsRoot).filePath(document)).canonicalFilePath() == QFileInfo(absolute).canonicalFilePath());
+            }
+            if (!isDocument) {
+                auto *add = menu.addAction(QIcon::fromTheme(QStringLiteral("document-new")), i18n("Add as Document…"));
+                add->setObjectName(QStringLiteral("libraryAddAsDocumentAction"));
+                add->setEnabled(QFileInfo(absolute).isFile() && !m_syncOperationRunning);
+                connect(add, &QAction::triggered, this, [this, project, absolute] {
+                    DocumentManagementDialog dialog(m_docsRoot, project, this);
+                    if (!dialog.selectSource(absolute)) {
+                        KMessageBox::information(this, i18n("“%1” is not a complete document yet: a LaTeX file needs \\documentclass and \\begin{document}, a Markdown file a title. Finish it, Sync, then try again.", QFileInfo(absolute).fileName()), i18n("Add as Document"));
+                        return;
+                    }
+                    if (dialog.exec() != QDialog::Accepted) return;
+                    updateLibraryTree();
+                    Q_EMIT projectAttachmentChangedLocally(project.value(QStringLiteral("target")).toString());
+                });
+            }
+        }
         auto *code = openWith->addAction(i18n("VS Code"));
         code->setEnabled(QFileInfo(absolute).isFile());
         connect(code, &QAction::triggered, this, [this, absolute] { Q_EMIT openSourceRequested(absolute, 1); });
@@ -9698,6 +9755,30 @@ void CommentsOverview::showLibraryItemContextMenu(QTreeWidgetItem *item, QTreeWi
                     editLibraryProject(project, kind, document);
                 });
             };
+            if (item == root) {
+                // The project's sources in the editor at once: its source folder (the first that is here).
+                QString folderPath;
+                for (const auto &value : project.value(QStringLiteral("source_folders")).toArray()) {
+                    const QString candidate = QDir(m_docsRoot).filePath(value.toObject().value(QStringLiteral("project")).toString());
+                    if (!value.toObject().value(QStringLiteral("project")).toString().isEmpty() && QFileInfo(candidate).isDir()) {
+                        folderPath = candidate;
+                        break;
+                    }
+                }
+                auto *openInCode = menu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Open in VS Code"));
+                openInCode->setObjectName(QStringLiteral("libraryProjectOpenInVSCodeAction"));
+                openInCode->setEnabled(!folderPath.isEmpty());
+                connect(openInCode, &QAction::triggered, this, [this, folderPath] { Q_EMIT openSourceRequested(folderPath, 0); });
+                // Who has the project, and sharing it with a username or an email address (project-links.md 14).
+                auto *share = menu.addAction(QIcon::fromTheme(QStringLiteral("document-share")), i18n("Share…"));
+                share->setObjectName(QStringLiteral("libraryProjectShareAction"));
+                connect(share, &QAction::triggered, this, [this, project] {
+                    auto *dialog = new ProjectShareDialog(project, serverAccountHooks(), this);
+                    dialog->setAttribute(Qt::WA_DeleteOnClose);
+                    dialog->show();
+                });
+                menu.addSeparator();
+            }
             if (item == root || group) {
                 const auto folders = project.value(QStringLiteral("source_folders")).toArray();
                 if (folders.size() == 1) addHtmlImport(menu, folders.first().toObject().value(QStringLiteral("project")).toString(), root->data(0, LibraryFilenameRole).toString());
@@ -9801,8 +9882,11 @@ void CommentsOverview::showLibraryItemContextMenu(QTreeWidgetItem *item, QTreeWi
                     Q_EMIT documentPageActivated(pdfPath, page, document.value(QStringLiteral("document_id")).toString(), document.value(QStringLiteral("name")).toString());
                 });
                 const QString sourcePath = document.value(QStringLiteral("source_file")).toString();
-                if (sourcePath.endsWith(QLatin1String(".md")) || sourcePath.endsWith(QLatin1String(".markdown"))) {
-                    auto *edit = menu.addAction(i18n("Edit source"));
+                if (sourcePath.endsWith(QLatin1String(".md"), Qt::CaseInsensitive) || sourcePath.endsWith(QLatin1String(".markdown"), Qt::CaseInsensitive)
+                    || sourcePath.endsWith(QLatin1String(".tex"), Qt::CaseInsensitive)) {
+                    auto *edit = menu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Edit Source in VS Code"));
+                    edit->setObjectName(QStringLiteral("libraryEditSourceAction"));
+                    edit->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
                     const QString absolute = QDir(m_docsRoot).filePath(sourcePath);
                     edit->setEnabled(QFileInfo::exists(absolute));
                     connect(edit, &QAction::triggered, this, [this, absolute] { Q_EMIT openSourceRequested(absolute, 1); });

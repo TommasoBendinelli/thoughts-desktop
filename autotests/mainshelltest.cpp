@@ -555,6 +555,8 @@ private Q_SLOTS:
     void testCopyForAgentInTheFileMenu();
     void testLibraryWindowHasTheApplicationMenus();
     void testMenusListEachEntryOnce();
+    void testReopensTheDocumentsOpenWhenItLastClosed();
+    void testEditSourceAndAMinimizedWindowComesBack();
     void testTabRevealInFinderAction();
     void testKeptEarlierVersionInCopyForAgentAndHistory();
     void testTabCopyDocumentNameAction();
@@ -2079,6 +2081,120 @@ void MainShellTest::testMenusListEachEntryOnce()
     QVERIFY(!toolBar->actions().isEmpty());
 }
 
+// The PDF window's Edit Source in VS Code (toolbar, File, title menu) finds the PDF's source in the
+// Library's projects; and opening a PDF from the Library brings back a window minimized to the Dock
+// (25 Nov 2026: double-clicks seemed to do nothing).
+void MainShellTest::testEditSourceAndAMinimizedWindowComesBack()
+{
+    QTemporaryDir library;
+    QVERIFY(library.isValid());
+    const QByteArray savedRoot = qgetenv("THOUGHTS_HOME");
+    qputenv("THOUGHTS_HOME", library.path().toLocal8Bit());
+    const auto restoreRoot = qScopeGuard([&savedRoot] {
+        if (savedRoot.isEmpty()) qunsetenv("THOUGHTS_HOME");
+        else qputenv("THOUGHTS_HOME", savedRoot);
+    });
+    const QDir root(library.path());
+    QVERIFY(root.mkpath(QStringLiteral("current_pdfs")) && root.mkpath(QStringLiteral("docs-notes/tex/source")));
+    const QString pdf = root.filePath(QStringLiteral("current_pdfs/notes.pdf"));
+    QVERIFY(QFile::copy(QStringLiteral(KDESRCDIR "data/file1.pdf"), pdf));
+    const QString source = root.filePath(QStringLiteral("docs-notes/tex/source/main.tex"));
+    QFile tex(source);
+    QVERIFY(tex.open(QIODevice::WriteOnly));
+    tex.write("\\documentclass{article}\n");
+    tex.close();
+    QVERIFY(root.mkpath(QStringLiteral(".thoughts")));
+    QFile projects(root.filePath(QStringLiteral(".thoughts/library-projects.json")));
+    QVERIFY(projects.open(QIODevice::WriteOnly));
+    projects.write(QJsonDocument(QJsonObject{{QStringLiteral("projects"), QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("project-notes")}, {QStringLiteral("name"), QStringLiteral("Notes")},
+                                                                               {QStringLiteral("documents"), QJsonArray{QJsonObject{{QStringLiteral("filename"), QStringLiteral("notes.pdf")},
+                                                                                                                                  {QStringLiteral("source_file"), QStringLiteral("docs-notes/tex/source/main.tex")},
+                                                                                                                                  {QStringLiteral("document_id"), QStringLiteral("doc-notes")}}}}}}},
+                           {QStringLiteral("pending"), QJsonArray{}}}).toJson());
+    projects.close();
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({pdf}, options), Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    // The lookup itself is documentSourcesOfTab's (Send to Agent), which needs a full Project manifest.
+    QAction *edit = s->actionCollection()->action(QStringLiteral("edit_source"));
+    QVERIFY(edit && edit->isEnabled());
+    QCOMPARE(edit->shortcut(), QKeySequence(Qt::CTRL | Qt::Key_E));
+    KToolBar *toolBar = s->toolBar(QStringLiteral("mainToolBar"));
+    QVERIFY(toolBar && toolBar->actions().contains(edit));
+    auto *file = qobject_cast<QMenu *>(s->factory()->container(QStringLiteral("file"), s));
+    QVERIFY(file && file->actions().contains(edit));
+    QMenu titleMenu;
+    s->addTabContextMenuActions(&titleMenu, s->m_tabWidget->currentIndex());
+    QVERIFY(titleMenu.actions().contains(edit));
+
+    s->show();
+    QVERIFY(QTest::qWaitForWindowExposed(s));
+    s->setWindowState(s->windowState() | Qt::WindowMinimized);
+    QTRY_VERIFY(s->isMinimized());
+    s->openTrackedDocument(pdf);
+    QTRY_VERIFY(!s->isMinimized());
+    QVERIFY(s->isVisible());
+}
+
+// 25 Nov 2026: "when it's closed abruptly, reopen the same". The tabs and pages open are kept, and a
+// start without documents opens them again; a window the person closes is left out.
+void MainShellTest::testReopensTheDocumentsOpenWhenItLastClosed()
+{
+    const QString first = QStringLiteral(KDESRCDIR "data/file1.pdf");
+    const QString second = QStringLiteral(KDESRCDIR "data/simple-multipage.pdf");
+    Okular::Settings::self()->setShellOpenFileInTabs(true);
+    Okular::Settings::self()->setReopenLastSession(true);
+    const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
+    QCOMPARE(Okular::main({first, second}, options), Okular::Success);
+    Shell *s = findShell();
+    QVERIFY(s);
+    QTRY_COMPARE(s->m_tabs.size(), 2);
+    s->setActiveTab(1);
+    auto *part = qobject_cast<Okular::Part *>(s->m_tabs.at(1).part);
+    QVERIFY(part);
+    QTRY_VERIFY(part->pages() >= 2);
+    part->goToPage(2);
+    QTRY_COMPARE(part->currentPage(), 2u);
+    Shell::saveOpenSession();
+    // The application stops (a crash, an update): its windows go without being closed by the person.
+    delete s;
+    QVERIFY(!findShell());
+
+    // The next start opens nothing itself: the same tabs come back, the second at its page and in front.
+    auto *fresh = new Shell(options);
+    QVERIFY(fresh->isValid());
+    fresh->show();
+    QVERIFY(Shell::reopenLastSession());
+    QTRY_COMPARE(fresh->m_tabs.size(), 2);
+    QCOMPARE(QFileInfo(fresh->m_tabs.at(0).part->url().toLocalFile()).canonicalFilePath(), QFileInfo(first).canonicalFilePath());
+    QCOMPARE(QFileInfo(fresh->m_tabs.at(1).part->url().toLocalFile()).canonicalFilePath(), QFileInfo(second).canonicalFilePath());
+    QCOMPARE(fresh->m_tabWidget->currentIndex(), 1);
+    auto *reopened = qobject_cast<Okular::Part *>(fresh->m_tabs.at(1).part);
+    QTRY_COMPARE(reopened->currentPage(), 2u);
+
+    // Closed by the person: it is not reopened next time.
+    QVERIFY(fresh->queryClose());
+    Shell::saveOpenSession();
+    delete fresh;
+    auto *next = new Shell(options);
+    next->show();
+    QVERIFY(!Shell::reopenLastSession());
+    QVERIFY(!next->hasOpenDocument());
+    delete next;
+
+    // Turned off in Configure Thoughts: nothing reopens.
+    QCOMPARE(Okular::main({first}, options), Okular::Success);
+    Shell::saveOpenSession();
+    delete findShell();
+    Okular::Settings::self()->setReopenLastSession(false);
+    auto *off = new Shell(options);
+    off->show();
+    QVERIFY(!Shell::reopenLastSession());
+    delete off;
+    Okular::Settings::self()->setReopenLastSession(true);
+}
+
 void MainShellTest::testLibraryWindowHasTheApplicationMenus()
 {
     const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
@@ -2160,8 +2276,11 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     QVERIFY(oldMenu.contains("<Action name=\"agent_notes\"/>"));
     oldMenu.replace("  <Action name=\"agent_notes\"/>\n", "");
     oldMenu.replace("   <Action name=\"agent_notes\" append=\"open_merge\" />\n", "");
-    QVERIFY(oldMenu.contains("<gui version=\"48\""));
-    oldMenu.replace("<gui version=\"48\"", "<gui version=\"42\"");
+    QVERIFY(oldMenu.contains("<Action name=\"edit_source\"/>"));
+    oldMenu.replace("  <Action name=\"edit_source\"/>\n", "");
+    oldMenu.replace("   <Action name=\"edit_source\" append=\"open_merge\" />\n", "");
+    QVERIFY(oldMenu.contains("<gui version=\"49\""));
+    oldMenu.replace("<gui version=\"49\"", "<gui version=\"42\"");
     // A layout saved while "A/B testing" existed (v36-v45) has it in the toolbar and the File menu.
     QVERIFY(!oldMenu.contains("ab_testing"));
     oldMenu.replace("  <Action name=\"review_overview\"/>\n", "  <Action name=\"review_overview\"/>\n  <Action name=\"ab_testing\"/>\n");
@@ -2189,7 +2308,10 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     savedMenu.close();
     QVERIFY(migrated.contains("name=\"copy_for_agent\""));
     QVERIFY(migrated.indexOf("copy_for_agent") > migrated.indexOf("review_overview"));
-    QVERIFY(migrated.contains("version=\"48\""));
+    QVERIFY(migrated.contains("version=\"49\""));
+    // v49: Edit Source in VS Code after the document title and in File.
+    QCOMPARE(migrated.count("name=\"edit_source\""), 2);
+    QVERIFY(migrated.indexOf("name=\"edit_source\"", migrated.indexOf("document_title")) > migrated.indexOf("document_title"));
     // v47: Send to Agent right after Copy for Agent; v48: Send to Last Agent after it.
     QCOMPARE(migrated.count("name=\"send_to_agent\""), 1);
     QVERIFY(migrated.indexOf("send_to_agent") > migrated.indexOf("copy_for_agent"));

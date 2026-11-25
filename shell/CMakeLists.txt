@@ -14,6 +14,7 @@ set(okular_SRCS
    agentnotedrawing.cpp
    appsignin.cpp
    signindialog.cpp
+   projectsharedialog.cpp
    main.cpp
    developerlog.cpp
    developerlogdialog.cpp

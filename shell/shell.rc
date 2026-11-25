@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!DOCTYPE gui SYSTEM "kpartgui.dtd">
-<gui version="48" name="okular_shell" >
+<gui version="49" name="okular_shell" >
  <MenuBar>
   <Menu name="file" >
    <text>&amp;File</text>
@@ -8,6 +8,7 @@
    <DefineGroup append="print_merge" name="file_print" />
    <Action name="open_from_url" append="open_merge" />
    <Action name="render_linked_pdf" append="open_merge" />
+   <Action name="edit_source" append="open_merge" />
    <Action name="review_overview" append="open_merge" />
    <Action name="agent_notes" append="open_merge" />
    <Action name="copy_for_agent" append="open_merge" />
@@ -43,6 +44,7 @@
   <Action name="mouse_draw"/>
   <Action name="mouse_text_box"/>
   <Action name="document_title"/>
+  <Action name="edit_source"/>
   <Spacer/>
   <Action name="go_document_back"/>
   <Action name="page_number"/>

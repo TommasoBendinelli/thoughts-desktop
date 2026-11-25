@@ -408,6 +408,8 @@ public:
     QRect mouseSelectionRect;
     QColor mouseSelectionColor;
     bool mouseTextSelecting = false;
+    // A text-tool drag that caught no text: the rectangle it covers is the selection (a figure).
+    bool textDragArea = false;
     Okular::Annotation *mouseCommentCandidate = nullptr;
     int mouseCommentCandidatePage = -1;
     QSet<int> pagesWithTextSelection;
@@ -5000,6 +5002,62 @@ bool PageView::feedbackCovers(int page, const QPointF &centre) const
     return std::any_of(d->feedbackAreaLines.cbegin(), d->feedbackAreaLines.cend(), [page, centre](const auto &line) { return line.first == page && line.second.contains(centre); });
 }
 
+void PageView::updateTextDragArea(const QPoint pos)
+{
+    // Large enough that a drag started in a margin beside a line reaches its text first.
+    constexpr int minimumSide = 40;
+    const QRect drag = QRect(d->mouseSelectPos.toPoint(), pos).normalized();
+    bool area = drag.width() >= minimumSide && drag.height() >= minimumSide;
+    for (int page : std::as_const(d->pagesWithTextSelection)) {
+        const Okular::Page *selected = area && page >= 0 && page < int(d->document->pages()) ? d->document->page(page) : nullptr;
+        if (selected && selected->textSelection() && !selected->textSelection()->isEmpty()) {
+            area = false;
+        }
+    }
+    if (!area && !d->textDragArea) {
+        return;
+    }
+    const QRect before = d->mouseSelectionRect.normalized();
+    d->textDragArea = area;
+    d->mouseSelectionRect = area ? drag : QRect();
+    if (area) {
+        d->mouseSelectionColor = palette().color(QPalette::Active, QPalette::Highlight);
+    }
+    viewport()->update((before | d->mouseSelectionRect).translated(-contentAreaPosition()).adjusted(-2, -2, 2, 2));
+}
+
+void PageView::showAreaFeedbackMenu(const QRect &selectionRect, const QPoint globalPos)
+{
+    // The text inside the area, if any, is its quote; a figure drawn without text gets "Area on page N".
+    QString text;
+    for (const PageViewItem *item : std::as_const(d->items)) {
+        if (!item->isVisible() || !selectionRect.intersects(item->croppedGeometry())) {
+            continue;
+        }
+        const Okular::Page *okularPage = item->page();
+        if (!okularPage->hasTextPage()) {
+            continue;
+        }
+        QRect relative = selectionRect.intersected(item->croppedGeometry());
+        relative.translate(-item->uncroppedGeometry().topLeft());
+        Okular::RegularAreaRect rects;
+        rects.append(Okular::NormalizedRect(relative, item->uncroppedWidth(), item->uncroppedHeight()));
+        text += okularPage->text(&rects);
+    }
+    setFeedbackArea(selectionRect, text);
+    const auto clearArea = qScopeGuard([this] {
+        d->feedbackAreaLines.clear();
+        selectionClear();
+    });
+    QMenu menu(this);
+    menu.setObjectName(QStringLiteral("AreaFeedbackMenu"));
+    addReviewFeedbackActions(&menu);
+    if (menu.actions().isEmpty()) {
+        return;
+    }
+    menu.exec(globalPos);
+}
+
 void PageView::setFeedbackArea(const QRect &selectionRect, const QString &text)
 {
     d->feedbackAreaLines.clear();
@@ -7226,6 +7284,10 @@ void PageView::mouseMoveEvent(QMouseEvent *e)
         // must never start or extend a drag from a stale press position.
         if (!leftButton) {
             d->mouseTextSelecting = false;
+            if (d->textDragArea) {
+                d->textDragArea = false;
+                selectionClear();
+            }
             if (e->buttons() == Qt::NoButton) {
                 d->mousePressPos = QPointF();
             }
@@ -7261,6 +7323,9 @@ void PageView::mouseMoveEvent(QMouseEvent *e)
         }
         d->mouseAnnotation->routeMouseMoveEvent(pageItem, eventPos, leftButton);
         updateSelection(eventPos);
+        if (d->mouseTextSelecting) {
+            updateTextDragArea(eventPos);
+        }
         updateCursor();
         break;
     }
@@ -7516,6 +7581,10 @@ void PageView::mousePressEvent(QMouseEvent *e)
         break;
     case Okular::Settings::EnumMouseMode::TextSelect:
         d->mouseSelectPos = eventPos;
+        if (d->textDragArea) {
+            d->textDragArea = false;
+            selectionClear();
+        }
         if (leftButton) {
             PageViewItem *pageItem = pickItemOnPoint(eventPos.x(), eventPos.y());
             if (Okular::Annotation *annotation = commentAnnotationAtPoint(pageItem, eventPos)) {
@@ -8210,6 +8279,13 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
         // A click on answer or document feedback opens its editor.
         if (leftButton && !d->mouseTextSelecting && (openReviewFeedbackAt(eventPos) || openDocumentFeedbackAt(eventPos))) break;
 
+        if (d->mouseTextSelecting && d->textDragArea && leftButton) {
+            // The drag caught no text: feedback on the area, as with the rectangle tool.
+            d->mouseTextSelecting = false;
+            d->textDragArea = false;
+            showAreaFeedbackMenu(d->mouseSelectionRect.normalized(), e->globalPosition().toPoint());
+            break;
+        }
         if (d->mouseTextSelecting) {
             d->mouseTextSelecting = false;
             //                    textSelectionClear();

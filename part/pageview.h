@@ -298,6 +298,10 @@ public Q_SLOTS:
     QString feedbackText() const;
     bool feedbackCovers(int page, const QPointF &centre) const;
     void setFeedbackArea(const QRect &selectionRect, const QString &text);
+    // A text-tool drag over no text shows (and becomes) the rectangle it covers.
+    void updateTextDragArea(const QPoint pos);
+    // Like, Dislike, Question…, Comment… for the area @p selectionRect (content coordinates).
+    void showAreaFeedbackMenu(const QRect &selectionRect, const QPoint globalPos);
     OKULARPART_EXPORT bool reviewFeedbackSelectionQualifies() const;
     OKULARPART_EXPORT QJsonObject reviewFeedbackForSelection(const QString &polarity, const QString &comment, QString *error = nullptr) const;
     // Like / Dislike: the record at once, with an empty comment; the selection is cleared.

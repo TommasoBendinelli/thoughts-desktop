@@ -187,6 +187,10 @@ int main(int argc, char **argv)
             // Do nothing
             break;
         }
+        // Nothing to open: the windows, tabs and pages open when Thoughts last closed.
+        if (paths.isEmpty() && thoughtsLinks.isEmpty() && !parser.isSet(QStringLiteral("presentation")) && !parser.isSet(QStringLiteral("print-and-exit"))) {
+            Shell::reopenLastSession();
+        }
         for (const QString &link : std::as_const(thoughtsLinks)) {
             QTimer::singleShot(0, &app, [link] {
                 QFileOpenEvent event{QUrl(link)};

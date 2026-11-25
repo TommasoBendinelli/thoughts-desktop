@@ -149,6 +149,27 @@ public:
         connect(m_list, &QListWidget::itemChanged, this, [this] { validate(); });
         validate();
     }
+    // Ticks and selects the row of the source file @p absolutePath (Add as Document…); false when the
+    // folder offers no such document (not a complete LaTeX or Markdown document).
+    bool selectSource(const QString &absolutePath) {
+        const QString wanted = QFileInfo(absolutePath).canonicalFilePath();
+        for (int i = 0; !wanted.isEmpty() && i < m_list->count(); ++i) {
+            auto *row = m_list->item(i);
+            const auto entry = row->data(Qt::UserRole).toJsonObject();
+            // A folder's candidate names its owner and source; a Project configuration's row has the
+            // document's Library path (its alias) as its tooltip.
+            const QString owner = entry.value(QStringLiteral("owner")).toString();
+            const QJsonValue source = entry.value(QStringLiteral("source"));
+            const QString relative = !owner.isEmpty() && source.isString() ? owner + QLatin1Char('/') + source.toString()
+                                                                           : row->toolTip().section(QLatin1Char('\n'), 0, 0);
+            if (relative.isEmpty() || QFileInfo(QDir(m_root).filePath(relative)).canonicalFilePath() != wanted) continue;
+            if (row->flags() & Qt::ItemIsUserCheckable) row->setCheckState(Qt::Checked);
+            m_list->setCurrentItem(row);
+            m_list->scrollToItem(row);
+            return true;
+        }
+        return false;
+    }
 private:
     static constexpr int RemovedRole = Qt::UserRole + 1;
     static QString orderPath(const QString &root, const QString &owner) {

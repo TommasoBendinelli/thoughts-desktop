@@ -2188,6 +2188,11 @@ QString Part::selectedText() const
     return m_pageView ? m_pageView->selectedText() : QString();
 }
 
+bool Part::reopenLastSessionEnabled() const
+{
+    return Okular::Settings::reopenLastSession();
+}
+
 uint Part::currentPage()
 {
     return m_document->pages() ? m_document->currentPage() + 1 : 0;

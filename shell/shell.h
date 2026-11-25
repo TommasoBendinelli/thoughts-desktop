@@ -136,6 +136,12 @@ public:
     bool openDocument(const QUrl &url, const QString &serializedOptions);
 
     static void showCommentsOverviewOnStartup();
+    // The windows, tabs and pages open now, for the next start (see reopenLastSession).
+    static void saveOpenSession();
+    static void scheduleOpenSessionSave();
+    // At a start without documents to open: the windows, tabs and pages open when Thoughts last
+    // closed (quit, update or crash), when Configure Thoughts says so. True when one opened.
+    static bool reopenLastSession();
     // At start, when no device token is stored for the configured server: Sign In over the
     // Library instead of staying unconnected. Not under THOUGHTS_TOKEN, in tests, or where the
     // system has no secret store for the tokens.
@@ -348,6 +354,12 @@ private Q_SLOTS:
     // A reader tab saved an Accept or Reject to its source (Part::agentProposalsDecidedLocally).
     void readerProposalDecided();
     void openTrackedDocument(const QString &pdfPath);
+    // Shows this window in front, restored if it was minimized.
+    void presentWindow();
+    // The source file (absolute) of the PDF in front, from the Library's projects; empty without one.
+    QString currentSourcePath() const;
+    // Edit Source in VS Code: the source of the PDF in front.
+    void editCurrentSource();
     void openTrackedComment(const QString &pdfPath, const QString &annotationId, int page);
     void openTrackedFeedback(const QString &pdfPath, const QString &feedbackId);
     // A page of an HTML attachment of the sender's document (Part::requestHtmlAttachmentTab): in
@@ -736,6 +748,8 @@ private:
     QAction *m_pdfSyncDetailMenuAction = nullptr;
     QAction *m_pdfSyncNowMenuAction = nullptr;
     QAction *m_pdfSignInMenuAction = nullptr;
+    // Closed by the person: no longer one of the windows reopened at the next start.
+    bool m_windowClosing = false;
     QAction *m_pdfStatusMenuAction = nullptr;
     QAction *m_pdfStatusDetailMenuAction = nullptr;
     QAction *m_pdfPrimaryMenuAction = nullptr;

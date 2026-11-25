@@ -617,6 +617,7 @@ private Q_SLOTS:
     void testManageDocumentsReusesRemovedIdentity();
     void testSingleProjectDocumentManagement();
     void testManageDefaultFolderDocuments();
+    void testAddAsDocumentTicksTheFile();
     void testPdfOnlyDocumentActions();
     void testMoveDocumentDialog();
     void testMoveSourceDocumentDialog();
@@ -3493,6 +3494,36 @@ void CommentsOverviewTest::testManageDefaultFolderDocuments()
     QCOMPARE(list->item(2)->checkState(), Qt::Checked);
 }
 
+// Add as Document… on a source file (25 Nov 2026: a new website.tex had no way to get a PDF): Manage
+// documents opens with that file ticked; a file that is not a complete document is not offered.
+void CommentsOverviewTest::testAddAsDocumentTicksTheFile()
+{
+    QTemporaryDir temporary;
+    using Thoughts::ProjectConfiguration;
+    const QString id = QStringLiteral("new:add-as-document");
+    const auto configuration = ProjectConfiguration::empty(temporary.path(), id, QStringLiteral("Notes"));
+    const QString path = ProjectConfiguration::path(temporary.path(), id);
+    QVERIFY(ProjectConfiguration::save(path, configuration).isEmpty());
+    const QString owner = QFileInfo(path).absolutePath().mid(QDir(temporary.path()).absolutePath().size() + 1);
+    QVERIFY(writeFile(temporary.filePath(owner + QStringLiteral("/notes.md")), "# Notes\n"));
+    QVERIFY(writeFile(temporary.filePath(owner + QStringLiteral("/Vendor/website.tex")), "\\documentclass{article}\n\\begin{document}Site\\end{document}\n"));
+    QVERIFY(writeFile(temporary.filePath(owner + QStringLiteral("/Vendor/part.tex")), "A part without a preamble.\n"));
+    Thoughts::DocumentManagementDialog dialog(temporary.path(), QJsonObject{{QStringLiteral("id"), id}});
+    auto *list = dialog.findChild<QListWidget *>();
+    QVERIFY(list);
+    QVERIFY(dialog.selectSource(temporary.filePath(owner + QStringLiteral("/Vendor/website.tex"))));
+    QCOMPARE(list->currentItem()->toolTip().section(QLatin1Char('\n'), 0, 0), owner + QStringLiteral("/Vendor/website.tex"));
+    QCOMPARE(list->currentItem()->checkState(), Qt::Checked);
+    QVERIFY(!dialog.selectSource(temporary.filePath(owner + QStringLiteral("/Vendor/part.tex"))));
+    dialog.findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Apply)->click();
+    QCOMPARE(dialog.result(), int(QDialog::Accepted));
+    bool declared = false;
+    for (const auto &value : ProjectConfiguration::read(path).value(QStringLiteral("documents")).toArray())
+        declared = declared || (value.toObject().value(QStringLiteral("source")).toObject().value(QStringLiteral("path")).toString() == QStringLiteral("Vendor/website.tex")
+                                && value.toObject().value(QStringLiteral("included")).toBool());
+    QVERIFY(declared);
+}
+
 void CommentsOverviewTest::testSingleProjectDocumentManagement()
 {
     QTemporaryDir temporary;
@@ -3652,6 +3683,8 @@ void CommentsOverviewTest::testProjectMenuHasNoCopyProjectName()
     overview.showLibraryItemContextMenu(tree->topLevelItem(0), tree, {}, true);
     // A Project's menu has Rename… but no Copy project name.
     QVERIFY2(labels.contains(QStringLiteral("Rename…")) && !labels.contains(QStringLiteral("Copy project name")), qPrintable(labels.join(QLatin1Char('|'))));
+    // 25 Nov: its sources open in the editor from its first entry.
+    QCOMPARE(labels.value(0), QStringLiteral("Open in VS Code"));
 }
 
 // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow, as a
@@ -7474,8 +7507,8 @@ void CommentsOverviewTest::testProjectDocumentCommentNavigation()
         QMetaObject::invokeMethod(&overview, inComments ? "showDocumentsContextMenu" : "showLibraryContextMenu", Qt::DirectConnection, Q_ARG(QPoint, view->visualItemRect(selected).center()));
         return actions;
     };
-    // A source-linked document can move to another Project with its source.
-    const QStringList expected {QStringLiteral("Open PDF"), QStringLiteral("Rename…"), QStringLiteral("Remove…"), QStringLiteral("Move to project…")};
+    // A source-linked document can move to another Project with its source; its source opens in the editor.
+    const QStringList expected {QStringLiteral("Open PDF"), QStringLiteral("Edit Source in VS Code"), QStringLiteral("Rename…"), QStringLiteral("Remove…"), QStringLiteral("Move to project…")};
     QCOMPARE(componentMenu(true, QStringLiteral("Open PDF")), expected);
     QCOMPARE(opened.size(), 1); QCOMPARE(opened.first().at(0).toString(), pdfPath); QCOMPARE(opened.first().at(1).toInt(), 2);
     QCOMPARE(componentMenu(false, {}), expected);
