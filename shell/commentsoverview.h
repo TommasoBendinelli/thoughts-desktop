@@ -318,10 +318,15 @@ public:
                                           const QVariantMap &information);
     Q_INVOKABLE void applySourceMonitoringBatch(quint64 requestId, const QVariantMap &information);
 
+    // Where Sign In, Share… and Report a Problem… find the server's tokens (tests: a fake store).
+    AppSignIn::Hooks serverAccountHooks() const;
+
 Q_SIGNALS:
     void noteAttachmentOpenRequested(const QVariantMap &attachment);
     void sourceMonitoringBatchRequested(quint64 requestId, const QStringList &targets);
     void documentActivated(const QString &pdfPath);
+    // A web page of a project's folder, from the Library: in a tab beside `pdfPath`, a PDF of its folder.
+    void htmlPageActivated(const QString &pdfPath, const QString &pagePath);
     void documentPageActivated(const QString &pdfPath, int page, const QString &documentId = {}, const QString &displayTitle = {}, const QString &projectId = {});
     // A Library search result: open the PDF, mark the query's words, and go to page (if > 0).
     void librarySearchPageActivated(const QString &pdfPath, int page, const QString &query);
@@ -437,7 +442,6 @@ private Q_SLOTS:
     // Where Sign In and the Server dialog keep tokens and send requests (tests: a fake secret
     // store and server). A token writer set above is used when these give none.
     void setServerAccountHooks(AppSignIn::Hooks hooks) { m_serverAccountHooks = std::move(hooks); }
-    AppSignIn::Hooks serverAccountHooks() const;
     void editLibraryProject(const QJsonObject &project, const QString &action, const QJsonObject &document = {});
     // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow,
     // queued as a set_review_kind Library-project action, and Retire project cards….

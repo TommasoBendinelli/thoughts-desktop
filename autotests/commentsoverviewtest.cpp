@@ -7,6 +7,7 @@
 
 #include "../shell/commentsoverview.h"
 #include "../part/agentconversations.h"
+#include "../core/htmllivepage.h"
 #include "../part/commentmissingstate.h"
 #include "../shell/reviewoverview.h"
 #include "../shell/rowbrowsertree.h"
@@ -762,6 +763,7 @@ private Q_SLOTS:
     void testDeleteKeepsUnrelatedRows();
     void testHistoryInvalidationIsPerDocument();
     void testLibraryAgentConversations();
+    void testLibraryWebPages();
 
 public Q_SLOTS:
     // QDesktopServices handler: records the conversation links the Library opens.
@@ -14232,6 +14234,68 @@ void CommentsOverviewTest::testHistoryInvalidationIsPerDocument()
     QTest::mouseClick(undoButton, Qt::LeftButton);
     QCOMPARE(undoRequested.size(), 2);
     QCOMPARE(undoRequested.constLast().at(0).toString(), alphaPath);
+}
+
+// The web pages of a project's folders are listed in the Library ("Web pages (N)"), a live page
+// apart from an embedded one; a double click opens one beside a PDF of its folder.
+void CommentsOverviewTest::testLibraryWebPages()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString projectId = QStringLiteral("new:pages");
+    const QJsonObject project {{QStringLiteral("id"), projectId}, {QStringLiteral("name"), QStringLiteral("Pages")},
+                              {QStringLiteral("revision"), 1}, {QStringLiteral("documents"), QJsonArray {}}};
+    Thoughts::LibraryProjectStore store(temporary.path());
+    QVERIFY(store.receive({{QStringLiteral("projects"), QJsonArray {project}}}).isEmpty());
+    QVERIFY(registerCatalogueProject(temporary.path(), project));
+    const QString folder = defaultSourceFolder(temporary.path(), projectId).mid(QDir(temporary.path()).absolutePath().size() + 1);
+    QVERIFY(writeFile(temporary.filePath(folder + QStringLiteral("/tex/support/html/results.html")),
+                      "<!doctype html><title>Results table</title><p>Every run.</p>"));
+    QVERIFY(writeFile(temporary.filePath(folder + QStringLiteral("/tex/support/html/report.html")),
+                      Thoughts::LivePage::stubHtml(QUrl(QStringLiteral("https://reports.example.org/weekly")), QStringLiteral("Weekly report"))));
+
+    Thoughts::CommentsOverview overview(temporary.path());
+    overview.show();
+    overview.showSummary();
+    auto *tree = overview.findChild<QTreeWidget *>(QStringLiteral("thoughtsOverviewLibraryTree"));
+    QVERIFY(tree);
+    QTRY_COMPARE(tree->topLevelItemCount(), 1);
+    constexpr int identityRole = Qt::UserRole + 107;
+    constexpr int orderRole = Qt::UserRole + 108;
+    constexpr int typeRole = Qt::UserRole + 114;
+    constexpr int pageRole = Qt::UserRole + 163;
+    const auto group = [&]() -> QTreeWidgetItem * {
+        auto *root = tree->topLevelItem(0);
+        for (int i = 0; i < root->childCount(); ++i)
+            if (root->child(i)->data(0, identityRole).toString() == projectId + QStringLiteral("/web-pages")) return root->child(i);
+        return nullptr;
+    };
+    QTRY_VERIFY(group());
+    QCOMPARE(group()->text(0), QStringLiteral("Web pages (2)"));
+    // After Documents, Sources and the agent conversations.
+    QCOMPARE(group()->data(0, orderRole).toInt(), 3);
+    QHash<QString, QTreeWidgetItem *> rows;
+    for (int i = 0; i < group()->childCount(); ++i) rows.insert(group()->child(i)->text(0), group()->child(i));
+    QVERIFY2(rows.contains(QStringLiteral("Results table")) && rows.contains(QStringLiteral("Weekly report")), qPrintable(rows.keys().join(QStringLiteral(", "))));
+    QTreeWidgetItem *embedded = rows.value(QStringLiteral("Results table"));
+    QTreeWidgetItem *live = rows.value(QStringLiteral("Weekly report"));
+    QCOMPARE(embedded->data(0, typeRole).toString(), QStringLiteral("Web page"));
+    QCOMPARE(live->data(0, typeRole).toString(), QStringLiteral("Live web page"));
+    QCOMPARE(embedded->data(0, pageRole).toString(), folder + QStringLiteral("/tex/support/html/results.html"));
+    QVERIFY(live->toolTip(0).contains(QStringLiteral("https://reports.example.org/weekly")));
+    QVERIFY(embedded->icon(0).cacheKey() != live->icon(0).cacheKey());
+    // The folder has no PDF yet: the row says so and a double click opens nothing.
+    QVERIFY2(embedded->toolTip(0).contains(QStringLiteral("has none yet")), qPrintable(embedded->toolTip(0)));
+    QSignalSpy opened(&overview, &Thoughts::CommentsOverview::htmlPageActivated);
+    Q_EMIT tree->itemDoubleClicked(embedded, 0);
+    QCOMPARE(opened.size(), 0);
+    // With a PDF of the folder: the page and that PDF.
+    const QString pdf = temporary.filePath(QStringLiteral("current_pdfs/pages.pdf"));
+    embedded->setData(0, Qt::UserRole, pdf);
+    Q_EMIT tree->itemDoubleClicked(embedded, 0);
+    QCOMPARE(opened.size(), 1);
+    QCOMPARE(opened.first().at(0).toString(), pdf);
+    QCOMPARE(opened.first().at(1).toString(), folder + QStringLiteral("/tex/support/html/results.html"));
 }
 
 void CommentsOverviewTest::testLibraryAgentConversations()

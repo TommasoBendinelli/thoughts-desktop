@@ -54,6 +54,22 @@ struct HtmlAttachmentTarget {
 };
 
 OKULARCORE_EXPORT QString htmlAttachmentPath(const QUrl &link);
+
+// A thoughts-html: link clicked inside an embedded page: another page of the same source folder,
+// opened at the page state its fragment names ("#slide=3", the page's own #hash route).
+struct HtmlPageLink {
+    QString path;
+    QString hash; // "#…", or empty for the page's start
+    bool isValid() const
+    {
+        return !path.isEmpty();
+    }
+};
+// The page @p link names, seen from the page at @p fromPath. Invalid for any other link: another
+// scheme, a host or query, a path that is no page (htmlAttachmentPath), a page of another folder,
+// or a fragment no page state can be (longer than 511 characters, control characters).
+OKULARCORE_EXPORT HtmlPageLink htmlPageLink(const QUrl &link, const QString &fromPath);
+
 OKULARCORE_EXPORT QString htmlAttachmentFile(const QString &bundleRoot, const QString &pdfPath, const QString &path);
 // The source bundles that can hold the attachments of @p pdfPath (the app's, then the Library's runtime).
 OKULARCORE_EXPORT QStringList htmlAttachmentBundleRoots(const QString &pdfPath);

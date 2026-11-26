@@ -204,6 +204,30 @@ ServerCheck serverCheckFromAnswer(int httpStatus, const QByteArray &body)
     return ServerCheck::NotFound;
 }
 
+QString accessContactFromAnswer(int httpStatus, const QByteArray &body)
+{
+    if (httpStatus != 200) {
+        return {};
+    }
+    const QString contact = QJsonDocument::fromJson(body).object().value(QLatin1String("access_contact")).toString().trimmed();
+    // The server's own rule: name@host.tld, ASCII, no spaces and nothing a mailto: link reads as structure.
+    static const QRegularExpression plain(QStringLiteral(R"(^[^\s@<>()\[\]\\,;:"?&#%/]+@[^\s@<>()\[\]\\,;:"?&#%/]+\.[^\s@<>()\[\]\\,;:"?&#%/.]+$)"));
+    const bool ascii = std::all_of(contact.cbegin(), contact.cend(), [](QChar c) {
+        return c.unicode() < 128;
+    });
+    return contact.size() <= 254 && ascii && plain.match(contact).hasMatch() ? contact : QString();
+}
+
+QUrl accessRequestUrl(const QString &contact, const QString &server, const QString &username)
+{
+    const QString body = i18n("Hello,\n\nI would like to use the Thoughts server at %1. Could you send me an invite?\n\nUsername I would like: %2\nMy name: \n",
+                              server, username.trimmed());
+    // Spaces as %20, not +: mail programs read a mailto: body literally.
+    const QByteArray encoded = QByteArray("mailto:") + contact.toLatin1() + "?subject=" + QUrl::toPercentEncoding(i18n("Thoughts access request"))
+        + "&body=" + QUrl::toPercentEncoding(body);
+    return QUrl::fromEncoded(encoded, QUrl::StrictMode);
+}
+
 QString serverCheckText(ServerCheck check)
 {
     switch (check) {

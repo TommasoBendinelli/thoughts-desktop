@@ -135,6 +135,7 @@ void Part::setupHtmlAttachmentView()
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::openInBrowserRequested, this, &Part::openAttachmentInBrowser);
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::selectionActionClicked, this, &Part::requestAttachmentCard);
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::externalLinkRequested, this, &Part::openAttachmentLink);
+    connect(m_attachmentView, &Thoughts::HtmlDocumentView::pageLinkRequested, this, &Part::openAttachmentPageLink);
     // A live page: its bar (Reload, Take Snapshot), its load, and the questions in its place.
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::reloadRequested, this, &Part::reloadLivePage);
     connect(m_attachmentView, &Thoughts::HtmlDocumentView::takeSnapshotRequested, this, &Part::takeLiveSnapshot);
@@ -493,7 +494,8 @@ bool Part::showInHtmlAttachmentTab(const QJsonObject &request)
     }
     QString error;
     const auto target = resolveHtmlPage(str(request, QStringLiteral("path")), &error);
-    if (!target.isValid() || !showHtmlAttachment(target, false, &error)) {
+    // A link of another page may name a page state of this one ("#slide=3").
+    if (!target.isValid() || !showHtmlAttachment(target, false, &error, str(request, QStringLiteral("hash")))) {
         displayInfoMessage(error, KMessageWidget::Warning, 6000);
         return false;
     }
@@ -580,7 +582,7 @@ void Part::readWebPageTitle()
     });
 }
 
-bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool forReview, QString *error)
+bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool forReview, QString *error, const QString &hash)
 {
     if (!m_attachmentReader || !m_documentStack) return false;
     const auto owner = attachmentOwner(localFilePath(), m_docsRenderRoot);
@@ -599,7 +601,7 @@ bool Part::showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool
         }
         if (m_liveState == LiveConsent || m_liveState == LiveUnavailable) showLiveMessage();
     } else {
-        if (!m_attachmentReader->open(target, owner, error)) return false;
+        if (!m_attachmentReader->open(target, owner, error, hash)) return false;
         m_liveState.clear();
     }
     m_attachmentTitle = attachmentTitle(target);
@@ -814,16 +816,7 @@ void Part::openAttachmentLink(const QUrl &url, bool userGesture)
         QDesktopServices::openUrl(url);
         return;
     }
-#ifdef Q_OS_MACOS
-    const bool clicksSeen = true;
-#elif defined(THOUGHTS_HAVE_WEBVIEW2)
-    // WebView2 says which links the reader clicked, in embedded pages as in live ones.
-    const bool clicksSeen = Thoughts::HtmlDocumentView::webViewAvailable();
-#else
-    // A live page's own web view sees them too.
-    const bool clicksSeen = m_attachmentReader && m_attachmentReader->isLive() && Thoughts::HtmlLiveWebView::available();
-#endif
-    if (clicksSeen) {
+    if (attachmentClicksSeen()) {
         displayInfoMessage(i18n("The page tried to open %1 by itself. It was not opened.", url.toDisplayString(QUrl::RemoveQuery | QUrl::RemoveFragment)), KMessageWidget::Warning, 5000);
         return;
     }
@@ -840,6 +833,61 @@ void Part::openAttachmentLink(const QUrl &url, bool userGesture)
         QDesktopServices::openUrl(url);
     }
 #endif
+}
+
+bool Part::attachmentClicksSeen() const
+{
+#ifdef Q_OS_MACOS
+    return true;
+#elif defined(THOUGHTS_HAVE_WEBVIEW2)
+    // WebView2 says which links the reader clicked, in embedded pages as in live ones.
+    return Thoughts::HtmlDocumentView::webViewAvailable();
+#else
+    // A live page's own web view sees them too.
+    return m_attachmentReader && m_attachmentReader->isLive() && Thoughts::HtmlLiveWebView::available();
+#endif
+}
+
+void Part::openAttachmentPageLink(const QUrl &link, bool userGesture)
+{
+    // Only from the embedded page shown now (a live page is no page of the Library's folder).
+    if (!m_attachmentReader || !m_attachmentReader->isOpen() || m_attachmentReader->isLive()) return;
+    const auto page = Thoughts::htmlPageLink(link, m_attachmentReader->target().path);
+    if (!page.isValid()) {
+        displayInfoMessage(i18n("This HTML attachment link is invalid."), KMessageWidget::Warning, 5000);
+        return;
+    }
+    // As a web link: the reader's click opens the page, the page's own script does not (it could
+    // open the folder's pages in tab after tab).
+    const QString name = QFileInfo(page.path).fileName();
+    if (!userGesture) {
+        if (attachmentClicksSeen()) {
+            displayInfoMessage(i18n("The page tried to open %1 by itself. It was not opened.", name), KMessageWidget::Warning, 5000);
+            return;
+        }
+        // Thoughts cannot see the page's clicks here: the reader decides, one question at a time.
+        if (m_attachmentLinkQuestion) return;
+        m_attachmentLinkQuestion = true;
+        const auto answer = KMessageBox::questionTwoActions(widget(), i18n("The page wants to open the page %1.", name), i18n("Open Page"), KGuiItem(i18n("Open")),
+                                                            KStandardGuiItem::cancel());
+        m_attachmentLinkQuestion = false;
+        if (answer != KMessageBox::PrimaryAction) return;
+    }
+    // Then as a link of the PDF opens it: a page this document's Sync brought, in a tab of its own.
+    QString error;
+    const auto target = resolveHtmlPage(page.path, &error);
+    if (!target.isValid()) {
+        displayInfoMessage(error, KMessageWidget::Warning, 6000);
+        return;
+    }
+    if (wantsHtmlAttachmentTab(target.path)) {
+        QJsonObject request{{QStringLiteral("path"), target.path}};
+        if (!page.hash.isEmpty()) request.insert(QStringLiteral("hash"), page.hash);
+        Q_EMIT requestHtmlAttachmentTab(request);
+        return;
+    }
+    // Its own page in its tab (a place of it), or the page in place of the document (no shell).
+    if (!showHtmlAttachment(target, false, &error, page.hash)) displayInfoMessage(error, KMessageWidget::Warning, 6000);
 }
 
 void Part::openAttachmentInBrowser()

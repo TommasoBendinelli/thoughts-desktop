@@ -86,6 +86,12 @@ void HtmlPageWebView::openOutside(const QUrl &url, bool userGesture)
 {
     // A new window, or another application's address (mailto): outside, from the reader's click
     // only (as WebKit, which opens no window by itself); an attachment's filter has its say.
+    // Another page of the Library (thoughts-html:, target=_blank too) is the filter's alone:
+    // an attachment's opens it in Thoughts.
+    if (url.scheme().compare(QLatin1String("thoughts-html"), Qt::CaseInsensitive) == 0) {
+        if (m_filter) m_filter(url, userGesture, true);
+        return;
+    }
     if (!userGesture || !openableOutside(url)) return;
     if (m_filter && !m_filter(url, userGesture, true)) return;
     QDesktopServices::openUrl(url);

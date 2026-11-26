@@ -89,14 +89,18 @@ QJsonObject HtmlAttachmentReader::loadOptions() const
             {QStringLiteral("forwardKeys"), QJsonArray::fromStringList(m_forwardedKeys ? m_forwardedKeys() : QStringList())}};
 }
 
-bool HtmlAttachmentReader::open(const HtmlAttachmentTarget &target, const Owner &owner, QString *error)
+bool HtmlAttachmentReader::open(const HtmlAttachmentTarget &target, const Owner &owner, QString *error, const QString &hash)
 {
     if (!target.isValid() || !m_view) {
         if (error) *error = tr("The HTML attachment is not on this computer.");
         return false;
     }
     m_owner = owner;
+    const QString state = validHash(hash) && hash.size() > 1 ? hash : QString();
     if (!m_live && m_target.file == target.file && m_target.path == target.path && m_url.isValid() && m_view->isAttachment()) {
+        if (!state.isEmpty()) {
+            restorePosition({{QStringLiteral("page_state"), QJsonObject{{QStringLiteral("hash"), state}}}});
+        }
         return true;
     }
     m_live = false;
@@ -118,7 +122,12 @@ bool HtmlAttachmentReader::open(const HtmlAttachmentTarget &target, const Owner 
         return false;
     }
     m_target = target;
-    m_view->loadAttachment(m_url, loadOptions());
+    // The page state in the address (the server never sees it): the page starts there.
+    QUrl load = m_url;
+    if (!state.isEmpty()) {
+        load.setFragment(state.mid(1));
+    }
+    m_view->loadAttachment(load, loadOptions());
     return true;
 }
 

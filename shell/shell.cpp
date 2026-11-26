@@ -41,6 +41,7 @@
 #include <QtConcurrentRun>
 #include "developerlog.h"
 #include "developerlogdialog.h"
+#include "problemreportdialog.h"
 #include "updatecheck.h"
 #include "visualstudiocode.h"
 #include "activeparttoolbarcontroller.h"
@@ -528,6 +529,61 @@ static QString syncInitiationControlLabel(const QString &control)
 static Thoughts::SyncJournal *syncJournal()
 {
     return Thoughts::SyncJournal::instance();
+}
+
+// Help › Donate…: the author's GitHub Sponsors page (in place of KDE's own Donate, which goes to KDE).
+static QUrl thoughtsDonateUrl()
+{
+    return QUrl(QStringLiteral("https://github.com/sponsors/TommasoBendinelli"));
+}
+
+// Report a Problem… (problemreportdialog.h): the app's own logs, newest part first in each.
+static QList<Thoughts::ProblemReports::Log> problemReportLogs()
+{
+    using Thoughts::ProblemReports::fileTail;
+    using Thoughts::ProblemReports::Log;
+    QList<Log> logs;
+    // Sync runs: the newest 60 in short, the newest 5 with their events.
+    const QJsonArray runs = syncJournal()->recentOperations(false);
+    QString summaries;
+    QString history;
+    for (qsizetype index = 0; index < runs.size() && index < 60; ++index) {
+        const QJsonObject run = runs.at(index).toObject();
+        summaries += QString::fromUtf8(QJsonDocument(run).toJson(QJsonDocument::Compact)) + QLatin1Char('\n');
+        if (index < 5) {
+            history += QString::fromUtf8(QJsonDocument(syncJournal()->operationWithHistory(run.value(QStringLiteral("id")).toString())).toJson(QJsonDocument::Indented))
+                + QLatin1Char('\n');
+        }
+    }
+    if (!history.isEmpty()) logs.append({QStringLiteral("sync-latest-runs.json"), history.right(2 * 1024 * 1024)});
+    if (!summaries.isEmpty()) logs.append({QStringLiteral("sync-runs.jsonl"), summaries});
+    // The developer log: its current file, and the one before when the current one is short.
+    QString developer = fileTail(Thoughts::DeveloperLog::currentFile(), 2 * 1024 * 1024);
+    if (developer.size() < 1024 * 1024) {
+        const auto older = QDir(Thoughts::DeveloperLog::directory()).entryInfoList({QStringLiteral("developer-2*.jsonl")}, QDir::Files, QDir::Time);
+        if (!older.isEmpty()) developer = fileTail(older.first().absoluteFilePath(), 1024 * 1024) + developer;
+    }
+    if (!developer.isEmpty()) logs.append({QStringLiteral("developer.jsonl"), developer});
+    const QString freeze = Thoughts::DeveloperLog::latestFreezeReport();
+    if (!freeze.isEmpty() && QFileInfo(freeze).lastModified().secsTo(QDateTime::currentDateTime()) < 2 * 24 * 3600) {
+        logs.append({QFileInfo(freeze).fileName(), fileTail(freeze, 1024 * 1024)});
+    }
+    const QDir serverLogs(QDir(Thoughts::Platform::applicationDataRoot()).filePath(QStringLiteral("thoughts-server/logs")));
+    for (const QFileInfo &file : serverLogs.entryInfoList({QStringLiteral("*.log")}, QDir::Files, QDir::Time)) {
+        logs.append({file.fileName(), fileTail(file.absoluteFilePath(), 512 * 1024)});
+    }
+    return logs;
+}
+
+static void showProblemReport(QWidget *window, const Thoughts::AppSignIn::Hooks &hooks)
+{
+    // The picture first: the dialog would cover the window.
+    const QImage picture = Thoughts::ProblemReports::grabWindow(window);
+    auto *dialog = new Thoughts::ProblemReportDialog(picture, problemReportLogs, hooks, window ? window->window() : nullptr);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 QJsonArray Shell::recentSyncOperationsWithHistory()
@@ -4783,6 +4839,19 @@ void Shell::setupActions()
             return diagnostics;
         });
     });
+    auto *reportAction = actionCollection()->addAction(QStringLiteral("thoughts_report_problem"));
+    // One entry for bugs and ideas: KDE's own Report Bug… (bugs.kde.org) is hidden in setActiveTab(), as are its
+    // Donate and About KDE.
+    reportAction->setText(i18n("Report Bug/Feature…"));
+    reportAction->setIcon(QIcon::fromTheme(QStringLiteral("tools-report-bug")));
+    connect(reportAction, &QAction::triggered, this, [this] {
+        showProblemReport(this, commentsOverview() ? commentsOverview()->serverAccountHooks() : Thoughts::AppSignIn::Hooks());
+    });
+    auto *donateAction = actionCollection()->addAction(QStringLiteral("thoughts_donate"));
+    donateAction->setText(i18n("Donate…"));
+    donateAction->setIcon(QIcon::fromTheme(QStringLiteral("help-donate")));
+    donateAction->setData(thoughtsDonateUrl());
+    connect(donateAction, &QAction::triggered, this, [] { QDesktopServices::openUrl(thoughtsDonateUrl()); });
     if (Thoughts::Updates::available()) {
         auto *updatesAction = actionCollection()->addAction(QStringLiteral("thoughts_check_updates"));
         updatesAction->setText(i18n("Check for Updates…"));
@@ -8106,6 +8175,15 @@ void Shell::addLibraryMenuBar(Thoughts::CommentsOverview *overview)
         connect(updates, &QAction::triggered, overview, [overview] { Thoughts::Updates::checkInteractively(overview); });
         help->addSeparator();
     }
+    QAction *report = help->addAction(QIcon::fromTheme(QStringLiteral("tools-report-bug")), i18n("Report Bug/Feature…"));
+    report->setObjectName(QStringLiteral("library_thoughts_report_problem"));
+    // The picture is of the Library window, which is the one on screen.
+    connect(report, &QAction::triggered, overview, [overview] { showProblemReport(overview, overview->serverAccountHooks()); });
+    QAction *donate = help->addAction(QIcon::fromTheme(QStringLiteral("help-donate")), i18n("Donate…"));
+    donate->setObjectName(QStringLiteral("library_thoughts_donate"));
+    donate->setData(thoughtsDonateUrl());
+    connect(donate, &QAction::triggered, overview, [] { QDesktopServices::openUrl(thoughtsDonateUrl()); });
+    help->addSeparator();
     add(help, KStandardAction::name(KStandardAction::AboutApp), i18n("About Thoughts"), QStringLiteral("help-about"));
     overview->layout()->setMenuBar(bar);
 }
@@ -8286,6 +8364,26 @@ Thoughts::CommentsOverview *Shell::commentsOverview()
         if (Shell *shell = shellForCommentsOverview(pdfPath)) {
             shell->openTrackedDocument(pdfPath);
         }
+    });
+    // A web page from the Library: its PDF's tab, then the page in a tab beside it, as a link in
+    // the PDF opens it.
+    connect(overview, &Thoughts::CommentsOverview::htmlPageActivated, overview, [](const QString &pdfPath, const QString &pagePath) {
+        Shell *shell = shellForCommentsOverview(pdfPath);
+        if (!shell) return;
+        QString error;
+        KParts::ReadWritePart *part = shell->trackedCommentPart(pdfPath, true, &error);
+        if (!part) {
+            KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : shell, error);
+            return;
+        }
+        const int document = shell->findTabIndex(part);
+        int beside = document;
+        while (beside + 1 < shell->m_tabs.size() && shell->isHtmlAttachmentTab(beside + 1) && shell->m_tabs[beside + 1].part->url() == part->url()) ++beside;
+        if (!shell->showHtmlAttachmentTab(part->url(), {{QStringLiteral("path"), pagePath}}, beside)) {
+            KMessageBox::error(s_commentsOverview ? static_cast<QWidget *>(s_commentsOverview.data()) : shell, i18n("This web page could not be opened."));
+            return;
+        }
+        shell->presentWindow();
     });
     connect(overview, &Thoughts::CommentsOverview::documentPageActivated, overview, [](const QString &pdfPath, int page, const QString &documentId, const QString &displayTitle, const QString &projectId) {
         if (Shell *shell = shellForCommentsOverview(pdfPath)) {
@@ -12738,6 +12836,25 @@ void Shell::setActiveTab(int tab)
             if (action && !fileMenu->actions().contains(action)) {
                 fileMenu->addAction(action);
             }
+        }
+    }
+    QMenu *helpMenu = factory() ? qobject_cast<QMenu *>(factory()->container(QStringLiteral("help"), nullptr)) : nullptr;
+    if (QAction *report = actionCollection()->action(QStringLiteral("thoughts_report_problem")); helpMenu && report && !helpMenu->actions().contains(report)) {
+        helpMenu->insertAction(helpMenu->actions().value(0), report);
+    }
+    if (QAction *report = actionCollection()->action(QStringLiteral("thoughts_report_problem")),
+        *donate = actionCollection()->action(QStringLiteral("thoughts_donate"));
+        helpMenu && report && donate && !helpMenu->actions().contains(donate)) {
+        const QList<QAction *> helpActions = helpMenu->actions();
+        const int reportIndex = helpActions.indexOf(report);
+        helpMenu->insertAction(reportIndex >= 0 ? helpActions.value(reportIndex + 1) : nullptr, donate);
+    }
+    // KHelpMenu's Report Bug… (KDE's bug tracker), Donate (to KDE) and About KDE: Thoughts has its own
+    // Report Bug/Feature… and Donate…, and About Thoughts.
+    for (const QString &name : {QStringLiteral("help_report_bug"), QStringLiteral("help_donate"), QStringLiteral("help_about_kde")}) {
+        if (QAction *kdeAction = actionCollection()->action(name)) {
+            kdeAction->setVisible(false);
+            kdeAction->setEnabled(false);
         }
     }
     removeMenuDuplicates();

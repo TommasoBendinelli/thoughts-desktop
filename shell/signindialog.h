@@ -52,6 +52,8 @@ private:
     void updateState();
     void signIn();
     void setBusy(bool busy);
+    // "Request access": an email to the server's access contact (protocol/app-sign-in.md 5).
+    void requestAccess();
     QString address() const;
 
     AppSignIn::Hooks m_hooks;
@@ -69,6 +71,8 @@ private:
     QLabel *m_passwordHint;
     QLineEdit *m_deviceName;
     QLabel *m_error;
+    // No account: where to ask for one, shown once the server has answered.
+    QLabel *m_access;
     QPushButton *m_signIn;
     QTimer *m_checkTimer;
     QPointer<QNetworkReply> m_checkReply;
@@ -76,6 +80,8 @@ private:
     // The address the last answer was for, and what it said.
     QString m_checkedAddress;
     std::optional<AppSignIn::ServerCheck> m_check;
+    // The access_contact of that answer; empty when it named none.
+    QString m_accessContact;
     QString m_invite;
     bool m_busy = false;
 };

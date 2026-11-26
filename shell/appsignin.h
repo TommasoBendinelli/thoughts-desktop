@@ -64,6 +64,13 @@ enum class ServerCheck {
 ServerCheck serverCheckFromAnswer(int httpStatus, const QByteArray &body);
 QString serverCheckText(ServerCheck check);
 
+// Where a person without a login asks for one (section 5): the plain email address GET /v1/ready
+// names as access_contact; empty when it names none (or anything but a plain address).
+QString accessContactFromAnswer(int httpStatus, const QByteArray &body);
+// The email that asks @p contact for a login on @p server: a mailto: link with the subject
+// "Thoughts access request" and a body naming the server and @p username (empty: left blank).
+QUrl accessRequestUrl(const QString &contact, const QString &server, const QString &username);
+
 // What POST /v1/apps/sign-in gave this computer.
 struct SignedIn {
     QString username;
@@ -106,6 +113,8 @@ struct Hooks {
     std::function<bool(const QString &account, QString *error)> removeToken;
     // The URL requests for @p address (normalized) go to.
     std::function<QUrl(const QString &address)> requestUrl;
+    // Opens a link outside the app (the access request's email); unset: the system's handler.
+    std::function<void(const QUrl &url)> openUrl;
 };
 bool writeToken(const Hooks &hooks, const QString &account, const QByteArray &token, QString *error);
 // THOUGHTS_TOKEN for this computer's device account when set, as the rest of Thoughts does.

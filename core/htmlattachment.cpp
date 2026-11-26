@@ -40,6 +40,19 @@ QString Thoughts::htmlAttachmentPath(const QUrl &link)
     return isHtmlSourcePath(path) ? path : QString();
 }
 
+Thoughts::HtmlPageLink Thoughts::htmlPageLink(const QUrl &link, const QString &fromPath)
+{
+    const QString path = htmlAttachmentPath(link.adjusted(QUrl::RemoveFragment));
+    const QString folder = htmlSourceFolder(path);
+    // Pages of one folder link each other; a page of another folder is not this page's to open.
+    if (path.isEmpty() || !isHtmlSourcePath(fromPath) || folder != htmlSourceFolder(fromPath)) return {};
+    // The fragment as the page reads it in location.hash (still percent-encoded).
+    const QString fragment = link.hasFragment() ? link.fragment(QUrl::FullyEncoded) : QString();
+    static const QRegularExpression control(QStringLiteral("[\\x00-\\x1f\\x7f]"));
+    if (fragment.size() > 511 || fragment.contains(control)) return {};
+    return {path, fragment.isEmpty() ? QString() : QLatin1Char('#') + fragment};
+}
+
 QString Thoughts::htmlAttachmentFile(const QString &bundleRoot, const QString &pdfPath, const QString &path)
 {
     if (htmlAttachmentPath(QUrl(QStringLiteral("thoughts-html:") + path)).isEmpty()) return {};

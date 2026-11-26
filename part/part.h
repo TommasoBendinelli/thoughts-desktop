@@ -524,7 +524,8 @@ Q_SIGNALS:
     void requestHtmlReviewCard(const QString &pdfPath, const QVariantMap &fields);
     // The page of an HTML attachment of this document, in a tab of its own next to the
     // document's (Shell::openHtmlAttachmentTab): @p request has its "path", and "feedback_id"
-    // (with "edit") or "card" to show there.
+    // (with "edit") or "card" to show there, or "hash", the page state a link of another page
+    // opens it at ("#slide=3").
     void requestHtmlAttachmentTab(const QJsonObject &request);
     // Close in a page's tab.
     void requestCloseHtmlAttachmentTab();
@@ -968,13 +969,20 @@ private:
     bool m_attachmentCardsSupported = false;
     QJsonArray m_sidebarCardRecords;
     void setupHtmlAttachmentView();
-    bool showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool forReview, QString *error);
+    // @p hash: the page state the page opens at (HtmlAttachmentReader::open).
+    bool showHtmlAttachment(const Thoughts::HtmlAttachmentTarget &target, bool forReview, QString *error, const QString &hash = QString());
     void hideHtmlAttachment();
     void updateAttachmentSelectionAction();
     void requestAttachmentCard();
     void openAttachmentInBrowser();
     // A link of an attachment page that leaves it: opened only on the reader's own click.
     void openAttachmentLink(const QUrl &url, bool userGesture);
+    // A thoughts-html: link of the embedded page shown: another page of its folder, in its own
+    // tab (or in place, as a link of the PDF opens it), at the link's fragment. Only on the
+    // reader's own click, as openAttachmentLink.
+    void openAttachmentPageLink(const QUrl &link, bool userGesture);
+    // Whether Thoughts sees which links the reader clicked in the page shown (else it asks).
+    bool attachmentClicksSeen() const;
     bool m_attachmentLinkQuestion = false;
     bool presentAttachmentReview();
     void closeHtmlAttachment();

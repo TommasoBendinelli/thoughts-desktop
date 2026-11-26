@@ -15,6 +15,7 @@ set(okular_SRCS
    appsignin.cpp
    signindialog.cpp
    projectsharedialog.cpp
+   problemreportdialog.cpp
    main.cpp
    developerlog.cpp
    developerlogdialog.cpp
@@ -118,6 +119,8 @@ set(THOUGHTS_RELEASE_VERSION "" CACHE STRING "Version of a published Thoughts re
 set(THOUGHTS_UPDATE_REPOSITORY "" CACHE STRING "GitHub owner/repository whose windows-* (or, on macOS, mac-*) releases update this build")
 set_property(SOURCE updatecheck.cpp APPEND PROPERTY COMPILE_DEFINITIONS
     THOUGHTS_RELEASE_VERSION="${THOUGHTS_RELEASE_VERSION}" THOUGHTS_UPDATE_REPOSITORY="${THOUGHTS_UPDATE_REPOSITORY}")
+# Report a Problem… names the release a report comes from.
+set_property(SOURCE problemreportdialog.cpp APPEND PROPERTY COMPILE_DEFINITIONS THOUGHTS_RELEASE_VERSION="${THOUGHTS_RELEASE_VERSION}")
 
 install(TARGETS thoughts ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 

@@ -38,6 +38,7 @@
 #include "proposaldecisions.h"
 #include "rowbrowsertree.h"
 #include "core/htmlattachment.h"
+#include "core/htmllivepage.h"
 #include <QStringDecoder>
 #include <QClipboard>
 #include "websiteimportdialog.h"
@@ -378,6 +379,8 @@ constexpr int LibraryDateTooltipRole = Qt::UserRole + 160;
 constexpr int LibraryConversationRole = Qt::UserRole + 161;
 // True on a Project document that is unpublished (protocol/project-document-publication.md).
 constexpr int LibraryUnpublishedRole = Qt::UserRole + 162;
+// A web page of the project's folder (<folder>/tex/support/html/<name>.html): its path from the docs root.
+constexpr int LibraryHtmlPageRole = Qt::UserRole + 163;
 enum LibraryDateTooltip { PlainDateTooltip = 0, BuiltDateTooltip = 1, ModifiedDateTooltip = 2 };
 
 QString libraryDateTooltip(qint64 stamp, int kind)
@@ -430,7 +433,7 @@ protected:
     }
 };
 
-enum class LibrarySymbol { Folder, PendingImport, Documents, Source, Pdf, Linked, Unlinked, LinkUnknown, MissingSource };
+enum class LibrarySymbol { Folder, PendingImport, Documents, Source, Pdf, Linked, Unlinked, LinkUnknown, MissingSource, WebPage, LivePage };
 
 // Small palette-aware outlines stay legible even when the platform PDF icon is tiny.
 QIcon librarySymbol(LibrarySymbol symbol, const QPalette &palette)
@@ -455,6 +458,22 @@ QIcon librarySymbol(LibrarySymbol symbol, const QPalette &palette)
             painter.drawPath(triangle);
             painter.drawLine(QPointF(12, 9), QPointF(12, 14));
             painter.drawPoint(QPointF(12, 17));
+            painter.end();
+            icon.addPixmap(pixmap);
+            continue;
+        }
+        if (symbol == LibrarySymbol::WebPage || symbol == LibrarySymbol::LivePage) {
+            // A globe; a live page (a site shown as it is now) has a dot in the accent colour.
+            painter.drawEllipse(QPointF(12, 12), 8.5, 8.5);
+            painter.drawEllipse(QPointF(12, 12), 3.6, 8.5);
+            painter.drawLine(QPointF(3.5, 12), QPointF(20.5, 12));
+            painter.drawLine(QPointF(5.2, 7.5), QPointF(18.8, 7.5));
+            painter.drawLine(QPointF(5.2, 16.5), QPointF(18.8, 16.5));
+            if (symbol == LibrarySymbol::LivePage) {
+                painter.setPen(QPen(palette.color(QPalette::Base), 1.5));
+                painter.setBrush(palette.color(QPalette::Highlight));
+                painter.drawEllipse(QPointF(18.5, 18.5), 4, 4);
+            }
             painter.end();
             icon.addPixmap(pixmap);
             continue;
@@ -5176,6 +5195,11 @@ CommentsOverview::CommentsOverview(const QString &docsRoot,
         }
         if (const QVariant conversation = item->data(0, LibraryConversationRole); conversation.isValid()) {
             openAgentConversation(conversation.value<QJsonObject>());
+            return;
+        }
+        if (const QString page = item->data(0, LibraryHtmlPageRole).toString(); !page.isEmpty()) {
+            const QString pdf = item->data(0, Qt::UserRole).toString();
+            if (!pdf.isEmpty()) Q_EMIT htmlPageActivated(pdf, page);
             return;
         }
         const QString sourcePath = item->data(0, Qt::UserRole + 1).toString();
@@ -13290,6 +13314,69 @@ void CommentsOverview::updateLibraryTree()
             conversationSecondary = QColor((conversationSecondary.red() * 3 + base.red()) / 4, (conversationSecondary.green() * 3 + base.green()) / 4,
                                            (conversationSecondary.blue() * 3 + base.blue()) / 4);
         }
+        // The web pages of the project's folders (<folder>/tex/support/html/*.html, embedded pages
+        // and live pages), each opened in a tab beside a PDF of its folder, as a link in it opens it.
+        const QIcon webPageIcon = librarySymbol(LibrarySymbol::WebPage, palette());
+        const QIcon livePageIcon = librarySymbol(LibrarySymbol::LivePage, palette());
+        const auto populateWebPages = [&](QTreeWidgetItem *root, const QJsonObject &project, const QString &id, const QJsonArray &documentEntries) {
+            struct Page {
+                QString path, title, detail, pdf;
+                QFileInfo file;
+                bool live = false;
+            };
+            QList<Page> pages;
+            for (const auto &entry : project.value(QStringLiteral("project_configuration")).toObject().value(QStringLiteral("source_folders")).toArray()) {
+                const QString folder = entry.toObject().value(QStringLiteral("path")).toString();
+                if (folder.isEmpty()) continue;
+                // A published PDF of the folder carries its pages (protocol/html-pages.md).
+                QString pdf;
+                for (const auto &value : documentEntries) {
+                    const QJsonObject doc = value.toObject();
+                    if (!doc.value(QStringLiteral("published")).toBool(true) || !doc.value(QStringLiteral("source_file")).toString().startsWith(folder + QLatin1Char('/'))) continue;
+                    QString path = doc.value(QStringLiteral("local_path")).toString();
+                    if (path.isEmpty() && !doc.value(QStringLiteral("filename")).toString().isEmpty())
+                        path = QDir(m_docsRoot).filePath(QStringLiteral("current_pdfs/") + doc.value(QStringLiteral("filename")).toString());
+                    if (!path.isEmpty() && QFileInfo::exists(path)) { pdf = path; break; }
+                }
+                const QDir html(QDir(m_docsRoot).filePath(folder + QStringLiteral("/tex/support/html")));
+                for (const QFileInfo &file : html.entryInfoList({QStringLiteral("*.html")}, QDir::Files, QDir::Name)) {
+                    Page page;
+                    page.path = folder + QStringLiteral("/tex/support/html/") + file.fileName();
+                    page.file = file;
+                    page.pdf = pdf;
+                    QByteArray head;
+                    if (QFile in(file.absoluteFilePath()); in.open(QIODevice::ReadOnly)) head = in.read(256 * 1024);
+                    const QUrl address = Thoughts::LivePage::stubAddress(head);
+                    page.live = address.isValid();
+                    page.title = Thoughts::LivePage::title(head).simplified();
+                    if (page.title.isEmpty()) page.title = page.live ? address.host() : file.completeBaseName();
+                    page.detail = page.live ? address.toDisplayString() : page.path;
+                    pages.append(page);
+                }
+            }
+            if (pages.isEmpty()) return;
+            auto *group = add(root, i18n("Web pages (%1)", pages.size()), id + QStringLiteral("/web-pages"), 0, QString());
+            group->setIcon(0, webPageIcon);
+            group->setData(0, LibraryOrderRole, 3);
+            groupStyle(group, true);
+            qint64 total = 0;
+            int order = 0;
+            for (const Page &page : std::as_const(pages)) {
+                auto *row = add(group, page.title, id + QStringLiteral("/web-page/") + page.path, page.file.size(), QString());
+                total += page.file.size();
+                row->setIcon(0, page.live ? livePageIcon : webPageIcon);
+                row->setData(0, LibraryOrderRole, order++);
+                row->setData(0, LibraryHtmlPageRole, page.path);
+                row->setData(0, Qt::UserRole, page.pdf);
+                row->setData(0, LibraryTypeRole, page.live ? i18n("Live web page") : i18n("Web page"));
+                row->setData(0, LibraryDetailRole, page.detail);
+                row->setData(0, LibraryRecordedDateRole, page.file.lastModified());
+                row->setToolTip(0, page.pdf.isEmpty() ? i18n("%1\nIt opens beside a PDF of its folder, and this folder has none yet.", page.detail)
+                                                      : page.live ? i18n("%1\nA live page: the site as it is now.", page.detail) : page.detail);
+                if (page.pdf.isEmpty()) row->setForeground(0, palette().color(QPalette::Disabled, QPalette::Text));
+            }
+            setSize(group, total);
+        };
         const auto populateConversations = [&](QTreeWidgetItem *root, const QString &id) {
             const QList<QJsonObject> records = Thoughts::AgentConversations::recordsFor(m_fedoraProjections, id);
             const auto clearSize = [](QTreeWidgetItem *item) {
@@ -13446,6 +13533,7 @@ void CommentsOverview::updateLibraryTree()
             setSize(documents, project.value(QStringLiteral("pdf_size_bytes")).toInteger(bytes)); setSize(root, project.value(QStringLiteral("pdf_size_bytes")).toInteger(bytes));
             populateSources(root, project, id);
             populateConversations(root, id);
+            populateWebPages(root, project, id, allEntries);
         }
         for (auto it = roots.cbegin(); it != roots.cend(); ++it) if (!visible.contains(it.key())) { topLevel.removeOne(it.value()); delete it.value(); }
         const QString summary = !store.error().isEmpty() ? store.error()
@@ -13455,8 +13543,10 @@ void CommentsOverview::updateLibraryTree()
     }
     const QIcon folderIcon = librarySymbol(LibrarySymbol::Folder, palette());
     const QIcon documentsIcon = librarySymbol(LibrarySymbol::Documents, palette());
-    const QIcon linkedIcon = librarySymbol(LibrarySymbol::Linked, palette());
-    const QIcon unlinkedIcon = librarySymbol(LibrarySymbol::Unlinked, palette());
+    // A document built from its sources (LaTeX, Markdown) shows a page of source; an imported PDF a
+    // page of text (25 Nov 2026: the chain and the broken chain did not say which was which).
+    const QIcon linkedIcon = librarySymbol(LibrarySymbol::Source, palette());
+    const QIcon unlinkedIcon = librarySymbol(LibrarySymbol::Pdf, palette());
     const QIcon unknownIcon = librarySymbol(LibrarySymbol::LinkUnknown, palette());
     const QIcon missingSourceIcon = librarySymbol(LibrarySymbol::MissingSource, palette());
     QColor secondary = palette().color(QPalette::Text);

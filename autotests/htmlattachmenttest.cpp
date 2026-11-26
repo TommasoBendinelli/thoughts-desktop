@@ -32,6 +32,42 @@ private Q_SLOTS:
         QVERIFY(!Thoughts::isHtmlSourcePath(QStringLiteral(".thoughts/tex/support/html/prompts.html")));
         for (const QString &uri : {"thoughts-html:../secret.html", "thoughts-html:docs-demo/tex/support/html/../plot.html", "thoughts-html:docs-demo/tex/support/html/plot.html?path=secret", "https://example.com/plot.html"}) QVERIFY(Thoughts::htmlAttachmentPath(QUrl(uri)).isEmpty());
     }
+    void pageLinks() {
+        // A link in an embedded page: another page of its folder, at the fragment's page state.
+        const QString from = "docs-x/tex/support/html/a.html";
+        auto page = Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html"), from);
+        QVERIFY(page.isValid()); QCOMPARE(page.path, QString("docs-x/tex/support/html/b.html")); QVERIFY(page.hash.isEmpty());
+        page = Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html#slide=3"), from);
+        QCOMPARE(page.path, QString("docs-x/tex/support/html/b.html")); QCOMPARE(page.hash, QString("#slide=3"));
+        // As the page reads location.hash: still percent-encoded; an empty fragment is the page's start.
+        QCOMPARE(Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html#q=a%20b&slide=2"), from).hash, QString("#q=a%20b&slide=2"));
+        page = Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html#"), from);
+        QVERIFY(page.isValid()); QVERIFY(page.hash.isEmpty());
+        // The page itself (a slide of it), and pages of the folder's other trees.
+        QCOMPARE(Thoughts::htmlPageLink(QUrl("thoughts-html:" + from + "#slide=5"), from).hash, QString("#slide=5"));
+        QVERIFY(Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/source/plots/c.htm"), from).isValid());
+        QVERIFY(Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/markdown/d.html"), from).isValid());
+        QCOMPARE(Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/my%20plot.html"), from).path, QString("docs-x/tex/support/html/my plot.html"));
+        // A Project's default folder links its own pages, never another Project's.
+        const QString project = ".thoughts/projects/" + QString(64, QLatin1Char('a')) + "/default";
+        const QString other = ".thoughts/projects/" + QString(64, QLatin1Char('b')) + "/default";
+        QVERIFY(Thoughts::htmlPageLink(QUrl("thoughts-html:" + project + "/tex/support/html/b.html"), project + "/tex/support/html/a.html").isValid());
+        QVERIFY(!Thoughts::htmlPageLink(QUrl("thoughts-html:" + other + "/tex/support/html/b.html"), project + "/tex/support/html/a.html").isValid());
+        // Refused: another folder, no page, a host or query, other schemes, a page state no page can have.
+        for (const QString &uri : {"thoughts-html:docs-y/tex/support/html/b.html", "thoughts-html:docs-xy/tex/support/html/b.html",
+                                   "thoughts-html:docs-x/tex/support/html/../../../docs-y/tex/b.html", "thoughts-html:docs-x/tex/support/html/notes.txt",
+                                   "thoughts-html:docs-x/b.html", "thoughts-html://host/docs-x/tex/support/html/b.html",
+                                   "thoughts-html:docs-x/tex/support/html/b.html?slide=3", "https://example.org/docs-x/tex/support/html/b.html",
+                                   "thoughts-pdf-link:x.pdf?page=2", "javascript:alert(1)", "thoughts-html:"}) {
+            QVERIFY2(!Thoughts::htmlPageLink(QUrl(uri), from).isValid(), qPrintable(uri));
+        }
+        QVERIFY(!Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html#" + QString(512, QLatin1Char('s'))), from).isValid());
+        QVERIFY(Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html#" + QString(511, QLatin1Char('s'))), from).isValid());
+        // Only from a page of the Library.
+        for (const QString &source : {QString(), QString("docs-x/tex/support/html/a.txt"), QString("https://example.org/a.html")}) {
+            QVERIFY(!Thoughts::htmlPageLink(QUrl("thoughts-html:docs-x/tex/support/html/b.html"), source).isValid());
+        }
+    }
     void offlineHttp() {
         const QByteArray html = "<!doctype html><button onclick=\"this.textContent=42\">Calculate</button>";
         QTemporaryDir temp; QFile file(temp.filePath("page.html")); QVERIFY(file.open(QIODevice::WriteOnly)); file.write(html); file.close();

@@ -15,7 +15,7 @@
   "use strict";
   if (root.ThoughtsViewer && root.ThoughtsViewer.version) { return; }
 
-  const VERSION = "0.3.2";
+  const VERSION = "0.3.3";
   const PROTOCOL = 1;
   const G = root.ThoughtsViewerGeometry;
   const T = root.ThoughtsViewerText;
@@ -73,6 +73,7 @@
     maskLayer: null,
     review: null,
     lastSelectionJson: "",
+    menuPick: null,             // the block a right click selected: {range, click} (pickBlock)
     selectionTimer: 0,
     positionTimer: 0,
     lastPositionJson: "",
@@ -1186,6 +1187,12 @@
       scroll: [round2(root.scrollX), round2(root.scrollY)]
     };
     if (attachment()) { payload.page_state = pageState(); }
+    // The right click that picked this block (pickBlock), while the selection is still that block.
+    const pick = state.menuPick;
+    if (pick && pick.range.compareBoundaryPoints(Range.START_TO_START, range) === 0 &&
+        pick.range.compareBoundaryPoints(Range.END_TO_END, range) === 0) {
+      payload.click = pick.click;
+    }
     const sr = sourceRangeOf(range);
     if (sr) { payload.source_range = sr; }
     const sl = sourceLinesOf(range);
@@ -1564,29 +1571,30 @@
     // "app" (default): the app shows its own menu. "native": the platform's selection UI stays
     // (an Android host may need it for long-press selection); the message is sent either way.
     // Attachments: the page's own contextmenu handlers and the platform menu stay, except with
-    // selectionMenu "app": on selected text or a feedback highlight outside the page's controls
-    // the app shows its menu (app_menu in the message).
+    // selectionMenu "app": anywhere outside the page's controls and links the app shows its menu
+    // (app_menu in the message), on the selection, a feedback highlight, or the block of text the
+    // click picks (pickBlock).
     if (state.options.contextMenu !== "native" && !attachment()) { ev.preventDefault(); }
     clipSelectionToMask();
     const t = ev.target;
     const a = t && t.closest ? t.closest("a[href], [data-thoughts-link]") : null;
+    const link = !!(a && !isUi(a));
     const payload = { point: [ev.clientX, ev.clientY], selection: selectionPayload(), items: itemsAtPoint(ev.clientX, ev.clientY, t) };
-    if (a && !isUi(a)) { payload.link = linkInfo(a); }
-    if (attachment() && state.options.selectionMenu === "app" && !(t && t.closest && t.closest(INTERACTIVE))) {
-      // Nothing selected and no highlight under the pointer: the line or paragraph of text there
-      // is selected, so the app's menu gives feedback on it. Over the page's text the app's menu
-      // always replaces the platform's (whose Back would leave the page).
+    if (link) { payload.link = linkInfo(a); }
+    if (attachment() && state.options.selectionMenu === "app" && !link && !(t && t.closest && t.closest(INTERACTIVE))) {
+      // Nothing selected and no highlight under the pointer: the line or paragraph of text there,
+      // or on blank space the nearest one, is selected, so the app's menu gives feedback on it.
+      // The app's menu always replaces the platform's (whose Back would leave the page, and whose
+      // Reload would lose the page's state).
       // A word WebKit selected for this very click (nothing was selected when the button went
       // down) counts as nothing selected.
       const platformWord = selectedBeforeMenuPress === false;
       if ((!payload.selection || platformWord) && !payload.items.some(function (item) { return item.kind === "feedback"; })
-          && selectBlockAt(t, ev.clientX, ev.clientY)) {
+          && pickBlock(ev.clientX, ev.clientY)) {
         payload.selection = selectionPayload();
       }
-      if (payload.selection || payload.items.some(function (item) { return item.kind === "feedback"; })) {
-        ev.preventDefault();
-        payload.app_menu = true;
-      }
+      ev.preventDefault();
+      payload.app_menu = true;
     }
     selectedBeforeMenuPress = null;
     send("contextmenu", payload);
@@ -1601,10 +1609,60 @@
     selectedBeforeMenuPress = !!(sel && !sel.isCollapsed && sel.toString().trim());
   }
 
-  // The smallest block of text (a line, paragraph, list item or cell) under the point, selected;
-  // false over no text, the viewer's own UI, a page control, or a block too long to be a passage.
+  // A right click with nothing selected picks a block of text (a line, paragraph, heading, list
+  // item or cell) and selects it: the one under the point, else (blank space between blocks, the
+  // page's margins) the nearest visible one. The selection payload then carries `click` (where
+  // the click was, and whether the block was the nearest rather than under it), for as long as
+  // that selection stays. False when nothing could be picked (no visible text).
   const SELECTED_BLOCK_MAX = 2000;
-  function selectBlockAt(target, x, y) {
+  function pickBlock(x, y) {
+    let el = blockAt(x, y);
+    let nearest = false;
+    if (!el) {
+      el = nearestBlock(x, y);
+      nearest = true;
+    }
+    if (!el || !selectBlock(el)) { state.menuPick = null; return false; }
+    const sel = root.getSelection();
+    state.menuPick = {
+      range: sel.getRangeAt(0).cloneRange(),
+      click: { point: [round2(x), round2(y)], page: [round2(x + root.scrollX), round2(y + root.scrollY)], nearest: nearest }
+    };
+    return true;
+  }
+
+  // The block element of a text node: its nearest ancestor that is not inline; null for text of
+  // the viewer's own UI, a page control, an atomic element (SVG, MathML, ...) or the body itself.
+  const ATOMIC_SELECTOR = Array.from(ATOMIC).join(", ");
+  function blockOfText(node) {
+    let el = node.parentElement;
+    if (!el || isUi(el) || !el.closest || el.closest(INTERACTIVE) || el.closest(ATOMIC_SELECTOR)) { return null; }
+    while (el && el !== doc.body && el !== doc.documentElement) {
+      const display = root.getComputedStyle(el).display;
+      if (display && display.indexOf("inline") !== 0 && display !== "contents") { break; }
+      el = el.parentElement;
+    }
+    return !el || el === doc.body || el === doc.documentElement ? null : el;
+  }
+
+  // Whether the text of an element is shown: not hidden, and neither it nor an ancestor fully
+  // transparent (a deck's other slides, stacked under the current one). memo: element -> bool.
+  function textShown(el, memo) {
+    return !!el && root.getComputedStyle(el).visibility === "visible" && !transparentIn(el, memo);
+  }
+  function transparentIn(el, memo) {
+    if (!el || el === doc.documentElement) { return false; }
+    let v = memo.get(el);
+    if (v === undefined) {
+      v = root.getComputedStyle(el).opacity === "0" || transparentIn(el.parentElement, memo);
+      memo.set(el, v);
+    }
+    return v;
+  }
+
+  // The block of the text under the point; null over no text, hidden text, or in the margin
+  // beside it.
+  function blockAt(x, y) {
     let node = null;
     if (doc.caretRangeFromPoint) {
       const r = doc.caretRangeFromPoint(x, y);
@@ -1613,18 +1671,68 @@
       const p = doc.caretPositionFromPoint(x, y);
       node = p && p.offsetNode;
     }
-    if (!node || node.nodeType !== 3 || !/\S/.test(node.nodeValue || "")) { return false; }
-    let el = node.parentElement;
-    if (!el || isUi(el) || (el.closest && el.closest(INTERACTIVE))) { return false; }
-    while (el && el !== doc.body && el !== doc.documentElement) {
-      const display = root.getComputedStyle(el).display;
-      if (display && display.indexOf("inline") !== 0 && display !== "contents") { break; }
-      el = el.parentElement;
-    }
-    if (!el || el === doc.body || el === doc.documentElement) { return false; }
+    if (!node || node.nodeType !== 3 || !/\S/.test(node.nodeValue || "")) { return null; }
+    const el = blockOfText(node);
+    if (!el || !textShown(node.parentElement, new Map())) { return null; }
     // The point must be on that block, not in the margin beside the nearest text.
     const b = el.getBoundingClientRect();
-    if (x < b.left || x > b.right || y < b.top || y > b.bottom) { return false; }
+    return x < b.left || x > b.right || y < b.top || y > b.bottom ? null : el;
+  }
+
+  // The visible block of text nearest to the point: the distance runs from the point to the
+  // block's own text vertically and to the block's box horizontally (so a short heading counts
+  // across its column, and a block of another column is farther). Equal distances (within a
+  // pixel) go to the block above the point. Text that is not shown (outside the view, hidden,
+  // transparent like a deck's other slides, under the review mask), of the viewer's UI, of the
+  // page's controls, or in a block too long to be a passage is never picked.
+  function nearestBlock(x, y) {
+    const vw = doc.documentElement.clientWidth || root.innerWidth;
+    const vh = doc.documentElement.clientHeight || root.innerHeight;
+    const masks = maskRangesActive();
+    const blocks = new Map();   // block element -> {dy, above}: its text nearest to the point
+    const parents = new Map();  // text parent -> its block element, or null
+    const memo = new Map();
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+    const range = doc.createRange();
+    let n;
+    while ((n = walker.nextNode())) {
+      if (!/\S/.test(n.nodeValue)) { continue; }
+      const parent = n.parentElement;
+      let el = parents.get(parent);
+      if (el === undefined) {
+        el = blockOfText(n);
+        if (el && !textShown(parent, memo)) { el = null; }
+        parents.set(parent, el);
+      }
+      if (!el) { continue; }
+      if (masks && masks.some(function (m) { return m.intersectsNode(n); })) { continue; }
+      range.selectNodeContents(n);
+      const q = range.getBoundingClientRect();
+      if (q.width <= 0 || q.height <= 0 || q.right <= 0 || q.bottom <= 0 || q.left >= vw || q.top >= vh) { continue; }
+      const dy = y < q.top ? q.top - y : y > q.bottom ? y - q.bottom : 0;
+      const b = blocks.get(el);
+      if (!b || dy < b.dy) { blocks.set(el, { dy: dy, above: q.bottom <= y }); }
+    }
+    const closer = function (c, best) {
+      if (!best) { return true; }
+      if (Math.abs(c.d - best.d) > 1) { return c.d < best.d; }
+      if (c.above !== best.above) { return c.above; }
+      return c.d < best.d;
+    };
+    let best = null;
+    blocks.forEach(function (b, el) {
+      const box = el.getBoundingClientRect();
+      const dx = x < box.left ? box.left - x : x > box.right ? x - box.right : 0;
+      const c = { el: el, d: Math.sqrt(dx * dx + b.dy * b.dy), above: b.above };
+      if (!closer(c, best)) { return; }
+      const text = (el.innerText || el.textContent || "").trim();
+      if (text && text.length <= SELECTED_BLOCK_MAX) { best = c; }
+    });
+    return best ? best.el : null;
+  }
+
+  // Selects the whole block (never masked text); false when nothing is left to select.
+  function selectBlock(el) {
     const text = (el.innerText || el.textContent || "").trim();
     if (!text || text.length > SELECTED_BLOCK_MAX) { return false; }
     const range = doc.createRange();
@@ -1633,7 +1741,8 @@
     if (!sel) { return false; }
     sel.removeAllRanges();
     sel.addRange(range);
-    return !sel.isCollapsed;
+    clipSelectionToMask();
+    return sel.rangeCount > 0 && !sel.isCollapsed;
   }
 
   // A text field of the page (or the browser's editing host): its keys are never taken.

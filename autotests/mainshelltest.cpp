@@ -6,6 +6,7 @@
 
 // clazy:excludeall=qstring-allocations
 
+#include <KAboutData>
 #include "../part/documentfeedback.h"
 #include "../core/htmlattachment.h"
 #include "../core/htmllivepage.h"
@@ -2286,6 +2287,12 @@ void MainShellTest::testNoteWebLinkFallsBackToTheBrowser()
 
 void MainShellTest::testLibraryWindowHasTheApplicationMenus()
 {
+    // With a bug address, as Thoughts' own about data has, KHelpMenu adds KDE's Report Bug… too.
+    const KAboutData originalAbout = KAboutData::applicationData();
+    KAboutData about = originalAbout;
+    about.setBugAddress(QByteArrayLiteral("submit@bugs.kde.org"));
+    KAboutData::setApplicationData(about);
+    const auto restoreAbout = qScopeGuard([&] { KAboutData::setApplicationData(originalAbout); });
     const QUrl url = QUrl::fromLocalFile(QStringLiteral(KDESRCDIR "data/file1.pdf"));
     const QString options = ShellUtils::serializeOptions(false, false, false, false, false, QString(), QString(), QString());
     QCOMPARE(Okular::main({url.toLocalFile()}, options), Okular::Success);
@@ -2320,6 +2327,43 @@ void MainShellTest::testLibraryWindowHasTheApplicationMenus()
     QStringList helpEntries;
     for (QAction *action : help->actions()) if (!action->isSeparator()) helpEntries << action->text();
     QVERIFY(helpEntries.contains(QStringLiteral("About Thoughts")));
+    QVERIFY(helpEntries.contains(QStringLiteral("Report Bug/Feature…")));
+    QVERIFY(helpEntries.contains(QStringLiteral("Donate…")));
+    const QUrl sponsors(QStringLiteral("https://github.com/sponsors/TommasoBendinelli"));
+    for (QAction *action : help->actions()) {
+        if (action->objectName() == QLatin1String("library_thoughts_donate")) QCOMPARE(action->data().toUrl(), sponsors);
+    }
+    QAction *donate = s->actionCollection()->action(QStringLiteral("thoughts_donate"));
+    QVERIFY(donate && donate->isVisible());
+    QCOMPARE(donate->data().toUrl(), sponsors);
+    QAction *aboutKde = s->actionCollection()->action(QStringLiteral("help_about_kde"));
+    QVERIFY(aboutKde && !aboutKde->isVisible());
+    QAction *kdeDonate = s->actionCollection()->action(QStringLiteral("help_donate"));
+    QVERIFY(!kdeDonate || !kdeDonate->isVisible());
+    // One entry for bugs and ideas in the window's Help menu too: KDE's own Report Bug… is hidden.
+    QAction *report = s->actionCollection()->action(QStringLiteral("thoughts_report_problem"));
+    QVERIFY(report && report->isVisible());
+    QCOMPARE(report->text(), QStringLiteral("Report Bug/Feature…"));
+    QAction *kdeBugReport = s->actionCollection()->action(QStringLiteral("help_report_bug"));
+    QVERIFY(kdeBugReport); // KHelpMenu makes it; hidden, it never shows
+    QVERIFY(!kdeBugReport->isVisible());
+    QVERIFY(!kdeBugReport->isEnabled());
+    if (auto *windowHelp = qobject_cast<QMenu *>(s->guiFactory()->container(QStringLiteral("help"), s))) {
+        QStringList reportEntries;
+        for (QAction *action : windowHelp->actions()) {
+            if (action->isVisible() && action->text().contains(QLatin1String("Report"))) reportEntries << action->text();
+        }
+        QCOMPARE(reportEntries, QStringList({QStringLiteral("Report Bug/Feature…")}));
+        QStringList visible;
+        for (QAction *action : windowHelp->actions()) {
+            if (action->isVisible() && !action->isSeparator()) visible << action->objectName();
+        }
+        // Thoughts' Donate… right after Report Bug/Feature…, and none of KDE's own.
+        QVERIFY(visible.indexOf(QStringLiteral("thoughts_donate")) == visible.indexOf(QStringLiteral("thoughts_report_problem")) + 1);
+        for (const QString &kde : {QStringLiteral("help_report_bug"), QStringLiteral("help_donate"), QStringLiteral("help_about_kde")}) {
+            QVERIFY2(!visible.contains(kde), qPrintable(kde));
+        }
+    }
     // A build without a release version has no Check for Updates… (Thoughts::Updates::available()).
     QCOMPARE(helpEntries.contains(QStringLiteral("Check for Updates…")), Thoughts::Updates::available());
     s->closeUrl();
@@ -2372,8 +2416,8 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     oldMenu.replace("  <Action name=\"view_zoom_out\"/>\n", "");
     QVERIFY(oldMenu.contains("<Action name=\"view_zoom_in\"/>"));
     oldMenu.replace("  <Action name=\"view_zoom_in\"/>\n", "");
-    QVERIFY(oldMenu.contains("<gui version=\"50\""));
-    oldMenu.replace("<gui version=\"50\"", "<gui version=\"42\"");
+    QVERIFY(oldMenu.contains("<gui version=\"51\""));
+    oldMenu.replace("<gui version=\"51\"", "<gui version=\"42\"");
     // A layout saved while "A/B testing" existed (v36-v45) has it in the toolbar and the File menu.
     QVERIFY(!oldMenu.contains("ab_testing"));
     oldMenu.replace("  <Action name=\"review_overview\"/>\n", "  <Action name=\"review_overview\"/>\n  <Action name=\"ab_testing\"/>\n");
@@ -2401,7 +2445,7 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     savedMenu.close();
     QVERIFY(migrated.contains("name=\"copy_for_agent\""));
     QVERIFY(migrated.indexOf("copy_for_agent") > migrated.indexOf("review_overview"));
-    QVERIFY(migrated.contains("version=\"50\""));
+    QVERIFY(migrated.contains("version=\"51\""));
     // v50: Zoom Out before the zoom field, Zoom In after it.
     QCOMPARE(migrated.count("name=\"view_zoom_out\""), 1);
     QCOMPARE(migrated.count("name=\"view_zoom_in\""), 1);

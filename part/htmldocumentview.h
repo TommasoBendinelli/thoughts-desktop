@@ -182,6 +182,16 @@ Q_SIGNALS:
     // reader clicked or typed in this window just before, so the page did not navigate by itself
     // (always false where Thoughts cannot see the page's clicks; the receiver then asks).
     void externalLinkRequested(const QUrl &url, bool userGesture);
+    // A thoughts-html: link of an attachment page (another page of the Library; the receiver
+    // decides which it opens). userGesture as for externalLinkRequested. On Windows WebView2's
+    // navigation says it; elsewhere the viewer's link message does (pageLinkOfMessage), as the
+    // web view hands such a link to the system and never navigates.
+    void pageLinkRequested(const QUrl &url, bool userGesture);
+
+public:
+    // The thoughts-html: link a viewer "link" message (the page's click on a link) names; empty
+    // for any other message or link.
+    static QUrl pageLinkOfMessage(const QJsonObject &message);
 
 protected:
     void changeEvent(QEvent *event) override;

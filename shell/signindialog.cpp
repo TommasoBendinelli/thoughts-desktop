@@ -6,6 +6,7 @@
 
 #include <KLocalizedString>
 
+#include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -156,6 +157,17 @@ SignInDialog::SignInDialog(const AppSignIn::Hooks &hooks, QWidget *parent)
     form->addRow(deviceLabel, m_deviceName);
     layout->addLayout(form);
 
+    // No account (protocol/app-sign-in.md 5): where to ask for one, once the server has answered.
+    m_access = new QLabel(this);
+    m_access->setObjectName(QStringLiteral("thoughtsSignInAccess"));
+    m_access->setWordWrap(true);
+    m_access->setTextFormat(Qt::RichText);
+    m_access->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::LinksAccessibleByKeyboard);
+    m_access->setOpenExternalLinks(false);
+    m_access->hide();
+    layout->addWidget(m_access);
+    connect(m_access, &QLabel::linkActivated, this, &SignInDialog::requestAccess);
+
     m_error = new QLabel(this);
     m_error->setObjectName(QStringLiteral("thoughtsSignInError"));
     m_error->setWordWrap(true);
@@ -245,6 +257,7 @@ QString SignInDialog::address() const
 void SignInDialog::scheduleCheck(int delayMs)
 {
     m_check.reset();
+    m_accessContact.clear();
     m_checkTimer->start(delayMs);
     updateState();
 }
@@ -276,6 +289,7 @@ void SignInDialog::checkServer()
         }
         m_checkedAddress = canonical;
         m_check = AppSignIn::serverCheckFromAnswer(status, body);
+        m_accessContact = AppSignIn::accessContactFromAnswer(status, body);
         m_addressStatus->setText(AppSignIn::serverCheckText(*m_check));
         updateState();
     });
@@ -303,6 +317,30 @@ void SignInDialog::updateState()
     }
     m_signIn->setEnabled(!m_busy && !canonical.isEmpty() && !refused && !m_username->text().trimmed().isEmpty() && passwordReady
                          && !AppSignIn::cleanDeviceName(m_deviceName->text()).isEmpty());
+    // An invite already is a login; a server not found has nobody to ask.
+    const bool found = m_check && m_checkedAddress == canonical && *m_check == AppSignIn::ServerCheck::Found;
+    if (found && !inviteMode()) {
+        m_access->setText(m_accessContact.isEmpty() ? i18n("No account? Ask the person who runs this server for an invite.")
+                                                    : i18n("No account? <a href=\"request\">Request access</a>"));
+        m_access->setToolTip(m_accessContact.isEmpty() ? QString() : i18n("Writes an email to %1 asking for an invite.", m_accessContact));
+        m_access->show();
+    } else {
+        m_access->hide();
+    }
+}
+
+void SignInDialog::requestAccess()
+{
+    const QString canonical = ServerAddress::normalized(address());
+    if (m_accessContact.isEmpty() || canonical.isEmpty() || canonical != m_checkedAddress) {
+        return;
+    }
+    const QUrl url = AppSignIn::accessRequestUrl(m_accessContact, canonical, m_username->text());
+    if (m_hooks.openUrl) {
+        m_hooks.openUrl(url);
+    } else {
+        QDesktopServices::openUrl(url);
+    }
 }
 
 void SignInDialog::setBusy(bool busy)

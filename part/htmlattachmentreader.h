@@ -43,7 +43,9 @@ public:
 
     // Shows the page of `target` (served on a fresh loopback origin that lives as long as the page
     // is shown). The same object already shown is kept as it is (its scripts' state too).
-    bool open(const HtmlAttachmentTarget &target, const Owner &owner, QString *error);
+    // With @p hash (a page state "#…", a link's fragment such as "#slide=3") the page loads at
+    // it, so its own scripts read it as they start; a page already shown goes to it.
+    bool open(const HtmlAttachmentTarget &target, const Owner &owner, QString *error, const QString &hash = QString());
     // A live page (thoughts-server protocol/html-live-pages.md): `target` is its stub, and the
     // view loads `address` instead, in its live mode (no viewer: no cards, highlights or selection
     // reports; text feedback reads the selection itself, readLiveSelection). With `load` false the

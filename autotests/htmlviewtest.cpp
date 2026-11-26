@@ -111,6 +111,7 @@ private Q_SLOTS:
     void webViewReviewSelectionAndCards();
     void attachmentShownInPlaceOfTheDocument();
     void attachmentTabShowsThePageAlone();
+    void attachmentPageLinksOpenTheirPage();
     void attachmentFollowsItsNewestVersion();
     void attachmentForwardsReviewKeys();
     void attachmentCardFromASelection();
@@ -131,7 +132,8 @@ private:
     QString addLibraryPdf(const QString &stem, const QString &kind, const QJsonObject &htmlFields);
     void shot(Part &part, const QString &name, QWidget *popup = nullptr, Thoughts::HtmlDocumentView *view = nullptr);
     // The attachment fixture (or @p html) in the PDF's source bundle (as Sync installs it) -> its target.
-    Thoughts::HtmlAttachmentTarget addAttachment(const QString &pdfPath, const QByteArray &page = {});
+    // The page at AttachmentPath, and @p others (path -> HTML) of the same bundle.
+    Thoughts::HtmlAttachmentTarget addAttachment(const QString &pdfPath, const QByteArray &page = {}, const QMap<QString, QByteArray> &others = {});
     QJsonObject attachmentCard(const QJsonObject &fields, const QString &question) const;
     QJsonValue callAttachment(Part &part, const QString &name, const QJsonArray &args = {});
     QJsonValue callViewer(Part &part, const QString &name, const QJsonArray &args = {});
@@ -266,7 +268,7 @@ QJsonValue HtmlViewTest::callViewer(Part &part, const QString &name, const QJson
     return value;
 }
 
-Thoughts::HtmlAttachmentTarget HtmlViewTest::addAttachment(const QString &pdfPath, const QByteArray &page)
+Thoughts::HtmlAttachmentTarget HtmlViewTest::addAttachment(const QString &pdfPath, const QByteArray &page, const QMap<QString, QByteArray> &others)
 {
     // <docs>/.runtime/target/source-bundle: the Library's bundle next to current_pdfs/.
     const QDir root(QFileInfo(pdfPath).absolutePath() + QStringLiteral("/../.runtime/target/source-bundle"));
@@ -280,9 +282,16 @@ Thoughts::HtmlAttachmentTarget HtmlViewTest::addAttachment(const QString &pdfPat
     };
     const QString filename = QFileInfo(pdfPath).fileName();
     const QJsonObject document{{QStringLiteral("filename"), filename}, {QStringLiteral("pdf_sha256"), sha(pdf)}};
-    const QJsonObject resource{{QStringLiteral("kind"), QStringLiteral("html_attachment")}, {QStringLiteral("path"), AttachmentPath},
-                               {QStringLiteral("sha256"), sha(html)}, {QStringLiteral("object"), sha(html)}, {QStringLiteral("bytes"), html.size()}};
-    const QByteArray manifest = QJsonDocument(QJsonObject{{QStringLiteral("pdf"), document}, {QStringLiteral("resources"), QJsonArray{resource}}}).toJson();
+    const auto resource = [](const QString &path, const QByteArray &bytes) {
+        return QJsonObject{{QStringLiteral("kind"), QStringLiteral("html_attachment")}, {QStringLiteral("path"), path},
+                           {QStringLiteral("sha256"), sha(bytes)}, {QStringLiteral("object"), sha(bytes)}, {QStringLiteral("bytes"), bytes.size()}};
+    };
+    QJsonArray resources{resource(AttachmentPath, html)};
+    for (auto it = others.cbegin(); it != others.cend(); ++it) {
+        if (!write(root.filePath(QStringLiteral("objects/") + sha(it.value())), it.value())) return {};
+        resources.append(resource(it.key(), it.value()));
+    }
+    const QByteArray manifest = QJsonDocument(QJsonObject{{QStringLiteral("pdf"), document}, {QStringLiteral("resources"), resources}}).toJson();
     QJsonObject pointer = document;
     pointer.insert(QStringLiteral("artifact_sha256"), sha(manifest));
     if (html.isEmpty() || !write(root.filePath(QStringLiteral("objects/") + sha(html)), html) || !write(root.filePath(QStringLiteral("objects/") + sha(manifest)), manifest)
@@ -457,6 +466,60 @@ void HtmlViewTest::attachmentTabShowsThePageAlone()
     QCOMPARE(close->text(), QStringLiteral("Back"));
     QCOMPARE(page.m_documentStack->currentWidget(), page.m_pageView.data());
     QCOMPARE(page.m_htmlReader->documentPath(), page.localFilePath());
+}
+
+void HtmlViewTest::attachmentPageLinksOpenTheirPage()
+{
+    // A deck (an embedded page) links another page of its folder, a slide of it too: the reader's
+    // click opens that page in a tab of its own, at the slide, as a link of the PDF opens a page.
+    const QString path = addLibraryPdf(QStringLiteral("deck"), QStringLiteral("source_linked"), {});
+    const QString answersPath = QStringLiteral("docs-ideas/tex/support/html/model-answers.html");
+    const auto target = addAttachment(path, {}, {{answersPath, QByteArrayLiteral("<!doctype html><title>Model answers</title><p>Answers</p>")}});
+    QVERIFY(target.isValid());
+    Part deck(nullptr, {});
+    QVERIFY(deck.openHtmlAttachmentTab(QUrl::fromLocalFile(path), {{QStringLiteral("path"), AttachmentPath}}));
+    QList<QJsonObject> requests;
+    QObject::connect(&deck, &Part::requestHtmlAttachmentTab, &deck, [&requests](const QJsonObject &request) { requests.append(request); });
+    const auto click = [&deck](const QString &href, bool userGesture = true) {
+        Q_EMIT deck.m_attachmentView->pageLinkRequested(QUrl(href), userGesture);
+    };
+    click(QStringLiteral("thoughts-html:") + answersPath + QStringLiteral("#slide=3"));
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.constLast().value(QStringLiteral("path")).toString(), answersPath);
+    QCOMPARE(requests.constLast().value(QStringLiteral("hash")).toString(), QStringLiteral("#slide=3"));
+    click(QStringLiteral("thoughts-html:") + answersPath);
+    QCOMPARE(requests.size(), 2);
+    QVERIFY(!requests.constLast().contains(QStringLiteral("hash")));
+    // Refused: a page of another folder, one this document's Sync did not bring, no page.
+    click(QStringLiteral("thoughts-html:docs-other/tex/support/html/model-answers.html"));
+    click(QStringLiteral("thoughts-html:docs-ideas/tex/support/html/missing.html"));
+    click(QStringLiteral("thoughts-html:docs-ideas/tex/support/html/model-answers.html?slide=3"));
+    QCOMPARE(requests.size(), 2);
+#ifdef Q_OS_MACOS
+    // The page's own script, no click of the reader's: nothing opens.
+    click(QStringLiteral("thoughts-html:") + answersPath, false);
+    QCOMPARE(requests.size(), 2);
+#endif
+    // The linked page's tab loads it at the slide: the page's scripts read it as they start.
+    Part answers(nullptr, {});
+    QVERIFY(answers.openHtmlAttachmentTab(QUrl::fromLocalFile(path), requests.constFirst()));
+    QCOMPARE(answers.htmlAttachmentState().value(QStringLiteral("path")).toString(), answersPath);
+    QCOMPARE(answers.htmlAttachmentTitle(), QStringLiteral("Model answers"));
+    QCOMPARE(answers.m_attachmentView->loadedUrl().fragment(), QStringLiteral("slide=3"));
+    QCOMPARE(answers.m_attachmentView->loadedUrl().adjusted(QUrl::RemoveFragment), answers.m_attachmentReader->pageUrl());
+    // Asked again (its tab is open already): the same page, kept as it is.
+    const QUrl shown = answers.m_attachmentView->loadedUrl();
+    QVERIFY(answers.showInHtmlAttachmentTab({{QStringLiteral("path"), answersPath}, {QStringLiteral("hash"), QStringLiteral("#slide=5")}}));
+    QCOMPARE(answers.m_attachmentView->loadedUrl(), shown);
+    // The deck's link to a slide of itself stays in its tab.
+    click(QStringLiteral("thoughts-html:") + AttachmentPath + QStringLiteral("#slide=2"));
+    QCOMPARE(requests.size(), 2);
+    QCOMPARE(deck.htmlAttachmentState().value(QStringLiteral("path")).toString(), AttachmentPath);
+    // What Qt WebView reports of a click: the viewer's link message, thoughts-html: links only.
+    const QString href = QStringLiteral("thoughts-html:") + answersPath + QStringLiteral("#slide=3");
+    QCOMPARE(Thoughts::HtmlDocumentView::pageLinkOfMessage({{QStringLiteral("type"), QStringLiteral("link")}, {QStringLiteral("href"), href}}), QUrl(href));
+    QVERIFY(Thoughts::HtmlDocumentView::pageLinkOfMessage({{QStringLiteral("type"), QStringLiteral("link")}, {QStringLiteral("href"), QStringLiteral("https://example.org/")}}).isEmpty());
+    QVERIFY(Thoughts::HtmlDocumentView::pageLinkOfMessage({{QStringLiteral("type"), QStringLiteral("selection")}, {QStringLiteral("href"), href}}).isEmpty());
 }
 
 void HtmlViewTest::attachmentForwardsReviewKeys()
@@ -1353,7 +1416,10 @@ void HtmlViewTest::webViewAttachmentCardsAndReview()
 #endif
     const QJsonObject info = callAttachment(part, QStringLiteral("info")).toObject();
     QCOMPARE(info.value(QStringLiteral("mode")).toString(), QStringLiteral("attachment"));
-    QCOMPARE(info.value(QStringLiteral("version")).toString(), QStringLiteral("0.3.0"));
+    // The vendored viewer (part/html-viewer, VERSION in the resources) is the one in the page.
+    const QString bundled = QString::fromUtf8(readFile(QStringLiteral(":/thoughts/html-viewer/VERSION"))).trimmed();
+    QVERIFY(!bundled.isEmpty());
+    QCOMPARE(info.value(QStringLiteral("version")).toString(), bundled);
     // The page's own script rendered its text (400 ms after load) and routes tabs by #hash.
     callAttachment(part, QStringLiteral("setPageState"), QJsonArray{QJsonObject{{QStringLiteral("hash"), QStringLiteral("#simulator")}}});
     QTRY_COMPARE_WITH_TIMEOUT(callAttachment(part, QStringLiteral("getPageState")).toObject().value(QStringLiteral("hash")).toString(), QStringLiteral("#simulator"), 5000);

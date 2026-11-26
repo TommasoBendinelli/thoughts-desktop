@@ -327,6 +327,16 @@ void HtmlDocumentView::ensureWebView()
         if (!m_attachment || !m_pageUrl.isValid() || (!newWindow && isLoadedPage(url))) {
             return true;
         }
+        // Another page of the Library: Thoughts opens it, never the web view.
+        if (url.scheme().compare(QLatin1String("thoughts-html"), Qt::CaseInsensitive) == 0) {
+            QMetaObject::invokeMethod(
+                this,
+                [this, url, userGesture] {
+                    Q_EMIT pageLinkRequested(url, userGesture);
+                },
+                Qt::QueuedConnection);
+            return false;
+        }
         const bool loopback = url.host() == QLatin1String("127.0.0.1") || url.host() == QLatin1String("localhost");
         if ((url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("mailto")) && !loopback) {
             // After WebView2's call returns: the receiver may ask the reader.
@@ -673,6 +683,24 @@ void HtmlDocumentView::startViewer()
     m_nextSeq = 1;
     m_held.clear();
     QString script;
+#if !defined(THOUGHTS_HAVE_WEBVIEW2)
+    if (m_attachment) {
+        // Thoughts opens a thoughts-html: link of the page itself (pageLinkRequested, from the
+        // viewer's link message, which still goes out): Qt WebView would hand it to the system,
+        // which may ask for an application to open it with. Before the viewer's listeners and
+        // the page's (capture on the window); nothing else of the click changes.
+        script += QStringLiteral(
+            "(function () {\n"
+            "  function library(ev) {\n"
+            "    var a = ev.target && ev.target.closest ? ev.target.closest('a') : null;\n"
+            "    var href = a ? (a.getAttribute('href') || a.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '') : '';\n"
+            "    if (/^\\s*thoughts-html:/i.test(href)) { ev.preventDefault(); }\n"
+            "  }\n"
+            "  window.addEventListener('click', library, true);\n"
+            "  window.addEventListener('auxclick', library, true);\n"
+            "})();\n;\n");
+    }
+#endif
     for (const QString &name : {QStringLiteral("geometry.js"), QStringLiteral("text.js"), QStringLiteral("viewer.js")}) {
         script += resourceText(name) + QStringLiteral("\n;\n");
     }
@@ -834,7 +862,36 @@ void HtmlDocumentView::deliver(const QJsonObject &message)
     } else if (type == QLatin1String("blur")) {
         m_pageFocused = false;
     }
+#if !defined(THOUGHTS_HAVE_WEBVIEW2)
+    // Qt WebView hands a thoughts-html: link to the system and stays on the page (WebView2 asks
+    // the navigation filter instead): the viewer's message about the click is all Thoughts sees.
+    // The page's scripts can post that message too, so it counts as the reader's only after a
+    // real click or key press in this window.
+    if (m_attachment) {
+        const QUrl link = pageLinkOfMessage(message);
+        if (link.isValid()) {
+            bool userGesture = false;
+#ifdef Q_OS_MACOS
+            userGesture = isUserGesture(HtmlMacNative::millisecondsSinceUserInput(m_web));
+#endif
+            Q_EMIT pageLinkRequested(link, userGesture);
+        }
+    }
+#endif
     Q_EMIT viewerMessage(message);
+}
+
+QUrl HtmlDocumentView::pageLinkOfMessage(const QJsonObject &message)
+{
+    if (message.value(QStringLiteral("type")).toString() != QLatin1String("link")) {
+        return {};
+    }
+    const QString href = message.value(QStringLiteral("href")).toString().trimmed();
+    if (href.size() > 4096) {
+        return {};
+    }
+    const QUrl link(href);
+    return link.isValid() && link.scheme().compare(QLatin1String("thoughts-html"), Qt::CaseInsensitive) == 0 ? link : QUrl();
 }
 
 QString HtmlDocumentView::themeForPalette() const

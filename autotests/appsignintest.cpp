@@ -4,6 +4,7 @@
 #include "../shell/appsignin.h"
 #include "../shell/signindialog.h"
 #include "../shell/projectsharedialog.h"
+#include "../shell/problemreportdialog.h"
 
 #include <QFile>
 #include <QJsonArray>
@@ -24,6 +25,11 @@
 #include <QTcpSocket>
 #include <QTest>
 #include <QTimeZone>
+#include <QUrlQuery>
+#include <QImage>
+#include <QPlainTextEdit>
+#include <QComboBox>
+#include <QCheckBox>
 
 using namespace Thoughts;
 
@@ -70,6 +76,8 @@ public:
     // GET /v1/ready
     int readyStatus = 200;
     QStringList capabilities {QStringLiteral("sync_state_v2"), QStringLiteral("app_sign_in_v1")};
+    // Where a person without a login asks for one (section 5); empty: null.
+    QString accessContact;
     // POST /v1/apps/sign-in: a password, or an invite with which a new password is chosen.
     QString username = QStringLiteral("alex");
     QString password = QStringLiteral("correct horse battery");
@@ -86,6 +94,9 @@ public:
     QJsonObject shareAnswer;
     QStringList requests;  // "GET /v1/ready"
     QList<QJsonObject> bodies;  // of the POSTs, in order
+    // POST /v1/problem-reports (problem-reports.md 2).
+    int problemReportStatus = 201;
+    QByteArray problemReportAnswer = R"({"report_id":"20261126T000000Z-00000000","redactions":0})";
     QList<QByteArray> authorizations;  // of every request
     QString lastQuery;  // of the last GET /v1/project-shares
 
@@ -120,7 +131,10 @@ private:
                 reply(socket, readyStatus, readyStatus == 503 ? R"({"detail":"Object store is unavailable"})" : R"({"detail":"Not Found"})");
                 return;
             }
-            reply(socket, 200, QJsonDocument(QJsonObject {{QStringLiteral("status"), QStringLiteral("ready")}, {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)}}).toJson());
+            reply(socket, 200, QJsonDocument(QJsonObject {{QStringLiteral("status"), QStringLiteral("ready")},
+                                                          {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)},
+                                                          {QStringLiteral("access_contact"), accessContact.isEmpty() ? QJsonValue() : QJsonValue(accessContact)}})
+                                  .toJson());
             return;
         }
         if (method == QLatin1String("POST") && path == QLatin1String("/v1/apps/sign-in")) {
@@ -157,6 +171,14 @@ private:
         if (method == QLatin1String("GET") && path == QLatin1String("/v1/project-shares")) {
             lastQuery = QUrl(QString::fromLatin1(words.value(1))).query(QUrl::FullyDecoded);
             reply(socket, 200, QJsonDocument(shares).toJson());
+            return;
+        }
+        if (method == QLatin1String("POST") && path == QLatin1String("/v1/problem-reports")) {
+            if (!authorized) {
+                reply(socket, 401, R"({"detail":"Invalid device token"})");
+                return;
+            }
+            reply(socket, problemReportStatus, problemReportAnswer);
             return;
         }
         if (method == QLatin1String("POST") && path == QLatin1String("/v1/project-shares")) {
@@ -253,7 +275,9 @@ private Q_SLOTS:
     void connectLinks();
     void connectLinks_data();
     void serverChecks();
+    void accessRequests();
     void projectShareDialog();
+    void problemReports();
     void signInAnswers();
     void devicesAnswer();
     void deviceNames();
@@ -261,6 +285,7 @@ private Q_SLOTS:
     void storingRecordsBothTokensForTheServer();
     void dialogChecksTheAddressAsTyped();
     void dialogNeedsEverything();
+    void dialogOffersToRequestAccess();
     void signInStoresBothTokens();
     void wrongPasswordIsShown();
     void unstoredTokensAreSignedOutAgain();
@@ -345,6 +370,29 @@ void AppSignInTest::connectLinks()
     }
     QVERIFY(AppSignIn::isConnectLinkUrl(QUrl(QStringLiteral("THOUGHTS://connect?x=1"))));
     QVERIFY(!AppSignIn::isConnectLinkUrl(QUrl(QStringLiteral("thoughts://open/document/x"))));
+}
+
+void AppSignInTest::accessRequests()
+{
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"status":"ready","access_contact":"owner@example.org"})"), QStringLiteral("owner@example.org"));
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"status":"ready","access_contact":null})"), QString());
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"status":"ready"})"), QString());
+    QCOMPARE(AppSignIn::accessContactFromAnswer(404, R"({"access_contact":"owner@example.org"})"), QString());
+    // Only a plain address: nothing a mailto: link would read as more recipients or fields.
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"access_contact":"owner@example.org?cc=x@example.org"})"), QString());
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"access_contact":"Owner <owner@example.org>"})"), QString());
+    QCOMPARE(AppSignIn::accessContactFromAnswer(200, R"({"access_contact":"a@b.org,c@d.org"})"), QString());
+
+    const QUrl url = AppSignIn::accessRequestUrl(QStringLiteral("owner@example.org"), QStringLiteral("https://thoughts.example.org"), QStringLiteral(" sam "));
+    QCOMPARE(url.scheme(), QStringLiteral("mailto"));
+    QCOMPARE(url.path(), QStringLiteral("owner@example.org"));
+    const QUrlQuery query(url);
+    QCOMPARE(query.queryItemValue(QStringLiteral("subject"), QUrl::FullyDecoded), QStringLiteral("Thoughts access request"));
+    QCOMPARE(query.queryItemValue(QStringLiteral("body"), QUrl::FullyDecoded),
+             QStringLiteral("Hello,\n\nI would like to use the Thoughts server at https://thoughts.example.org. Could you send me an invite?\n\n"
+                            "Username I would like: sam\nMy name: \n"));
+    // Spaces are %20: a + would reach the message as a plus.
+    QVERIFY(!url.toEncoded().contains('+'));
 }
 
 void AppSignInTest::serverChecks()
@@ -521,6 +569,58 @@ void AppSignInTest::dialogChecksTheAddressAsTyped()
     QTRY_COMPARE(status->text(), QStringLiteral("The server address must start with https://."));
     QTest::qWait(600);
     QCOMPARE(server.requests.size(), asked);
+}
+
+void AppSignInTest::dialogOffersToRequestAccess()
+{
+    FakeServer server;
+    server.accessContact = QStringLiteral("owner@example.org");
+    Secrets secrets;
+    QList<QUrl> opened;
+    AppSignIn::Hooks hooks = secrets.hooks(server);
+    hooks.openUrl = [&opened](const QUrl &url) {
+        opened.append(url);
+    };
+    SignInDialog dialog(hooks);
+    dialog.show();
+    auto *status = child<QLabel>(dialog, QStringLiteral("thoughtsSignInServerStatus"));
+    auto *access = child<QLabel>(dialog, QStringLiteral("thoughtsSignInAccess"));
+    QVERIFY(status && access);
+    QTRY_COMPARE(status->text(), QStringLiteral("Thoughts server found"));
+    QTRY_VERIFY(access->isVisible());
+    QVERIFY(access->text().contains(QLatin1String("Request access")));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername")), QStringLiteral("sam"));
+    Q_EMIT access->linkActivated(QStringLiteral("request"));
+    QCOMPARE(opened.size(), 1);
+    QCOMPARE(opened.first().scheme(), QStringLiteral("mailto"));
+    QCOMPARE(opened.first().path(), QStringLiteral("owner@example.org"));
+    const QString body = QUrlQuery(opened.first()).queryItemValue(QStringLiteral("body"), QUrl::FullyDecoded);
+    QVERIFY2(body.contains(QStringLiteral("Thoughts server at %1.").arg(ServerAddress::defaultUrl())), qPrintable(body));
+    QVERIFY2(body.contains(QLatin1String("Username I would like: sam\n")), qPrintable(body));
+
+    // A server that names nobody: the person is told whom to ask, and nothing opens.
+    server.accessContact.clear();
+    auto *address = child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"));
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("other.example.org"));
+    QTRY_COMPARE(access->text(), QStringLiteral("No account? Ask the person who runs this server for an invite."));
+    Q_EMIT access->linkActivated(QStringLiteral("request"));
+    QCOMPARE(opened.size(), 1);
+
+    // No server, nobody to ask.
+    server.readyStatus = 404;
+    address->clear();
+    QTest::keyClicks(address, QStringLiteral("gone.example.org"));
+    QTRY_COMPARE(status->text(), QStringLiteral("No Thoughts server at this address"));
+    QVERIFY(!access->isVisible());
+
+    // An invite is a login already.
+    server.readyStatus = 200;
+    server.accessContact = QStringLiteral("owner@example.org");
+    dialog.fill({ServerAddress::defaultUrl(), QStringLiteral("sam"), QStringLiteral("aW52aXRl")});
+    QTRY_COMPARE(status->text(), QStringLiteral("Thoughts server found"));
+    QTest::qWait(50);
+    QVERIFY(!access->isVisible());
 }
 
 void AppSignInTest::dialogNeedsEverything()
@@ -738,6 +838,81 @@ void AppSignInTest::linkFillsTheDialog()
 
 // Share… of a Library project: the people and invitations the server lists, a share by username, and an
 // invitation whose link is copied (the server sends no email).
+void AppSignInTest::problemReports()
+{
+    using namespace Thoughts::ProblemReports;
+    // A large window is scaled to 2560 pixels; a plain one stays a PNG.
+    QImage wide(5120, 1000, QImage::Format_RGB32);
+    wide.fill(Qt::white);
+    const QByteArray encoded = encodedPicture(wide);
+    QVERIFY(encoded.startsWith("\x89PNG"));
+    QCOMPARE(QImage::fromData(encoded).size(), QSize(2560, 500));
+    QVERIFY(encodedPicture(QImage()).isEmpty());
+    // Logs keep their newest part, from the start of a line, within MaxLogBytes together.
+    QString lines;
+    for (int line = 0; line < 200; ++line) lines += QStringLiteral("line %1\n").arg(line);
+    const QList<Log> kept = fitted({{QStringLiteral("big"), QString(MaxLogBytes - 100, QLatin1Char('x'))}, {QStringLiteral("lines"), lines}, {QStringLiteral("after"), QStringLiteral("left out")}});
+    QCOMPARE(kept.size(), 2);
+    QVERIFY(kept.at(1).text.endsWith(QStringLiteral("line 199\n")));
+    QVERIFY(kept.at(1).text.startsWith(QStringLiteral("line ")));
+    QVERIFY(kept.at(1).text.toUtf8().size() <= 100);
+    QCOMPARE(failure(404, {}), QStringLiteral("This Thoughts server cannot take problem reports yet."));
+    QCOMPARE(failure(429, R"({"detail":"This device sent 30 reports today. Try again tomorrow."})"), QStringLiteral("This device sent 30 reports today. Try again tomorrow."));
+
+    FakeServer server;
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    QImage window(400, 300, QImage::Format_RGB32);
+    window.fill(Qt::red);
+    const auto logs = [] { return QList<Log> {{QStringLiteral("developer.jsonl"), QStringLiteral("{\"event\":\"sync.failed\"}\n")}}; };
+    {
+        ProblemReportDialog dialog(window, logs, secrets.hooks(server));
+        dialog.show();
+        // Without words nothing is sent.
+        child<QPushButton>(dialog, QStringLiteral("problemReportSend"))->click();
+        QVERIFY(!child<QLabel>(dialog, QStringLiteral("problemReportStatus"))->text().isEmpty());
+        QCOMPARE(server.bodies.size(), 0);
+        child<QPlainTextEdit>(dialog, QStringLiteral("problemReportDescription"))->setPlainText(QStringLiteral("  Sync never ends.\n"));
+        child<QPushButton>(dialog, QStringLiteral("problemReportSend"))->click();
+        QTRY_COMPARE(server.bodies.size(), 1);
+        QTRY_VERIFY(!dialog.isVisible());
+        QCOMPARE(dialog.result(), int(QDialog::Accepted));
+    }
+    const QJsonObject sent = server.bodies.constLast();
+    QCOMPARE(server.requests.constLast(), QStringLiteral("POST /v1/problem-reports"));
+    QCOMPARE(server.authorizations.constLast(), QByteArray("Bearer app-token"));
+    QCOMPARE(sent.value(QStringLiteral("description")).toString(), QStringLiteral("Sync never ends."));
+    QCOMPARE(sent.value(QStringLiteral("kind")).toString(), QStringLiteral("problem"));
+    QCOMPARE(sent.value(QStringLiteral("app")).toObject().value(QStringLiteral("name")).toString(), QStringLiteral("thoughts-desktop"));
+    QCOMPARE(sent.value(QStringLiteral("app")).toObject().value(QStringLiteral("platform")).toString(), AppSignIn::platform());
+    const QImage picture = QImage::fromData(QByteArray::fromBase64(sent.value(QStringLiteral("screenshot")).toObject().value(QStringLiteral("data")).toString().toLatin1()));
+    QCOMPARE(picture.size(), QSize(400, 300));
+    QCOMPARE(sent.value(QStringLiteral("logs")).toArray().size(), 1);
+    QCOMPARE(sent.value(QStringLiteral("logs")).toArray().at(0).toObject().value(QStringLiteral("name")).toString(), QStringLiteral("developer.jsonl"));
+    for (QWidget *top : QApplication::topLevelWidgets()) {
+        if (top->objectName() == QLatin1String("problemReportThanks")) top->close();
+    }
+
+    // The picture and the logs can be left out; a refusal is shown in the server's words.
+    server.bodies.clear();
+    server.problemReportStatus = 429;
+    server.problemReportAnswer = R"({"detail":"This device sent 30 reports today. Try again tomorrow.","error_code":"too_many_reports"})";
+    ProblemReportDialog dialog(window, logs, secrets.hooks(server));
+    dialog.show();
+    child<QComboBox>(dialog, QStringLiteral("problemReportKind"))->setCurrentIndex(1);
+    child<QCheckBox>(dialog, QStringLiteral("problemReportIncludePicture"))->setChecked(false);
+    child<QCheckBox>(dialog, QStringLiteral("problemReportIncludeLogs"))->setChecked(false);
+    child<QPlainTextEdit>(dialog, QStringLiteral("problemReportDescription"))->setPlainText(QStringLiteral("Show what changed since yesterday"));
+    child<QPushButton>(dialog, QStringLiteral("problemReportSend"))->click();
+    QTRY_COMPARE(child<QLabel>(dialog, QStringLiteral("problemReportStatus"))->text(), QStringLiteral("This device sent 30 reports today. Try again tomorrow."));
+    QVERIFY(dialog.isVisible());
+    QVERIFY(child<QPushButton>(dialog, QStringLiteral("problemReportSend"))->isEnabled());
+    QCOMPARE(server.bodies.constLast().value(QStringLiteral("kind")).toString(), QStringLiteral("idea"));
+    QVERIFY(server.bodies.constLast().value(QStringLiteral("screenshot")).isNull());
+    QCOMPARE(server.bodies.constLast().value(QStringLiteral("logs")).toArray().size(), 0);
+}
+
 void AppSignInTest::projectShareDialog()
 {
     using namespace Thoughts::ProjectShares;
