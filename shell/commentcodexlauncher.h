@@ -42,6 +42,9 @@ public:
     // Thoughts' configuration file (thoughtsrc), or THOUGHTS_CODEX_YOLO=1 in
     // the environment (0 turns it off whatever the file says).
     static bool codexBypassesApprovalsAndSandbox();
+    // The Codex executable of this account: @p preferred when it is one, else npm's, the standalone
+    // release's, Homebrew's or the one on PATH; empty when there is none.
+    static QString findCodexExecutable(const QString &preferred = {});
     static QString terminalScript(const QString &runtimeDirectory,
                                   const QString &docsRoot,
                                   const QString &codexHome,

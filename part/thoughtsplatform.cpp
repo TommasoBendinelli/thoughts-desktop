@@ -649,12 +649,15 @@ void keepStandardStreamsPrivate()
 #endif
 }
 
-bool startInNewConsole(const QString &program, const QStringList &arguments, const QProcessEnvironment &environment)
+bool startInNewConsole(const QString &program, const QStringList &arguments, const QProcessEnvironment &environment, const QString &workingDirectory)
 {
     QProcess process;
     process.setProgram(program);
     process.setArguments(arguments);
     process.setProcessEnvironment(environment);
+    if (!workingDirectory.isEmpty()) {
+        process.setWorkingDirectory(workingDirectory);
+    }
 #ifdef Q_OS_WIN
     process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments) {
         arguments->flags &= ~DWORD(CREATE_NO_WINDOW | DETACHED_PROCESS);

@@ -42,6 +42,7 @@
 #include "developerlog.h"
 #include "developerlogdialog.h"
 #include "problemreportdialog.h"
+#include "sessionstarter.h"
 #include "updatecheck.h"
 #include "visualstudiocode.h"
 #include "activeparttoolbarcontroller.h"
@@ -3068,6 +3069,8 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
         }
         // Tests never poll on their own: under test mode only an explicit request reaches a server.
         if (!QStandardPaths::isTestModeEnabled()) agentNotes->start();
+        // The phone's Start a new study session starts an agent session on this computer.
+        if (!QStandardPaths::isTestModeEnabled()) Thoughts::SessionStarter::instance()->start();
 
         // NOTE : apply default sidebar width only after calling setupGUI(...)
         resizeDocks({m_sidebar}, {200}, Qt::Horizontal);

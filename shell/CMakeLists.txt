@@ -36,6 +36,7 @@ set(okular_SRCS
    reviewcardeditor.cpp
    reviewcardmerge.cpp
    serverlink.cpp
+   sessionstarter.cpp
    shell.cpp
    shellutils.cpp
    syncjournal.cpp

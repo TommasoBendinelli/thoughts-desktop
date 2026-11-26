@@ -164,9 +164,14 @@ QString CommentCodexLauncher::resolveCodexHome() const
 
 QString CommentCodexLauncher::resolveCodexExecutable() const
 {
+    return findCodexExecutable(m_options.codexExecutable);
+}
+
+QString CommentCodexLauncher::findCodexExecutable(const QString &preferred)
+{
     QStringList candidates;
-    if (!m_options.codexExecutable.isEmpty()) {
-        candidates.append(m_options.codexExecutable);
+    if (!preferred.isEmpty()) {
+        candidates.append(preferred);
     }
 #ifdef Q_OS_WIN
     // npm installs a codex.cmd shim; the standalone release is codex.exe.

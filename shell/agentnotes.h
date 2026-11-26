@@ -467,6 +467,20 @@ public:
     // GET /v1/agent-notes/wakers: every reply waker seen lately, with the sessions it can wake
     // (recipients() reads it). Nothing, and why, when the server did not answer it.
     void wakers(QObject *context, std::function<void(const std::optional<QJsonObject> &answer, const QString &error)> done);
+    // GET /v1/agent-notes/pages (endpoint 12): the pages the user sent to the agents with a sequence
+    // above @p after, oldest first, waiting up to @p waitSeconds (at most 60) for one; without @p
+    // after (negative) no pages and the cursor where a new reader starts. It records nothing on the
+    // server (no inbox listener, no delivery). @p cursor is the highest sequence answered (or after).
+    struct PagesResult {
+        Failure failure = Failure::None;
+        QString error;
+        QList<Note> notes;
+        qint64 cursor = -1;
+    };
+    void pages(qint64 after, int waitSeconds, QObject *context, std::function<void(const PagesResult &)> done);
+    // GET /v1/agent-notes/handling/{item_id} (endpoint 13): who answers a reply or page; json holds
+    // the record ("claim" null while nobody took it). A server without claims answers Unsupported.
+    void handling(const QString &itemId, QObject *context, std::function<void(const WriteResult &)> done);
     // GET /v1/agent-notes/{id}: one note with its replies (a mark note too, which no list has).
     // A deleted note fails as one the server does not have (Unsupported, "This note was deleted.").
     void note(const QString &noteId, QObject *context, std::function<void(const std::optional<Note> &note, Failure failure, const QString &error)> done);

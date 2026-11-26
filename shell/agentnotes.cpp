@@ -984,6 +984,61 @@ void Client::changes(const QString &after, int waitSeconds, QObject *context, st
     });
 }
 
+void Client::pages(qint64 after, int waitSeconds, QObject *context, std::function<void(const PagesResult &)> done)
+{
+    QPointer<QObject> guard(context);
+    QString error;
+    if (!ensureServer(&error)) {
+        QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
+            if (guard) done({Failure::NotConnected, error, {}, -1});
+        });
+        return;
+    }
+    const int wait = after < 0 ? 0 : qBound(0, waitSeconds, 60);
+    QUrlQuery query;
+    if (after >= 0) {
+        query.addQueryItem(QStringLiteral("after"), QString::number(after));
+        query.addQueryItem(QStringLiteral("wait"), QString::number(wait));
+    }
+    const QString pathAndQuery = QStringLiteral("/v1/agent-notes/pages") + (query.isEmpty() ? QString() : QStringLiteral("?") + query.toString(QUrl::FullyEncoded));
+    QNetworkReply *reply = get(pathAndQuery, (wait + 15) * 1000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, guard, after, done = std::move(done)] {
+        reply->deleteLater();
+        PagesResult result;
+        result.failure = failureOf(reply);
+        if (result.failure == Failure::Unauthorized) m_link.tokenRefused();
+        if (result.failure == Failure::None) {
+            const QJsonObject json = QJsonDocument::fromJson(reply->readAll()).object();
+            const QJsonValue cursor = json.value(QLatin1String("cursor"));
+            if (!cursor.isDouble() || !json.value(QLatin1String("notes")).isArray()) {
+                result.failure = Failure::Failed;
+                result.error = i18n("The Thoughts server sent an unreadable list of pages.");
+            } else {
+                result.cursor = qMax(after, qint64(cursor.toDouble()));
+                for (const QJsonValue &value : json.value(QLatin1String("notes")).toArray()) {
+                    if (auto note = Note::fromJson(value.toObject())) result.notes.append(*note);
+                }
+            }
+        } else {
+            result.error = describe(result.failure, reply);
+        }
+        if (guard) done(result);
+    });
+}
+
+void Client::handling(const QString &itemId, QObject *context, std::function<void(const WriteResult &)> done)
+{
+    QString error;
+    if (!ensureServer(&error)) {
+        QPointer<QObject> guard(context);
+        QTimer::singleShot(0, this, [guard, done = std::move(done), error] {
+            if (guard) done({0, {}, Failure::NotConnected, error, {}});
+        });
+        return;
+    }
+    finishWrite(get(QStringLiteral("/v1/agent-notes/handling/%1").arg(QString::fromLatin1(QUrl::toPercentEncoding(itemId))), 30000), context, std::move(done));
+}
+
 void Client::finishWrite(QNetworkReply *reply, QObject *context, std::function<void(const WriteResult &)> done)
 {
     QPointer<QObject> guard(context);

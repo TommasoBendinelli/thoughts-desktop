@@ -102,8 +102,9 @@ QString nativeServerTool(const QString &name);
 void keepStandardStreamsPrivate();
 
 // Starts a console program in its own new console window (on Windows; a GUI
-// process would otherwise start it hidden), with the given environment.
-bool startInNewConsole(const QString &program, const QStringList &arguments, const QProcessEnvironment &environment);
+// process would otherwise start it hidden), with the given environment, in
+// workingDirectory when one is given.
+bool startInNewConsole(const QString &program, const QStringList &arguments, const QProcessEnvironment &environment, const QString &workingDirectory = {});
 // Whether the process with this ID still runs.
 bool processIsRunning(const QString &pid);
 // Brings the top-level window with exactly this title to the front.

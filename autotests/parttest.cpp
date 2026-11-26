@@ -67,6 +67,7 @@
 #include "../part/reviewmaskgeometry.h"
 #include "../part/part.h"
 #include "../part/agentpromptsettings.h"
+#include "../part/agentsessionsettings.h"
 #include "../part/agentproposalwindow.h"
 #include "../part/presentationwidget.h"
 #include "../part/side_reviews.h"
@@ -556,6 +557,7 @@ private Q_SLOTS:
     void init();
 
     void testAgentPromptsSettingsPage();
+    void testPhoneSessionsSetting();
     void testReadAloudSettingsPage();
 
     void testFedoraRepositoryStartupDoesNotQueueLibraryPruning();
@@ -1004,6 +1006,43 @@ void PartTest::testAgentPromptsSettingsPage()
     const KConfigGroup group(KSharedConfig::openConfig(), configGroup());
     QVERIFY(!group.hasKey(configKey(Kind::Agent)));
     QTRY_VERIFY(!dialog);
+}
+
+// Settings > Agent prompts: whether this computer starts the study sessions the phone asks for
+// (Ask each time, Always, Never), saved by OK/Apply; Ask, the default, is no entry at all.
+void PartTest::testPhoneSessionsSetting()
+{
+    using Thoughts::AgentSessions::PhoneStart;
+    Thoughts::AgentSessions::setPhoneStartChoice(PhoneStart::Ask);
+    Okular::Part part(nullptr, {});
+    QPointer<KConfigDialog> dialog = part.realSlotPreferences();
+    QVERIFY(dialog);
+    auto *choice = dialog->findChild<QComboBox *>(QStringLiteral("phoneSessionStart"));
+    QVERIFY(choice);
+    QCOMPARE(choice->count(), 3);
+    QCOMPARE(choice->currentIndex(), int(PhoneStart::Ask));
+    QCOMPARE(choice->itemText(0), QStringLiteral("Ask each time"));
+
+    choice->setCurrentIndex(int(PhoneStart::Never));
+    QVERIFY(dialog->button(QDialogButtonBox::Apply)->isEnabled());
+    dialog->button(QDialogButtonBox::Apply)->click();
+    QCOMPARE(Thoughts::AgentSessions::phoneStartChoice(), PhoneStart::Never);
+
+    // Defaults puts Ask back; OK saves it, which removes the entry.
+    dialog->button(QDialogButtonBox::RestoreDefaults)->click();
+    QCOMPARE(choice->currentIndex(), int(PhoneStart::Ask));
+    dialog->button(QDialogButtonBox::Ok)->click();
+    QCOMPARE(Thoughts::AgentSessions::phoneStartChoice(), PhoneStart::Ask);
+    QVERIFY(!KConfigGroup(KSharedConfig::openConfig(), Thoughts::AgentSessions::configGroup()).hasKey(Thoughts::AgentSessions::phoneStartKey()));
+    QTRY_VERIFY(!dialog);
+
+    // A choice made elsewhere (the question's Always) shows when Settings opens.
+    Thoughts::AgentSessions::setPhoneStartChoice(PhoneStart::Always);
+    dialog = part.realSlotPreferences();
+    QVERIFY(dialog);
+    QCOMPARE(dialog->findChild<QComboBox *>(QStringLiteral("phoneSessionStart"))->currentIndex(), int(PhoneStart::Always));
+    dialog->close();
+    Thoughts::AgentSessions::setPhoneStartChoice(PhoneStart::Ask);
 }
 
 // Settings > Read Aloud: the OpenRouter key field is masked, checked before it
