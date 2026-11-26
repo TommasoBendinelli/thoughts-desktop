@@ -75,6 +75,7 @@
 #include <QKeyEvent>
 #include <QTimeZone>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
 
 #include "../part/docscommentsynchronizer.h"
 #include "../part/proposalhistory.h"
@@ -13149,12 +13150,67 @@ void CommentsOverview::updateCommentSummary()
     }
 }
 
+void CommentsOverview::refreshProjectLinks()
+{
+    if (m_projectLinksPending || (m_projectLinksAsked.isValid() && m_projectLinksAsked.elapsed() < 60 * 1000)) {
+        return;
+    }
+    m_projectLinksPending = true;
+    m_projectLinksAsked.start();
+    if (!m_projectLinksNetwork) m_projectLinksNetwork = new QNetworkAccessManager(this);
+    Thoughts::ProjectShares::send(m_projectLinksNetwork, serverAccountHooks(), "GET", QStringLiteral("/v1/project-links"), nullptr, this,
+                                  [this](int status, const QJsonObject &answer) {
+        m_projectLinksPending = false;
+        if (status != 200) return; // not signed in, or a server without links: nothing to show
+        const auto states = Thoughts::ProjectShares::linkStates(answer);
+        const auto digest = [](const QHash<QString, Thoughts::ProjectShares::LinkState> &links) {
+            QStringList parts;
+            for (auto it = links.cbegin(); it != links.cend(); ++it) parts.append(it.key() + QLatin1Char('|') + it->linkId + QLatin1Char('|') + it->status + QLatin1Char('|') + it->peer);
+            parts.sort();
+            return parts.join(QLatin1Char('\n'));
+        };
+        if (digest(states) == digest(m_projectLinks)) return;
+        m_projectLinks = states;
+        scheduleLibraryTreeUpdate(QStringLiteral("project links"));
+        noticeEndedProjectLinks();
+    });
+}
+
+void CommentsOverview::noticeEndedProjectLinks()
+{
+    KConfigGroup group = KSharedConfig::openConfig()->group(QStringLiteral("ProjectLinks"));
+    QStringList noticed = group.readEntry(QStringLiteral("NoticedEnded"), QStringList());
+    QHash<QString, QString> names;
+    if (m_libraryTree) {
+        for (int i = 0; i < m_libraryTree->topLevelItemCount(); ++i) {
+            const auto metadata = m_libraryTree->topLevelItem(i)->data(0, Qt::UserRole + 140).value<QJsonObject>();
+            names.insert(metadata.value(QStringLiteral("id")).toString(), metadata.value(QStringLiteral("name")).toString());
+        }
+    }
+    for (const auto &link : std::as_const(m_projectLinks)) {
+        const bool member = link.role == QLatin1String("member") && link.status == QLatin1String("frozen");
+        const bool left = link.role == QLatin1String("owner") && link.status == QLatin1String("ended") && link.endReason == QLatin1String("leave");
+        // By link and end: sharing again resumes the same link, which can end again.
+        const QString key = link.linkId + QLatin1Char('@') + link.endedAt.toUTC().toString(Qt::ISODate);
+        if ((!member && !left) || link.linkId.isEmpty() || noticed.contains(key)) continue;
+        noticed.append(key);
+        const QString name = names.value(link.projectId).isEmpty() ? link.projectId : names.value(link.projectId);
+        auto *box = new QMessageBox(QMessageBox::Information, i18n("“%1” is no longer shared", name), Thoughts::ProjectShares::linkSentence(link), QMessageBox::Ok, this);
+        box->setObjectName(QStringLiteral("projectLinkEndedNotice"));
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        box->open();
+    }
+    group.writeEntry(QStringLiteral("NoticedEnded"), noticed);
+    group.sync();
+}
+
 void CommentsOverview::updateLibraryTree()
 {
     if (m_syncContentDeferred || (m_syncRefreshPending && !m_syncLibraryTree)) { return; }
     if (!m_libraryTree) {
         return;
     }
+    refreshProjectLinks();
     // This rebuild covers every change scheduled so far.
     if (m_libraryTreeTimer) m_libraryTreeTimer->stop();
     m_libraryTreeDirty = false;
@@ -13543,6 +13599,8 @@ void CommentsOverview::updateLibraryTree()
     }
     const QIcon folderIcon = librarySymbol(LibrarySymbol::Folder, palette());
     const QIcon documentsIcon = librarySymbol(LibrarySymbol::Documents, palette());
+    const QIcon sharedIcon = librarySymbol(LibrarySymbol::Linked, palette());
+    const QIcon sharingEndedIcon = librarySymbol(LibrarySymbol::Unlinked, palette());
     // A document built from its sources (LaTeX, Markdown) shows a page of source; an imported PDF a
     // page of text (25 Nov 2026: the chain and the broken chain did not say which was which).
     const QIcon linkedIcon = librarySymbol(LibrarySymbol::Source, palette());
@@ -13574,6 +13632,13 @@ void CommentsOverview::updateLibraryTree()
             const QString error = currentFolderBuildError(metadata, folder.toObject().value(QStringLiteral("project")).toString(),
                                                           folder.toObject().value(QStringLiteral("build_error")).toString());
             if (!error.isEmpty()) markBuildFailed(error);
+        }
+        // Shared with someone, or its sharing ended (a build failure's sign stays; the sentence joins its tooltip).
+        if (const auto link = m_projectLinks.constFind(metadata.value(QStringLiteral("id")).toString()); link != m_projectLinks.constEnd()) {
+            if (project->icon(0).isNull()) project->setIcon(0, link->live() ? sharedIcon : sharingEndedIcon);
+            const QString sentence = Thoughts::ProjectShares::linkSentence(*link);
+            const QString tip = project->toolTip(0);
+            project->setToolTip(0, tip.isEmpty() ? sentence : tip + QLatin1Char('\n') + sentence);
         }
         project->setData(0, LibraryTypeRole, i18n("Project"));
         project->setForeground(1, secondary);

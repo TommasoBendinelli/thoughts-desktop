@@ -4,6 +4,7 @@
 #include "../part/thoughtsserveraddress.h"
 
 #include <KLocalizedString>
+#include <algorithm>
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
@@ -32,6 +33,18 @@ QString text(const QJsonObject &object, const QString &key)
     const QJsonValue value = object.value(key);
     return value.isString() ? value.toString() : QString();
 }
+
+QDateTime moment(const QJsonObject &object, const QString &key)
+{
+    return QDateTime::fromString(text(object, key), Qt::ISODateWithMs);
+}
+
+// "24 Nov", or "24 Nov 2025" for another year, in local time.
+QString shortDate(const QDateTime &when, const QLocale &locale)
+{
+    const QDate date = when.toLocalTime().date();
+    return locale.toString(date, date.year() == QDate::currentDate().year() ? QStringLiteral("d MMM") : QStringLiteral("d MMM yyyy"));
+}
 }
 
 Listing listing(const QJsonObject &answer)
@@ -48,7 +61,8 @@ Listing listing(const QJsonObject &answer)
     for (const QJsonValue &value : answer.value(QStringLiteral("invitations")).toArray()) {
         const QJsonObject invitation = value.toObject();
         if (!text(invitation, QStringLiteral("invitation_id")).isEmpty()) {
-            result.invitations.append({text(invitation, QStringLiteral("invitation_id")), text(invitation, QStringLiteral("email"))});
+            result.invitations.append({text(invitation, QStringLiteral("invitation_id")), text(invitation, QStringLiteral("email")),
+                                       moment(invitation, QStringLiteral("created_at"))});
         }
     }
     result.spareLibraries = answer.value(QStringLiteral("spare_libraries")).toInt(0);
@@ -59,6 +73,92 @@ Listing listing(const QJsonObject &answer)
         }
     }
     return result;
+}
+
+QString invitationLabel(const Invitation &invitation, const QList<Person> &people, const QLocale &locale)
+{
+    QString label = invitation.createdAt.isValid() ? i18n("%1 · invited %2, not accepted yet", invitation.email, shortDate(invitation.createdAt, locale))
+                                                   : i18n("%1 · invited, not accepted yet", invitation.email);
+    for (const Person &person : people) {
+        if (!person.email.isEmpty() && person.email.compare(invitation.email, Qt::CaseInsensitive) == 0) {
+            label += i18n(" · already has the account %1: share with it instead", person.username);
+            break;
+        }
+    }
+    return label;
+}
+
+bool LinkState::live() const
+{
+    return status == QLatin1String("seeding") || status == QLatin1String("active");
+}
+
+bool LinkState::ended() const
+{
+    return status == QLatin1String("ended") || status == QLatin1String("frozen");
+}
+
+QHash<QString, LinkState> linkStates(const QJsonObject &answer)
+{
+    QHash<QString, LinkState> result;
+    for (const QJsonValue &value : answer.value(QStringLiteral("links")).toArray()) {
+        const QJsonObject link = value.toObject();
+        LinkState state{text(link, QStringLiteral("link_id")), text(link, QStringLiteral("project_id")), text(link, QStringLiteral("role")),
+                        text(link, QStringLiteral("status")), text(link, QStringLiteral("peer_username")), text(link, QStringLiteral("end_reason")),
+                        moment(link, QStringLiteral("created_at")), moment(link, QStringLiteral("ended_at"))};
+        if (state.projectId.isEmpty() || (!state.live() && !state.ended())) {
+            continue;
+        }
+        const auto known = result.constFind(state.projectId);
+        const bool better = known == result.constEnd()
+            || (state.live() && (!known->live() || state.createdAt > known->createdAt))
+            || (!state.live() && !known->live() && state.endedAt > known->endedAt);
+        if (better) {
+            result.insert(state.projectId, state);
+        }
+    }
+    return result;
+}
+
+QString linkSentence(const LinkState &state, const QLocale &locale)
+{
+    const bool owner = state.role == QLatin1String("owner");
+    if (state.live()) {
+        return owner ? i18n("Shared with %1.", state.peer) : i18n("%1 shared this project with you.", state.peer);
+    }
+    if (!state.ended()) {
+        return QString();
+    }
+    const QString date = shortDate(state.endedAt, locale);
+    if (owner) {
+        const QString what = state.endReason == QLatin1String("leave") ? i18n("%1 left this project on %2.", state.peer, date)
+                                                                       : i18n("Sharing with %1 ended on %2.", state.peer, date);
+        return what + QLatin1Char(' ') + i18n("Changes either of you make now stay on your own side.");
+    }
+    const QString what = state.endReason == QLatin1String("leave")                 ? i18n("You left this project on %1.", date)
+        : state.endReason == QLatin1String("owner_removed_project")                 ? i18n("%1 removed this project on %2.", state.peer, date)
+                                                                                      : i18n("%1 stopped sharing this project on %2.", state.peer, date);
+    return what + QLatin1Char(' ') + i18n("This is your own copy now: your changes stay here and no longer reach %1.", state.peer);
+}
+
+void send(QNetworkAccessManager *network, const AppSignIn::Hooks &hooks, const QByteArray &method, const QString &path,
+          const QJsonObject *body, QObject *context, std::function<void(int status, const QJsonObject &answer)> done)
+{
+    const QString configured = ServerAddress::configured();
+    const QString canonical = ServerAddress::normalized(configured);
+    const QByteArray token = canonical.isEmpty() ? QByteArray() : AppSignIn::readToken(hooks, Platform::desktopDeviceAccount(), canonical);
+    // requestUrl takes a path: the query goes on afterwards, or its "?" would be escaped.
+    QUrl url = AppSignIn::requestUrl(hooks, configured, path.section(QLatin1Char('?'), 0, 0));
+    if (path.contains(QLatin1Char('?'))) {
+        url.setQuery(path.section(QLatin1Char('?'), 1), QUrl::StrictMode);
+    }
+    if (url.isEmpty() || token.isEmpty()) {
+        done(401, {});
+        return;
+    }
+    AppSignIn::send(network, method, url, token, body, 30000, context, [done](int status, const QByteArray &answer, const QByteArray &) {
+        done(status, QJsonDocument::fromJson(answer).object());
+    });
 }
 
 Mail mail(const QJsonObject &answer)
@@ -178,21 +278,7 @@ ProjectShareDialog::ProjectShareDialog(const QJsonObject &project, const AppSign
 void ProjectShareDialog::request(const QByteArray &method, const QString &path, const QJsonObject *body,
                                  std::function<void(int status, const QJsonObject &answer)> done)
 {
-    const QString configured = ServerAddress::configured();
-    const QString canonical = ServerAddress::normalized(configured);
-    const QByteArray token = canonical.isEmpty() ? QByteArray() : AppSignIn::readToken(m_hooks, Platform::desktopDeviceAccount(), canonical);
-    // requestUrl takes a path: the query goes on afterwards, or its "?" would be escaped.
-    QUrl url = AppSignIn::requestUrl(m_hooks, configured, path.section(QLatin1Char('?'), 0, 0));
-    if (path.contains(QLatin1Char('?'))) {
-        url.setQuery(path.section(QLatin1Char('?'), 1), QUrl::StrictMode);
-    }
-    if (url.isEmpty() || token.isEmpty()) {
-        done(401, {});
-        return;
-    }
-    AppSignIn::send(m_network, method, url, token, body, 30000, this, [done](int status, const QByteArray &answer, const QByteArray &) {
-        done(status, QJsonDocument::fromJson(answer).object());
-    });
+    ProjectShares::send(m_network, m_hooks, method, path, body, this, std::move(done));
 }
 
 void ProjectShareDialog::setSharing(bool enabled)
@@ -203,15 +289,25 @@ void ProjectShareDialog::setSharing(bool enabled)
 
 void ProjectShareDialog::load()
 {
-    QUrlQuery query;
-    query.addQueryItem(QStringLiteral("project_id"), m_projectId);
-    request("GET", QStringLiteral("/v1/project-shares?") + query.toString(QUrl::FullyEncoded), nullptr, [this](int status, const QJsonObject &answer) {
-        if (status != 200) {
-            m_status->setText(ProjectShares::refusal(status, answer));
-            setSharing(false);
-            return;
+    // The link first (a share that ended says so; a server without links answers 404), then who has it.
+    request("GET", QStringLiteral("/v1/project-links"), nullptr, [this](int linksStatus, const QJsonObject &links) {
+        m_link.reset();
+        if (linksStatus == 200) {
+            const auto states = ProjectShares::linkStates(links);
+            if (const auto found = states.constFind(m_projectId); found != states.constEnd()) {
+                m_link = *found;
+            }
         }
-        render(ProjectShares::listing(answer));
+        QUrlQuery query;
+        query.addQueryItem(QStringLiteral("project_id"), m_projectId);
+        request("GET", QStringLiteral("/v1/project-shares?") + query.toString(QUrl::FullyEncoded), nullptr, [this](int status, const QJsonObject &answer) {
+            if (status != 200) {
+                m_status->setText(ProjectShares::refusal(status, answer));
+                setSharing(false);
+                return;
+            }
+            render(ProjectShares::listing(answer));
+        });
     });
 }
 
@@ -227,13 +323,33 @@ void ProjectShareDialog::render(const ProjectShares::Listing &listing)
         return;
     }
     setSharing(true);
-    m_status->setText(listing.shares.isEmpty() && listing.invitations.isEmpty() ? i18n("Only you have this project.") : i18n("Shared with:"));
+    // Not shared now, but it was: say so first (a pending invitation is not a share).
+    QStringList status;
+    if (listing.shares.isEmpty() && m_link && m_link->ended()) {
+        status.append(ProjectShares::linkSentence(*m_link));
+        const bool oneTap = std::any_of(listing.people.cbegin(), listing.people.cend(), [this](const ProjectShares::Person &person) {
+            return person.username == m_link->peer;
+        });
+        if (m_link->role == QLatin1String("owner") && oneTap) {
+            status.append(i18n("Tap %1 below to share again: what either of you changed since then comes over.", m_link->peer));
+        }
+    }
+    if (!listing.shares.isEmpty()) {
+        status.append(i18n("Shared with:"));
+    } else if (!listing.invitations.isEmpty()) {
+        status.append(i18n("Not shared yet. Invitation waiting:"));
+    } else if (status.isEmpty()) {
+        status.append(i18n("Only you have this project."));
+    }
+    m_status->setText(status.join(QStringLiteral("\n\n")));
     const auto row = [this](const QString &label, const QString &objectName) {
         auto *line = new QWidget;
         line->setObjectName(objectName);
         auto *layout = new QHBoxLayout(line);
         layout->setContentsMargins(0, 0, 0, 0);
-        layout->addWidget(new QLabel(label, line), 1);
+        auto *text = new QLabel(label, line);
+        text->setWordWrap(true);
+        layout->addWidget(text, 1);
         m_people->addWidget(line);
         return layout;
     };
@@ -254,7 +370,7 @@ void ProjectShareDialog::render(const ProjectShares::Listing &listing)
         line->addWidget(stop);
     }
     for (const ProjectShares::Invitation &invitation : listing.invitations) {
-        QHBoxLayout *line = row(i18n("%1 · invited", invitation.email), QStringLiteral("projectShareInvitationRow"));
+        QHBoxLayout *line = row(ProjectShares::invitationLabel(invitation, listing.people), QStringLiteral("projectShareInvitationRow"));
         // An invitation's link is answered once: Send again makes a new one for the same address.
         auto *again = new QPushButton(i18n("Send Again"));
         again->setObjectName(QStringLiteral("projectShareSendAgain"));

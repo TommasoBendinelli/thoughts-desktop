@@ -99,6 +99,7 @@ public:
     QByteArray problemReportAnswer = R"({"report_id":"20261126T000000Z-00000000","redactions":0})";
     QList<QByteArray> authorizations;  // of every request
     QString lastQuery;  // of the last GET /v1/project-shares
+    QJsonObject links;  // GET /v1/project-links (404 while empty: a server without links)
 
 private:
     void reply(QTcpSocket *socket, int code, const QByteArray &body, const QByteArray &headers = {})
@@ -166,6 +167,11 @@ private:
         }
         if (!authorized) {
             reply(socket, 401, R"({"detail":"invalid token"})");
+            return;
+        }
+        if (method == QLatin1String("GET") && path == QLatin1String("/v1/project-links")) {
+            if (links.isEmpty()) reply(socket, 404, R"({"detail":"Not Found"})");
+            else reply(socket, 200, QJsonDocument(links).toJson());
             return;
         }
         if (method == QLatin1String("GET") && path == QLatin1String("/v1/project-shares")) {
@@ -277,6 +283,7 @@ private Q_SLOTS:
     void serverChecks();
     void accessRequests();
     void projectShareDialog();
+    void projectShareEnded();
     void problemReports();
     void signInAnswers();
     void devicesAnswer();
@@ -982,6 +989,79 @@ void AppSignInTest::projectShareDialog()
     // Withdraw: the invitation by its id.
     dialog.findChild<QPushButton *>(QStringLiteral("projectShareWithdraw"))->click();
     QTRY_VERIFY(server.requests.contains(QStringLiteral("DELETE /v1/project-invitations/inv-1")));
+}
+
+void AppSignInTest::projectShareEnded()
+{
+    using namespace Thoughts::ProjectShares;
+    // A share that ended says so, on both sides; a pending invitation is not a share (26 Nov 2026: the owner read
+    // "Shared with: <address> · invited" as shared while the member edited a copy that no longer followed).
+    const QLocale english(QLocale::English);
+    const int year = QDate::currentDate().year();
+    const QDateTime ended(QDate(year, 11, 24), QTime(12, 0), QTimeZone::UTC);
+    const QString day = english.toString(ended.toLocalTime().date(), QStringLiteral("d MMM"));
+    const auto link = [](const QString &id, const QString &project, const QString &role, const QString &status, const QString &peer,
+                         const QString &created, const QString &endedAt, const QString &reason) {
+        QJsonObject value {{QStringLiteral("link_id"), id}, {QStringLiteral("project_id"), project}, {QStringLiteral("role"), role},
+                           {QStringLiteral("status"), status}, {QStringLiteral("peer_username"), peer}, {QStringLiteral("created_at"), created}};
+        value.insert(QStringLiteral("ended_at"), endedAt.isEmpty() ? QJsonValue() : QJsonValue(endedAt));
+        value.insert(QStringLiteral("end_reason"), reason.isEmpty() ? QJsonValue() : QJsonValue(reason));
+        return value;
+    };
+    const QString endedAt = ended.toString(Qt::ISODateWithMs);
+    const QJsonObject answer {{QStringLiteral("links"), QJsonArray {
+        link(QStringLiteral("l1"), QStringLiteral("new:field-notes"), QStringLiteral("owner"), QStringLiteral("ended"), QStringLiteral("alex"), QStringLiteral("2026-11-24T10:00:00Z"), endedAt, QStringLiteral("revoke")),
+        link(QStringLiteral("l2"), QStringLiteral("new:other"), QStringLiteral("owner"), QStringLiteral("ended"), QStringLiteral("alex"), QStringLiteral("2026-11-20T10:00:00Z"), QStringLiteral("2026-11-21T10:00:00Z"), QStringLiteral("revoke")),
+        link(QStringLiteral("l3"), QStringLiteral("new:other"), QStringLiteral("owner"), QStringLiteral("active"), QStringLiteral("sam"), QStringLiteral("2026-11-22T10:00:00Z"), QString(), QString()),
+        link(QStringLiteral("l4"), QStringLiteral("new:theirs"), QStringLiteral("member"), QStringLiteral("frozen"), QStringLiteral("alex"), QStringLiteral("2026-11-20T10:00:00Z"), endedAt, QStringLiteral("revoke")),
+        link(QStringLiteral("l5"), QStringLiteral("new:left"), QStringLiteral("owner"), QStringLiteral("ended"), QStringLiteral("sam"), QStringLiteral("2026-11-20T10:00:00Z"), endedAt, QStringLiteral("leave"))}}};
+    const auto states = linkStates(answer);
+    QCOMPARE(states.size(), 4);
+    QCOMPARE(states.value(QStringLiteral("new:other")).linkId, QStringLiteral("l3")); // a live link wins over an ended one
+    QCOMPARE(linkSentence(states.value(QStringLiteral("new:other")), english), QStringLiteral("Shared with sam."));
+    QCOMPARE(linkSentence(states.value(QStringLiteral("new:field-notes")), english),
+             QStringLiteral("Sharing with alex ended on %1. Changes either of you make now stay on your own side.").arg(day));
+    QCOMPARE(linkSentence(states.value(QStringLiteral("new:theirs")), english),
+             QStringLiteral("alex stopped sharing this project on %1. This is your own copy now: your changes stay here and no longer reach alex.").arg(day));
+    QCOMPARE(linkSentence(states.value(QStringLiteral("new:left")), english),
+             QStringLiteral("sam left this project on %1. Changes either of you make now stay on your own side.").arg(day));
+    const Invitation invitation {QStringLiteral("inv-1"), QStringLiteral("Alex@example.org"), ended};
+    QCOMPARE(invitationLabel(invitation, {{QStringLiteral("sam"), QStringLiteral("sam@example.org")}}, english),
+             QStringLiteral("Alex@example.org · invited %1, not accepted yet").arg(day));
+    QCOMPARE(invitationLabel(invitation, {{QStringLiteral("alex"), QStringLiteral("alex@example.org")}}, english),
+             QStringLiteral("Alex@example.org · invited %1, not accepted yet · already has the account alex: share with it instead").arg(day));
+
+    // The owner's dialog: not shared, the old invitation waiting, one tap to share again.
+    FakeServer server;
+    server.links = answer;
+    server.shares = QJsonObject {{QStringLiteral("name"), QStringLiteral("Field notes")}, {QStringLiteral("shares"), QJsonArray()},
+                                 {QStringLiteral("invitations"), QJsonArray {QJsonObject {{QStringLiteral("invitation_id"), QStringLiteral("inv-1")},
+                                                                                          {QStringLiteral("email"), QStringLiteral("alex@example.org")},
+                                                                                          {QStringLiteral("created_at"), endedAt}}}},
+                                 {QStringLiteral("spare_libraries"), 1000},
+                                 {QStringLiteral("people"), QJsonArray {QJsonObject {{QStringLiteral("username"), QStringLiteral("alex")}, {QStringLiteral("email"), QStringLiteral("alex@example.org")}}}}};
+    Secrets secrets;
+    secrets.tokens.insert(Platform::desktopDeviceAccount(), "app-token");
+    QVERIFY(ServerAddress::save(QStringLiteral("https://thoughts.example.org")));
+    ProjectShareDialog owner(QJsonObject {{QStringLiteral("id"), QStringLiteral("new:field-notes")}, {QStringLiteral("name"), QStringLiteral("Field notes")}}, secrets.hooks(server));
+    owner.show();
+    QTRY_COMPARE(owner.findChildren<QWidget *>(QStringLiteral("projectShareInvitationRow")).size(), 1);
+    const QString status = child<QLabel>(owner, QStringLiteral("projectShareStatus"))->text();
+    QVERIFY2(status.contains(QStringLiteral("Sharing with alex ended on")), qPrintable(status));
+    QVERIFY2(status.contains(QStringLiteral("Tap alex below to share again: what either of you changed since then comes over.")), qPrintable(status));
+    QVERIFY2(status.endsWith(QStringLiteral("Not shared yet. Invitation waiting:")), qPrintable(status));
+    QVERIFY(!status.contains(QStringLiteral("Shared with:")));
+    const QWidget *row = owner.findChild<QWidget *>(QStringLiteral("projectShareInvitationRow"));
+    QVERIFY(row->findChild<QLabel *>()->text().contains(QStringLiteral("already has the account alex: share with it instead")));
+    QVERIFY(server.requests.contains(QStringLiteral("GET /v1/project-links")));
+
+    // The member's frozen copy: its own project now.
+    server.shares = QJsonObject {{QStringLiteral("name"), QStringLiteral("Theirs")}, {QStringLiteral("shares"), QJsonArray()},
+                                 {QStringLiteral("invitations"), QJsonArray()}, {QStringLiteral("people"), QJsonArray()}};
+    ProjectShareDialog member(QJsonObject {{QStringLiteral("id"), QStringLiteral("new:theirs")}, {QStringLiteral("name"), QStringLiteral("Theirs")}}, secrets.hooks(server));
+    member.show();
+    QTRY_VERIFY(child<QLabel>(member, QStringLiteral("projectShareStatus"))->text().contains(QStringLiteral("alex stopped sharing this project on")));
+    QVERIFY(!child<QLabel>(member, QStringLiteral("projectShareStatus"))->text().contains(QStringLiteral("Only you have this project.")));
 }
 
 void AppSignInTest::serverDialogListsDevices()

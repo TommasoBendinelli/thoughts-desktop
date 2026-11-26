@@ -28,6 +28,9 @@
 
 #include "agentproposalparser.h"
 #include "appsignin.h"
+#include "projectsharedialog.h"
+
+class QNetworkAccessManager;
 #include "reviewstore.h"
 
 class KMessageWidget;
@@ -611,6 +614,15 @@ private:
     void applyLibraryModificationDates(const QList<QTreeWidgetItem *> *detached = nullptr);
     void applyLibraryReviewCounts(const QList<QTreeWidgetItem *> *detached = nullptr);
     QList<QTreeWidgetItem *> libraryProjectItems(const QList<QTreeWidgetItem *> *detached) const;
+    // Who has each Library project (GET /v1/project-links): a chain on a shared project's row, a
+    // broken one when its sharing ended, the sentence in its tooltip; asked at most once a minute.
+    void refreshProjectLinks();
+    // Once per link: the member's copy stopped following (or the member left the owner's project).
+    void noticeEndedProjectLinks();
+    QHash<QString, ProjectShares::LinkState> m_projectLinks;
+    QElapsedTimer m_projectLinksAsked;
+    bool m_projectLinksPending = false;
+    QNetworkAccessManager *m_projectLinksNetwork = nullptr;
     QTimer *m_libraryTreeTimer = nullptr;
     bool m_libraryTreeDirty = false;
     QStringList m_libraryTreeReasons;

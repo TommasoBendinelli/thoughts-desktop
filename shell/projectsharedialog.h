@@ -7,11 +7,15 @@
 
 #include "appsignin.h"
 
+#include <QDateTime>
 #include <QDialog>
+#include <QHash>
 #include <QJsonObject>
 #include <QList>
+#include <QLocale>
 #include <QPointer>
 
+#include <functional>
 #include <optional>
 
 class QHBoxLayout;
@@ -32,6 +36,7 @@ struct Share {
 struct Invitation {
     QString id;
     QString email;
+    QDateTime createdAt;
 };
 struct Person {
     QString username;
@@ -65,6 +70,31 @@ struct Target {
 std::optional<Target> target(const QString &typed);
 // What a refusal means to the owner, by its error_code.
 QString refusal(int httpStatus, const QJsonObject &answer);
+// "a@b.c · invited 24 Nov, not accepted yet", and when the address belongs to someone with an
+// account (people): "… · already has the account x: share with it instead".
+QString invitationLabel(const Invitation &invitation, const QList<Person> &people, const QLocale &locale = QLocale());
+
+// A Project's link with another person's Library (GET /v1/project-links, project-links.md 9.3):
+// live while seeding or active; the owner's row of an ended link is "ended", the member's "frozen".
+struct LinkState {
+    QString linkId;
+    QString projectId;
+    QString role; // "owner" or "member"
+    QString status;
+    QString peer;
+    QString endReason; // "revoke", "leave", "owner_removed_project"
+    QDateTime createdAt;
+    QDateTime endedAt;
+    bool live() const;
+    bool ended() const;
+};
+// One state per Project: a live link wins (the newest), else the one that ended last.
+QHash<QString, LinkState> linkStates(const QJsonObject &answer);
+// What the state means, in a sentence: "Sharing with x ended on 24 Nov. …".
+QString linkSentence(const LinkState &state, const QLocale &locale = QLocale());
+// A request to the server with this computer's device token (Sign In); 401 without one.
+void send(QNetworkAccessManager *network, const AppSignIn::Hooks &hooks, const QByteArray &method, const QString &path,
+          const QJsonObject *body, QObject *context, std::function<void(int status, const QJsonObject &answer)> done);
 }
 
 class ProjectShareDialog : public QDialog
@@ -88,6 +118,8 @@ private:
                  std::function<void(int status, const QJsonObject &answer)> done);
     void setSharing(bool enabled);
 
+    // The Project's link state (GET /v1/project-links), when the server has links.
+    std::optional<ProjectShares::LinkState> m_link;
     QString m_projectId;
     QString m_name;
     AppSignIn::Hooks m_hooks;
