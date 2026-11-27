@@ -252,7 +252,10 @@ void installAndRestart(QWidget *parent, const QString &installer)
         return;
     }
     const QString folder = QFileInfo(bundle).absolutePath();
-    if (!QFileInfo(folder).isWritable()) {
+    // A managed Mac may refuse this account /Applications but leave it the app it owns:
+    // the installer then replaces the app's contents in place (install-update.sh).
+    const bool ownsBundle = QFileInfo(bundle).isWritable() && QFileInfo(QDir(bundle).filePath(QStringLiteral("Contents"))).isWritable();
+    if (!QFileInfo(folder).isWritable() && !ownsBundle) {
         KMessageBox::information(parent,
                                  i18n("Thoughts cannot replace itself in %1, because this account may not change that folder. Quit Thoughts, open %2 and drag Thoughts onto Applications.",
                                       folder,

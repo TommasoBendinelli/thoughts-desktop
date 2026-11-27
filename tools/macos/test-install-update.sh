@@ -88,11 +88,14 @@ run_case "refuses an unsigned app" 1 1 "$(make_dmg 2 unsigned)"
 run_case "refuses another identifier" 1 1 "$(make_dmg 2 org.tbend.thoughts.other)"
 run_case "refuses an image without Thoughts.app" 1 1 "$(rm -rf "$root/empty"; mkdir "$root/empty"; hdiutil create -quiet -srcfolder "$root/empty" -ov "$root/empty.dmg"; echo "$root/empty.dmg")"
 run_case "refuses a damaged image" 1 1 "$(head -c 4096 "$(make_dmg 2)" >"$root/broken.dmg"; echo "$root/broken.dmg")"
-chmod a-w "$root/Applications"
-run_case "refuses a folder it cannot change" 1 1 "$(make_dmg 2)"
+chmod a-w "$root/Applications" "$root/Applications/Thoughts.app"
+run_case "refuses a folder and an app it cannot change" 1 1 "$(make_dmg 2)"
+chmod u+w "$root/Applications/Thoughts.app"
+# A managed Mac: /Applications is not the account's, the app is. Its contents are replaced in place.
+run_case "replaces the app's contents when only the app is the account's" 0 2 "$(make_dmg 2)"
 chmod u+w "$root/Applications"
-dmg=$(make_dmg 2)
-run_case "installs a signed newer app" 0 2 "$dmg"
+dmg=$(make_dmg 3)
+run_case "installs a signed newer app" 0 3 "$dmg"
 [ ! -e "$dmg" ] && echo "ok   removes the installed image" || { echo "FAIL the image was not removed"; failures=$((failures + 1)); }
 grep -q '^failed: ' "$root/home/Library/Logs/Thoughts/install-update.log" && echo "ok   logs refusals" || { echo "FAIL no refusal in the log"; failures=$((failures + 1)); }
 

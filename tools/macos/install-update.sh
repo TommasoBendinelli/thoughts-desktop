@@ -10,8 +10,11 @@
 # process PID to exit, mounts DMG and accepts its Thoughts.app only if it satisfies
 # the designated requirement of the installed APP (same identifier, same signing
 # certificate). It copies the new app beside APP under a hidden name, renames APP
-# away and the copy into its place, and opens it. On any failure the old app stays
-# (or is put back), opens again, and an alert names the log:
+# away and the copy into its place, and opens it. When this account may not change
+# APP's folder but owns APP itself (/Applications on a managed Mac without admin
+# rights), it replaces APP's Contents in place instead, through a verified copy in a
+# temporary folder. On any failure the old app stays (or is put back), opens again,
+# and an alert names the log:
 # ~/Library/Logs/Thoughts/install-update.log.
 # THOUGHTS_UPDATE_NO_ALERT=1 leaves out the alert (for tests).
 set -u
@@ -50,6 +53,10 @@ fail() {
     if [ ! -e "$app" ] && [ -d "$old" ]; then
         mv "$old" "$app" && echo "restored $app"
     fi
+    # In place: put the old Contents back if they were already moved away.
+    if [ -d "$work/old-Contents" ]; then
+        rm -rf "$app/Contents" && mv "$work/old-Contents" "$app/Contents" && echo "restored $app/Contents"
+    fi
     cleanup
     if [ "${THOUGHTS_UPDATE_NO_ALERT:-}" != 1 ]; then
         /usr/bin/osascript -e 'on run argv' \
@@ -69,7 +76,11 @@ while kill -0 "$pid" 2>/dev/null; do
 done
 
 [ -d "$app/Contents" ] || fail "$app is not an app bundle."
-[ -w "$parent" ] || fail "Thoughts cannot write to $parent."
+in_place=0
+if [ ! -w "$parent" ]; then
+    [ -w "$app" ] && [ -w "$app/Contents" ] || fail "Thoughts cannot write to $parent or to $app."
+    in_place=1
+fi
 requirement=$(/usr/bin/codesign -d -r- "$app" 2>/dev/null | sed -n 's/^designated => //p')
 [ -n "$requirement" ] || fail "The signature of the installed Thoughts could not be read."
 echo "requirement: $requirement"
@@ -82,6 +93,24 @@ new="$mount/Thoughts.app"
 [ -d "$new" ] || fail "The disk image contains no Thoughts.app."
 /usr/bin/codesign --verify --deep --strict -R "=$requirement" "$new" \
     || fail "The new Thoughts is not signed like the installed one."
+
+if [ "$in_place" = 1 ]; then
+    # The bundle folder stays; its Contents are swapped for the verified copy's.
+    /usr/bin/ditto "$new" "$work/new.app" || fail "Could not copy the new Thoughts to $work."
+    /usr/bin/codesign --verify --deep --strict -R "=$requirement" "$work/new.app" \
+        || fail "The copied Thoughts does not verify."
+    mv "$app/Contents" "$work/old-Contents" || fail "Could not move the installed Thoughts aside."
+    mv "$work/new.app/Contents" "$app/Contents" || fail "Could not move the new Thoughts into place."
+    /usr/bin/codesign --verify --deep --strict -R "=$requirement" "$app" \
+        || fail "The installed Thoughts does not verify."
+    echo "replaced the contents of $app"
+    rm -rf "$work/old-Contents"
+    cleanup
+    rm -f "$dmg"
+    /usr/bin/open "$app"
+    echo "done"
+    exit 0
+fi
 
 /usr/bin/ditto "$new" "$staged" || fail "Could not copy the new Thoughts to $parent."
 /usr/bin/codesign --verify --deep --strict -R "=$requirement" "$staged" \
