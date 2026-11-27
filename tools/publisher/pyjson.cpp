@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #if defined(__APPLE__)
@@ -579,6 +580,45 @@ std::optional<QByteArray> dumps(const Json &value, const DumpOptions &options, Q
 
 namespace
 {
+#if !defined(__APPLE__)
+// A float literal std::from_chars found out of range: ±infinity when its first
+// significant digit stands at a positive power of ten, else ±0. Only the
+// position of that digit matters, so no locale is involved.
+double outOfRangeFloatLiteral(const std::string &literal)
+{
+    const bool negative = !literal.empty() && literal.front() == '-';
+    const size_t begin = negative ? 1 : 0;
+    const size_t exponentAt = std::min(literal.find_first_of("eE", begin), literal.size());
+    long long exponent = 0;
+    if (exponentAt < literal.size()) {
+        const char *first = literal.data() + exponentAt + 1;
+        const char *last = literal.data() + literal.size();
+        const bool negativeExponent = first < last && *first == '-';
+        if (first < last && (*first == '+' || *first == '-')) {
+            ++first;
+        }
+        if (std::from_chars(first, last, exponent).ec == std::errc::result_out_of_range) {
+            exponent = std::numeric_limits<long long>::max() / 2;
+        }
+        if (negativeExponent) {
+            exponent = -exponent;
+        }
+    }
+    const size_t pointAt = std::min(literal.find('.', begin), exponentAt);
+    const size_t digitAt = literal.find_first_of("123456789", begin);
+    long long position = 0;
+    if (digitAt < pointAt) {
+        position = (long long)(pointAt - digitAt) - 1;
+    } else if (digitAt < exponentAt) {
+        position = -(long long)(digitAt - pointAt);
+    } else {
+        return negative ? -0.0 : 0.0;
+    }
+    const double magnitude = exponent + position > 0 ? HUGE_VAL : 0.0;
+    return negative ? -magnitude : magnitude;
+}
+#endif
+
 // A float literal as Decoder::parseNumber scanned it (JSON's grammar, ASCII
 // only) as the double Python's float() reads: correctly rounded to nearest,
 // ties to even, ±infinity past DBL_MAX, ±0 below the smallest subnormal.
@@ -596,8 +636,9 @@ double parseFloatLiteral(const std::string &literal)
     double value = 0;
     const auto result = std::from_chars(literal.data(), literal.data() + literal.size(), value);
     if (result.ec == std::errc::result_out_of_range) {
-        // Python's float() saturates to infinity or underflows to 0.
-        value = std::strtod(literal.c_str(), nullptr);
+        // Python's float() saturates to infinity or underflows to 0. Not with
+        // strtod: it reads LC_NUMERIC, and with a decimal comma "1.5e400" is 1.
+        return outOfRangeFloatLiteral(literal);
     }
     return value;
 #endif
