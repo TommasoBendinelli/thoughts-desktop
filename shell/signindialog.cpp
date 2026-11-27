@@ -3,11 +3,13 @@
 
 #include "../part/thoughtsplatform.h"
 #include "../part/thoughtsserveraddress.h"
+#include "../part/libraryswitch.h"
 
 #include <KLocalizedString>
 
 #include <QDesktopServices>
 #include <QDialogButtonBox>
+#include <QCoreApplication>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QJsonObject>
@@ -19,6 +21,8 @@
 #include <QNetworkReply>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QStandardPaths>
+#include <QUrl>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -385,6 +389,9 @@ void SignInDialog::signIn()
             showMessage(m_error, error);
             return;
         }
+        // The server and account this computer's Library was synchronized with, before Sign In
+        // changes the saved address (installations from before the record: the saved address).
+        const LibrarySwitch::Holder held = LibrarySwitch::origin().value_or(LibrarySwitch::Holder{ServerAddress::saved(), {}});
         if (!AppSignIn::storeSignedIn(m_hooks, canonical, *signedIn, &error)) {
             showMessage(m_error, i18n("Signed in, but the tokens could not be stored: %1", error));
             // The server issued a device this computer cannot use: end it again.
@@ -394,6 +401,19 @@ void SignInDialog::signIn()
             }
             return;
         }
+        // Another server or account: the Library here is the other one's. It is set aside at the
+        // next start, and Sync waits until then (libraryswitch.h).
+        const LibrarySwitch::Holder to{canonical, signedIn->username};
+        bool switching = false;
+        if (LibrarySwitch::holdsLibrary() && LibrarySwitch::differs(held, to)) {
+            if (!LibrarySwitch::schedule(held, to, &error)) {
+                showMessage(m_error, i18n("Signed in, but Thoughts could not prepare this computer for the other Library: %1", error));
+                return;
+            }
+            switching = true;
+        } else {
+            LibrarySwitch::recordOrigin(to);
+        }
         // Passwords are not kept.
         m_password->clear();
         m_newPassword->clear();
@@ -401,7 +421,35 @@ void SignInDialog::signIn()
         showMessage(m_error, {});
         Q_EMIT this->signedIn(canonical, signedIn->username);
         accept();
+        if (switching) {
+            explainLibrarySwitch(held, to);
+        }
     });
+}
+
+void SignInDialog::explainLibrarySwitch(const LibrarySwitch::Holder &held, const LibrarySwitch::Holder &to)
+{
+    const auto host = [](const QString &server) {
+        const QString name = QUrl(server).host();
+        return name.isEmpty() ? server : name;
+    };
+    QMessageBox box(QMessageBox::Information, i18n("Open the Library on %1", host(to.server)),
+                    i18n("This computer holds the Library from %1. When Thoughts opens again, it keeps that Library aside on this "
+                         "computer and starts with your Library on %2, which the next Sync downloads.\n\n"
+                         "Quit Thoughts and open it again to finish. Sync waits until then.",
+                         host(held.server), host(to.server)),
+                    QMessageBox::NoButton, parentWidget());
+    box.setObjectName(QStringLiteral("librarySwitchMessage"));
+    QPushButton *quit = box.addButton(i18n("Quit Thoughts"), QMessageBox::AcceptRole);
+    box.addButton(i18n("Later"), QMessageBox::RejectRole);
+    box.setDefaultButton(quit);
+    if (QStandardPaths::isTestModeEnabled()) {
+        return; // Tests read the scheduled switch instead of answering a modal box.
+    }
+    box.exec();
+    if (box.clickedButton() == quit) {
+        QCoreApplication::quit();
+    }
 }
 
 ServerAccountSection::ServerAccountSection(const AppSignIn::Hooks &hooks, QWidget *parent)

@@ -4359,10 +4359,18 @@ void ReviewCardsWidget::ensureLoaded()
     }
 }
 
+QString ReviewCardsWidget::browseEmptyText() const
+{
+    // Cards not read yet are not "no cards": a list first opened during a Sync waits for its end.
+    if (m_loadedAt.isValid()) return noReviewCardsText();
+    return m_syncInProgress ? i18n("Cards appear when the Sync finishes…") : i18n("Loading cards…");
+}
+
 void ReviewCardsWidget::setSyncInProgress(bool running)
 {
     if (m_syncInProgress == running) return;
     m_syncInProgress = running;
+    if (m_browseCards.isEmpty()) m_browseCount->setText(browseEmptyText());
     if (m_browseUpdateHistoryButton) {
         const auto *item = selectedBrowseCard();
         m_browseUpdateHistoryButton->setEnabled(!running && item && item->card.isApproved() && !item->card.schedule.deleted);
@@ -4819,7 +4827,7 @@ void ReviewCardsWidget::refreshBrowseTable()
         m_browseTable->setCurrentItem(currentItem, 0, QItemSelectionModel::NoUpdate);
         if (!hasSelection) currentItem->setSelected(true);
     }
-    m_browseCount->setText(m_browseCards.isEmpty() ? noReviewCardsText() : i18n("Showing %1 of %2 cards", m_visibleBrowseCards.size(), cardsInDocumentScope));
+    m_browseCount->setText(m_browseCards.isEmpty() ? browseEmptyText() : i18n("Showing %1 of %2 cards", m_visibleBrowseCards.size(), cardsInDocumentScope));
     updateBrowseExportAction();
     showBrowseCard(selectedBrowseCard());
     if (auto *top = rows.value(topId); top && !top->isHidden()) {

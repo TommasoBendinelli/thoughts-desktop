@@ -4587,10 +4587,9 @@ void Shell::openUrl(const QUrl &url, const QString &serializedOptions)
             }
         }
     }
-
-    if (!isVisible() && hasOpenDocument() && s_commentsOverviewShell == this && s_commentsOverview && s_commentsOverview->isVisible()) {
-        s_commentsOverview->hide();
-    }
+    // The Library stays open behind the PDF it opened (27 Nov 2026): it used to be hidden
+    // whenever the PDF opened into a viewer window not on screen, which on Windows, where
+    // closed windows do not come back at the next start, was nearly every time.
 }
 
 void Shell::closeUrl()

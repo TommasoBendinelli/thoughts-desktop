@@ -630,6 +630,7 @@ private Q_SLOTS:
     void testLibrarySummarySaysLoadingUntilFirstLoad();
     void testLibraryMenuSurvivesRefresh_data();
     void testLibraryMenuSurvivesRefresh();
+    void testLibraryRemovesSeveralDocumentsAtOnce();
     void testLibraryDocumentDoubleClickWithoutPage();
     void testLibrarySearchFindsSourceLines();
     void testLibrarySearchDocumentHitsOpenTheirSearch();
@@ -3877,6 +3878,85 @@ void CommentsOverviewTest::testLibrarySearchFindsSourceLines()
     QTest::keyClick(field, Qt::Key_1, Qt::ControlModifier);
     QCOMPARE(KConfigGroup(KSharedConfig::openConfig(), QStringLiteral("LibrarySearch")).readEntry("Scope", QString()), QStringLiteral("documents"));
     QVERIFY(!Thoughts::LibrarySearchIndex(overview.m_librarySearchIndexPath).search(QStringLiteral("quokka"), Thoughts::LibrarySearchScope::Documents).size());
+}
+
+void CommentsOverviewTest::testLibraryRemovesSeveralDocumentsAtOnce()
+{
+    // A Project whose sources moved lists many missing documents: the Project's menu removes
+    // the ticked ones (missing ones start ticked) after one confirmation, each queued one
+    // revision after the one before (a repeated base revision is refused by the server).
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    QJsonArray documents;
+    for (const QString &name : {QStringLiteral("first"), QStringLiteral("second"), QStringLiteral("third")}) {
+        QVERIFY(writeFile(temporary.filePath(QStringLiteral("current_pdfs/%1.pdf").arg(name)), QByteArrayLiteral("%PDF-") + name.toUtf8()));
+        const QString filename = name + QStringLiteral(".pdf");
+        QJsonObject document {{QStringLiteral("id"), filename}, {QStringLiteral("filename"), filename},
+                              {QStringLiteral("name"), name}, {QStringLiteral("start_page"), 1}};
+        if (name != QLatin1String("second")) document.insert(QStringLiteral("source_file"), QStringLiteral("notes/%1-gone.tex").arg(name));
+        documents.append(document);
+    }
+    const QJsonObject project {{QStringLiteral("id"), QStringLiteral("new:course")}, {QStringLiteral("name"), QStringLiteral("Course")},
+                              {QStringLiteral("revision"), 4}, {QStringLiteral("documents"), documents}};
+    Thoughts::LibraryProjectStore store(temporary.path());
+    QVERIFY(store.receive({{QStringLiteral("projects"), QJsonArray {project}}}).isEmpty());
+    QVERIFY(registerCatalogueProject(temporary.path(), project));
+    Thoughts::CommentsOverview overview(temporary.path());
+    overview.show();
+    overview.showSummary();
+    auto *tree = overview.findChild<QTreeWidget *>(QStringLiteral("thoughtsOverviewLibraryTree"));
+    QVERIFY(tree);
+    QTRY_COMPARE(tree->topLevelItemCount(), 1);
+    auto *root = tree->topLevelItem(0);
+    QSignalSpy changed(&overview, &Thoughts::CommentsOverview::projectAttachmentChangedLocally);
+    bool triggered = false;
+    QStringList listed;
+    QStringList ticked;
+    QTimer::singleShot(0, &overview, [&] {
+        auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        QVERIFY(menu);
+        QTimer::singleShot(3000, menu, &QMenu::close);
+        auto *remove = menu->findChild<QAction *>(QStringLiteral("libraryRemoveDocumentsAction"));
+        QVERIFY(remove);
+        QCOMPARE(remove->text(), QStringLiteral("Remove missing documents…"));
+        QTimer *confirmation = new QTimer(&overview);
+        connect(confirmation, &QTimer::timeout, &overview, [&, confirmation] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog || dialog->objectName() != QLatin1String("removeDocumentsDialog")) return;
+            confirmation->stop();
+            QTimer::singleShot(3000, dialog, &QDialog::reject);
+            auto *list = dialog->findChild<QListWidget *>(QStringLiteral("removeDocumentsList"));
+            QVERIFY(list);
+            for (int i = 0; i < list->count(); ++i) {
+                listed.append(list->item(i)->text());
+                if (list->item(i)->checkState() == Qt::Checked) ticked.append(list->item(i)->data(Qt::UserRole).toString());
+            }
+            auto *buttons = dialog->findChild<QDialogButtonBox *>();
+            QVERIFY(buttons);
+            QCOMPARE(buttons->button(QDialogButtonBox::Ok)->text(), QStringLiteral("Remove 2 documents"));
+            buttons->button(QDialogButtonBox::Ok)->click();
+        });
+        confirmation->start(10);
+        triggered = true;
+        remove->trigger();
+        menu->close();
+    });
+    overview.showLibraryItemContextMenu(root, tree, tree->visualItemRect(root).center(), true);
+    QVERIFY(triggered);
+    QCOMPARE(listed, (QStringList {QStringLiteral("first (missing)"), QStringLiteral("second"), QStringLiteral("third (missing)")}));
+    QCOMPARE(ticked, (QStringList {QStringLiteral("first.pdf"), QStringLiteral("third.pdf")}));
+    const auto pending = store.pending();
+    QCOMPARE(pending.size(), 2);
+    for (int i = 0; i < 2; ++i) {
+        const auto operation = pending.at(i).toObject();
+        QCOMPARE(operation.value(QStringLiteral("action")).toString(), QStringLiteral("remove_document"));
+        QCOMPARE(operation.value(QStringLiteral("document_id")).toString(), ticked.at(i));
+        QCOMPARE(operation.value(QStringLiteral("base_revision")).toInt(), 4 + i);
+    }
+    QCOMPARE(changed.size(), 1);
+    // A third removal queued from the Project as it was first read still follows on.
+    QVERIFY(store.enqueue(QStringLiteral("remove_document"), project, {{QStringLiteral("document_id"), QStringLiteral("second.pdf")}}).isEmpty());
+    QCOMPARE(store.pending().at(2).toObject().value(QStringLiteral("base_revision")).toInt(), 6);
 }
 
 void CommentsOverviewTest::testLibraryMenuSurvivesRefresh_data()

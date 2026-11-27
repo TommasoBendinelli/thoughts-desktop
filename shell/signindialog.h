@@ -2,6 +2,7 @@
 #pragma once
 
 #include "appsignin.h"
+#include "../part/libraryswitch.h"
 
 #include <QDialog>
 #include <QPointer>
@@ -52,6 +53,8 @@ private:
     void updateState();
     void signIn();
     void setBusy(bool busy);
+    // After Sign In to another server or account: the Library here is set aside at the next start.
+    void explainLibrarySwitch(const LibrarySwitch::Holder &held, const LibrarySwitch::Holder &to);
     // "Request access": an email to the server's access contact (protocol/app-sign-in.md 5).
     void requestAccess();
     QString address() const;

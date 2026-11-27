@@ -189,6 +189,7 @@ private Q_SLOTS:
     void placeBrowseCard(bool again);
 
 private:
+    QString browseEmptyText() const;
     void sortVisibleBrowseCards();
     // Writes the retire (or with @p restore the restore) of @p cardId off the GUI thread, shows it,
     // then reads the cards again.

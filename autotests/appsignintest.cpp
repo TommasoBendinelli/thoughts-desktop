@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "../part/thoughtsplatform.h"
 #include "../part/thoughtsserveraddress.h"
+#include "../part/libraryswitch.h"
 #include "../shell/appsignin.h"
 #include "../shell/signindialog.h"
 #include "../shell/projectsharedialog.h"
@@ -17,6 +18,7 @@
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSignalSpy>
+#include <QTemporaryDir>
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTimer>
@@ -294,6 +296,7 @@ private Q_SLOTS:
     void dialogNeedsEverything();
     void dialogOffersToRequestAccess();
     void signInStoresBothTokens();
+    void signInToAnotherServerSetsTheLibraryAside();
     void wrongPasswordIsShown();
     void unstoredTokensAreSignedOutAgain();
     void inviteChoosesAPassword();
@@ -703,6 +706,76 @@ void AppSignInTest::signInStoresBothTokens()
     QCOMPARE(ServerAddress::tokenOrigin(AppSignIn::sourceSyncAccount()), QStringLiteral("https://thoughts.example.org"));
     // The password is not kept.
     QVERIFY(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword"))->text().isEmpty());
+}
+
+void AppSignInTest::signInToAnotherServerSetsTheLibraryAside()
+{
+    // A computer synchronized with one server signs in to another (26 Nov 2026: every Sync then
+    // stopped with "sources on the server kept changing"): the next start keeps the Library
+    // aside and begins with an empty one; Sync waits until then.
+    QVERIFY(QStandardPaths::isTestModeEnabled());
+    QTemporaryDir home;
+    QVERIFY(home.isValid());
+    const QString library = home.filePath(QStringLiteral("docs"));
+    qputenv("THOUGHTS_HOME", library.toUtf8());
+    const auto restore = qScopeGuard([] { qunsetenv("THOUGHTS_HOME"); });
+    QFile::remove(LibrarySwitch::pendingPath());
+    const QDir application(Platform::applicationDataRoot());
+    QVERIFY(QDir(application.filePath(QStringLiteral("thoughts-server"))).removeRecursively());
+    QVERIFY(QDir().mkpath(application.filePath(QStringLiteral("thoughts-server"))));
+    const auto write = [](const QString &path, const QByteArray &bytes) {
+        QDir().mkpath(QFileInfo(path).absolutePath());
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+    };
+    QVERIFY(write(application.filePath(QStringLiteral("thoughts-server/desktop-sync.sqlite")), "old checkpoint"));
+    const QString manifest = QDir(Platform::thoughtsDataRoot()).filePath(QStringLiteral("source-manifest.json"));
+    QVERIFY(write(manifest, "{}"));
+    QVERIFY(write(QDir(library).filePath(QStringLiteral("docs-notes/note.tex")), "old note"));
+    QVERIFY(ServerAddress::save(QStringLiteral("https://old.example.org")));
+    QVERIFY(LibrarySwitch::holdsLibrary());
+
+    FakeServer server;
+    Secrets secrets;
+    SignInDialog dialog(secrets.hooks(server));
+    QSignalSpy signedIn(&dialog, &SignInDialog::signedIn);
+    dialog.show();
+    child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInServer"))->setText(QStringLiteral("https://thoughts.example.org"));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInUsername")), QStringLiteral("alex"));
+    QTest::keyClicks(child<QLineEdit>(dialog, QStringLiteral("thoughtsSignInPassword")), server.password);
+    auto *signIn = child<QPushButton>(dialog, QStringLiteral("thoughtsSignInButton"));
+    QTRY_VERIFY(signIn->isEnabled());
+    signIn->click();
+    QTRY_COMPARE(signedIn.size(), 1);
+    QVERIFY(LibrarySwitch::pending());
+    QCOMPARE(LibrarySwitch::pendingTarget()->server, QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(LibrarySwitch::pendingTarget()->username, QStringLiteral("alex"));
+
+    const LibrarySwitch::Result switched = LibrarySwitch::runPending();
+    QVERIFY2(switched.succeeded, qPrintable(switched.error));
+    const auto cleanupKept = qScopeGuard([&switched] {
+        QDir(switched.keptIn).removeRecursively();
+        QDir(switched.keptLibrary).removeRecursively();
+    });
+    QVERIFY(!LibrarySwitch::pending());
+    QVERIFY(switched.keptIn.contains(QStringLiteral("old.example.org")));
+    QCOMPARE(QFile(QDir(switched.keptIn).filePath(QStringLiteral("thoughts-server/desktop-sync.sqlite"))).size(), qint64(14));
+    QVERIFY(QFileInfo::exists(QDir(switched.keptIn).filePath(QStringLiteral("source-manifest.json"))));
+    QVERIFY(QFileInfo::exists(QDir(switched.keptLibrary).filePath(QStringLiteral("docs-notes/note.tex"))));
+    QVERIFY(!QFileInfo::exists(manifest));
+    QVERIFY(QDir(library).exists());
+    QVERIFY(QDir(library).isEmpty(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot));
+    QVERIFY(!LibrarySwitch::holdsLibrary());
+    QCOMPARE(LibrarySwitch::origin()->server, QStringLiteral("https://thoughts.example.org"));
+    QCOMPARE(LibrarySwitch::origin()->username, QStringLiteral("alex"));
+
+    // The same server and account again keeps the Library; another account there does not.
+    const LibrarySwitch::Holder held{QStringLiteral("https://thoughts.example.org"), QStringLiteral("alex")};
+    QVERIFY(!LibrarySwitch::differs(held, {QStringLiteral("https://thoughts.example.org/"), QStringLiteral("alex")}));
+    QVERIFY(LibrarySwitch::differs(held, {QStringLiteral("https://thoughts.example.org"), QStringLiteral("sam")}));
+    QVERIFY(!LibrarySwitch::differs({QStringLiteral("https://thoughts.example.org"), {}}, {QStringLiteral("https://thoughts.example.org"), QStringLiteral("sam")}));
+    QVERIFY(LibrarySwitch::differs(held, {QStringLiteral("https://other.example.org"), QStringLiteral("alex")}));
+    QFile::remove(LibrarySwitch::originPath());
 }
 
 void AppSignInTest::wrongPasswordIsShown()

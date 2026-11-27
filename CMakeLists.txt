@@ -326,7 +326,7 @@ endif()
 # Operating-system services (secrets, file identity, directory links) behind
 # one Qt-only interface, so Windows headers stay out of shared headers, and
 # the server address that goes with this computer's device token.
-add_library(thoughtsplatform STATIC part/thoughtsplatform.cpp part/thoughtsserveraddress.cpp)
+add_library(thoughtsplatform STATIC part/thoughtsplatform.cpp part/thoughtsserveraddress.cpp part/libraryswitch.cpp)
 set_target_properties(thoughtsplatform PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(thoughtsplatform PUBLIC Qt6::Core)
 if(WIN32)

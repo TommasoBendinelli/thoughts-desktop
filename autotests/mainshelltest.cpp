@@ -5531,8 +5531,10 @@ void MainShellTest::testClosingLastDocumentReturnsToOverview()
     Q_EMIT Shell::s_commentsOverview->documentActivated(pdfUrl.toLocalFile());
 
     QTRY_VERIFY(shell->isVisible());
-    QTRY_VERIFY(!Shell::s_commentsOverview->isVisible());
     QVERIFY(shell->hasOpenDocument());
+    // Opening a PDF from the Library keeps the Library open behind it.
+    QTest::qWait(100);
+    QVERIFY(Shell::s_commentsOverview->isVisible());
 }
 
 void MainShellTest::testArchivedCommentHistoryRestoration()
@@ -5811,6 +5813,8 @@ void MainShellTest::testCommentsOverviewSurvivesLastPdfWindow()
     workerShell->hide();
     Q_EMIT overview->documentFeedbackActivated(pdfUrl.toLocalFile(), QStringLiteral("not-in-this-document"));
     QTRY_VERIFY(workerShell->isVisible());
+    // After the last PDF window was closed, a PDF opened from the Library keeps it open.
+    QVERIFY(overview->isVisible());
     bool answer = true;
     QVERIFY(QMetaObject::invokeMethod(part, "openDocumentFeedback", Qt::DirectConnection, Q_RETURN_ARG(bool, answer), Q_ARG(QString, QStringLiteral("not-in-this-document"))));
     QVERIFY(!answer);
@@ -12191,6 +12195,21 @@ void MainShellTest::testReviewSaysHowToMakeTheFirstCard()
     Thoughts::ReviewCardsWidget cards(temporary.path(), {}, {});
     QTRY_VERIFY(cards.m_loadedAt.isValid());
     QTRY_COMPARE(cards.m_browseCount->text(), howTo);
+    {
+        // Opened during a Sync (View cards on the review page), the list has read nothing yet:
+        // it says it waits for the Sync, not that there is no card.
+        const QString waitingText = QStringLiteral("Cards appear when the Sync finishes…");
+        Thoughts::ReviewCardsWidget waiting(temporary.path(), {}, {});
+        waiting.setSyncInProgress(true);
+        waiting.setStateFilter(QStringLiteral("unavailable"));
+        QCOMPARE(waiting.m_browseCount->text(), waitingText);
+        QTest::qWait(300);
+        QVERIFY(!waiting.m_loadedAt.isValid());
+        QCOMPARE(waiting.m_browseCount->text(), waitingText);
+        waiting.setSyncInProgress(false);
+        QTRY_VERIFY(waiting.m_loadedAt.isValid());
+        QTRY_COMPARE(waiting.m_browseCount->text(), howTo);
+    }
 }
 
 void MainShellTest::testReviewCanStartDuringSync()

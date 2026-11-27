@@ -8944,6 +8944,68 @@ void CommentsOverview::editLibraryProject(const QJsonObject &project, const QStr
     updateLibraryTree(); Q_EMIT projectAttachmentChangedLocally(project.value(QStringLiteral("target")).toString());
 }
 
+void CommentsOverview::removeLibraryDocuments(const QJsonObject &project, const QList<QPair<QJsonObject, bool>> &documents)
+{
+    if (m_syncOperationRunning) return;
+    // Missing documents start ticked, the others not; one confirmation removes every ticked one.
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("removeDocumentsDialog"));
+    dialog.setWindowTitle(i18n("Remove documents"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *label = new QLabel(i18n("Remove the ticked documents from “%1”?\n\nTheir comments are removed and their review cards are deleted permanently; "
+                                  "Unpublish keeps them instead. Original files remain. Click Sync to apply the change on other devices.",
+                                  project.value(QStringLiteral("name")).toString()), &dialog);
+    label->setWordWrap(true);
+    layout->addWidget(label);
+    auto *list = new QListWidget(&dialog);
+    list->setObjectName(QStringLiteral("removeDocumentsList"));
+    for (const auto &[document, missing] : documents) {
+        const QString name = document.value(QStringLiteral("name")).toString(document.value(QStringLiteral("id")).toString());
+        auto *entry = new QListWidgetItem(missing ? i18n("%1 (missing)", name) : name, list);
+        entry->setFlags(entry->flags() | Qt::ItemIsUserCheckable);
+        entry->setCheckState(missing ? Qt::Checked : Qt::Unchecked);
+        entry->setData(Qt::UserRole, document.value(QStringLiteral("id")).toString());
+    }
+    layout->addWidget(list);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    auto *remove = buttons->button(QDialogButtonBox::Ok);
+    buttons->button(QDialogButtonBox::Cancel)->setDefault(true);
+    const auto ticked = [list] {
+        QStringList ids;
+        for (int i = 0; i < list->count(); ++i)
+            if (list->item(i)->checkState() == Qt::Checked) ids.append(list->item(i)->data(Qt::UserRole).toString());
+        return ids;
+    };
+    const auto updateButton = [remove, ticked] {
+        const int count = int(ticked().size());
+        remove->setText(i18np("Remove 1 document", "Remove %1 documents", count));
+        remove->setEnabled(count > 0);
+    };
+    updateButton();
+    connect(list, &QListWidget::itemChanged, &dialog, updateButton);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.resize(560, 420);
+    if (dialog.exec() != QDialog::Accepted) return;
+    const QStringList ids = ticked();
+    LibraryProjectStore store(m_docsRoot);
+    int removed = 0;
+    QString error;
+    for (const QString &id : ids) {
+        // The store follows on from the removals queued before it (one revision each).
+        error = store.enqueue(QStringLiteral("remove_document"), project, {{QStringLiteral("document_id"), id}});
+        if (!error.isEmpty()) break;
+        ++removed;
+    }
+    if (removed > 0) {
+        updateLibraryTree();
+        Q_EMIT projectAttachmentChangedLocally(project.value(QStringLiteral("target")).toString());
+    }
+    if (!error.isEmpty())
+        KMessageBox::error(this, removed > 0 ? i18n("%1 of %2 documents were removed. %3", removed, ids.size(), error) : error);
+}
+
 QString CommentsOverview::saveWebsiteImport(const QJsonObject &project, const QString &projectName, const QString &target, const QString &path, const QString &name, const QUrl &link)
 {
     if (project.isEmpty()) {
@@ -9888,6 +9950,25 @@ void CommentsOverview::showLibraryItemContextMenu(QTreeWidgetItem *item, QTreeWi
                     retire->setEnabled(!m_syncOperationRunning && active != 0);
                     retire->setToolTip(i18n("Take this Project's project cards out of review, each with its history"));
                     connect(retire, &QAction::triggered, this, [this, project] { retireLibraryProjectCards(project); });
+                }
+                // Several documents at once (a Project whose sources moved can list dozens of missing ones).
+                QList<QPair<QJsonObject, bool>> removable;
+                std::function<void(QTreeWidgetItem *)> collect = [&](QTreeWidgetItem *parent) {
+                    for (int i = 0; i < parent->childCount(); ++i) {
+                        auto *child = parent->child(i);
+                        const auto doc = child->data(0, Qt::UserRole + 141).value<QJsonObject>();
+                        if (!doc.value(QStringLiteral("id")).toString().isEmpty())
+                            removable.append({doc, !child->data(0, LibraryMissingSourcesRole).toStringList().isEmpty()});
+                        collect(child);
+                    }
+                };
+                collect(root);
+                if (removable.size() > 1) {
+                    const bool anyMissing = std::any_of(removable.cbegin(), removable.cend(), [](const auto &entry) { return entry.second; });
+                    auto *removeDocuments = menu.addAction(anyMissing ? i18n("Remove missing documents…") : i18n("Remove documents…"));
+                    removeDocuments->setObjectName(QStringLiteral("libraryRemoveDocumentsAction"));
+                    removeDocuments->setEnabled(!m_syncOperationRunning);
+                    connect(removeDocuments, &QAction::triggered, this, [this, project, removable] { removeLibraryDocuments(project, removable); });
                 }
                 action(i18n("Remove project…"), QStringLiteral("remove"));
             }

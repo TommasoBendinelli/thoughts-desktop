@@ -28,6 +28,8 @@
 #include "feedbackversion.h"
 #include "thoughtsplatform.h"
 #include "thoughtsserveraddress.h"
+#include "libraryswitch.h"
+#include "thoughtshome.h"
 #include "sourcechangetracker.h"
 #include "thoughtignore.h"
 #include "core/htmlattachment.h"
@@ -6726,6 +6728,14 @@ void FedoraRepository::beginManualSync(const QString &target, bool conditionalRe
     }
     m_activeReaderTransferPlanId.clear();
     m_syncCoordinator.begin(target, conditionalRenderCheck, m_activeTraceId);
+    // Signed in to another server or account: this Library is the previous one's until the next
+    // start sets it aside (libraryswitch.h). A Sync now would mix the two Libraries.
+    if (Thoughts::LibrarySwitch::pending() && QDir::cleanPath(m_docsRoot) == QDir::cleanPath(Thoughts::thoughtsHome())) {
+        failManualSync(QStringLiteral("You signed in to another server or account. Quit Thoughts and open it again: it then keeps this "
+                                      "computer's Library aside, and Sync downloads your Library."),
+                       QString(), QStringLiteral("needs_user"));
+        return;
+    }
     if (!QDir(QDir(m_docsRoot).filePath(QStringLiteral("reviews/source-transactions"))).entryList({QStringLiteral("*.json")}, QDir::Files).isEmpty()) {
         failManualSync(QStringLiteral("An interrupted review source edit needs recovery. Open Reviews before retrying Sync."), QString(), QStringLiteral("needs_user"));
         return;

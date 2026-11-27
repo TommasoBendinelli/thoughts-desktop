@@ -16,6 +16,7 @@
 #include "shellutils.h"
 #include "thoughtscommandprotocol.h"
 #include "../part/thoughtsserveraddress.h"
+#include "../part/libraryswitch.h"
 #if defined(Q_OS_MACOS)
 #include "agentnotesnotifier.h"
 #include "macquitevent.h"
@@ -160,6 +161,26 @@ int main(int argc, char **argv)
     // run of this version keeps an installation that synchronized before on
     // the address it used (see Thoughts::ServerAddress::configured).
     Thoughts::ServerAddress::configured();
+
+    // A Sign In to another server or account set this computer's Library aside for this
+    // start (libraryswitch.h): before anything opens the Library.
+    if (!app.isSessionRestored() && qEnvironmentVariableIsEmpty("THOUGHTS_HOME")) {
+        const Thoughts::LibrarySwitch::Result switched = Thoughts::LibrarySwitch::runPending();
+        if (switched.ran && switched.succeeded) {
+            KMessageBox::information(nullptr,
+                                     i18n("Thoughts now opens your Library on the server you signed in to; the next Sync downloads it.\n\n"
+                                          "The previous Library stays on this computer:\n%1\n%2",
+                                          QDir::toNativeSeparators(switched.keptLibrary.isEmpty() ? QString() : switched.keptLibrary),
+                                          QDir::toNativeSeparators(switched.keptIn)),
+                                     i18n("Library set aside"));
+        } else if (switched.ran) {
+            KMessageBox::error(nullptr,
+                               i18n("Thoughts could not set the previous Library aside, so Sync waits.\n\n%1\n\n"
+                                    "Close any program that uses those files and open Thoughts again.",
+                                    switched.error),
+                               i18n("Library not switched"));
+        }
+    }
 
     // see if we are starting with session management
     if (app.isSessionRestored()) {

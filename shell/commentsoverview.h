@@ -446,6 +446,9 @@ private Q_SLOTS:
     // store and server). A token writer set above is used when these give none.
     void setServerAccountHooks(AppSignIn::Hooks hooks) { m_serverAccountHooks = std::move(hooks); }
     void editLibraryProject(const QJsonObject &project, const QString &action, const QJsonObject &document = {});
+    // Removes several of a Project's documents after one confirmation: each entry is a document
+    // and whether its source is missing (those start ticked).
+    void removeLibraryDocuments(const QJsonObject &project, const QList<QPair<QJsonObject, bool>> &documents);
     // A Project's Review cards menu (review-card-kinds.md §2.3, §6.4): the kind its cards follow,
     // queued as a set_review_kind Library-project action, and Retire project cards….
     void setLibraryProjectReviewKind(const QJsonObject &project, const QString &kind);

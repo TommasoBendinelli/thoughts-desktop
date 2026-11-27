@@ -2,6 +2,8 @@
 #include "fileidentitycache.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+
+#include <algorithm>
 #include "markdownfolderimport.h"
 #include "thoughtignore.h"
 #include "documentbuildselection.h"
@@ -929,7 +931,19 @@ public:
             values.insert(QStringLiteral("source_project"), name);
         }
         values.insert(QStringLiteral("project_id"), project.value(QStringLiteral("id")));
-        values.insert(QStringLiteral("base_revision"), project.value(QStringLiteral("revision")).toInt());
+        // The server takes a Project's queued changes one after another, each one revision on.
+        // A Project read before the last change was queued (two removals in a row, before the
+        // Library list refreshed) would repeat its base revision and be refused with a 409
+        // at every later Sync (20 Nov 2026): follow on from the changes already queued.
+        int baseRevision = project.value(QStringLiteral("revision")).toInt();
+        for (const auto &queued : state.value(QStringLiteral("pending")).toArray()) {
+            const auto op = queued.toObject();
+            if (op.value(QStringLiteral("project_id")) == project.value(QStringLiteral("id")))
+                baseRevision = std::max(baseRevision, op.value(QStringLiteral("base_revision")).toInt() + 1);
+            if (op.contains(QStringLiteral("destination_revision")) && op.value(QStringLiteral("destination_project_id")) == project.value(QStringLiteral("id")))
+                baseRevision = std::max(baseRevision, op.value(QStringLiteral("destination_revision")).toInt() + 1);
+        }
+        values.insert(QStringLiteral("base_revision"), baseRevision);
         if (action == QLatin1String("create")) {
             const auto id = project.value(QStringLiteral("id")).toString();
             const auto error = ProjectConfiguration::save(ProjectConfiguration::path(root(), id), ProjectConfiguration::empty(root(), id, values.value(QStringLiteral("name")).toString()));
