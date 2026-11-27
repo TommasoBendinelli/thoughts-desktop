@@ -363,9 +363,12 @@ QList<QPair<bool, QString>> scanHtmlPageMentions(const QString &text)
         const bool prefixed = QStringView(text).mid(start, runEnd - start).startsWith(prefix, Qt::CaseInsensitive);
         const qsizetype nameStart = prefixed ? start + prefix.size() : start;
         // The longest mention: the last .htm(l) of the run that no letter, digit or _ follows.
+        // Searched within the run only, so the whole text is read a bounded number of times.
+        const QStringView run = QStringView(text).mid(nameStart, runEnd - nameStart);
         qsizetype end = -1;
-        for (qsizetype dot = text.lastIndexOf(QStringLiteral(".htm"), runEnd - 1, Qt::CaseInsensitive); dot > nameStart; 
-             dot = dot > 0 ? text.lastIndexOf(QStringLiteral(".htm"), dot - 1, Qt::CaseInsensitive) : -1) {
+        for (qsizetype found = run.lastIndexOf(QStringLiteral(".htm"), -1, Qt::CaseInsensitive); found > 0;
+             found = run.lastIndexOf(QStringLiteral(".htm"), found - 1, Qt::CaseInsensitive)) {
+            const qsizetype dot = nameStart + found;
             if (dot + 4 > runEnd) {
                 continue;
             }

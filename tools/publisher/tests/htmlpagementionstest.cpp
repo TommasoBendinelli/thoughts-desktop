@@ -40,6 +40,18 @@ void HtmlPageMentionsTest::longRunsTakeLinearTime()
     QVERIFY2(timer.elapsed() < 2000, qPrintable(QString::number(timer.elapsed())));
     QCOMPARE(mentions.size(), 1);
     QCOMPARE(mentions.first().second, QStringLiteral("docs-notes/tex/support/html/next.html"));
+
+    // Many short runs: each is searched on its own, never back to the start of the text.
+    QString words;
+    for (int i = 0; i < 300000; ++i) {
+        words += QStringLiteral("word ");
+    }
+    words += QStringLiteral("last.html");
+    timer.restart();
+    const auto found = htmlPageMentions(words);
+    QVERIFY2(timer.elapsed() < 2000, qPrintable(QString::number(timer.elapsed())));
+    QCOMPARE(found.size(), 1);
+    QCOMPARE(found.first().second, QStringLiteral("last.html"));
 }
 
 QTEST_GUILESS_MAIN(HtmlPageMentionsTest)
