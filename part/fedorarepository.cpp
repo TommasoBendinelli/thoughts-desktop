@@ -1822,8 +1822,10 @@ QByteArray fileSha256(const QString &path)
 {
     // Status refreshes check every Library PDF, often twice. Rehash a file only
     // when its identity (inode, size, mtime, ctime) changed since it was hashed.
-    static QMutex mutex;
-    static QHash<QString, QByteArray> digests;
+    // Never destroyed: the detached Library cleanup thread may still hash a file
+    // while the app exits, after static objects are gone (crash on quit, 27 Nov 2026).
+    static QMutex &mutex = *new QMutex;
+    static QHash<QString, QByteArray> &digests = *new QHash<QString, QByteArray>;
     const QString identity = Thoughts::artifactFileIdentity(path);
     if (!identity.isEmpty()) {
         QMutexLocker lock(&mutex);
@@ -1841,8 +1843,9 @@ QByteArray fileSha256(const QString &path)
 // Parse a small state file once per version instead of once per caller.
 QJsonDocument cachedJsonFile(const QString &path)
 {
-    static QMutex mutex;
-    static QHash<QString, QPair<QString, QJsonDocument>> documents;
+    // Never destroyed, as fileSha256's cache: a detached worker may read while the app exits.
+    static QMutex &mutex = *new QMutex;
+    static QHash<QString, QPair<QString, QJsonDocument>> &documents = *new QHash<QString, QPair<QString, QJsonDocument>>;
     const QString identity = Thoughts::artifactFileIdentity(path);
     if (identity.isEmpty()) return {};
     {
