@@ -107,7 +107,8 @@ QList<BuildInput> publicationBuildInputEntries(const Py::Path &givenRoot, const 
     for (const Json &entry : authored.items()) {
         managed.insert(entry.value(QStringLiteral("path")).toString());
     }
-    return projectBuildInputEntries(docsRoot, projectName, projectRoot, managed);
+    return withCarriedPagesOnly(docsRoot, projectName, projectRoot, target,
+                                projectBuildInputEntries(docsRoot, projectName, projectRoot, managed));
 }
 
 void reportBuildInputSelection(ProgressReporter &reporter, const QString &target, const QString &project, const QList<BuildInput> &entries)

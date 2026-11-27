@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "buildinputs.h"
 #include "markdownlinks.h"
+#include "projectdocuments.h"
 
 #include "cssreferences.h"
 #include "manifestcommands.h"
@@ -18,6 +19,9 @@
 #include "thoughtignore.h"
 
 #include <QCryptographicHash>
+#include <QFile>
+#include <QRegularExpression>
+#include <QUrl>
 #include <QHash>
 #include <QMap>
 
@@ -327,9 +331,94 @@ Json stringArray(QStringList values)
     return array;
 }
 
-Json buildInputInventory(const Py::Path &docsRoot, const QString &target, const Py::Path &sourceManifest, const QString &projectName,
-                         const Py::Path &project, const Json &authored, const QList<BuildInput> &entries)
+// The HTML pages of projectName that the file at path links: `thoughts-html:` links (docs-root
+// paths) and relative .html links, resolved as the server resolves them (beside the file, in the
+// folder, in its tex/). A linked page that does not exist yet still counts.
+QSet<QString> linkedHtmlPages(const Py::Path &docsRoot, const QString &projectName, const Py::Path &project, const Py::Path &path)
 {
+    QSet<QString> pages;
+    QFile file(path.str());
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 32 * 1024 * 1024) {
+        return pages;
+    }
+    const QString text = QString::fromUtf8(file.readAll());
+    static const QRegularExpression link(QStringLiteral(R"((thoughts-html:)?([^\s{}()<>"'\[\]\\|]+\.html?)(?![A-Za-z0-9_]))"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    for (auto match = link.globalMatch(text); match.hasNext();) {
+        const QRegularExpressionMatch found = match.next();
+        const QString target = QUrl::fromPercentEncoding(found.captured(2).toUtf8());
+        if (target.contains(QLatin1String("://"))) {
+            continue;
+        }
+        QStringList candidates;
+        if (!found.captured(1).isEmpty()) {
+            candidates.append(target);
+        } else {
+            for (const Py::Path &base : {path.parent(), project, project / QStringLiteral("tex")}) {
+                if (const auto relative = Py::resolve(base / target).relativeTo(Py::resolve(docsRoot))) {
+                    candidates.append(*relative);
+                }
+            }
+        }
+        for (const QString &candidate : candidates) {
+            if (isHtmlSourcePath(candidate, projectName) && (!found.captured(1).isEmpty() || Py::isFile(docsRoot / candidate))) {
+                pages.insert(candidate);
+                break;
+            }
+        }
+    }
+    return pages;
+}
+
+QList<BuildInput> carriedPagesOnly(const Py::Path &docsRoot, const QString &projectName, const Py::Path &project,
+                                   const QString &target, const QList<BuildInput> &entries)
+{
+    if (std::none_of(entries.cbegin(), entries.cend(), [&](const BuildInput &entry) { return isHtmlSourcePath(entry.path, projectName); })) {
+        return entries; // no page among the inputs: nothing to read
+    }
+    QList<ProjectDocument> documents;
+    try {
+        documents = projectDocuments(project, true);
+    } catch (...) {
+        return entries; // documents that cannot be read: every page stays
+    }
+    QString first;
+    QString source;
+    for (const ProjectDocument &document : documents) {
+        if (first.isEmpty() || document.output < first) {
+            first = document.output;
+        }
+        if (document.output == target) {
+            source = document.source;
+        }
+    }
+    if (source.isEmpty() || target == first) {
+        return entries; // the folder's first PDF carries every page; an unknown target keeps them too
+    }
+    QSet<QString> carried = linkedHtmlPages(docsRoot, projectName, project, project / source);
+    QStringList pending(carried.cbegin(), carried.cend());
+    while (!pending.isEmpty()) {
+        const QString page = pending.takeLast();
+        for (const QString &other : linkedHtmlPages(docsRoot, projectName, project, docsRoot / page)) {
+            if (!carried.contains(other)) {
+                carried.insert(other);
+                pending.append(other);
+            }
+        }
+    }
+    QList<BuildInput> kept;
+    for (const BuildInput &entry : entries) {
+        if (!isHtmlSourcePath(entry.path, projectName) || carried.contains(entry.path)) {
+            kept.append(entry);
+        }
+    }
+    return kept;
+}
+
+Json buildInputInventory(const Py::Path &docsRoot, const QString &target, const Py::Path &sourceManifest, const QString &projectName,
+                         const Py::Path &project, const Json &authored, const QList<BuildInput> &allEntries)
+{
+    const QList<BuildInput> entries = carriedPagesOnly(docsRoot, projectName, project, target, allEntries);
     QSet<QString> managed;
     for (const Json &entry : authored.items()) {
         managed.insert(entry.value(QStringLiteral("path")).toString());
@@ -376,6 +465,12 @@ QSet<QString> pathSet(const Json &authored)
     }
     return paths;
 }
+}
+
+QList<BuildInput> withCarriedPagesOnly(const Py::Path &docsRoot, const QString &projectName, const Py::Path &project,
+                                       const QString &target, const QList<BuildInput> &entries)
+{
+    return carriedPagesOnly(docsRoot, projectName, project, target, entries);
 }
 
 bool isHtmlSourcePath(const QString &path, const QString &project)

@@ -71,6 +71,11 @@ QString projectDiscoveryPolicy(const Py::Path &project);
 QList<Py::Path> stylesheetDependencies(const Py::Path &project);
 // is_html_source_path(path, project)
 bool isHtmlSourcePath(const QString &path, const QString &project);
+// entries without the HTML pages target's PDF does not carry: thoughts-server makes a PDF carry the
+// pages its source links (and the pages those link), and the folder's alphabetically first PDF
+// all of them. So a page edit changes only the build inputs of the PDFs that carry the page.
+QList<BuildInput> withCarriedPagesOnly(const Py::Path &docsRoot, const QString &projectName, const Py::Path &project,
+                                       const QString &target, const QList<BuildInput> &entries);
 // is_latex_source_asset(path) and is_markdown_asset(path)
 bool isLatexSourceAsset(const QString &path);
 bool isMarkdownAsset(const QString &path);
