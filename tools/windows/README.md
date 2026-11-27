@@ -156,17 +156,17 @@ All commands run in a normal (not administrator) PowerShell.
    powershell -ExecutionPolicy Bypass -File thoughts-desktop\tools\windows\register.ps1
    ```
 
-5. **Store the two tokens from step 1.3.** Each is read from standard input, so it doesn't end up in your history:
+5. **Connect to your server.** With a Thoughts account (a username and password, or an invitation link), skip this step: when Thoughts first starts without a token it opens **Sign In**, and signing in stores the tokens. Otherwise save your server's address, then store the two tokens from step 1.3. The address comes first: `store-secret` ties each token to the address saved at that moment, and the token is sent only there. Skip the address only if this build was made for your server (`-ServerUrl`).
+   ```powershell
+   C:\CraftRoot\bin\thoughtsctl.exe set-server https://thoughts.example.org
+   ```
+   Each token is read from standard input, so it doesn't end up in your history:
    ```powershell
    Read-Host 'Desktop token (thoughts-windows)' | C:\CraftRoot\bin\thoughtsctl.exe store-secret --account thoughts-windows
    Read-Host 'Publisher token (thoughts-windows-source-sync)' | C:\CraftRoot\bin\thoughtsctl.exe store-secret --account thoughts-source-sync
    ```
-   They appear in Credential Manager as `thoughts-server/thoughts-windows` and `thoughts-server/thoughts-source-sync`.
-   Thoughts uses them with the build's default server unless you save another address under **File › Server…** or with `C:\CraftRoot\bin\thoughtsctl.exe set-server https://…`; `THOUGHTS_SERVER_URL` overrides both.
-   With your own server, save its address now, before Thoughts first starts: Thoughts contacts its server as soon as it starts.
-   ```powershell
-   C:\CraftRoot\bin\thoughtsctl.exe set-server https://thoughts.example.org
-   ```
+   Each command names the server the token is now stored for. They appear in Credential Manager as `thoughts-server/thoughts-windows` and `thoughts-server/thoughts-source-sync`.
+   Do this before Thoughts first starts: Thoughts contacts its server as soon as it starts. `THOUGHTS_SERVER_URL` overrides the saved address.
 
 6. **Unpack the sources** from step 1.2 (only when moving an existing Library) into the docs folder, which is `%USERPROFILE%\Thoughts\docs` unless `THOUGHTS_HOME` says otherwise:
    ```powershell
