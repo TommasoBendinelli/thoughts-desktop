@@ -271,6 +271,7 @@ private Q_SLOTS:
 
     void decidesWhichPagesToActOn_data();
     void decidesWhichPagesToActOn();
+    void decidesWhereThePageIsFor();
     void consentAndAnswers();
     void phoneStartSetting();
     void namesAndHeaders();
@@ -291,6 +292,8 @@ private Q_SLOTS:
     void questionAlwaysThenStartsWithoutAsking();
     void questionNotHereDeclinesForGood();
     void startsCodexSession();
+    void startsSessionAskedForOnThisComputer();
+    void pagesForAnotherComputerOrTheServerStartNothing();
 
 private:
     struct Fixture {
@@ -466,6 +469,36 @@ void SessionStarterTest::decidesWhichPagesToActOn()
     else QVERIFY(!decision.why.isEmpty());
 }
 
+// Where a page asks for its session: any of the person's computers ("computer", or nothing from a
+// phone before it could choose), this one only ("one_computer" naming its id: Send to Agent's New
+// session on this computer, started without a question), the Thoughts server, or anywhere else.
+void SessionStarterTest::decidesWhereThePageIsFor()
+{
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QString here = QStringLiteral("0b5c9a1e-here");
+    const auto decide = [&](const QJsonObject &origin) { return decidePage(page(pageRecord(QStringLiteral("p1"), 1, now, QStringLiteral("Study"), origin)), now, {}, here); };
+    PageDecision decision = decide({});
+    QVERIFY(decision.act && !decision.askedHere);
+    decision = decide({{QStringLiteral("where"), QStringLiteral("computer")}});
+    QVERIFY(decision.act && !decision.askedHere);
+    decision = decide({{QStringLiteral("where"), QStringLiteral("one_computer")}, {QStringLiteral("computer"), here}});
+    QVERIFY(decision.act && decision.askedHere);
+    QCOMPARE(decision.agent, Agent::Claude);
+    for (const QJsonObject &origin : {QJsonObject{{QStringLiteral("where"), QStringLiteral("one_computer")}, {QStringLiteral("computer"), QStringLiteral("another-id")}},
+                                      QJsonObject{{QStringLiteral("where"), QStringLiteral("one_computer")}},
+                                      QJsonObject{{QStringLiteral("where"), QStringLiteral("server")}},
+                                      QJsonObject{{QStringLiteral("where"), QStringLiteral("somewhere-new")}}}) {
+        decision = decide(origin);
+        QVERIFY2(!decision.act, qPrintable(QString::fromUtf8(QJsonDocument(origin).toJson(QJsonDocument::Compact))));
+        QVERIFY(decision.startSession);  // remembered as handled, so never looked at again
+        QVERIFY(!decision.why.isEmpty());
+    }
+    // A computer without an id acts on no page for one computer.
+    QVERIFY(!decidePage(page(pageRecord(QStringLiteral("p1"), 1, now, QStringLiteral("Study"), {{QStringLiteral("where"), QStringLiteral("one_computer")}, {QStringLiteral("computer"), QString()}})),
+                        now, {}, QString())
+                 .act);
+}
+
 void SessionStarterTest::consentAndAnswers()
 {
     QCOMPARE(consentFor(AgentSessions::PhoneStart::Ask), Consent::Ask);
@@ -516,6 +549,15 @@ void SessionStarterTest::namesAndHeaders()
     QVERIFY(header.contains(QStringLiteral("page-1")));
     QVERIFY(!header.contains(QLatin1Char('\n')));
     QVERIFY(promptHeader(Agent::Codex, QStringLiteral("Alex's Mac"), local, QStringLiteral("page-1")).contains(QStringLiteral("codex exec")));
+    // Asked for on this computer: another name, and the session is told what it gets and how to answer.
+    QCOMPARE(sessionName(local, true), QStringLiteral("Thoughts session · 6 Nov 09:05"));
+    const QString here = promptHeader(Agent::Claude, QStringLiteral("Alex's PC"), local, QStringLiteral("page-2"), true);
+    QVERIFY(here.startsWith(QStringLiteral("[Thoughts on Alex's PC started this session at 09:05")));
+    QVERIFY(here.contains(QStringLiteral("New session on this computer")));
+    QVERIFY(here.contains(QStringLiteral("send_note")));
+    QVERIFY(here.contains(QStringLiteral("page-2")));
+    QVERIFY(here.endsWith(QLatin1Char(']')));
+    QVERIFY(!here.contains(QLatin1Char('\n')));
 }
 
 void SessionStarterTest::commandLines()
@@ -803,6 +845,62 @@ void SessionStarterTest::neverAndOldPagesStartNothing()
     QVERIFY(calls().isEmpty());
     QVERIFY(server.claimBodies.isEmpty());
     QVERIFY(server.notes.isEmpty());
+}
+
+// Send to Agent's New session on this computer: started at once, also when this computer never
+// starts the phone's sessions (the person asked for it here), with what was sent as its prompt;
+// the session started is announced so Send to Agent sends to it next.
+void SessionStarterTest::startsSessionAskedForOnThisComputer()
+{
+#ifdef Q_OS_WIN
+    QSKIP("The fake claude is a shell script.");
+#endif
+    SessionStarter::Options settings = options();
+    settings.consent = AgentSessions::PhoneStart::Never;
+    settings.computerId = QStringLiteral("0b5c9a1e-here");
+    settings.ask = [](const SessionStarter::AskRequest &, std::function<void(AskAnswer)>) { QFAIL("asked although the person chose it here"); };
+    Fixture fixture = start(settings);
+    QSignalSpy started(fixture.starter.get(), &SessionStarter::sessionStarted);
+    FakeServer &server = *fixture.server;
+    const QString text = QStringLiteral("Copy for agent: Notes · page 2\nThe selection and its feedback.");
+    server.addPage(pageRecord(QStringLiteral("page-here"), 8, QDateTime::currentDateTimeUtc(), text,
+                              {{QStringLiteral("where"), QStringLiteral("one_computer")}, {QStringLiteral("computer"), QStringLiteral("0b5c9a1e-here")},
+                               {QStringLiteral("agent"), QStringLiteral("claude")}, {QStringLiteral("device"), QStringLiteral("mac")}}));
+    QTRY_COMPARE_WITH_TIMEOUT(fixture.finished->size(), 1, 20000);
+    QCOMPARE(fixture.finished->at(0).at(1).toString(), QStringLiteral("started"));
+    const QStringList arguments = argv(callOf(QStringLiteral("--bg")));
+    QCOMPARE(arguments.size(), 6);
+    QVERIFY2(arguments.at(2).startsWith(QStringLiteral("Thoughts session · ")), qPrintable(arguments.at(2)));
+    QVERIFY(arguments.at(5).contains(QStringLiteral("New session on this computer")));
+    QVERIFY(arguments.at(5).endsWith(QStringLiteral("]\n\n") + text));
+    QCOMPARE(server.claimBodies.size(), 1);
+    QCOMPARE(server.notes.size(), 1);
+    QCOMPARE(server.notes.at(0).value(QStringLiteral("title")).toString(), QStringLiteral("Session started"));
+    QVERIFY(server.notes.at(0).value(QStringLiteral("message")).toString().contains(QStringLiteral("Send to Agent")));
+    QCOMPARE(started.size(), 1);
+    QCOMPARE(started.at(0).at(0).toString(), QStringLiteral("page-here"));
+    QCOMPARE(started.at(0).at(1).toString(), QStringLiteral("1a2b3c4d-0000-4000-8000-000000000001"));
+    QCOMPARE(started.at(0).at(2).toString(), arguments.at(2));
+}
+
+// A page for another computer's new session, or the server's, is left to it: not even its
+// handling is asked for.
+void SessionStarterTest::pagesForAnotherComputerOrTheServerStartNothing()
+{
+    SessionStarter::Options settings = options();
+    settings.computerId = QStringLiteral("0b5c9a1e-here");
+    Fixture fixture = start(settings);
+    FakeServer &server = *fixture.server;
+    server.addPage(pageRecord(QStringLiteral("page-there"), 8, QDateTime::currentDateTimeUtc(), QStringLiteral("Study"),
+                              {{QStringLiteral("where"), QStringLiteral("one_computer")}, {QStringLiteral("computer"), QStringLiteral("another-computer")}}));
+    server.addPage(pageRecord(QStringLiteral("page-server"), 9, QDateTime::currentDateTimeUtc(), QStringLiteral("Study"), {{QStringLiteral("where"), QStringLiteral("server")}}));
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests.contains(QStringLiteral("GET /v1/agent-notes/pages?after=9&wait=%1").arg(SessionStarter::PagesWaitSeconds)), 10000);
+    QTest::qWait(300);
+    QCOMPARE(fixture.finished->size(), 0);
+    QVERIFY(!server.requests.contains(QStringLiteral("GET /v1/agent-notes/handling/page-there")));
+    QVERIFY(!server.requests.contains(QStringLiteral("GET /v1/agent-notes/handling/page-server")));
+    QVERIFY(calls().isEmpty());
+    QVERIFY(server.claimBodies.isEmpty());
 }
 
 void SessionStarterTest::questionAlwaysThenStartsWithoutAsking()

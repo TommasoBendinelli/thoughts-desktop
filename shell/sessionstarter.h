@@ -29,6 +29,13 @@ class QTimer;
 // reply-agent/thoughts_reply_waker.py, feature/start-session 77ee6aa): start the session, claim
 // the page for it (the first claim wins, so of two computers only one keeps its session), and send
 // the owner a note saying where it runs, or why it could not start.
+//
+// Send to Agent's and Ask Agent's "New session on this computer" (27 Nov 2026) sends the same kind
+// of page from this computer for this computer only: origin.where "one_computer" and
+// origin.computer this computer's id (AgentSessions::computerId()). Only the computer it names acts
+// on it, at once (the person asked for it there), and its text (what Copy for agent copies, or the
+// question) is the new session's first prompt. The reply wakers leave such a page alone (they start
+// sessions only for where "computer"), and the server too (it starts those with where "server").
 namespace Thoughts::SessionStarts
 {
 enum class Agent { Claude, Codex };
@@ -43,12 +50,17 @@ struct PageDecision {
     // A request for a new session at all (remembered as handled even when not acted on).
     bool startSession = false;
     Agent agent = Agent::Claude;
+    // Asked for on this computer (where "one_computer" naming it): started without a question.
+    bool askedHere = false;
     QString why;  // when it is not acted on
 };
-// Whether this computer acts on a page of the pages feed: a phone page asking for a new session,
-// not deleted, not handled here before, at most MaxPageAgeSeconds old, for an agent this computer
-// can start. Whether another computer took it already is the server's to say (handling).
-PageDecision decidePage(const AgentNotes::Note &page, const QDateTime &nowUtc, const QSet<QString> &handled);
+// Whether this computer (@p computerId) acts on a page of the pages feed: a phone page asking for a
+// new session, not deleted, not handled here before, at most MaxPageAgeSeconds old, for an agent
+// this computer can start, and for any of the person's computers (where "computer" or none) or for
+// this one (where "one_computer", origin.computer @p computerId); never one for the server (where
+// "server") or another computer. Whether another computer took it already is the server's to say
+// (handling).
+PageDecision decidePage(const AgentNotes::Note &page, const QDateTime &nowUtc, const QSet<QString> &handled, const QString &computerId = {});
 
 // What this computer's choice means for a request.
 enum class Consent { Start, Ask, Decline };
@@ -62,10 +74,11 @@ struct AskOutcome {
 };
 AskOutcome outcomeOf(AskAnswer answer);
 
-// "Study session · 26 Nov 15:04" (local time).
-QString sessionName(const QDateTime &local);
+// "Study session · 26 Nov 15:04" (local time); "Thoughts session · 26 Nov 15:04" for one asked for
+// on this computer.
+QString sessionName(const QDateTime &local, bool askedHere = false);
 // The line before the owner's prompt: who started the session, when, and for which page.
-QString promptHeader(Agent agent, const QString &computer, const QDateTime &local, const QString &pageId);
+QString promptHeader(Agent agent, const QString &computer, const QDateTime &local, const QString &pageId, bool askedHere = false);
 // claude --bg -n <name> --permission-mode auto <prompt>: a background session in auto mode (nobody
 // is there to answer permission prompts; auto's classifier still checks each action). Never
 // bypassPermissions.
@@ -143,6 +156,8 @@ public:
         QString statePath;
         // This computer in notes and prompts; empty: Platform::computerName().
         QString computerName;
+        // This computer's id for pages meant for it only; empty: AgentSessions::computerId().
+        QString computerId;
         // Set (tests): this executable only, never a search; a missing file counts as not installed.
         QString claudeExecutable;
         QString codexExecutable;
@@ -183,6 +198,9 @@ Q_SIGNALS:
     // Once for each page acted on: "started", "taken" (another computer claimed it), "declined"
     // (Never, or Not on this computer), "untrusted", "not_installed", "signed_out" or "failed".
     void pageFinished(const QString &pageId, const QString &outcome);
+    // A Claude Code session started for @p pageId and claimed it (before pageFinished "started"),
+    // with its full id when `claude agents` named it: Send to Agent then sends to it next.
+    void sessionStarted(const QString &pageId, const QString &sessionId, const QString &name);
 
 private:
     struct Job;
@@ -222,6 +240,7 @@ private:
     void setChoice(AgentSessions::PhoneStart choice);
     QString folder() const;
     QString computer() const;
+    QString computerId() const;
     QDateTime now() const;
     void remember(const QString &pageId);
     void loadState();

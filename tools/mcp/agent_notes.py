@@ -52,8 +52,19 @@ from typing import Callable
 
 try:
     import fcntl
-except ImportError:  # Windows: one process at a time is assumed.
+except ImportError:  # Windows: msvcrt's locks instead (lock_file).
     fcntl = None
+try:
+    import msvcrt
+except ImportError:  # everywhere but Windows
+    msvcrt = None
+
+WINDOWS = os.name == "nt"
+# Windows process creation flags (subprocess has the names only on Windows).
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = 0x08000000
+# Windows: the byte a lock file's lock covers, far past what the file holds, so its text stays readable.
+LOCK_OFFSET = 1 << 30
 
 PAGE_WIDTH = 480                      # CSS px, phone width
 SCALE = 2.5                           # device pixels per CSS px
@@ -82,7 +93,21 @@ RENDER_HOST = "thoughts-note.invalid"   # the page's only origin; it exists nowh
 MAX_INLINE_FILE = 20 * 1024 * 1024
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 RENDER_HINT = "Render the picture yourself and send it as a PNG with image_path instead."
-KEYCHAIN_ACCOUNT = "thoughts-mac"     # the desktop app's device token in the login Keychain
+TOKEN_SERVICE = "thoughts-server"     # the desktop app's device token: this service ...
+
+
+def device_account(platform: str | None = None) -> str:
+    """... and this account (Platform::desktopDeviceAccount): the login Keychain's generic password on macOS, the
+    Credential Manager's generic credential "thoughts-server/thoughts-windows" on Windows."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return "thoughts-mac"
+    if platform == "win32":
+        return "thoughts-windows"
+    return "thoughts-linux"
+
+
+KEYCHAIN_ACCOUNT = device_account()
 
 
 class AgentNoteError(Exception):
@@ -116,12 +141,98 @@ def keychain_token() -> str | None:
     if sys.platform != "darwin":
         return None
     try:
-        done = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "thoughts-server", "-a", KEYCHAIN_ACCOUNT, "-w"],
+        done = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", TOKEN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
                               capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
     token = done.stdout.strip()
     return token if done.returncode == 0 and token else None
+
+
+def decode_secret(blob: bytes) -> str:
+    """A Credential Manager secret as text, read as Thoughts reads it (Platform::readSecret): UTF-8 as Thoughts
+    stores it, or UTF-16 as cmdkey and PowerShell store it (every second byte zero), without a byte order mark or
+    surrounding whitespace."""
+    utf16 = len(blob) >= 2 and len(blob) % 2 == 0 and all(blob[index] == 0 for index in range(1, len(blob), 2))
+    text = blob.decode("utf-16-le", "replace") if utf16 else blob.decode("utf-8", "replace")
+    return text.lstrip("\ufeff").strip()
+
+
+def credential_manager_secret(target: str) -> bytes | None:
+    """Windows: the secret of the generic credential named target (CredReadW), or None when there is none."""
+    import ctypes  # noqa: PLC0415 (Windows only)
+    from ctypes import wintypes  # noqa: PLC0415
+
+    class Credential(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD), ("TargetName", wintypes.LPWSTR),
+                    ("Comment", wintypes.LPWSTR), ("LastWritten", wintypes.FILETIME),
+                    ("CredentialBlobSize", wintypes.DWORD), ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+                    ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(Credential))]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    credential = ctypes.POINTER(Credential)()
+    if not advapi32.CredReadW(target, 1, 0, ctypes.byref(credential)):  # 1: CRED_TYPE_GENERIC
+        return None
+    try:
+        size = credential.contents.CredentialBlobSize
+        return ctypes.string_at(credential.contents.CredentialBlob, size) if size else b""
+    finally:
+        advapi32.CredFree(credential)
+
+
+def credential_manager_token(read: Callable[[str], bytes | None] | None = None) -> str | None:
+    """The token the desktop app stores in Windows Credential Manager: the generic credential
+    "thoughts-server/thoughts-windows" (Platform::writeSecret, credentialTarget(service, account))."""
+    if read is None:
+        if not WINDOWS:
+            return None
+        read = credential_manager_secret
+    try:
+        blob = read(f"{TOKEN_SERVICE}/{device_account('win32')}")
+    except OSError:
+        return None
+    token = decode_secret(blob) if blob else ""
+    return token or None
+
+
+def stored_token() -> str | None:
+    """The desktop app's device token where this system keeps it: the Keychain, or Credential Manager."""
+    if sys.platform == "darwin":
+        return keychain_token()
+    if WINDOWS:
+        return credential_manager_token()
+    return None
+
+
+def token_store_name() -> str:
+    if sys.platform == "darwin":
+        return f"Keychain item {TOKEN_SERVICE} / {KEYCHAIN_ACCOUNT}"
+    if WINDOWS:
+        return f"Windows Credential Manager entry {TOKEN_SERVICE}/{KEYCHAIN_ACCOUNT}"
+    return "no system store here"
+
+
+def this_computer() -> str:
+    return "this Mac" if sys.platform == "darwin" else "this computer"
+
+
+def server_settings_path(home: Path | None = None, environ=None, platform: str | None = None) -> Path:
+    """Thoughts' server.json (in Platform::thoughtsDataRoot()): ~/Library/Application Support/Thoughts on macOS,
+    %LOCALAPPDATA%\\Thoughts on Windows, $XDG_DATA_HOME/Thoughts (~/.local/share/Thoughts) elsewhere."""
+    environ = os.environ if environ is None else environ
+    platform = platform or sys.platform
+    home = home or Path.home()
+    if platform == "darwin":
+        return home / "Library/Application Support/Thoughts/server.json"
+    if platform == "win32":
+        local = environ.get("LOCALAPPDATA")
+        return (Path(local) if local else home / "AppData" / "Local") / "Thoughts" / "server.json"
+    data = environ.get("XDG_DATA_HOME")
+    return (Path(data) if data else home / ".local" / "share") / "Thoughts" / "server.json"
 
 
 def is_loopback_host(host: str) -> bool:
@@ -251,9 +362,10 @@ def stored_token_origin(settings: dict, token: str) -> str:
     return recorded("*")[0] or saved
 
 
-def load_config(environ=None, keychain: Callable[[], str | None] = keychain_token, home: Path | None = None) -> Config:
+def load_config(environ=None, keychain: Callable[[], str | None] = stored_token, home: Path | None = None,
+                platform: str | None = None) -> Config:
     environ = os.environ if environ is None else environ
-    path = (home or Path.home()) / "Library/Application Support/Thoughts/server.json"
+    path = server_settings_path(home, environ, platform)
     try:
         settings = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -278,12 +390,12 @@ def load_config(environ=None, keychain: Callable[[], str | None] = keychain_toke
         # (a changed server.json, or a THOUGHTS_SERVER_URL override).
         issued_for = stored_token_origin(settings, token) if token else ""
         if issued_for and issued_for != url_origin(url):
-            raise AgentNoteError("no_credentials", f"The device token stored on this Mac was issued for {issued_for} and is not sent to "
+            raise AgentNoteError("no_credentials", f"The device token stored on {this_computer()} was issued for {issued_for} and is not sent to "
                                                    f"{url_origin(url) or url}. Set THOUGHTS_TOKEN for that server, or store its token with "
                                                    f"thoughtsctl store-secret --account {KEYCHAIN_ACCOUNT}.")
     if not token:
-        raise AgentNoteError("no_credentials", "No Thoughts device token: set THOUGHTS_TOKEN, or pair this Mac in Thoughts "
-                                               "(Keychain item thoughts-server / thoughts-mac).")
+        raise AgentNoteError("no_credentials", f"No Thoughts device token: set THOUGHTS_TOKEN, or sign in to Thoughts on {this_computer()} "
+                                               f"({token_store_name()}).")
     return Config(url.rstrip("/"), token)
 
 
@@ -869,9 +981,28 @@ class RenderServer:
         self.close()
 
 
-def chrome_path(environ=None) -> str:
+def chrome_candidates(environ=None, platform: str | None = None) -> list[Path]:
+    """Where a Chromium browser for rendering notes is looked for on Windows: Google Chrome (installed for
+    everyone or for this user), then Microsoft Edge, which every Windows 10 and 11 has."""
     environ = os.environ if environ is None else environ
-    return environ.get("THOUGHTS_CHROME") or CHROME_DEFAULT
+    if (platform or sys.platform) != "win32":
+        return []
+    roots = [environ.get(name) for name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+    chrome = [Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe" for root in roots if root]
+    edge = [Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe" for root in roots[:2] if root]
+    return chrome + edge
+
+
+def chrome_path(environ=None, platform: str | None = None) -> str:
+    environ = os.environ if environ is None else environ
+    if environ.get("THOUGHTS_CHROME"):
+        return environ["THOUGHTS_CHROME"]
+    candidates = chrome_candidates(environ, platform)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    # Windows without either: Edge's usual place, which the error then names.
+    return str(candidates[-1]) if candidates else CHROME_DEFAULT
 
 
 def chrome_command(chrome: str, profile: Path, url: str, height: int, screenshot: Path | None = None,
@@ -894,8 +1025,10 @@ def chrome_command(chrome: str, profile: Path, url: str, height: int, screenshot
         every request, and Chromium resolves no host a page names (only its own service hosts).
     """
     linux = (platform or sys.platform).startswith("linux")
+    windows = (platform or sys.platform) == "win32"
     nice = "/usr/bin/nice" if os.path.exists("/usr/bin/nice") else "nice"
-    argv = [nice, "-n", "10", chrome, "--headless=new", f"--user-data-dir={profile}", "--hide-scrollbars",
+    # Windows has no nice: Chrome or Edge runs at normal priority there.
+    argv = ([] if windows else [nice, "-n", "10"]) + [chrome, "--headless=new", f"--user-data-dir={profile}", "--hide-scrollbars",
             f"--force-device-scale-factor={SCALE}", f"--window-size={PAGE_WIDTH},{height}",
             f"--virtual-time-budget={budget_ms}", "--use-mock-keychain", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--disable-sync", "--disable-background-networking", "--disable-component-update",
@@ -911,13 +1044,21 @@ def chrome_command(chrome: str, profile: Path, url: str, height: int, screenshot
 
 
 def run_process(argv: list[str], timeout: float = CHROME_TIMEOUT) -> tuple[int, bytes, bytes]:
-    """Run Chrome in its own process group and kill the whole group on timeout."""
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, start_new_session=True)
+    """Run Chrome in its own process group and kill the whole group on timeout (Windows: its process tree)."""
+    group = {"creationflags": CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, **group)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        if WINDOWS:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, timeout=30,
+                               stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
         with contextlib.suppress(OSError):
-            os.killpg(process.pid, signal.SIGKILL)
+            if WINDOWS:
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         raise AgentNoteError("render_failed", f"Chrome did not finish rendering within {timeout:.0f} s. {RENDER_HINT}") from None
     return process.returncode, stdout, stderr
@@ -1123,19 +1264,48 @@ def write_json(path: Path, value) -> None:
     atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+def lock_file(handle, blocking: bool = True) -> bool:
+    """An exclusive lock on an open file: flock, or on Windows msvcrt's lock of one byte at LOCK_OFFSET (so what
+    the file says stays readable). False when blocking is False and another process holds it."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            return True
+        except BlockingIOError:
+            return False
+    if msvcrt is not None:
+        descriptor = handle.fileno()
+        while True:
+            os.lseek(descriptor, LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if not blocking:
+                    return False
+                time.sleep(0.1)
+    return True
+
+
+def unlock_file(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(handle.fileno(), LOCK_OFFSET, os.SEEK_SET)
+        with contextlib.suppress(OSError):
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 @contextlib.contextmanager
 def folder_lock(root: Path):
     """Serializes writers (MCP servers, `watch`) on one folder; held only for local writes."""
     root.mkdir(parents=True, exist_ok=True)
-    if fcntl is None:
-        yield
-        return
     with open(root / ".lock", "a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        lock_file(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            unlock_file(handle)
 
 
 def slug(title: str) -> str:
@@ -1683,7 +1853,7 @@ class SyncHolder:
     def acquire(self) -> bool:
         if self.held:
             return True
-        if fcntl is None:     # Windows: one process at a time is assumed, as for folder_lock
+        if fcntl is None and msvcrt is None:     # no lock here: one process at a time is assumed
             self.held = True
             return True
         try:
@@ -1692,8 +1862,10 @@ class SyncHolder:
         except OSError:
             return False
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = lock_file(handle, blocking=False)
         except OSError:
+            locked = False
+        if not locked:
             handle.close()
             return False
         with contextlib.suppress(OSError):
@@ -1719,7 +1891,7 @@ class SyncHolder:
                 self.handle.seek(0)
                 self.handle.truncate()
             with contextlib.suppress(OSError):
-                fcntl.flock(self.handle, fcntl.LOCK_UN)
+                unlock_file(self.handle)
             self.handle.close()
         self.handle, self.held = None, False
 

@@ -2573,8 +2573,11 @@ void MainShellTest::testCopyForAgentInTheFileMenu()
     };
     forgetSessions();
     Thoughts::AgentNotes::Center::instance()->client()->setServer(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(notes.server.serverPort())), "secret");
+    // Whatever Claude Code this computer has: none here, so no "New session on this computer".
+    Thoughts::AgentSessionList::instance()->setClaudeFinder([] { return QString(); });
     const auto restoreServer = qScopeGuard([forgetSessions] {
         Thoughts::AgentNotes::Center::instance()->client()->setServer(QUrl(), QByteArray());
+        Thoughts::AgentSessionList::instance()->setClaudeFinder({});
         forgetSessions();
     });
     QMenu sendMenu;

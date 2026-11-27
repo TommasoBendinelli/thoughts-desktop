@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: 2026 Tommaso Bendinelli
+# What the Windows installer's Python brings for the Thoughts tools (tools/mcp/requirements.txt)
+# and the reply waker (tools/waker: the standard library only). pip resolves dependencies with the
+# builder's own platform markers, so the Windows-only ones are named here too. lock.json pins the
+# exact win_amd64 files of all of them; `lock.py` writes it (see README.md).
+mcp==1.30.0
+# mcp needs it on Windows (sys_platform == 'win32'); pip on Linux does not see that.
+pywin32==312

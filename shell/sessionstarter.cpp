@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "sessionstarter.h"
 
+#include "../part/claudecode.h"
 #include "../part/thoughtsplatform.h"
 #include "../part/thoughtsserveraddress.h"
 #include "commentcodexlauncher.h"
@@ -48,38 +49,6 @@ constexpr int MaxPromptArgumentCharacters = 24000;
 constexpr int MaxPromptArgumentCharacters = 200000;
 #endif
 
-QList<int> versionKey(const QString &text)
-{
-    QList<int> key;
-    for (const QString &part : text.split(QRegularExpression(QStringLiteral("[.-]")))) {
-        bool ok = false;
-        const int number = part.toInt(&ok);
-        key.append(ok ? number : 0);
-    }
-    return key;
-}
-
-#ifdef Q_OS_MACOS
-// The newest Claude Code the Claude app keeps: claude-code/<version>/claude.app or
-// claude-code/<version>/<build>/claude.app.
-QString bundledClaude()
-{
-    const QDir root(QDir::home().filePath(QStringLiteral("Library/Application Support/Claude/claude-code")));
-    QStringList versions = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    std::sort(versions.begin(), versions.end(), [](const QString &a, const QString &b) { return versionKey(a) > versionKey(b); });
-    const QString inside = QStringLiteral("claude.app/Contents/MacOS/claude");
-    for (const QString &version : std::as_const(versions)) {
-        const QDir versionDir(root.filePath(version));
-        if (QFileInfo(versionDir.filePath(inside)).isExecutable()) return versionDir.filePath(inside);
-        for (const QString &build : versionDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
-            const QString candidate = QDir(versionDir.filePath(build)).filePath(inside);
-            if (QFileInfo(candidate).isExecutable()) return candidate;
-        }
-    }
-    return {};
-}
-#endif
-
 bool isExecutableFile(const QString &path)
 {
     const QFileInfo info(path);
@@ -92,7 +61,7 @@ QString agentName(Agent agent)
     return agent == Agent::Codex ? QStringLiteral("Codex") : QStringLiteral("Claude Code");
 }
 
-PageDecision decidePage(const AgentNotes::Note &page, const QDateTime &nowUtc, const QSet<QString> &handled)
+PageDecision decidePage(const AgentNotes::Note &page, const QDateTime &nowUtc, const QSet<QString> &handled, const QString &computerId)
 {
     PageDecision decision;
     if (!page.isPhonePage()) {
@@ -118,6 +87,20 @@ PageDecision decidePage(const AgentNotes::Note &page, const QDateTime &nowUtc, c
     }
     if (page.createdAt.secsTo(nowUtc) > MaxPageAgeSeconds) {
         decision.why = QStringLiteral("older than 15 minutes");
+        return decision;
+    }
+    // Where it runs: any of the person's computers (none said: the phone before it could choose),
+    // this one only, or the Thoughts server, which starts its own.
+    const QString where = page.origin.value(QLatin1String("where")).toString().trimmed().toLower();
+    if (where == AgentSessions::oneComputerWhere()) {
+        const QString named = page.origin.value(QLatin1String("computer")).toString().trimmed();
+        if (named.isEmpty() || named != computerId) {
+            decision.why = QStringLiteral("for another computer");
+            return decision;
+        }
+        decision.askedHere = true;
+    } else if (!where.isEmpty() && where != QLatin1String("computer")) {
+        decision.why = QStringLiteral("for %1, not a computer").arg(where.left(40));
         return decision;
     }
     const QString agent = page.origin.value(QLatin1String("agent")).toString().trimmed().toLower();
@@ -161,16 +144,22 @@ AskOutcome outcomeOf(AskAnswer answer)
     return {false, std::nullopt};
 }
 
-QString sessionName(const QDateTime &local)
+QString sessionName(const QDateTime &local, bool askedHere)
 {
-    return QStringLiteral("Study session · %1").arg(QLocale::c().toString(local, QStringLiteral("d MMM HH:mm")));
+    return (askedHere ? QStringLiteral("Thoughts session · %1") : QStringLiteral("Study session · %1")).arg(QLocale::c().toString(local, QStringLiteral("d MMM HH:mm")));
 }
 
-QString promptHeader(Agent agent, const QString &computer, const QDateTime &local, const QString &pageId)
+QString promptHeader(Agent agent, const QString &computer, const QDateTime &local, const QString &pageId, bool askedHere)
 {
-    QString header = QStringLiteral("[Thoughts on %1 started this session at %2 because the owner tapped Start on their phone's "
-                                    "“Start a new study session” (page %3). Their prompt for it follows.")
-                         .arg(computer, QLocale::c().toString(local, QStringLiteral("HH:mm")), pageId);
+    QString header = askedHere ? QStringLiteral("[Thoughts on %1 started this session at %2 because the owner chose “New session on this computer” "
+                                                "in Send to Agent or Ask Agent (page %3). What they sent follows: what Copy for agent copies from the "
+                                                "page they read, or their question about it. Nobody watches this session: answer the owner with "
+                                                "Thoughts notes (send_note). If what follows only gives you the page, send a short note that you have "
+                                                "it and wait for their request.")
+                                     .arg(computer, QLocale::c().toString(local, QStringLiteral("HH:mm")), pageId)
+                               : QStringLiteral("[Thoughts on %1 started this session at %2 because the owner tapped Start on their phone's "
+                                                "“Start a new study session” (page %3). Their prompt for it follows.")
+                                     .arg(computer, QLocale::c().toString(local, QStringLiteral("HH:mm")), pageId);
     if (agent == Agent::Codex) {
         header += QStringLiteral(" You run non-interactively (codex exec): nobody answers questions here, so answer the owner with Thoughts notes.");
     }
@@ -211,9 +200,7 @@ QString sessionIdFromAgents(const QByteArray &json, const QString &shortId)
 
 std::optional<bool> claudeLoggedIn(const QByteArray &authStatusJson)
 {
-    const QJsonValue loggedIn = QJsonDocument::fromJson(authStatusJson.trimmed()).object().value(QLatin1String("loggedIn"));
-    if (!loggedIn.isBool()) return std::nullopt;
-    return loggedIn.toBool();
+    return ClaudeCode::loggedIn(authStatusJson);
 }
 
 QString codexThreadId(const QByteArray &jsonLines)
@@ -246,67 +233,22 @@ ClaudeFailure classifyClaudeFailure(const QString &output)
 
 QStringList claudeCandidates()
 {
-    QStringList candidates;
-    const QDir home = QDir::home();
-#ifdef Q_OS_WIN
-    candidates.append(home.filePath(QStringLiteral(".local/bin/claude.exe")));
-    // QStandardPaths tries PATHEXT's suffixes, as `where claude` does.
-    candidates.append(QStandardPaths::findExecutable(QStringLiteral("claude")));
-    candidates.append(QDir(qEnvironmentVariable("APPDATA")).filePath(QStringLiteral("npm/claude.cmd")));
-#else
-    candidates.append(QStandardPaths::findExecutable(QStringLiteral("claude")));
-    candidates.append({home.filePath(QStringLiteral(".local/bin/claude")),
-                       QStringLiteral("/opt/homebrew/bin/claude"),
-                       QStringLiteral("/usr/local/bin/claude"),
-                       home.filePath(QStringLiteral(".npm-global/bin/claude"))});
-#ifdef Q_OS_MACOS
-    candidates.append(bundledClaude());
-#endif
-#endif
-    candidates.removeAll(QString());
-    candidates.removeDuplicates();
-    return candidates;
+    return ClaudeCode::candidates();
 }
 
 QString findClaude()
 {
-    for (const QString &candidate : claudeCandidates()) {
-        if (isExecutableFile(candidate)) return QFileInfo(candidate).absoluteFilePath();
-    }
-    return {};
+    return ClaudeCode::find();
 }
 
 bool isBatchFile(const QString &program)
 {
-    return program.endsWith(QLatin1String(".cmd"), Qt::CaseInsensitive) || program.endsWith(QLatin1String(".bat"), Qt::CaseInsensitive);
+    return ClaudeCode::isBatchFile(program);
 }
 
 QProcessEnvironment agentEnvironment(const QString &executable, QProcessEnvironment base)
 {
-    static const QStringList dropped {QStringLiteral("CLAUDE_CODE_"), QStringLiteral("CLAUDECODE"), QStringLiteral("CLAUDE_AGENT_SDK"),
-                                      QStringLiteral("CLAUDE_PID"), QStringLiteral("CLAUDE_EFFORT"), QStringLiteral("ANTHROPIC_")};
-    const QStringList keys = base.keys();
-    for (const QString &key : keys) {
-        if (std::any_of(dropped.cbegin(), dropped.cend(), [&key](const QString &prefix) { return key.startsWith(prefix, Qt::CaseInsensitive); }))
-            base.remove(key);
-    }
-#ifdef Q_OS_WIN
-    const QChar separator = QLatin1Char(';');
-    const QStringList extra {executable.isEmpty() ? QString() : QDir::toNativeSeparators(QFileInfo(executable).absolutePath())};
-#else
-    const QChar separator = QLatin1Char(':');
-    const QStringList extra {executable.isEmpty() ? QString() : QFileInfo(executable).absolutePath(),
-                             QDir::home().filePath(QStringLiteral(".local/bin")),
-                             QStringLiteral("/opt/homebrew/bin"),
-                             QStringLiteral("/usr/local/bin")};
-    if (!base.contains(QStringLiteral("HOME"))) base.insert(QStringLiteral("HOME"), QDir::homePath());
-#endif
-    QStringList path = base.value(QStringLiteral("PATH")).split(separator, Qt::SkipEmptyParts);
-    for (auto it = extra.crbegin(); it != extra.crend(); ++it) {
-        if (!it->isEmpty() && !path.contains(*it)) path.prepend(*it);
-    }
-    base.insert(QStringLiteral("PATH"), path.join(separator));
-    return base;
+    return ClaudeCode::environment(executable, std::move(base));
 }
 
 QByteArray noticeImage(const QString &title, const QString &message)
@@ -362,6 +304,12 @@ void writeFile(const QString &path, const QByteArray &contents)
     if (file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size()) file.commit();
 }
 
+// How the owner asks again: on the phone, or here.
+QString startAgain(bool askedHere)
+{
+    return askedHere ? i18n("choose New session on this computer again") : i18n("tap Start again");
+}
+
 [[maybe_unused]] QString shellQuote(const QString &value)
 {
     QString escaped = value;
@@ -374,6 +322,7 @@ struct SessionStarter::Job {
     QString pageId;
     QString prompt;
     Agent agent = Agent::Claude;
+    bool askedHere = false;
     QDateTime startedAt;  // local
     QString name;
     QString folder;
@@ -435,6 +384,11 @@ QDateTime SessionStarter::now() const
 QString SessionStarter::folder() const
 {
     return m_options.folder.isEmpty() ? AgentSessions::sessionsFolder() : m_options.folder;
+}
+
+QString SessionStarter::computerId() const
+{
+    return m_options.computerId.isEmpty() ? AgentSessions::computerId() : m_options.computerId;
 }
 
 QString SessionStarter::computer() const
@@ -519,7 +473,7 @@ void SessionStarter::pagesAnswered(const AgentNotes::Client::PagesResult &result
 void SessionStarter::consider(const AgentNotes::Note &page)
 {
     if (!m_stateLoaded) loadState();
-    const PageDecision decision = decidePage(page, now(), m_handled);
+    const PageDecision decision = decidePage(page, now(), m_handled, computerId());
     if (!decision.act) {
         if (decision.startSession && !m_handled.contains(page.id)) {
             remember(page.id);
@@ -532,8 +486,13 @@ void SessionStarter::consider(const AgentNotes::Note &page)
     job->pageId = page.id;
     job->prompt = page.message.trimmed();
     job->agent = decision.agent;
-    DeveloperLog::record(QStringLiteral("session_starter.request"), {{QStringLiteral("agent"), agentName(job->agent)}});
-    whenUnclaimed(job, [this, job] { decideConsent(job); });
+    job->askedHere = decision.askedHere;
+    DeveloperLog::record(QStringLiteral("session_starter.request"), {{QStringLiteral("agent"), agentName(job->agent)}, {QStringLiteral("asked_here"), job->askedHere}});
+    // Asked for here, by the person at this computer: no question (their phone's choice is for the phone).
+    whenUnclaimed(job, [this, job] {
+        if (job->askedHere) launch(job);
+        else decideConsent(job);
+    });
 }
 
 void SessionStarter::whenUnclaimed(const JobPointer &job, std::function<void()> then)
@@ -636,7 +595,7 @@ void SessionStarter::showUntrusted(const QString &folder, const QString &claude)
         return;
     }
     auto *box = new QMessageBox(QMessageBox::Information, i18n("Trust the Study Sessions Folder"),
-                                i18n("Claude Code must trust %1 once: open a terminal there, run claude, accept, then tap Start again.", QDir::toNativeSeparators(folder)),
+                                i18n("Claude Code must trust %1 once: open a terminal there, run claude, accept, then start the session again.", QDir::toNativeSeparators(folder)),
                                 QMessageBox::Close);
     box->setObjectName(QStringLiteral("sessionStartUntrusted"));
     box->setInformativeText(i18n("Open Terminal Here opens a terminal in that folder and starts Claude Code there, which asks whether you trust the folder."));
@@ -665,7 +624,7 @@ bool SessionStarter::openTerminalHere(const QString &folder, const QString &clau
     QString text = QStringLiteral("#!/bin/zsh\ncd %1 || exit 1\n").arg(shellQuote(folder));
     if (!claude.isEmpty()) {
         text += QStringLiteral("print -r -- %1\nexec %2\n")
-                    .arg(shellQuote(QStringLiteral("Claude Code asks once whether you trust this folder. Accept, then type /exit and tap Start again on your phone.")),
+                    .arg(shellQuote(QStringLiteral("Claude Code asks once whether you trust this folder. Accept, then type /exit and start the session again.")),
                          shellQuote(claude));
     } else {
         text += QStringLiteral("exec /bin/zsh -l\n");
@@ -688,11 +647,11 @@ bool SessionStarter::openTerminalHere(const QString &folder, const QString &clau
 void SessionStarter::launch(const JobPointer &job)
 {
     job->startedAt = now().toLocalTime();
-    job->name = sessionName(job->startedAt);
+    job->name = sessionName(job->startedAt, job->askedHere);
     job->folder = folder();
     if (job->prompt.isEmpty()) {
         tellNotStarted(job, QStringLiteral("failed"), i18n("No study session started"),
-                       i18n("Thoughts on %1 started no study session: the request from your phone held no prompt.", computer()));
+                       i18n("Thoughts on %1 started no study session: the request held no prompt.", computer()));
         return;
     }
     if (!QDir().mkpath(job->folder)) {
@@ -714,8 +673,8 @@ void SessionStarter::launchClaude(const JobPointer &job)
     const auto notInstalled = [this, job] {
         tellNotStarted(job, QStringLiteral("not_installed"), i18n("Claude Code is not on %1", computer()),
                        i18n("Thoughts on %1 could not find Claude Code, so no study session started there. Install Claude Code on %1 (claude.com/claude-code), "
-                            "sign in with your Claude subscription by running claude once, then tap Start again.",
-                            computer()));
+                            "sign in with your Claude subscription by running claude once, then %2.",
+                            computer(), startAgain(job->askedHere)));
     };
     if (job->executable.isEmpty()) {
         notInstalled();
@@ -731,8 +690,8 @@ void SessionStarter::launchClaude(const JobPointer &job)
             if (claudeLoggedIn(result.output) == false) {
                 tellNotStarted(job, QStringLiteral("signed_out"), i18n("Claude Code is signed out on %1", computer()),
                                i18n("Claude Code on %1 is not signed in, so no study session started there. On %1, open a terminal, run claude and sign in "
-                                    "with /login (your Claude subscription), then tap Start again.",
-                                    computer()));
+                                    "with /login (your Claude subscription), then %2.",
+                                    computer(), startAgain(job->askedHere)));
                 return;
             }
             startClaudeSession(job);
@@ -741,7 +700,7 @@ void SessionStarter::launchClaude(const JobPointer &job)
 
 void SessionStarter::startClaudeSession(const JobPointer &job)
 {
-    const QString header = promptHeader(Agent::Claude, computer(), job->startedAt, job->pageId);
+    const QString header = promptHeader(Agent::Claude, computer(), job->startedAt, job->pageId, job->askedHere);
     QString prompt = header + QStringLiteral("\n\n") + job->prompt;
     // cmd.exe parses a batch file's command line (and ends it at a line break), and Windows command
     // lines are short: the prompt then goes in a file of the folder, and the argument only names it.
@@ -775,20 +734,20 @@ void SessionStarter::startClaudeSession(const JobPointer &job)
         case ClaudeFailure::Untrusted:
             tellNotStarted(job, QStringLiteral("untrusted"), i18n("Claude Code must trust a folder on %1", computer()),
                            i18n("No study session started: Claude Code on %1 does not trust %2 yet. On %1, open a terminal in that folder, run claude and accept "
-                                "(Thoughts there shows a button for it), then tap Start again.",
-                                computer(), QDir::toNativeSeparators(job->folder)));
+                                "(Thoughts there shows a button for it), then %3.",
+                                computer(), QDir::toNativeSeparators(job->folder), startAgain(job->askedHere)));
             showUntrusted(job->folder, job->executable);
             return;
         case ClaudeFailure::SignedOut:
             tellNotStarted(job, QStringLiteral("signed_out"), i18n("Claude Code is signed out on %1", computer()),
-                           i18n("Claude Code on %1 could not start the session because it is not signed in. On %1, run claude and sign in with /login, then tap Start again. "
+                           i18n("Claude Code on %1 could not start the session because it is not signed in. On %1, run claude and sign in with /login, then %3. "
                                 "It said: %2",
-                                computer(), output.right(300)));
+                                computer(), output.right(300), startAgain(job->askedHere)));
             return;
         case ClaudeFailure::TooOld:
             tellNotStarted(job, QStringLiteral("failed"), i18n("Claude Code is too old on %1", computer()),
-                           i18n("Claude Code at %2 on %1 cannot start background sessions. Update it (claude update), then tap Start again.", computer(),
-                                QDir::toNativeSeparators(job->executable)));
+                           i18n("Claude Code at %2 on %1 cannot start background sessions. Update it (claude update), then %3.", computer(),
+                                QDir::toNativeSeparators(job->executable), startAgain(job->askedHere)));
             return;
         case ClaudeFailure::Other:
             break;
@@ -846,7 +805,7 @@ void SessionStarter::startCodexSession(const JobPointer &job)
     const QString promptPath = QDir(job->runDirectory).filePath(QStringLiteral("prompt.md"));
     job->outputPath = QDir(job->runDirectory).filePath(QStringLiteral("output.jsonl"));
     job->errorsPath = QDir(job->runDirectory).filePath(QStringLiteral("errors.log"));
-    writeFile(promptPath, (promptHeader(Agent::Codex, computer(), job->startedAt, job->pageId) + QStringLiteral("\n\n") + job->prompt).toUtf8());
+    writeFile(promptPath, (promptHeader(Agent::Codex, computer(), job->startedAt, job->pageId, job->askedHere) + QStringLiteral("\n\n") + job->prompt).toUtf8());
     QProcess process;
     process.setProgram(job->executable);
     process.setArguments(codexArguments(job->folder));
@@ -951,18 +910,23 @@ void SessionStarter::tellStarted(const JobPointer &job)
                        "listening for replies yet: replies to its notes go to whatever answers replies that no session takes. Its output: %5.",
                        job->name, computer(), time, where, QDir::toNativeSeparators(job->outputPath));
         if (!job->sessionId.isEmpty()) message += QLatin1Char(' ') + i18n("To continue it on %1: codex resume %2", computer(), job->sessionId);
+    } else if (job->askedHere) {
+        message = i18n("“%1” started on %2 at %3 with Claude Code (your own sign-in), in %4, with what you sent from Thoughts. It answers with notes, "
+                       "and Send to Agent and Ask Agent send to it next. To see it on %2: claude attach %5",
+                       job->name, computer(), time, where, job->shortId);
     } else {
         message = i18n("“%1” started on %2 at %3 with Claude Code (your own sign-in), in %4. It works from your prompt and answers with notes. "
                        "To see it on %2: claude attach %5",
                        job->name, computer(), time, where, job->shortId);
     }
+    if (job->agent == Agent::Claude) Q_EMIT sessionStarted(job->pageId, job->sessionId, job->name);
     QJsonObject origin {{QStringLiteral("agent"), QStringLiteral("thoughts-desktop")},
                         {QStringLiteral("kind"), QStringLiteral("session_started")},
                         {QStringLiteral("machine"), computer()},
                         {QStringLiteral("item_id"), job->pageId},
                         {QStringLiteral("session_agent"), job->agent == Agent::Codex ? QStringLiteral("codex") : QStringLiteral("claude")},
                         {QStringLiteral("conversation_id"), job->sessionId.isEmpty() ? QJsonValue() : QJsonValue(job->sessionId)}};
-    sendNote(job, i18n("Study session started"), message, origin, QStringLiteral("started"));
+    sendNote(job, job->askedHere ? i18n("Session started") : i18n("Study session started"), message, origin, QStringLiteral("started"));
 }
 
 void SessionStarter::tellNotStarted(const JobPointer &job, const QString &outcome, const QString &title, const QString &message)

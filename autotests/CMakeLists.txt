@@ -265,7 +265,7 @@ if(BUILD_DESKTOP)
 
     ecm_add_test(agentnotestest.cpp ../shell/agentnotes.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/developerlog.cpp ../shell/serverlink.cpp
         TEST_NAME "agentnotestest"
-        LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n thoughtsplatform
+        LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n KF6::ConfigCore thoughtsplatform thoughtsclaudecode
     )
 
     # The phone's Start a new study session on this computer: which pages are acted on, the
@@ -273,7 +273,14 @@ if(BUILD_DESKTOP)
     # fake claude and codex: the pages long poll, the claim and the note.
     ecm_add_test(sessionstartertest.cpp ../shell/sessionstarter.cpp ../shell/agentnotes.cpp ../shell/agentnotedrawing.cpp ../shell/commentcodexlauncher.cpp ../shell/developerlog.cpp ../shell/serverlink.cpp
         TEST_NAME "sessionstartertest"
-        LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n KF6::ConfigCore thoughtsplatform
+        LINK_LIBRARIES Qt6::Widgets Qt6::Network Qt6::Test KF6::I18n KF6::ConfigCore thoughtsplatform thoughtsclaudecode
+    )
+
+    # Claude Code on the person's own computer: the tools an installation brings, Set up Claude Code
+    # against a fake claude, and the app's supervision of the reply waker against a fake Python.
+    ecm_add_test(claudecodetest.cpp ../shell/wakersupervisor.cpp ../shell/developerlog.cpp
+        TEST_NAME "claudecodetest"
+        LINK_LIBRARIES Qt6::Widgets Qt6::Test KF6::I18n KF6::ConfigCore thoughtsplatform thoughtsclaudecode
     )
 
     ecm_add_test(todocommandstest.cpp ../shell/todocommands.cpp ../shell/thoughtscommandprotocol.cpp
@@ -333,9 +340,9 @@ if(BUILD_DESKTOP)
         LINK_LIBRARIES Qt6::Core Qt6::Test okulardocscommentsync
     )
 
-    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/sessionstarter.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/projectsharedialog.cpp ../shell/problemreportdialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
+    ecm_add_test(mainshelltest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/sessionstarter.cpp ../shell/wakersupervisor.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/projectsharedialog.cpp ../shell/problemreportdialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../shell/shell.qrc ../gui/recentitemsmodel.cpp closedialoghelper.cpp
         TEST_NAME "mainshelltest"
-        LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
+        LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone thoughtsclaudecode
     )
     target_compile_definitions(mainshelltest PRIVATE OKULAR_BINARY="$<TARGET_FILE:thoughts>")
     # thoughts generates shell/ui_welcomescreen.h, which the test compiles. The
@@ -372,9 +379,9 @@ if(BUILD_DESKTOP)
 endif()
 
 if(BUILD_DESKTOP)
-    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/sessionstarter.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/projectsharedialog.cpp ../shell/problemreportdialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
+    ecm_add_test(annotationtoolbartest.cpp ../shell/activeparttoolbarcontroller.cpp ../shell/agentnotes.cpp ../shell/serverlink.cpp ../shell/syncstatewatch.cpp ../shell/agentnoteswindow.cpp ../shell/agentnotecomposer.cpp ../shell/agentnotedrawing.cpp ../shell/okular_main.cpp ../shell/buildterminallauncher.cpp ../shell/sessionstarter.cpp ../shell/wakersupervisor.cpp ../shell/commentcodexlauncher.cpp ../shell/commentsoverview.cpp ../shell/appsignin.cpp ../shell/signindialog.cpp ../shell/projectsharedialog.cpp ../shell/problemreportdialog.cpp ../shell/librarysearch.cpp ../shell/websiteimportdialog.cpp ../shell/documentstyleinformation.cpp ../shell/documentsyncpresentation.cpp ../shell/reviewoverview.cpp ../shell/reviewdraftsync.cpp ../shell/reviewfeedbackpanel.cpp ../shell/reviewstore.cpp ../shell/reviewtagplan.cpp ../shell/reviewdocumenttools.cpp ../shell/shellutils.cpp ../shell/shell.cpp ../shell/syncjournal.cpp ../shell/todocommands.cpp ../shell/reviewcardeditor.cpp ../shell/reviewcardmerge.cpp ../shell/developerlog.cpp ../shell/developerlogdialog.cpp ../shell/thoughtscommandprotocol.cpp ../shell/welcomescreen.cpp ../shell/updatecheck.cpp ../shell/visualstudiocode.cpp ../gui/recentitemsmodel.cpp closedialoghelper.cpp ../shell/welcomescreen.ui
         TEST_NAME "annotationtoolbartest"
-        LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone
+        LINK_LIBRARIES OpenSSL::Crypto Qt6::Concurrent Qt6::Network Qt6::Sql Qt6::Test Poppler::Qt6 okularpart okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone thoughtsclaudecode
     )
 
     if(APPLE)

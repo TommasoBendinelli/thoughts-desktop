@@ -358,6 +358,12 @@ if(BUILD_DESKTOP)
     set_target_properties(okulardocscommentsync PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(okulardocscommentsync PUBLIC Qt6::Core Qt6::Sql KF6::Archive okularcore thoughtsplatform thoughtsagentproposals)
 
+    # The person's own Claude Code: where claude is, and Set up Claude Code, which registers the
+    # Thoughts tools an installation brings (Settings > Agent prompts; the app's waker supervisor).
+    add_library(thoughtsclaudecode STATIC part/claudecode.cpp)
+    set_target_properties(thoughtsclaudecode PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(thoughtsclaudecode PUBLIC Qt6::Core PRIVATE KF6::I18n)
+
     # Import sources › From Git repository clones with libgit2, so no installed Git
     # is needed (GPL-2.0 with the linking exception). 1.7 adds server timeouts.
     find_package(LibGit2 1.7 REQUIRED)
@@ -776,7 +782,7 @@ kconfig_add_kcfg_files(okularpart_SRCS GENERATE_MOC conf/settings.kcfgc)
 add_library(okularpart SHARED ${okularpart_SRCS})
 generate_export_header(okularpart BASE_NAME okularpart)
 
-target_link_libraries(okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsreadaloud thoughtshtmlview
+target_link_libraries(okularpart okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsreadaloud thoughtshtmlview thoughtsclaudecode
     ${MATH_LIB}
     Qt6::Svg
     KF6::Archive

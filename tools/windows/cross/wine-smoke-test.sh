@@ -37,6 +37,23 @@ for command in "thoughtsctl.exe knowledge-levels" "thoughts-publish-sources.exe 
     fi
 done
 
+# The Python of the Thoughts tools and the reply waker (tools/windows/agent-tools): what the tools need,
+# Windows' APIs as the tools use them (Wine's here), the MCP server's answer, the waker.
+python=$(ls -d "$app"/python-*/python.exe 2>/dev/null | head -1)
+if [ -z "$python" ] || [ ! -f "$app/tools/agent-tools.json" ]; then
+    echo "FAIL: no Thoughts tools' Python in $app"; status=1
+else
+    echo "agent tools: $(du -sh "$(dirname "$python")" | cut -f1) in $(basename "$(dirname "$python")"), $(du -sh "$app/tools" | cut -f1) of tools"
+    cp "$(dirname "$0")/agent-tools-check.py" "$OUT/agent-tools-check.py"
+    timeout 300 wine "$python" -X utf8 -B "$(winepath -w "$OUT/agent-tools-check.py")" "$(winepath -w "$app")" > "$OUT/agent-tools.txt" 2>&1
+    code=$?
+    if grep -q '^agent tools: ok' "$OUT/agent-tools.txt"; then
+        echo "ok: the Thoughts tools' Python:"; grep -v '^agent tools: ok' "$OUT/agent-tools.txt" | grep -vE '^[0-9a-f]{4}:(err|fixme)' | sed 's/^/    /' | head -20
+    else
+        echo "FAIL: the Thoughts tools' Python (exit $code):"; tail -15 "$OUT/agent-tools.txt"; status=1
+    fi
+fi
+
 wine "$app/bin/thoughts.exe" > "$OUT/thoughts.log" 2>&1 &
 for _ in $(seq 60); do
     sleep 2
@@ -55,4 +72,5 @@ wineserver -k 2>/dev/null; sleep 2
 wine "$app/uninstall.exe" /S _?="$(winepath -w "$app")"
 echo "uninstaller exit $?"
 [ ! -e "$app/bin" ] && echo "ok: uninstalled" || { echo "FAIL: uninstall left $app/bin"; status=1; }
+ls -d "$app"/python-* "$app/tools" >/dev/null 2>&1 && { echo "FAIL: uninstall left the Thoughts tools"; status=1; } || echo "ok: the Thoughts tools uninstalled"
 exit $status

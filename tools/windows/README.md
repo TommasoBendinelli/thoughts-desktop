@@ -178,7 +178,18 @@ All commands run in a normal (not administrator) PowerShell.
    - If you unpacked sources in step 6, it adopts them; they match Fedora.
    - On a new server the Library is empty. Create a Project with **Add project…** in the Library and press Sync again.
 
-## Agents (MCP)
+## Agents on this PC (Claude Code)
+
+The installer brings what a person needs to use their own Claude Code with Thoughts on this PC, as the owner does on a Mac, with nothing else to install but Claude Code:
+
+- **A Python of its own** (`python-<id>\`, 57 MB installed; with it the installer grew from 56 MB to 73 MB): the official CPython embeddable package for Windows amd64 from python.org and the win_amd64 wheels the tools need from PyPI, every file pinned by its SHA-256 in `agent-tools/lock.json` (`agent-tools/agent_tools.py`; `<id>` changes with the pinned files, so an update never writes over the Python a running Claude Code session holds).
+- **The Thoughts tools** (`tools\mcp\`) and **the reply waker** (`tools\waker\`), with `tools\agent-tools.json` naming them.
+- **Settings › Agent prompts › Claude Code on this computer**: *Set up Claude Code* finds `claude` (the native installer's `%USERPROFILE%\.local\bin\claude.exe`, then `PATH`, then npm's `claude.cmd`) and runs `claude mcp add --scope user thoughts -e THOUGHTSCTL=<bin\thoughtsctl.exe> -- <python-<id>\python.exe> -X utf8 -B <tools\mcp\server.py>`, replacing an earlier `thoughts` entry. The tools read this PC's Thoughts sign-in from Windows Credential Manager (`thoughts-server/thoughts-windows`) and the server address from `%LOCALAPPDATA%\Thoughts\server.json`. After an update that brings another Python, Thoughts registers them again by itself.
+- *Let Claude Code sessions on this computer answer* (on once Claude Code is set up): while Thoughts runs and is signed in, it runs the reply waker with `pythonw.exe` (home `%LOCALAPPDATA%\Thoughts\reply-waker`: `config.json`, `state.db`, `logs\waker.log`). The waker registers this PC's Claude Code sessions (from `%USERPROFILE%\.claude\sessions`), so they show in Send to Agent and Ask Agent, and brings them the pages and replies that are theirs: a running one by a message, a closed one by resuming it in its folder. Thoughts starts it again when it ends, stops it when Thoughts quits (it ends with Thoughts even after a crash), and never lets it start sessions: Send to Agent's *New session on this computer* and the phone's *Start a new study session* are started by Thoughts itself, in `%USERPROFILE%\Thoughts Sessions`.
+
+Once on the PC: install Claude Code and sign in (`claude` in a terminal), choose *Set up Claude Code*, and run `claude` once in `%USERPROFILE%\Thoughts Sessions` to trust that folder (Thoughts offers *Open Terminal Here* when a start finds it untrusted). Uninstalling Thoughts leaves Claude Code's `thoughts` entry; `claude mcp remove --scope user thoughts` removes it.
+
+### Your own Python instead
 
 `tools/mcp/server.py` works on Windows. It finds `thoughtsctl.exe` on `PATH`, or at `C:\CraftRoot\bin\thoughtsctl.exe`; `THOUGHTSCTL` overrides both. It starts `thoughtsctl.exe` without flashing a console window. Set it up as on the Mac (`tools/mcp/README.md`), with a Windows virtual environment:
 

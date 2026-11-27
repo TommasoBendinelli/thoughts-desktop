@@ -37,6 +37,7 @@ set(okular_SRCS
    reviewcardmerge.cpp
    serverlink.cpp
    sessionstarter.cpp
+   wakersupervisor.cpp
    shell.cpp
    shellutils.cpp
    syncjournal.cpp
@@ -102,7 +103,7 @@ endif()
 
 add_executable(thoughts ${okular_SRCS})
 
-target_link_libraries(thoughts okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone OpenSSL::Crypto Poppler::Qt6 Qt6::Concurrent Qt6::Network Qt6::Sql KF6::I18n KF6::Parts KF6::WindowSystem KF6::Crash KF6::IconThemes KF6::KIOGui)
+target_link_libraries(thoughts okularcore okulardocscommentsync thoughtsclient thoughtsdesktopsync thoughtsgitclone thoughtsclaudecode OpenSSL::Crypto Poppler::Qt6 Qt6::Concurrent Qt6::Network Qt6::Sql KF6::I18n KF6::Parts KF6::WindowSystem KF6::Crash KF6::IconThemes KF6::KIOGui)
 if (TARGET Qt6::DBus)
     target_link_libraries(thoughts Qt6::DBus)
 endif()

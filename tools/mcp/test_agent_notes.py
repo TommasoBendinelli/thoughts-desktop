@@ -426,6 +426,104 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(agent_notes.notes_root({}), Path.home() / 'Thoughts/agent-notes')
 
 
+class FakeMsvcrt:
+    """msvcrt.locking: one byte at the descriptor's position, refused while another descriptor holds it."""
+
+    LK_NBLCK, LK_UNLCK = 2, 0
+
+    def __init__(self):
+        self.held = {}
+        self.calls = []
+
+    def locking(self, descriptor, mode, count):
+        where = (os.fstat(descriptor).st_ino, os.lseek(descriptor, 0, os.SEEK_CUR))
+        self.calls.append((mode, where[1], count))
+        if mode == self.LK_NBLCK:
+            if self.held.get(where, descriptor) != descriptor:
+                raise OSError(36, 'Resource deadlock avoided')
+            self.held[where] = descriptor
+        else:
+            self.held.pop(where, None)
+
+
+class WindowsTest(unittest.TestCase):
+    """The tools as on Windows, with fakes: Credential Manager, its paths, Edge, msvcrt's locks."""
+
+    def test_the_device_token_is_read_from_credential_manager_as_thoughts_stores_it(self):
+        asked = []
+
+        def read(target):
+            asked.append(target)
+            return stored
+        for stored, expected in ((b'device-token', 'device-token'),                       # Thoughts: UTF-8
+                                 ('device-token'.encode('utf-16-le'), 'device-token'),    # cmdkey, PowerShell: UTF-16
+                                 (b'\xef\xbb\xbfdevice-token\r\n', 'device-token'),        # a byte order mark piped in
+                                 (b'', None), (None, None)):
+            self.assertEqual(agent_notes.credential_manager_token(read), expected)
+        self.assertEqual(set(asked), {'thoughts-server/thoughts-windows'})
+        self.assertEqual(agent_notes.device_account('win32'), 'thoughts-windows')
+        self.assertEqual(agent_notes.device_account('darwin'), 'thoughts-mac')
+        self.assertIsNone(agent_notes.credential_manager_token(lambda target: (_ for _ in ()).throw(OSError('denied'))))
+
+    def test_server_json_is_where_thoughts_keeps_it(self):
+        home = Path('/home/alex')
+        self.assertEqual(agent_notes.server_settings_path(home, {'LOCALAPPDATA': 'C:/Users/alex/AppData/Local'}, 'win32'),
+                         Path('C:/Users/alex/AppData/Local/Thoughts/server.json'))
+        self.assertEqual(agent_notes.server_settings_path(home, {}, 'win32'), home / 'AppData/Local/Thoughts/server.json')
+        self.assertEqual(agent_notes.server_settings_path(home, {}, 'darwin'), home / 'Library/Application Support/Thoughts/server.json')
+        self.assertEqual(agent_notes.server_settings_path(home, {}, 'linux'), home / '.local/share/Thoughts/server.json')
+
+    def test_load_config_on_windows(self):
+        with tempfile.TemporaryDirectory() as home, unittest.mock.patch.object(agent_notes, 'KEYCHAIN_ACCOUNT', 'thoughts-windows'):
+            folder = Path(home) / 'AppData/Local/Thoughts'
+            folder.mkdir(parents=True)
+            server = 'https://example-server.test'
+            bound = {'thoughts-windows': {'origin': server, 'token_fingerprint': agent_notes.token_fingerprint('device-token')}}
+            (folder / 'server.json').write_text(json.dumps({'server_url': server, 'token_origins': bound}))
+            token = lambda: agent_notes.credential_manager_token(lambda target: b'device-token')  # noqa: E731
+            config = agent_notes.load_config({}, token, Path(home), 'win32')
+            self.assertEqual((config.server_url, config.token), (server, 'device-token'))
+            with self.assertRaises(agent_notes.AgentNoteError) as caught:
+                agent_notes.load_config({}, lambda: None, Path(home), 'win32')
+            self.assertEqual(caught.exception.error_code, 'no_credentials')
+
+    def test_notes_are_drawn_with_chrome_else_edge(self):
+        with tempfile.TemporaryDirectory() as root:
+            environ = {'PROGRAMFILES': f'{root}/pf', 'PROGRAMFILES(X86)': f'{root}/pf86', 'LOCALAPPDATA': f'{root}/local'}
+            edge = Path(root) / 'pf86/Microsoft/Edge/Application/msedge.exe'
+            edge.parent.mkdir(parents=True)
+            edge.write_text('')
+            self.assertEqual(agent_notes.chrome_path(environ, 'win32'), str(edge))
+            chrome = Path(root) / 'local/Google/Chrome/Application/chrome.exe'
+            chrome.parent.mkdir(parents=True)
+            chrome.write_text('')
+            self.assertEqual(agent_notes.chrome_path(environ, 'win32'), str(chrome))
+            self.assertEqual(agent_notes.chrome_path({**environ, 'THOUGHTS_CHROME': 'C:/chrome.exe'}, 'win32'), 'C:/chrome.exe')
+            self.assertEqual(agent_notes.chrome_candidates(environ, 'darwin'), [])
+        with tempfile.TemporaryDirectory() as root:
+            # Neither installed: Edge's usual place, never the Mac's Chrome.
+            environ = {'PROGRAMFILES': f'{root}/pf', 'PROGRAMFILES(X86)': f'{root}/pf86'}
+            self.assertEqual(agent_notes.chrome_path(environ, 'win32'), str(Path(root) / 'pf86/Microsoft/Edge/Application/msedge.exe'))
+        argv = agent_notes.chrome_command('C:/Edge/msedge.exe', Path('C:/profile'), 'http://127.0.0.1:1/', 400, platform='win32')
+        self.assertEqual(argv[0], 'C:/Edge/msedge.exe')  # no nice on Windows
+        self.assertIn('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', argv)
+
+    def test_folder_locks_are_msvcrt_locks(self):
+        fake = FakeMsvcrt()
+        with tempfile.TemporaryDirectory() as root, unittest.mock.patch.object(agent_notes, 'fcntl', None), \
+                unittest.mock.patch.object(agent_notes, 'msvcrt', fake):
+            first, second = agent_notes.SyncHolder(Path(root)), agent_notes.SyncHolder(Path(root))
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())      # one syncer per folder, also on Windows
+            self.assertIn('"pid"', (Path(root) / agent_notes.SYNC_LOCK).read_text())  # its text stays readable
+            first.release()
+            self.assertTrue(second.acquire())
+            second.release()
+            with agent_notes.folder_lock(Path(root)):
+                pass
+            self.assertTrue(all(offset == agent_notes.LOCK_OFFSET for _mode, offset, _count in fake.calls))
+
+
 class PathTest(unittest.TestCase):
     """Files an agent names (image_path, html_path, a PDF to import): never from private locations."""
 

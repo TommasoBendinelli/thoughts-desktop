@@ -47,6 +47,8 @@ Point the plugin's `.mcp.json` at absolute interpreter and adapter paths (for ex
 For Codex, also set `"tool_timeout_sec": 600`: proposal calls wait for a Sync, and Codex otherwise ends tool calls after its default timeout.
 Start a new agent task after an update to discover the updated tool catalog.
 
+On Windows the Thoughts installer brings these tools with a Python of its own (`python-<id>\python.exe` in the installation folder, with `mcp` and its dependencies; `tools\agent-tools.json` names it) and `tools\mcp\server.py`. Settings › Agent prompts › Set up Claude Code registers them for Claude Code (`claude mcp add --scope user thoughts -e THOUGHTSCTL=… -- <that python> -X utf8 -B <server.py>`, replacing an earlier `thoughts` entry). There the agent-note tools read the device token from Windows Credential Manager (the generic credential `thoughts-server/thoughts-windows`, which Thoughts writes when it signs in) and the server address from `%LOCALAPPDATA%\Thoughts\server.json`; notes are drawn with Google Chrome when it is installed, else with Microsoft Edge (`THOUGHTS_CHROME` chooses another); and the folder locks are `msvcrt` locks.
+
 The underlying CLI also works independently of MCP:
 
 ```sh

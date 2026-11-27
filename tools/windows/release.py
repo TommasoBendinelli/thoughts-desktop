@@ -10,6 +10,13 @@ are scanned for personal or private strings before they are packed
 
     python3 tools/windows/release.py                  # build + publish windows-YYYY.MM.DD.N
     python3 tools/windows/release.py --no-publish     # build only, keep the setup.exe locally
+    python3 tools/windows/release.py --no-publish --allow-unpushed --version 2026.11.27.90 --worktree wt-test
+                                                      # a test build of a branch in a worktree of its own;
+                                                      # with --version it never asks GitHub anything
+
+The installer also brings a Python of its own with the Thoughts tools and the reply waker
+(tools/windows/agent-tools/agent_tools.py): its pinned files are downloaded on the builder from
+python.org and PyPI (checked by SHA-256, kept in wincross/agent-tools-cache) and staged offline.
 
 The builder (tools/windows/cross/README.md) cross-compiles with clang-cl against KDE
 Craft's Windows libraries in a container; nothing heavy runs on the Mac.
@@ -27,6 +34,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -103,6 +111,8 @@ def main():
     parser.add_argument("--notes", help="release notes (default: commit subjects since the last release)")
     parser.add_argument("--no-publish", action="store_true", help="build the installer but publish nothing")
     parser.add_argument("--allow-unpushed", action="store_true", help="with --no-publish: build a dirty or unpushed tree")
+    parser.add_argument("--worktree", default="wt",
+                        help="the builder's worktree under wincross/ (default wt, the releases'); a test build of a branch uses its own")
     parser.add_argument("--builder", action="append",
                         help="SSH host of the Linux builder, repeatable; the first that answers builds (default: THOUGHTS_WINDOWS_BUILDERS)")
     parser.add_argument("--builder-root", default=os.environ.get("THOUGHTS_WINDOWS_BUILDER_ROOT"),
@@ -134,9 +144,14 @@ def main():
         problem = release_scan.source_problem(ROOT, repository)
         if problem:
             sys.exit(problem)
+        if args.worktree != "wt":
+            sys.exit("A published release is built in the worktree wt.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.worktree):
+        sys.exit("--worktree: letters, digits, '.', '_' and '-' only.")
     if not os.path.exists(os.path.join(args.sdk, "CMakeLists.txt")):
         sys.exit(f"No Thoughts server SDK at {args.sdk}; pass --sdk.")
-    tags = releases(repository)
+    # A build that is not published, with its version given, needs nothing from GitHub.
+    tags = [] if args.no_publish and args.version else releases(repository)
     version = args.version or next_version(tags)
     if f"windows-{version}" in tags:
         sys.exit(f"Release windows-{version} exists already.")
@@ -144,33 +159,41 @@ def main():
     host = builder(hosts)
     RB = builder_root(host, args.builder_root)
     W = f"{RB}/wincross"
+    WT = f"{W}/{args.worktree}"
     print(f"Building Thoughts {version} ({head[:9]}) on {host}, SDK {args.sdk}")
 
     excludes = ["--exclude", ".git", "--exclude", "build*/", "--exclude", ".claude"]
-    run(["ssh", host, f"mkdir -p {W}/wt/src {W}/wt/server/sdk {W}/dist {W}/logs"])
-    run(["rsync", "-a", "--delete", *excludes, ROOT + "/", f"{host}:{W}/wt/src/"])
-    run(["rsync", "-a", "--delete", args.sdk.rstrip("/") + "/", f"{host}:{W}/wt/server/sdk/cpp/"])
+    excludes += ["--exclude", "__pycache__/", "--exclude", ".pytest_cache/"]
+    run(["ssh", host, f"mkdir -p {WT}/src {WT}/server/sdk {W}/dist {W}/logs"])
+    run(["rsync", "-a", "--delete", *excludes, ROOT + "/", f"{host}:{WT}/src/"])
+    run(["rsync", "-a", "--delete", args.sdk.rstrip("/") + "/", f"{host}:{WT}/server/sdk/cpp/"])
     # This computer's own markers for the scan (an empty list when it has none); never in the repository.
     markers = release_scan.private_patterns()
-    run(["ssh", host, f"cat > {W}/wt/release-private-patterns.txt"], input="\n".join(p.decode() for p in markers.values()).encode())
+    run(["ssh", host, f"cat > {WT}/release-private-patterns.txt"], input="\n".join(p.decode() for p in markers.values()).encode())
     # The generic hits this computer's owner accepts, so the builder's scan judges as this computer's
     # would; a private marker is never accepted (release_scan.scan_bytes).
     release_scan.accepted_patterns()  # A broken line stops here, before the build.
     accepted = release_scan.accepted_lines()
-    run(["ssh", host, f"cat > {W}/wt/release-accepted.txt"], input="\n".join(accepted).encode())
+    run(["ssh", host, f"cat > {WT}/release-accepted.txt"], input="\n".join(accepted).encode())
 
     # Before packing: the installer may carry nothing personal. A build that is not published only warns.
     scan_outcome = " || echo 'These strings must be gone before this build may be published.'" if args.no_publish else ""
     podman = f"{RB}/bin/thoughts-desktop-podman run --rm --init --security-opt label=disable -e WINCROSS={W} -v {W}:{W}"
+    agent_tools = f"{WT}/src/tools/windows/agent-tools/agent_tools.py"
     script = f"""set -euo pipefail
-{podman} --network none -w {W}/wt {IMAGE} bash {W}/wt/src/tools/windows/cross/build-in-container.sh \\
-    {W}/wt/src {W}/wt/server/sdk/cpp {W}/wt/build {W}/wt/stage {version} {repository} \\
+{podman} --network none -w {WT} {IMAGE} bash {WT}/src/tools/windows/cross/build-in-container.sh \\
+    {WT}/src {WT}/server/sdk/cpp {WT}/build {WT}/stage {version} {repository} \\
     {shlex.quote(args.server_url)} {shlex.quote(args.legacy_server_url)} > {W}/logs/release-{version}.log 2>&1 \\
   || {{ grep -nE 'error:|CMake Error|FAILED' {W}/logs/release-{version}.log | head -20; tail -5 {W}/logs/release-{version}.log; exit 1; }}
-{podman} --network none {IMAGE} python3 {W}/wt/src/tools/windows/cross/stage-runtime.py {W}/wt/stage {W}/craft-win {W}/vcredist/x64 {W}/xwin-sdk {W}/wt/runtime
-{podman} --network none -e THOUGHTS_RELEASE_ACCEPTED={W}/wt/release-accepted.txt {IMAGE} python3 {W}/wt/src/tools/release_scan.py scan --patterns {W}/wt/release-private-patterns.txt {W}/wt/runtime{scan_outcome}
-{podman} --network none {NSIS_IMAGE} makensis -V2 -DVERSION={version} -DSTAGE={W}/wt/runtime \\
-    -DICON={W}/wt/src/icons/thoughts.ico -DOUTFILE={W}/dist/{setup} {W}/wt/src/tools/windows/installer/thoughts.nsi
+{podman} --network none {IMAGE} python3 {WT}/src/tools/windows/cross/stage-runtime.py {WT}/stage {W}/craft-win {W}/vcredist/x64 {W}/xwin-sdk {WT}/runtime
+# The Thoughts tools' and the waker's Python: its pinned files from python.org and PyPI (the only
+# step with a network), then into the runtime tree with the tools, offline.
+{podman} {IMAGE} python3 -I {agent_tools} fetch {W}/agent-tools-cache
+{podman} --network none {IMAGE} python3 -I {agent_tools} stage {W}/agent-tools-cache {WT}/src {WT}/runtime
+agent_python=python-$({podman} --network none {IMAGE} python3 -I {agent_tools} id)
+{podman} --network none -e THOUGHTS_RELEASE_ACCEPTED={WT}/release-accepted.txt {IMAGE} python3 {WT}/src/tools/release_scan.py scan --patterns {WT}/release-private-patterns.txt {WT}/runtime{scan_outcome}
+{podman} --network none {NSIS_IMAGE} makensis -V2 -DVERSION={version} -DSTAGE={WT}/runtime -DAGENT_PYTHON=$agent_python \\
+    -DICON={WT}/src/icons/thoughts.ico -DOUTFILE={W}/dist/{setup} {WT}/src/tools/windows/installer/thoughts.nsi
 ls -l {W}/dist/{setup}
 """
     run(["ssh", host, "bash -s"], input=script.encode())

@@ -107,6 +107,10 @@ void keepStandardStreamsPrivate();
 bool startInNewConsole(const QString &program, const QStringList &arguments, const QProcessEnvironment &environment, const QString &workingDirectory = {});
 // Whether the process with this ID still runs.
 bool processIsRunning(const QString &pid);
+// Ties a child process (and what it starts later) to this one: when this process ends, also by a
+// crash, Windows ends it too (a job object that kills its processes when its last handle closes).
+// Windows only; false elsewhere, and when Windows refused.
+bool endWithThisProcess(qint64 pid);
 // Brings the top-level window with exactly this title to the front.
 bool focusWindowTitled(const QString &title);
 

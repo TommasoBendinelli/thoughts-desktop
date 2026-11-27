@@ -130,6 +130,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QCheckBox>
 #include <QScopeGuard>
 #include <QSplitter>
 #include <QStackedWidget>
@@ -572,6 +573,7 @@ private Q_SLOTS:
 
     void testAgentPromptsSettingsPage();
     void testPhoneSessionsSetting();
+    void testClaudeCodeOnThisComputer();
     void testReadAloudSettingsPage();
 
     void testFedoraRepositoryStartupDoesNotQueueLibraryPruning();
@@ -1058,6 +1060,74 @@ void PartTest::testPhoneSessionsSetting()
     QCOMPARE(dialog->findChild<QComboBox *>(QStringLiteral("phoneSessionStart"))->currentIndex(), int(PhoneStart::Always));
     dialog->close();
     Thoughts::AgentSessions::setPhoneStartChoice(PhoneStart::Ask);
+}
+
+// Settings > Agent prompts > Claude Code on this computer: only where the installation brings the
+// Thoughts tools (THOUGHTS_AGENT_TOOLS names a fake one here); its answer setting is on once Set up
+// Claude Code registered them, and a choice saved by OK/Apply. Set up is never chosen here: it
+// would register the tools for this computer's own Claude Code.
+void PartTest::testClaudeCodeOnThisComputer()
+{
+    using namespace Thoughts;
+    AgentSessions::setRegisteredTools(QString());
+    KConfigGroup(KSharedConfig::openConfig(), AgentSessions::configGroup()).deleteEntry(AgentSessions::answerHereKey());
+    Okular::Part part(nullptr, {});
+    {
+        // This build brings no tools: nothing about it.
+        QPointer<KConfigDialog> dialog = part.realSlotPreferences();
+        QVERIFY(dialog);
+        QVERIFY(!dialog->findChild<QPushButton *>(QStringLiteral("setUpClaudeCode")));
+        dialog->close();
+        QTRY_VERIFY(!dialog);
+    }
+    QTemporaryDir installation;
+    QVERIFY(installation.isValid());
+    const QDir root(installation.path());
+    QVERIFY(root.mkpath(QStringLiteral("python-1a2b3c4d5e6f")) && root.mkpath(QStringLiteral("tools/mcp")) && root.mkpath(QStringLiteral("bin")));
+    for (const QString &file : {QStringLiteral("python-1a2b3c4d5e6f/python.exe"), QStringLiteral("tools/mcp/server.py")}) {
+        QFile created(root.filePath(file));
+        QVERIFY(created.open(QIODevice::WriteOnly));
+    }
+    QFile described(root.filePath(QStringLiteral("tools/agent-tools.json")));
+    QVERIFY(described.open(QIODevice::WriteOnly));
+    described.write(R"({"python": "python-1a2b3c4d5e6f/python.exe", "mcp_server": "tools/mcp/server.py"})");
+    described.close();
+    qputenv("THOUGHTS_AGENT_TOOLS", root.absolutePath().toUtf8());
+    const auto restore = qScopeGuard([] {
+        qunsetenv("THOUGHTS_AGENT_TOOLS");
+        AgentSessions::setRegisteredTools(QString());
+        KConfigGroup(KSharedConfig::openConfig(), AgentSessions::configGroup()).deleteEntry(AgentSessions::answerHereKey());
+    });
+    QPointer<KConfigDialog> dialog = part.realSlotPreferences();
+    QVERIFY(dialog);
+    auto *setUp = dialog->findChild<QPushButton *>(QStringLiteral("setUpClaudeCode"));
+    auto *state = dialog->findChild<QLabel *>(QStringLiteral("claudeCodeState"));
+    auto *answer = dialog->findChild<QCheckBox *>(QStringLiteral("answerOnThisComputer"));
+    QVERIFY(setUp && state && answer);
+    QCOMPARE(setUp->text(), QStringLiteral("Set up Claude Code"));
+    QVERIFY(state->text().contains(QStringLiteral("does not have the Thoughts tools yet")));
+    QVERIFY(!answer->isChecked());  // not set up yet
+    dialog->close();
+    QTRY_VERIFY(!dialog);
+
+    // Set up before: on, and Claude Code has them; turning it off is saved by Apply.
+    AgentSessions::setRegisteredTools(QStringLiteral("python\nserver"));
+    dialog = part.realSlotPreferences();
+    QVERIFY(dialog);
+    answer = dialog->findChild<QCheckBox *>(QStringLiteral("answerOnThisComputer"));
+    QVERIFY(answer->isChecked());
+    QCOMPARE(dialog->findChild<QLabel *>(QStringLiteral("claudeCodeState"))->text(), QStringLiteral("Claude Code has the Thoughts tools."));
+    answer->setChecked(false);
+    QVERIFY(dialog->button(QDialogButtonBox::Apply)->isEnabled());
+    dialog->button(QDialogButtonBox::Apply)->click();
+    QVERIFY(!AgentSessions::answerHere());
+    // Defaults: on again (it follows Set up), which OK saves as no entry.
+    dialog->button(QDialogButtonBox::RestoreDefaults)->click();
+    QVERIFY(answer->isChecked());
+    dialog->button(QDialogButtonBox::Ok)->click();
+    QVERIFY(AgentSessions::answerHere());
+    QVERIFY(!KConfigGroup(KSharedConfig::openConfig(), AgentSessions::configGroup()).hasKey(AgentSessions::answerHereKey()));
+    QTRY_VERIFY(!dialog);
 }
 
 // Settings > Read Aloud: the OpenRouter key field is masked, checked before it

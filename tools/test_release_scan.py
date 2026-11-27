@@ -42,6 +42,11 @@ class ScanTest(unittest.TestCase):
     def test_fixtures_build_accounts_and_ordinary_numbers_pass(self):
         self.assertEqual(self.kinds(b"https://server.example.ts.net/ /Users/Shared/x /Users/runner/work/qt/ /home/qt/work/"), [])
         self.assertEqual(self.kinds(b"version 100.2.3.4 and 10.100.64.1 and 100.128.0.1"), [])
+        # Third-party parts of the Windows installer's Python: GitHub's Windows runner account in wheels'
+        # Rust extensions, and the shared address space's network in the standard library's ipaddress.
+        self.assertEqual(self.kinds(b"C:\\Users\\runneradmin\\.cargo\\registry\\src\\x.rs"), [])
+        self.assertEqual(self.kinds(b"IPv4Network('" + b".".join([b"100", b"64", b"0", b"0"]) + b"/10')"), [])
+        self.assertEqual(self.kinds(b"host " + b".".join([b"100", b"64", b"0", b"1"]) + b" port"), ["Tailscale address"])
 
     def test_this_computers_markers_come_from_its_own_file(self):
         self.assertEqual(self.kinds(b"mail to Alex.Example-Person.org and SECRET-library-name"), ["private marker (line 2)", "private marker (line 3)"])

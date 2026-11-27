@@ -2,6 +2,7 @@
 #include "../shell/agentnotes.h"
 #include "../shell/agentnotecomposer.h"
 #include "../shell/agentnoteswindow.h"
+#include "../part/agentsessionsettings.h"
 #include "../part/thoughtsplatform.h"
 
 #include <QBuffer>
@@ -549,6 +550,7 @@ private Q_SLOTS:
     void askedPageNamesItsSession();
     void sendToAgentRecipients();
     void sendToAgentSessionMenu();
+    void sendToAgentNewSessionHere();
     void sendToAgentRanking();
     void sendToAgentRankedMenu();
     void copyForAgentMessageGoesAsItIs();
@@ -2562,6 +2564,7 @@ void AgentNotesTest::sendToAgentSessionMenu()
     {
         // Nothing fetched yet: listing, then the sessions, also into the open menu.
         AgentSessionList sessions(&center);
+        sessions.setClaudeFinder([] { return QString(); });  // no Claude Code here (this computer's own may be)
         QMenu menu;
         std::optional<Recipient> clicked;
         sessions.populate(&menu, [&clicked](const Recipient &session) { clicked = session; });
@@ -2592,6 +2595,7 @@ void AgentNotesTest::sendToAgentSessionMenu()
         // The next run: the list as last fetched at once, also when the server cannot list it now.
         server.wakersSupported = false;
         AgentSessionList sessions(&center);
+        sessions.setClaudeFinder([] { return QString(); });  // no Claude Code here (this computer's own may be)
         QMenu menu;
         sessions.populate(&menu, [](const Recipient &) {});
         QCOMPARE(menu.actions().size(), 6);
@@ -2607,6 +2611,7 @@ void AgentNotesTest::sendToAgentSessionMenu()
         // Nothing kept and nothing to be had: why.
         QSettings().remove(QStringLiteral("AgentNotes/SendToSessions"));
         AgentSessionList sessions(&center);
+        sessions.setClaudeFinder([] { return QString(); });  // no Claude Code here (this computer's own may be)
         QMenu menu;
         sessions.populate(&menu, [](const Recipient &) {});
         menu.popup(QPoint(10, 10));
@@ -2628,6 +2633,7 @@ void AgentNotesTest::sendToAgentSessionMenu()
         // computer that runs a reply waker): after the computers' sessions, a new server session.
         server.capabilities = {QStringLiteral("server_agents_v1")};
         AgentSessionList sessions(&center);
+        sessions.setClaudeFinder([] { return QString(); });  // no Claude Code here (this computer's own may be)
         QMenu menu;
         std::optional<Recipient> clicked;
         const auto send = [&clicked](const Recipient &session) { clicked = session; };
@@ -2670,6 +2676,93 @@ void AgentNotesTest::sendToAgentSessionMenu()
         QCOMPARE(entries(menu).constFirst(), QStringLiteral("Thought Editor · example-server"));
         server.capabilities.clear();
     }
+}
+
+// Send to Agent's and Ask Agent's "New session on this computer" (27 Nov 2026), while Claude Code is
+// here: after the sessions there are, a page that starts a new session on this computer only
+// (where "one_computer", this computer's id), whose session is sent to next once it started.
+void AgentNotesTest::sendToAgentNewSessionHere()
+{
+    FakeServer server;
+    server.wakers = testWakers();
+    Client client(cachePath());
+    client.setServer(server.url(), "secret");
+    Center center(&client, statePath());
+    const auto forget = [] {
+        QSettings settings;
+        for (const QString &key : {QStringLiteral("AgentNotes/SendToSessions"), QStringLiteral("AgentNotes/SendToSession"), QStringLiteral("AgentNotes/SendToSessionLabel"),
+                                   QStringLiteral("AgentNotes/ServerAgents"), QStringLiteral("AgentNotes/ServerSession")})
+            settings.remove(key);
+    };
+    forget();
+    const auto restore = qScopeGuard(forget);
+    AgentSessionList sessions(&center);
+    QString claude = QStringLiteral("/opt/tools/bin/claude");
+    sessions.setClaudeFinder([&claude] { return claude; });
+    QVERIFY(sessions.claudeHere());
+    QMenu menu;
+    std::optional<Recipient> clicked;
+    const auto send = [&clicked](const Recipient &session) { clicked = session; };
+    sessions.populate(&menu, send);
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing() && !sessions.sessions().isEmpty(); }));
+    sessions.populate(&menu, send, false);
+    QStringList entries = menuEntries(menu);
+    QCOMPARE(entries.constLast(), QStringLiteral("New session on this computer"));
+    QCOMPARE(entries.at(entries.size() - 2), QStringLiteral("---"));
+    QCOMPARE(entries.constFirst(), QStringLiteral("Thought Editor · example-server"));
+    QAction *fresh = menu.actions().constLast();
+    QCOMPARE(fresh->objectName(), QStringLiteral("sendToAgentComputerNew"));
+    QVERIFY(fresh->toolTip().contains(QStringLiteral("this computer")));
+    fresh->trigger();
+    QVERIFY(clicked && AgentSessionList::isNewComputerSession(clicked->sessionId));
+
+    // Its page: a new session's start for this computer only, its text the session's first prompt.
+    Center::Page page;
+    page.message = QStringLiteral("What Copy for agent copies");
+    page.origin = QJsonObject{{QStringLiteral("copy_for_agent"), true}, {QStringLiteral("conversation_id"), QStringLiteral("s1")}};
+    AgentSessionList::preparePage(page, *clicked);
+    QVERIFY(!page.noteId.isEmpty());
+    QVERIFY(page.origin.value(QStringLiteral("start_session")).toBool());
+    QCOMPARE(page.origin.value(QStringLiteral("where")).toString(), QStringLiteral("one_computer"));
+    const QString computer = page.origin.value(QStringLiteral("computer")).toString();
+    QVERIFY(!computer.isEmpty());
+    QCOMPARE(computer, Thoughts::AgentSessions::computerId());  // the same id every time
+    QVERIFY(!computer.contains(Thoughts::Platform::computerName(), Qt::CaseInsensitive) || Thoughts::Platform::computerName().isEmpty());
+    QCOMPARE(page.origin.value(QStringLiteral("agent")).toString(), QStringLiteral("claude"));
+    QVERIFY(!page.origin.contains(QStringLiteral("conversation_id")));
+    QVERIFY(page.origin.value(QStringLiteral("copy_for_agent")).toBool());
+
+    // It never becomes the last session itself (Send to Last Agent would start one session after
+    // another); the session started for it does.
+    sessions.setLastSession(sessions.sessions().constFirst());
+    sessions.setLastSession(*clicked);
+    QCOMPARE(sessions.lastSession(), QStringLiteral("s1"));
+    sessions.pageSent(page, *clicked);
+    sessions.sessionStarted(QStringLiteral("another-page"), QStringLiteral("ffffffff-0000-4000-8000-000000000000"), QStringLiteral("Not ours"));
+    QCOMPARE(sessions.lastSession(), QStringLiteral("s1"));
+    sessions.sessionStarted(page.noteId, QStringLiteral("1a2b3c4d-0000-4000-8000-000000000001"), QStringLiteral("Thoughts session · 27 Nov 10:00"));
+    QCOMPARE(sessions.lastSession(), QStringLiteral("1a2b3c4d-0000-4000-8000-000000000001"));
+    QVERIFY(sessions.lastSessionLabel().startsWith(QStringLiteral("Thoughts session · 27 Nov 10:00")));
+    // Once only.
+    sessions.setLastSession(sessions.sessions().constFirst());
+    sessions.sessionStarted(page.noteId, QStringLiteral("1a2b3c4d-0000-4000-8000-000000000001"), QStringLiteral("again"));
+    QCOMPARE(sessions.lastSession(), QStringLiteral("s1"));
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+
+    // Without Claude Code here (looked for again at each refresh), not offered.
+    claude.clear();
+    sessions.refresh();
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+    QVERIFY(!sessions.claudeHere());
+    sessions.populate(&menu, send, false);
+    QVERIFY(!menuEntries(menu).contains(QStringLiteral("New session on this computer")));
+    // Nothing to wake, but Claude Code here: the new session all the same.
+    claude = QStringLiteral("/opt/tools/bin/claude");
+    server.wakers = QJsonObject{{QStringLiteral("wakers"), QJsonArray()}};
+    sessions.refresh();
+    QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+    sessions.populate(&menu, send, false);
+    QCOMPARE(menuEntries(menu), (QStringList{QStringLiteral("No session can be woken now [off]"), QStringLiteral("---"), QStringLiteral("New session on this computer")}));
 }
 
 // Send to Agent's order: the sessions that wrote the most proposals on the document first, then
@@ -2778,6 +2871,7 @@ void AgentNotesTest::sendToAgentRankedMenu()
     forget();
     const auto restore = qScopeGuard(forget);
     AgentSessionList sessions(&center);
+    sessions.setClaudeFinder([] { return QString(); });  // no Claude Code here (this computer's own may be)
     int loads = 0;
     sessions.setProposalLoader([&loads] { ++loads; });
     const DocumentSources paper{QStringLiteral("docs-paper/main.tex"), {}};

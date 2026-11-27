@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "agentnoteswindow.h"
 
+#include "../part/agentsessionsettings.h"
+#include "../part/claudecode.h"
+#include "../part/thoughtsplatform.h"
+
 #include "agentnotecomposer.h"
 
 #include <KLocalizedString>
@@ -1866,6 +1870,8 @@ const QString ServerAgentsKey = QStringLiteral("AgentNotes/ServerAgents");
 const QString ServerSessionKey = QStringLiteral("AgentNotes/ServerSession");
 // A server session's conversation id (server-agents.md §1); "new" stands for one to start.
 const QString ServerAgentPrefix = QStringLiteral("server-agent:");
+// Stands for a new session on this computer (never a real conversation id).
+const QString NewComputerSession = QStringLiteral("this-computer:new");
 }
 
 AgentSessionList::AgentSessionList(AgentNotes::Center *center, QObject *parent)
@@ -1875,6 +1881,23 @@ AgentSessionList::AgentSessionList(AgentNotes::Center *center, QObject *parent)
     // The list as last fetched, at once.
     m_sessions = AgentNotes::recipientsFromJson(QJsonDocument::fromJson(QSettings().value(SessionsKey).toByteArray()).array());
     m_serverAgents = QSettings().value(ServerAgentsKey, false).toBool();
+    m_claudeHere = !ClaudeCode::find().isEmpty();
+}
+
+AgentNotes::Recipient AgentSessionList::newComputerSession()
+{
+    return {NewComputerSession, i18n("New session"), i18n("this computer"), QStringLiteral("idle"), true, {}};
+}
+
+bool AgentSessionList::isNewComputerSession(const QString &sessionId)
+{
+    return sessionId == NewComputerSession;
+}
+
+void AgentSessionList::setClaudeFinder(std::function<QString()> find)
+{
+    m_findClaude = std::move(find);
+    m_claudeHere = m_findClaude && !m_findClaude().isEmpty();
 }
 
 bool AgentSessionList::isServerAgent(const QString &sessionId)
@@ -1901,11 +1924,25 @@ void AgentSessionList::preparePage(AgentNotes::Center::Page &page, const AgentNo
         page.origin.insert(QStringLiteral("where"), QStringLiteral("server"));
         return;
     }
+    if (isNewComputerSession(session.sessionId)) {
+        // For this computer's SessionStarter only: the wakers start sessions for where "computer",
+        // the server for where "server".
+        page.origin.remove(QStringLiteral("conversation_id"));
+        page.origin.insert(QStringLiteral("start_session"), true);
+        page.origin.insert(QStringLiteral("where"), AgentSessions::oneComputerWhere());
+        page.origin.insert(QStringLiteral("computer"), AgentSessions::computerId());
+        page.origin.insert(QStringLiteral("agent"), QStringLiteral("claude"));
+        return;
+    }
     page.origin.insert(QStringLiteral("conversation_id"), session.sessionId);
 }
 
 void AgentSessionList::pageSent(const AgentNotes::Center::Page &page, const AgentNotes::Recipient &session)
 {
+    if (isNewComputerSession(session.sessionId)) {
+        if (!page.noteId.isEmpty()) m_startsSentHere.insert(page.noteId);
+        return;
+    }
     if (session.sessionId != newServerSession().sessionId || !m_center || page.noteId.isEmpty()) return;
     // The server claimed the page for the session it started before it answered (§1).
     QPointer<AgentSessionList> guard(this);
@@ -1916,6 +1953,16 @@ void AgentSessionList::pageSent(const AgentNotes::Center::Page &page, const Agen
         guard->setLastSession(serverSession(conversation));
         Q_EMIT guard->changed();
     });
+}
+
+void AgentSessionList::sessionStarted(const QString &pageId, const QString &sessionId, const QString &name)
+{
+    if (!m_startsSentHere.remove(pageId) || sessionId.isEmpty()) return;
+    const QString computer = Platform::computerName();
+    setLastSession({sessionId, name, computer.isEmpty() ? i18n("this computer") : computer, QStringLiteral("busy"), true, QDateTime::currentDateTimeUtc()});
+    // Listed by the wakers' next answer; asked for now.
+    Q_EMIT changed();
+    refresh();
 }
 
 AgentSessionList *AgentSessionList::instance()
@@ -1935,6 +1982,8 @@ void AgentSessionList::refresh()
 {
     // Who wrote which proposals, read again in the background (the menu's order).
     if (m_loadProposals) m_loadProposals();
+    // Claude Code installed (or removed) since.
+    m_claudeHere = !(m_findClaude ? m_findClaude() : ClaudeCode::find()).isEmpty();
     if (m_refreshing || !m_center) return;
     m_refreshing = true;
     QPointer<AgentSessionList> guard(this);
@@ -1975,6 +2024,8 @@ QString AgentSessionList::lastSessionLabel() const
 
 void AgentSessionList::setLastSession(const AgentNotes::Recipient &session)
 {
+    // A new session is not a session to send to again: the one it starts is (sessionStarted).
+    if (isNewComputerSession(session.sessionId)) return;
     QSettings settings;
     settings.setValue(LastSessionKey, session.sessionId);
     settings.setValue(LastSessionLabelKey, session.label());
@@ -2011,6 +2062,20 @@ void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNot
     menu->clear();
     // The More Sessions of an earlier fill goes with its entry.
     for (QMenu *more : menu->findChildren<QMenu *>(QStringLiteral("sendToAgentMore"), Qt::FindDirectChildrenOnly)) more->deleteLater();
+    // A new Claude Code session on this computer, after the sessions there are.
+    const auto addComputer = [this, menu, send] {
+        if (!m_claudeHere) return;
+        if (!menu->isEmpty()) menu->addSeparator();
+        const AgentNotes::Recipient fresh = newComputerSession();
+        QAction *action = menu->addAction(i18n("New session on this computer"));
+        action->setObjectName(QStringLiteral("sendToAgentComputerNew"));
+        action->setData(fresh.sessionId);
+        action->setToolTip(i18n("Starts Claude Code on this computer with this, with your own Claude sign-in and the Thoughts tools. "
+                                "It answers with notes, and Send to Agent sends to it next."));
+        connect(action, &QAction::triggered, menu, [send, fresh] {
+            if (send) send(fresh);
+        });
+    };
     // The server's own agent, after the computers' sessions: a new session, and the one started
     // from here last.
     const auto addServer = [this, menu, send] {
@@ -2046,6 +2111,7 @@ void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNot
         QAction *none = menu->addAction(why);
         none->setObjectName(QStringLiteral("sendToAgentNone"));
         none->setEnabled(false);
+        addComputer();
         addServer();
         return;
     }
@@ -2076,6 +2142,7 @@ void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNot
         menu->addMenu(more);
         for (const AgentNotes::Recipient &session : order.more) add(more, session);
     }
+    addComputer();
     addServer();
 }
 

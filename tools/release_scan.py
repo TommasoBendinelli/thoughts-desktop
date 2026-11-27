@@ -37,12 +37,14 @@ from pathlib import Path
 
 # Accounts that build machines use (other projects' CI paths in third-party libraries); a
 # person's home folder is anything else.
-_BUILD_ACCOUNTS = rb"(?:Shared|Public|runner|qt|build|builder|buildbot|ci|user|username|vagrant|ubuntu)"
+# runneradmin: GitHub's Windows runners, in the Rust extensions of PyPI wheels (pydantic_core, cryptography).
+_BUILD_ACCOUNTS = rb"(?:Shared|Public|runner|runneradmin|qt|build|builder|buildbot|ci|user|username|vagrant|ubuntu)"
 GENERIC_PATTERNS = {
     "home folder": rb"/Users/(?!" + _BUILD_ACCOUNTS + rb"/)[A-Za-z0-9._-]+/|/home/(?!" + _BUILD_ACCOUNTS
                    + rb"/)[a-z_][a-z0-9_-]*/|[A-Za-z]:\\\\?Users\\\\?(?!" + _BUILD_ACCOUNTS + rb"\\)[A-Za-z0-9._ -]+\\",
     "tailnet host": rb"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net",
-    "Tailscale address": rb"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9.])",
+    # Not 100.64.0.0 itself, the shared address space's network (Python's ipaddress names it): no device has it.
+    "Tailscale address": rb"(?<![0-9.])(?!100\.64\.0\.0(?![0-9.]))100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}(?![0-9.])",
     # Key material, not the bare label that key-handling code carries as a constant.
     "private key": rb"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----\s*[A-Za-z0-9+/=]{40,}",
     "token": rb"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,}|sk-(?:ant|or)-[A-Za-z0-9_-]{32,})",

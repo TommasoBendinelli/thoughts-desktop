@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QImage>
 #include <QPointer>
+#include <QSet>
 #include <QWidget>
 
 #include <functional>
@@ -375,12 +376,29 @@ public:
     static bool isServerAgent(const QString &sessionId);
     static AgentNotes::Recipient newServerSession();
     static AgentNotes::Recipient serverSession(const QString &conversationId);
+    // "New session on this computer" (27 Nov 2026), offered while Claude Code is on this computer:
+    // the page goes as a new session's start that only this computer acts on (origin start_session,
+    // where "one_computer", computer AgentSessions::computerId(), agent "claude"); the app's
+    // SessionStarter starts Claude Code with the page's text as its first prompt, and that session
+    // becomes the last session (sessionStarted). It is never the last session itself, so Send to
+    // Last Agent and Ask Agent do not start one session after another.
+    static AgentNotes::Recipient newComputerSession();
+    static bool isNewComputerSession(const QString &sessionId);
+    // Whether Claude Code is on this computer, as last looked (each refresh() looks again).
+    bool claudeHere() const { return m_claudeHere; }
+    // Tests: how claude is found (empty: not here); unset, ClaudeCode::find().
+    void setClaudeFinder(std::function<QString()> find);
     // @p page's origin for @p session: its conversation (it is woken, or the server session
-    // resumes), or a new server session's start (origin start_session and where "server").
+    // resumes), a new server session's start (origin start_session and where "server"), or a new
+    // session's start on this computer.
     static void preparePage(AgentNotes::Center::Page &page, const AgentNotes::Recipient &session);
     // After @p page went to @p session: a new server session's id, from the server's claim of the
-    // page, becomes the server session the menu offers and the last session.
+    // page, becomes the server session the menu offers and the last session. A new session on this
+    // computer becomes the last session once it started (sessionStarted).
     void pageSent(const AgentNotes::Center::Page &page, const AgentNotes::Recipient &session);
+    // The SessionStarter started @p sessionId (named @p name) for @p pageId: when that page went
+    // from here as "New session on this computer", the session is the last session from now on.
+    void sessionStarted(const QString &pageId, const QString &sessionId, const QString &name);
 
 Q_SIGNALS:
     void changed();
@@ -400,6 +418,10 @@ private:
     // The server lists server_agents_v1 (as last asked; asked once a run).
     bool m_serverAgents = false;
     bool m_capabilitiesAsked = false;
+    std::function<QString()> m_findClaude;
+    bool m_claudeHere = false;
+    // Pages sent from here as "New session on this computer", until their session started.
+    QSet<QString> m_startsSentHere;
 };
 
 }

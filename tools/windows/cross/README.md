@@ -9,7 +9,8 @@
 | `case-insensitive-overlay.py` | Writes a clang VFS overlay so Craft's headers are found case-insensitively, as on Windows. |
 | `stage-runtime.py` | Picks the files the installer ships: Thoughts' install, plus the Craft DLLs, plugins and data it needs (by PE imports), plus the MSVC runtime. |
 | `../installer/thoughts.nsi` | NSIS per-user installer and uninstaller. |
-| `wine-smoke-test.sh` | Installs a setup.exe under Wine on a virtual display, runs the programs, takes a screenshot, uninstalls. |
+| `../agent-tools/agent_tools.py` | The Python of the Thoughts tools and the reply waker: `fetch` downloads the files `lock.json` pins (python.org, PyPI; SHA-256 checked) into `wincross/agent-tools-cache`, the only step with a network; `stage` puts `python-<id>/` and `tools/` into the runtime tree, offline. |
+| `wine-smoke-test.sh` | Installs a setup.exe under Wine on a virtual display, runs the programs and the Thoughts tools' Python (`agent-tools-check.py`), takes a screenshot, uninstalls. |
 | `setup-builder.sh` | Recreates the builder's tree from scratch. |
 
 ## What is in `wincross/`

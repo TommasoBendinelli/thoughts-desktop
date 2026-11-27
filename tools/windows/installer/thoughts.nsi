@@ -2,7 +2,9 @@
 ; SPDX-FileCopyrightText: 2026 Tommaso Bendinelli
 ; Thoughts for Windows: a per-user installer (no administrator rights needed).
 ; Built by tools/windows/release.py with makensis:
-;   makensis -DVERSION=2026.10.15.1 -DSTAGE=<runtime tree> -DOUTFILE=<setup.exe> thoughts.nsi
+;   makensis -DVERSION=2026.10.15.1 -DSTAGE=<runtime tree> -DOUTFILE=<setup.exe> [-DAGENT_PYTHON=python-<id>] thoughts.nsi
+; AGENT_PYTHON: the folder of the Python that runs the Thoughts tools and the reply waker
+; (tools/windows/agent-tools/agent_tools.py), named after its pinned files.
 ; Options: /S installs silently; /RELAUNCH starts Thoughts afterwards (the in-app updater
 ; passes both). User data lives in %LOCALAPPDATA%\Thoughts and is never touched.
 
@@ -103,8 +105,35 @@ Section "Thoughts"
     RMDir /r "$INSTDIR\etc"
     RMDir /r "$INSTDIR\qml"
     RMDir /r "$INSTDIR\translations"
+    RMDir /r "$INSTDIR\tools"
     SetOutPath "$INSTDIR"
+!ifdef AGENT_PYTHON
+    File /r /x "${AGENT_PYTHON}" "${STAGE}\*.*"
+    ; The Python of the Thoughts tools: a Claude Code session that runs them keeps its files
+    ; locked. The same folder name is the same files, so a locked one stays as it is; another
+    ; Python goes to a folder of its own, and Thoughts registers the tools again.
+    SetOutPath "$INSTDIR\${AGENT_PYTHON}"
+    SetOverwrite try
+    File /r "${STAGE}\${AGENT_PYTHON}\*.*"
+    SetOverwrite on
+    SetOutPath "$INSTDIR"
+    ; Earlier Pythons go once nothing uses them (a folder in use cannot be renamed).
+    FindFirst $3 $4 "$INSTDIR\python-*"
+    ${DoWhile} $4 != ""
+        ${If} $4 != "${AGENT_PYTHON}"
+        ${AndIfNot} $4 == "${AGENT_PYTHON}.remove"
+            ClearErrors
+            Rename "$INSTDIR\$4" "$INSTDIR\$4.remove"
+            ${IfNot} ${Errors}
+                RMDir /r "$INSTDIR\$4.remove"
+            ${EndIf}
+        ${EndIf}
+        FindNext $3 $4
+    ${Loop}
+    FindClose $3
+!else
     File /r "${STAGE}\*.*"
+!endif
 
     WriteUninstaller "$INSTDIR\uninstall.exe"
     WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${APP}"
@@ -156,6 +185,15 @@ Section "Uninstall"
     RMDir /r "$INSTDIR\etc"
     RMDir /r "$INSTDIR\qml"
     RMDir /r "$INSTDIR\translations"
+    RMDir /r "$INSTDIR\tools"
+    ; The Thoughts tools' Python (python-<id>); Claude Code keeps their registration (claude mcp
+    ; remove thoughts removes it).
+    FindFirst $3 $4 "$INSTDIR\python-*"
+    ${DoWhile} $4 != ""
+        RMDir /r "$INSTDIR\$4"
+        FindNext $3 $4
+    ${Loop}
+    FindClose $3
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"
 SectionEnd

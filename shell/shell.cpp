@@ -43,6 +43,7 @@
 #include "developerlogdialog.h"
 #include "problemreportdialog.h"
 #include "sessionstarter.h"
+#include "wakersupervisor.h"
 #include "updatecheck.h"
 #include "visualstudiocode.h"
 #include "activeparttoolbarcontroller.h"
@@ -3073,6 +3074,17 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
         if (!QStandardPaths::isTestModeEnabled()) agentNotes->start();
         // The phone's Start a new study session starts an agent session on this computer.
         if (!QStandardPaths::isTestModeEnabled()) Thoughts::SessionStarter::instance()->start();
+        // Send to Agent's "New session on this computer": the session started for it is sent to next.
+        static bool sessionStartsFollowed = false;
+        if (!std::exchange(sessionStartsFollowed, true) && !QStandardPaths::isTestModeEnabled()) {
+            connect(Thoughts::SessionStarter::instance(), &Thoughts::SessionStarter::sessionStarted, Thoughts::AgentSessionList::instance(),
+                    &Thoughts::AgentSessionList::sessionStarted);
+        }
+#ifdef Q_OS_WIN
+        // Windows has no reply waker of its own: the app runs it for this computer's Claude Code
+        // sessions (Mac and Linux keep the one the person installed).
+        if (!QStandardPaths::isTestModeEnabled()) Thoughts::WakerSupervisor::instance()->start();
+#endif
 
         // NOTE : apply default sidebar width only after calling setupGUI(...)
         resizeDocks({m_sidebar}, {200}, Qt::Horizontal);

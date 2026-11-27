@@ -687,6 +687,39 @@ bool processIsRunning(const QString &pid)
 #endif
 }
 
+bool endWithThisProcess(qint64 pid)
+{
+#ifdef Q_OS_WIN
+    // One job for the whole run, never closed before this process ends: closing its last handle
+    // (when this process ends, also by a crash) ends every process in it.
+    static HANDLE job = [] {
+        HANDLE created = CreateJobObjectW(nullptr, nullptr);
+        if (created) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(created, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+                CloseHandle(created);
+                created = nullptr;
+            }
+        }
+        return created;
+    }();
+    if (!job || pid <= 0) {
+        return false;
+    }
+    HANDLE process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, DWORD(pid));
+    if (!process) {
+        return false;
+    }
+    const bool assigned = AssignProcessToJobObject(job, process);
+    CloseHandle(process);
+    return assigned;
+#else
+    Q_UNUSED(pid)
+    return false;
+#endif
+}
+
 bool focusWindowTitled(const QString &title)
 {
 #ifdef Q_OS_WIN
