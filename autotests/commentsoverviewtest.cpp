@@ -647,6 +647,7 @@ private Q_SLOTS:
     void testTodosHiddenUntilTheirDate();
     void testDiaryEntriesListedInDiaryNotTodos();
     void testOverviewTabs();
+    void testMentalModelAsksForRefreshAfterStudy();
     void testReviewCardsRefreshWhenSourceLocationsChange();
     void testLibraryTellsOfCardsThoughtsRetired();
     void testPersistentBrowsersKeepState();
@@ -1540,6 +1541,38 @@ void CommentsOverviewTest::testTabSwitchScales()
     QCOMPARE(inserted.size(), 0);
     // Generous CI guard; reported measurements provide the stricter local check.
     QVERIFY2(worst < 500000000, "A warm tab switch blocked the event loop for over 500 ms");
+}
+
+void CommentsOverviewTest::testMentalModelAsksForRefreshAfterStudy()
+{
+    Thoughts::MentalModelView view;
+    auto *status = view.findChild<QLabel *>(QStringLiteral("mentalModelStatus"));
+    QVERIFY(status);
+    QFile::remove(Thoughts::MentalModelView::path());
+    view.reload();
+    QCOMPARE(status->text(), QStringLiteral("No Mental Model yet. Click Refresh to write it from your review cards."));
+
+    QVERIFY(QDir().mkpath(QFileInfo(Thoughts::MentalModelView::path()).absolutePath()));
+    QVERIFY(writeFile(Thoughts::MentalModelView::path(), QByteArrayLiteral("# Mental Model\n")));
+    const auto remove = qScopeGuard([] { QFile::remove(Thoughts::MentalModelView::path()); });
+    int studied = 0;
+    QDateTime askedSince;
+    view.setReviewedSince([&](const QDateTime &since) {
+        askedSince = since;
+        return studied;
+    });
+    view.reload();
+    // Nothing studied since it was written: the page says when it was written.
+    QCOMPARE(askedSince, QFileInfo(Thoughts::MentalModelView::path()).lastModified());
+    QVERIFY(status->text().startsWith(QStringLiteral("Written from your review cards · updated ")));
+    QVERIFY(!status->text().contains(QStringLiteral("since")));
+    // Cards studied since: Refresh adds them.
+    studied = 1;
+    view.reload();
+    QVERIFY(status->text().endsWith(QStringLiteral(" · 1 card reviewed since: click Refresh to add it")));
+    studied = 3;
+    view.reload();
+    QVERIFY(status->text().endsWith(QStringLiteral(" · 3 cards reviewed since: click Refresh to add them")));
 }
 
 void CommentsOverviewTest::testOverviewTabs()
