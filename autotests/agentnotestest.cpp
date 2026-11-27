@@ -571,6 +571,12 @@ void AgentNotesTest::initTestCase()
     qunsetenv("THOUGHTS_TOKEN");
     qunsetenv("THOUGHTS_SERVER_URL");
     QVERIFY(m_dir.isValid());
+    // Settings in a file of the test's own: without an organization name QSettings
+    // cannot write on Windows (the registry), and the user's settings stay untouched.
+    QCoreApplication::setOrganizationName(QStringLiteral("ThoughtsAutotests"));
+    QCoreApplication::setApplicationName(QStringLiteral("agentnotestest"));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_dir.filePath(QStringLiteral("settings")));
 }
 
 void AgentNotesTest::parsesNoteRecords()

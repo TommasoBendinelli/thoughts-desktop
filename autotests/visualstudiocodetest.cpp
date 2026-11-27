@@ -86,6 +86,9 @@ private Q_SLOTS:
     // as before; LaunchServices still gives the app for the fallback.
     void pathThenFixedCommands()
     {
+#ifdef Q_OS_WIN
+        QSKIP("Extension-less commands and .app bundles are macOS and Linux; Windows finds code.cmd on PATH");
+#endif
         const QString onPath = makeFile(m_root.filePath(QStringLiteral("path/code")));
         const QString fixed = makeFile(m_root.filePath(QStringLiteral("usr/local/bin/code")));
         const QString app = m_root.filePath(QStringLiteral("Somewhere/Visual Studio Code.app"));
@@ -108,6 +111,9 @@ private Q_SLOTS:
     // /Applications (here a Downloads folder). LaunchServices knows where it is.
     void appLaunchServicesKnows()
     {
+#ifdef Q_OS_WIN
+        QSKIP("Extension-less commands and .app bundles are macOS and Linux; Windows finds code.cmd on PATH");
+#endif
         const QString app = m_root.filePath(QStringLiteral("home/Downloads/Visual Studio Code.app"));
         const QString cli = makeBundle(app);
         QStringList asked;
@@ -124,6 +130,9 @@ private Q_SLOTS:
     // VS Code first, then Insiders, then VSCodium, whose command line is codium.
     void bundleIdentifierOrder()
     {
+#ifdef Q_OS_WIN
+        QSKIP("Extension-less commands and .app bundles are macOS and Linux; Windows finds code.cmd on PATH");
+#endif
         const QString insiders = m_root.filePath(QStringLiteral("Apps/Visual Studio Code - Insiders.app"));
         const QString insidersCli = makeBundle(insiders);
         const QString codium = m_root.filePath(QStringLiteral("Apps/VSCodium.app"));
@@ -148,6 +157,9 @@ private Q_SLOTS:
     // file in it by its identifier (open -b), without the line.
     void appWithoutCommandLine()
     {
+#ifdef Q_OS_WIN
+        QSKIP("Extension-less commands and .app bundles are macOS and Linux; Windows finds code.cmd on PATH");
+#endif
         const QString app = m_root.filePath(QStringLiteral("Apps/Visual Studio Code.app"));
         makeBundle(app, QStringLiteral("code"), false);
         Places places;
@@ -170,6 +182,9 @@ private Q_SLOTS:
     // /Applications first, then ~/Applications.
     void applicationFolders()
     {
+#ifdef Q_OS_WIN
+        QSKIP("Extension-less commands and .app bundles are macOS and Linux; Windows finds code.cmd on PATH");
+#endif
         const QString system = m_root.filePath(QStringLiteral("Applications"));
         const QString user = m_root.filePath(QStringLiteral("home/Applications"));
         const QString userCli = makeBundle(QDir(user).filePath(QStringLiteral("Visual Studio Code.app")));

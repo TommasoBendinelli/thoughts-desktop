@@ -748,6 +748,10 @@ bool markDownloaded(const QString &path)
     const QByteArray value = "0081;" + QByteArray::number(QDateTime::currentSecsSinceEpoch(), 16) + ";Thoughts;";
     return ::setxattr(QFile::encodeName(path).constData(), "com.apple.quarantine", value.constData(), size_t(value.size()), 0, XATTR_NOFOLLOW) == 0;
 #elif defined(Q_OS_WIN)
+    // Opening the stream of a missing file would create the file, empty.
+    if (!QFileInfo(path).isFile()) {
+        return false;
+    }
     QFile zone(path + QStringLiteral(":Zone.Identifier"));
     const QByteArray value("[ZoneTransfer]\r\nZoneId=3\r\n");
     return zone.open(QIODevice::WriteOnly | QIODevice::Truncate) && zone.write(value) == value.size();

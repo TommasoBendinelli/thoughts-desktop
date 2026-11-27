@@ -156,6 +156,8 @@ void PdfVersionsTest::storeVerifiesAndPrunes()
     QFile stored(path);
     QVERIFY(stored.open(QIODevice::ReadOnly));
     QCOMPARE(stored.readAll(), bytes);
+    // Windows cannot remove a file that is still open, so pruning would keep it.
+    stored.close();
     PdfVersions::setTitle(path, QStringLiteral("Paper — version of 2026-10-22 16:06"));
     QCOMPARE(PdfVersions::title(path), QStringLiteral("Paper — version of 2026-10-22 16:06"));
     // At most maximumCachedVersions stay.
