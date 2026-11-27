@@ -36,6 +36,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
@@ -75,6 +76,13 @@ static bool forwardToRunningThoughts(const QStringList &arguments)
 
 int main(int argc, char **argv)
 {
+#ifdef Q_OS_WIN
+    // A Thoughts that an autotest starts (mainshelltest) keeps to the test's QStandardPaths test-mode folders, as the
+    // test itself does (autotests/testhome.cpp), instead of the user's AppData.
+    if (qEnvironmentVariableIsSet("THOUGHTS_AUTOTEST_APPDATA")) {
+        QStandardPaths::setTestModeEnabled(true);
+    }
+#endif
     /**
      * trigger initialisation of proper icon theme
      */

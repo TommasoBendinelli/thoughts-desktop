@@ -78,6 +78,8 @@ struct TestHome {
         // QStandardPaths and KConfig read whatever HOME says: without test mode a test writes the user's open tabs
         // (thoughts-open-tabsrc) and docdata. Test mode moves every writable location to its qttest folder.
         QStandardPaths::setTestModeEnabled(true);
+        // A Thoughts the test starts does the same (shell/main.cpp).
+        qputenv("THOUGHTS_AUTOTEST_APPDATA", "1");
 #endif
     }
 
