@@ -1,4 +1,5 @@
 #include "../core/busycursor.h"
+#include "../part/commentauthor.h"
 #include "flowlayout.h"
 #include "../part/thoughtsplatform.h"
 #include "../core/htmlattachment.h"
@@ -1997,7 +1998,7 @@ void mergeLogicalComments(Thoughts::TrackedCommentDocument &document, const Agen
         comment.threadRootId = payload.value(QStringLiteral("thread_root_id")).toString(id);
         comment.contents = payload.value(QStringLiteral("contents")).toString();
         comment.selectedText = payload.value(QStringLiteral("selected_text")).toString();
-        comment.author = payload.value(QStringLiteral("author")).toString();
+        comment.author = Thoughts::commentAuthor(payload);
         comment.sourceFile = payload.value(QStringLiteral("source_file")).toString(payload.value(QStringLiteral("scope")).toObject().value(QStringLiteral("source_file")).toString(comment.sourceFile));
         comment.sourceLine = payload.value(QStringLiteral("source_line")).toInt(payload.value(QStringLiteral("scope")).toObject().value(QStringLiteral("source_line")).toInt(comment.sourceLine));
         comment.priorityRaw = payload.value(QStringLiteral("priority")).toString(QStringLiteral("normal"));
@@ -2106,7 +2107,7 @@ void consolidateLogicalComments(QList<Thoughts::TrackedCommentDocument> &documen
         comment.threadRootId = payload.value(QStringLiteral("thread_root_id")).toString(iterator.key());
         comment.contents = payload.value(QStringLiteral("contents")).toString();
         comment.selectedText = payload.value(QStringLiteral("selected_text")).toString();
-        comment.author = payload.value(QStringLiteral("author")).toString();
+        comment.author = Thoughts::commentAuthor(payload);
         comment.sourceFile = payload.value(QStringLiteral("source_file"))
                                  .toString(payload.value(QStringLiteral("scope")).toObject().value(QStringLiteral("source_file")).toString(comment.sourceFile));
         comment.sourceLine = payload.value(QStringLiteral("source_line"))
@@ -3211,7 +3212,7 @@ std::optional<TrackedCommentDocument> loadTrackedCommentDocument(const QString &
             }
             comment.contents = record.value(QStringLiteral("contents")).toString();
             comment.selectedText = record.value(QStringLiteral("selected_text")).toString();
-            comment.author = record.value(QStringLiteral("author")).toString();
+            comment.author = Thoughts::commentAuthor(record);
             comment.sourceFile = record.value(QStringLiteral("tex_file")).toString();
             comment.annotationPdfSha256 = record.value(QStringLiteral("annotation_pdf_sha256")).toString();
             comment.sourceLine = record.value(QStringLiteral("tex_line")).toInt();
@@ -12820,6 +12821,8 @@ void CommentsOverview::mergeDocumentFeedback()
             comment.rootSortDate = comment.modifiedDate;
             comment.feedbackKind = feedbackKindOf(record);
             comment.feedbackRecord = record;
+            // The other person of a shared Project, for a comment of theirs (the server's shared_author).
+            comment.author = Thoughts::commentAuthor(record);
             // Without the current PDF's identity nothing can be called earlier.
             comment.feedbackEarlier = !document.librarySha256.isEmpty() && !Thoughts::DocumentFeedback::shownOn(record, document.librarySha256, attachmentVersions.value(page));
             // Left out here, so the counts, the tree and the table agree on what is listed.

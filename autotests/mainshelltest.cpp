@@ -3133,6 +3133,12 @@ void MainShellTest::testAgentDocumentDescription()
     QCOMPARE(Thoughts::agentDocumentDescription(root.path(), imported, paper, QStringLiteral("Paper"), QString()),
              QStringLiteral("Thoughts document: \"Paper\"\nProject: Applications\nBuilt PDF: %1\n"
                             "Project file: %2\nDocument ID: 1fd11935-ae0e-4960-a8bd-27c39f1b7ace\n").arg(paper, configuration));
+    // Ask Agent (questions are asked, never kept): the description, the passage on one line, the
+    // question and what to do; an HTML page's passage has no page.
+    QCOMPARE(Thoughts::agentQuestionText(QStringLiteral("Thoughts document: \"Paper\"\n"), 2, QStringLiteral("y for\n each  q."), QStringLiteral(" Is it worse if y is long? ")),
+             QStringLiteral("Thoughts document: \"Paper\"\nMy question (page 2) about \"y for each q.\":\nIs it worse if y is long?\n"
+                            "Answer my question with an agent note on this document. It is a question, not a change request: make no proposals unless I ask.\n"));
+    QVERIFY(Thoughts::agentQuestionText(QString(), 0, QString(700, QLatin1Char('x')), QStringLiteral("Why?")).startsWith(QStringLiteral("My question about \"") + QString(600, QLatin1Char('x')) + QStringLiteral("…\":\n")));
 }
 
 void MainShellTest::testLibraryProjectNameForPdf()

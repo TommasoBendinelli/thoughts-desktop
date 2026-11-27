@@ -4,6 +4,7 @@
 #include <QToolButton>
 #include <functional>
 #include "projectreadingcontext.h"
+#include "commentauthor.h"
 #include "projectfeedback.h"
 #include "thoughtsplatform.h"
 #include "thoughtsserveraddress.h"
@@ -899,6 +900,8 @@ Part::Part(QObject *parent, const QVariantList &args)
     // its page to the agent (through the Shell).
     connect(m_pageView.data(), &PageView::readingOverlayMarkRevealRequested, this, &Part::revealReadingOverlayMark);
     connect(m_pageView.data(), &PageView::readingOverlayQuestionAsked, this, &Part::askAboutReadingOverlayMark);
+    // A question about a passage goes to the agent, never into the document.
+    connect(m_pageView.data(), &PageView::documentQuestionAsked, this, &Part::askDocumentQuestion);
     // A mark's note: its picture in the popup, and the note itself in Agent Notes (the Shell has them).
     connect(m_pageView.data(), &PageView::readingOverlayNoteRequested, this, &Part::requestReadingOverlayMarkNote);
     connect(m_pageView.data(), &PageView::readingOverlayNoteOpenRequested, this, &Part::requestOpenAgentNote);
@@ -5637,7 +5640,7 @@ static Okular::Annotation *docsAnnotationFromSidecar(const QJsonObject &record, 
     annotation->setUniqueName(record.value(QStringLiteral("id")).toString());
     annotation->setCreatorApplication(record.value(QStringLiteral("created_in_app")).toString());
     annotation->setBoundingRectangle(normalizedRect);
-    annotation->setAuthor(record.value(QStringLiteral("author")).toString());
+    annotation->setAuthor(Thoughts::commentAuthor(record));
     annotation->setContents(record.value(QStringLiteral("contents")).toString());
     const QDateTime modified = Okular::DocsCommentSynchronizer::parseCommentDate(record.value(QStringLiteral("modified")));
     const QDateTime created = Okular::DocsCommentSynchronizer::parseCommentDate(record.value(QStringLiteral("created")));
@@ -10511,6 +10514,21 @@ bool Part::askAboutReadingOverlayMark(const QString &overlayId, const QString &m
     }
     Q_EMIT requestAskAboutReadingOverlayMark(request);
     return true;
+}
+
+void Part::askDocumentQuestion(const QJsonObject &request)
+{
+    if (!isSignalConnected(QMetaMethod::fromSignal(&Part::requestAskDocumentQuestion))) {
+        keepUnsentQuestion(request.value(QStringLiteral("question")).toString());
+        noticeMessage(i18n("Asking an agent needs the Thoughts app."));
+        return;
+    }
+    Q_EMIT requestAskDocumentQuestion(request);
+}
+
+void Part::keepUnsentQuestion(const QString &question)
+{
+    if (m_pageView && !question.isEmpty()) m_pageView->setUnsentQuestion(question);
 }
 
 bool Part::showReadingOverlay(const QString &requested)

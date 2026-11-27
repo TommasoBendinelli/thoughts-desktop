@@ -2342,6 +2342,9 @@ void Reviews::setDocumentFeedback(const QList<QJsonObject> &records)
                                                           : QFileInfo(pagePath).completeBaseName().replace(QLatin1Char('_'), QLatin1Char(' ')).replace(QLatin1Char('-'), QLatin1Char(' '));
         // Under the text: the passage under a comment, and what the row is not any more.
         QStringList notes;
+        // A comment of the other person of a shared Project says whose it is.
+        const QString sharedBy = record.value(QStringLiteral("shared_author")).toObject().value(QStringLiteral("username")).toString().trimmed();
+        if (!sharedBy.isEmpty()) notes.append(i18n("by %1", sharedBy));
         if (!comment.isEmpty()) notes.append(passage);
         if (Thoughts::DocumentFeedback::isResolved(record)) notes.append(i18n("Resolved"));
         if (m_earlierFeedbackIds.contains(id)) notes.append(i18n("Earlier version"));

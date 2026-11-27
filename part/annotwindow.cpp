@@ -9,6 +9,7 @@
 */
 
 #include "annotwindow.h"
+#include "commentauthor.h"
 
 #include <QSignalBlocker>
 
@@ -1068,7 +1069,7 @@ static Okular::Annotation *detachedDisplayAnnotation(const QJsonObject &record)
         ? static_cast<Okular::Annotation *>(new Okular::HighlightAnnotation()) : new Okular::TextAnnotation();
     annotation->setUniqueName(record.value(QStringLiteral("id")).toString());
     annotation->setContents(record.value(QStringLiteral("contents")).toString());
-    annotation->setAuthor(record.value(QStringLiteral("author")).toString());
+    annotation->setAuthor(Thoughts::commentAuthor(record));
     annotation->setCreationDate(Okular::DocsCommentSynchronizer::parseCommentDate(record.value(QStringLiteral("created"))));
     annotation->setModificationDate(Okular::DocsCommentSynchronizer::parseCommentDate(record.value(QStringLiteral("modified"))));
     return annotation;
@@ -1121,7 +1122,7 @@ void AnnotWindow::setDetachedThread(const QList<QJsonObject> &thread)
     }
     if (m_detachedRefreshBlocked) return;
     m_annot->setContents(incoming);
-    m_annot->setAuthor(selectedRecord.value(QStringLiteral("author")).toString());
+    m_annot->setAuthor(Thoughts::commentAuthor(selectedRecord));
     m_annot->setCreationDate(Okular::DocsCommentSynchronizer::parseCommentDate(selectedRecord.value(QStringLiteral("created"))));
     m_annot->setModificationDate(Okular::DocsCommentSynchronizer::parseCommentDate(selectedRecord.value(QStringLiteral("modified"))));
     if (clean && draft != incoming) {

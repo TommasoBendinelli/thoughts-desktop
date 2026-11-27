@@ -238,6 +238,8 @@ public:
     int putStatus = 0;  // set: every PUT answers it
     // GET /v1/health: {"status": "ok", "capabilities": [...]}.
     QStringList capabilities;
+    // item id -> GET /v1/agent-notes/handling/{item_id}'s answer (who answers it); else 404.
+    QHash<QString, QJsonObject> handling;
     // This computer's device account, so pages it sends are its own on every system.
     QString device = Thoughts::Platform::desktopDeviceAccount();
     // GET /v1/agent-notes/changes: its cursor; a request with that cursor as `after` is held until
@@ -343,6 +345,10 @@ private:
                     body = QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact);
                 }
             }
+        } else if (method == QLatin1String("GET") && target.path().startsWith(QLatin1String("/v1/agent-notes/handling/"))) {
+            const QString id = target.path().section(QLatin1Char('/'), -1);
+            code = handling.contains(id) ? 200 : 404;
+            body = QJsonDocument(handling.value(id)).toJson(QJsonDocument::Compact);
         } else if (method == QLatin1String("GET") && target.path() == QLatin1String("/v1/health")) {
             code = 200;
             body = QJsonDocument(QJsonObject{{QStringLiteral("status"), QStringLiteral("ok")}, {QStringLiteral("capabilities"), QJsonArray::fromStringList(capabilities)}})
@@ -2546,7 +2552,8 @@ void AgentNotesTest::sendToAgentSessionMenu()
     Center center(&client, statePath());
     const auto forget = [] {
         QSettings settings;
-        for (const QString &key : {QStringLiteral("AgentNotes/SendToSessions"), QStringLiteral("AgentNotes/SendToSession"), QStringLiteral("AgentNotes/SendToSessionLabel")})
+        for (const QString &key : {QStringLiteral("AgentNotes/SendToSessions"), QStringLiteral("AgentNotes/SendToSession"), QStringLiteral("AgentNotes/SendToSessionLabel"),
+                                   QStringLiteral("AgentNotes/ServerAgents"), QStringLiteral("AgentNotes/ServerSession")})
             settings.remove(key);
     };
     forget();  // nothing kept from an earlier run
@@ -2615,6 +2622,53 @@ void AgentNotesTest::sendToAgentSessionMenu()
         sessions.populate(&menu, [](const Recipient &) {});
         QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
         QCOMPARE(entries(menu), QStringList{QStringLiteral("No session can be woken now [off]")});
+    }
+    {
+        // A server with its own agent (server_agents_v1; 27 Nov 2026, for someone without a
+        // computer that runs a reply waker): after the computers' sessions, a new server session.
+        server.capabilities = {QStringLiteral("server_agents_v1")};
+        AgentSessionList sessions(&center);
+        QMenu menu;
+        std::optional<Recipient> clicked;
+        const auto send = [&clicked](const Recipient &session) { clicked = session; };
+        sessions.populate(&menu, send);
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing() && sessions.serverAgentsAvailable(); }));
+        sessions.populate(&menu, send);
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        QCOMPARE(entries(menu), (QStringList{QStringLiteral("No session on a computer can be woken now [off]"), QStringLiteral("---"), QStringLiteral("Server agent: new session")}));
+        menu.actions().last()->trigger();
+        QVERIFY(clicked && AgentSessionList::isServerAgent(clicked->sessionId));
+        // Its page starts a server session (server-agents.md §1), with no conversation of its own.
+        Center::Page page;
+        page.origin = QJsonObject{{QStringLiteral("copy_for_agent"), true}};
+        AgentSessionList::preparePage(page, *clicked);
+        QVERIFY(!page.noteId.isEmpty());
+        QVERIFY(page.origin.value(QStringLiteral("start_session")).toBool());
+        QCOMPARE(page.origin.value(QStringLiteral("where")).toString(), QStringLiteral("server"));
+        QVERIFY(!page.origin.contains(QStringLiteral("conversation_id")));
+        QVERIFY(page.origin.value(QStringLiteral("copy_for_agent")).toBool());
+        // Sent: the session the server claimed it for is offered next and is the last session.
+        server.handling.insert(page.noteId, QJsonObject{{QStringLiteral("claim"), QJsonObject{{QStringLiteral("conversation_id"), QStringLiteral("server-agent:5e55")}}}});
+        sessions.pageSent(page, *clicked);
+        QVERIFY(waitFor([&] { return sessions.lastSession() == QStringLiteral("server-agent:5e55"); }));
+        QCOMPARE(sessions.lastSessionLabel(), QStringLiteral("Server agent · Thoughts server"));
+        sessions.populate(&menu, send);
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing(); }));
+        QCOMPARE(entries(menu), (QStringList{QStringLiteral("No session on a computer can be woken now [off]"), QStringLiteral("---"), QStringLiteral("Server agent"),
+                                             QStringLiteral("Server agent: new session")}));
+        // A page to that session goes to its conversation (the server resumes it, §2).
+        Center::Page next;
+        AgentSessionList::preparePage(next, AgentSessionList::serverSession(QStringLiteral("server-agent:5e55")));
+        QCOMPARE(next.origin.value(QStringLiteral("conversation_id")).toString(), QStringLiteral("server-agent:5e55"));
+        QVERIFY(!next.origin.contains(QStringLiteral("start_session")));
+        // With the computers' sessions, after them.
+        server.wakers = testWakers();
+        sessions.populate(&menu, send);
+        QVERIFY(waitFor([&] { return !sessions.isRefreshing() && !sessions.sessions().isEmpty(); }));
+        sessions.populate(&menu, send);
+        QCOMPARE(entries(menu).constLast(), QStringLiteral("Server agent: new session"));
+        QCOMPARE(entries(menu).constFirst(), QStringLiteral("Thought Editor · example-server"));
+        server.capabilities.clear();
     }
 }
 

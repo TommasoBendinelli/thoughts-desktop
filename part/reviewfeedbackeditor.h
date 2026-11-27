@@ -27,7 +27,7 @@ namespace Thoughts
 // for a new record) and Cancel. There is no Save: what was written is kept when the editor goes
 // away, however it goes, and only Cancel throws it away. It only reports the choice; the caller
 // writes. With @p kinds it also offers Question and Comment (document-feedback.md §9), which need
-// text.
+// text. With setAskAvailable a question is never kept: Ask Agent sends it (askRequested).
 class OKULARPART_EXPORT ReviewFeedbackEditor : public QFrame
 {
     Q_OBJECT
@@ -47,6 +47,11 @@ public:
     // Offers Change passage (hidden until then): the caller does so only for a highlight drawn on
     // the displayed PDF that this card or document owns.
     void setChangePassageAvailable(bool available);
+    // Questions go to an agent, not into the document (27 Nov 2026): while Question is chosen the
+    // editor offers Ask Agent instead of keeping the text, and a new question is never saved (its
+    // text, if any, is given back by unsentQuestion when the editor goes away without asking). A
+    // comment, like or dislike cannot become a question; a question kept before can still be asked.
+    void setAskAvailable(bool available);
     // Shows the editor next to @p anchor (global coordinates), on screen.
     void popupAt(const QRect &anchor);
 
@@ -78,6 +83,10 @@ Q_SIGNALS:
     void saveRequested(const QString &polarity, const QString &comment);
     void deleteRequested();
     void resolveRequested();
+    // Ask Agent with the question as typed (never empty); the editor closes.
+    void askRequested(const QString &question);
+    // A new question closed without asking: what was typed, to offer again.
+    void unsentQuestion(const QString &text);
     // Change passage: the editor closes without saving; the polarity, kind and comment as they
     // stand go with the new passage.
     void changePassageRequested(const QString &polarity, const QString &kind, const QString &comment);
@@ -88,6 +97,9 @@ protected:
 
 private:
     void keep();
+    // Whether the chosen kind is a question that is asked rather than kept.
+    bool asking() const;
+    void updateAskMode();
     // Adds pictures, up to the limit; says why one could not be added.
     void addPictureFiles(const QStringList &paths);
     void addPictureImage(const QImage &image, bool png);
@@ -110,6 +122,9 @@ private:
     QToolButton *m_other = nullptr;
     QPlainTextEdit *m_comment = nullptr;
     QPushButton *m_changePassage = nullptr;
+    QPushButton *m_ask = nullptr;
+    bool m_askAvailable = false;
+    QString m_commentPlaceholder;
     // Pictures (§12): the store, the record's pictures as edited, the row that shows them.
     PictureStore m_store;
     bool m_picturesEnabled = false;

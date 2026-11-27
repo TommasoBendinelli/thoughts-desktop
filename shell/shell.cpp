@@ -52,6 +52,8 @@
 #include "thoughtspagelink.h"
 #include "../part/pdfplacelink.h"
 #include "../part/readingoverlays.h"
+#include "../part/feedbackicon.h"
+#include "../part/reviewcardfeedback.h"
 
 #include <atomic>
 #include <limits>
@@ -3733,15 +3735,17 @@ void Shell::sendTabToSession(int tab, const Thoughts::AgentNotes::Recipient &ses
     page.page = capture->page;
     page.pages = capture->pages;
     page.image = image;
-    page.origin = QJsonObject{{QStringLiteral("conversation_id"), session.sessionId}, {QStringLiteral("copy_for_agent"), true}};
+    page.origin = QJsonObject{{QStringLiteral("copy_for_agent"), true}};
+    Thoughts::AgentSessionList::preparePage(page, session);
     Thoughts::AgentSessionList::instance()->setLastSession(session);
-    Thoughts::AgentNotes::Center::instance()->sendPage(page, [tell, label](bool ok, const QString &error) {
+    Thoughts::AgentNotes::Center::instance()->sendPage(page, [tell, label, page, session](bool ok, const QString &error) {
+        if (ok) Thoughts::AgentSessionList::instance()->pageSent(page, session);
         tell(ok, ok ? i18n("Sent to %1", label) : i18n("Not sent to %1: %2", label, error));
     });
 }
 
 void Shell::sendHtmlPageTabToSession(int tab, const Thoughts::AgentNotes::Recipient &session, const QString &text,
-                                     const std::function<void(bool ok, const QString &notice)> &tell)
+                                     const std::function<void(bool ok, const QString &notice)> &tell, const QString &titlePrefix, const QString &sentNotice)
 {
     const QPointer<KParts::ReadWritePart> part = m_tabs.at(tab).part;
     const QString label = session.label();
@@ -3758,13 +3762,15 @@ void Shell::sendHtmlPageTabToSession(int tab, const Thoughts::AgentNotes::Recipi
     if (QFileInfo(path).absolutePath() == QFileInfo(QDir(docsRoot).filePath(QStringLiteral("current_pdfs"))).absoluteFilePath())
         page.documentFilename = QFileInfo(path).fileName();
     page.documentName = readerDocumentTitle(part, path, page.documentId);
-    page.title = QStringLiteral("Copy for agent: %1 · %2").arg(page.documentName, pageTitle);
+    page.title = QStringLiteral("%1: %2 · %3").arg(titlePrefix, page.documentName, pageTitle);
     page.message = text;
     page.verbatim = true;
-    page.origin = QJsonObject{{QStringLiteral("conversation_id"), session.sessionId}, {QStringLiteral("copy_for_agent"), true}};
+    page.origin = QJsonObject{{QStringLiteral("copy_for_agent"), true}};
+    Thoughts::AgentSessionList::preparePage(page, session);
+    const QString sent = sentNotice.isEmpty() ? i18n("Sent to %1", label) : sentNotice;
     // The page's picture comes from its web view, later (htmlAttachmentPictureReady).
     const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    m_htmlPagePictureRequests.insert(requestId, [page, session, label, tell](const QImage &shown) mutable {
+    m_htmlPagePictureRequests.insert(requestId, [page, session, label, tell, sent](const QImage &shown) mutable {
         if (shown.isNull()) {
             tell(false, i18n("Not sent to %1: the page could not be pictured.", label));
             return;
@@ -3773,8 +3779,9 @@ void Shell::sendHtmlPageTabToSession(int tab, const Thoughts::AgentNotes::Recipi
         page.image = shown.width() > 1600 ? shown.scaledToWidth(1600, Qt::SmoothTransformation) : shown;
         page.image.setDevicePixelRatio(1.0);
         Thoughts::AgentSessionList::instance()->setLastSession(session);
-        Thoughts::AgentNotes::Center::instance()->sendPage(page, [tell, label](bool ok, const QString &error) {
-            tell(ok, ok ? i18n("Sent to %1", label) : i18n("Not sent to %1: %2", label, error));
+        Thoughts::AgentNotes::Center::instance()->sendPage(page, [tell, label, sent, page, session](bool ok, const QString &error) {
+            if (ok) Thoughts::AgentSessionList::instance()->pageSent(page, session);
+            tell(ok, ok ? sent : i18n("Not sent to %1: %2", label, error));
         });
     });
     connect(part, SIGNAL(htmlAttachmentPictureReady(QString,QImage)), this, SLOT(htmlAttachmentPictureReady(QString,QImage)), // clazy:exclude=old-style-connect
@@ -3795,13 +3802,21 @@ void Shell::htmlAttachmentPictureReady(const QString &requestId, const QImage &p
 
 void Shell::sendTabToLastSession(int tab)
 {
+    QPointer<Shell> guard(this);
+    withLastAgentSession(tab, [guard, tab](const Thoughts::AgentNotes::Recipient &session) {
+        if (guard) guard->sendTabToSession(tab, session);
+    });
+}
+
+void Shell::withLastAgentSession(int tab, const std::function<void(const Thoughts::AgentNotes::Recipient &session)> &act)
+{
     Thoughts::AgentSessionList *sessions = Thoughts::AgentSessionList::instance();
     const QString last = sessions->lastSession();
     if (!last.isEmpty()) {
         // As listed now, else as it was when chosen.
         Thoughts::AgentNotes::Recipient session = sessions->session(last).value_or(Thoughts::AgentNotes::Recipient{last, QString(), QString(), QString(), true, {}});
         if (!sessions->session(last)) session.title = sessions->lastSessionLabel();
-        sendTabToSession(tab, session);
+        act(session);
         return;
     }
     // None chosen yet: the sessions to choose from, where the reader is.
@@ -3811,15 +3826,103 @@ void Shell::sendTabToLastSession(int tab)
     picker->setTitle(i18n("Send to Agent"));
     QPointer<Shell> guard(this);
     installProposalLoader();
-    sessions->populate(
-        picker,
-        [guard, tab](const Thoughts::AgentNotes::Recipient &session) {
-            if (guard) guard->sendTabToSession(tab, session);
-        },
-        true,
-        [guard, tab]() { return guard ? guard->documentSourcesOfTab(tab) : Thoughts::AgentNotes::DocumentSources{}; });
+    sessions->populate(picker, act, true, [guard, tab]() { return guard ? guard->documentSourcesOfTab(tab) : Thoughts::AgentNotes::DocumentSources{}; });
     QWidget *anchor = tab >= 0 && tab < m_tabs.size() && m_tabs.at(tab).part ? m_tabs.at(tab).part->widget() : static_cast<QWidget *>(this);
     picker->popup(anchor->mapToGlobal(anchor->rect().center()));
+}
+
+namespace
+{
+// Below, with Ask About This.
+QImage washedReadingOverlayPage(const QImage &page, const QJsonArray &regions, const QColor &colour);
+}
+
+void Shell::askDocumentQuestion(const QJsonObject &request)
+{
+    const QPointer<KParts::ReadWritePart> part = qobject_cast<KParts::ReadWritePart *>(sender());
+    if (!part || request.value(QStringLiteral("question")).toString().trimmed().isEmpty()) return;
+    int tab = -1;
+    for (int index = 0; index < m_tabs.size(); ++index) {
+        if (m_tabs.at(index).part == part) tab = index;
+    }
+    if (tab < 0) return;
+    QPointer<Shell> guard(this);
+    withLastAgentSession(tab, [guard, part, request](const Thoughts::AgentNotes::Recipient &session) {
+        if (guard && part) guard->sendQuestionToSession(part, session, request);
+    });
+}
+
+void Shell::sendQuestionToSession(const QPointer<KParts::ReadWritePart> &part, const Thoughts::AgentNotes::Recipient &session, const QJsonObject &request)
+{
+    int tab = -1;
+    for (int index = 0; index < m_tabs.size(); ++index) {
+        if (m_tabs.at(index).part == part) tab = index;
+    }
+    if (tab < 0 || !part) return;
+    const QString label = session.label();
+    const QString question = request.value(QStringLiteral("question")).toString().trimmed();
+    // Said where the user reads; a question that did not go is offered again by the next Question….
+    const auto tell = [part, question](bool ok, const QString &notice) {
+        if (!part) return;
+        if (!ok) QMetaObject::invokeMethod(part, "keepUnsentQuestion", Qt::DirectConnection, Q_ARG(QString, question));
+        QMetaObject::invokeMethod(part, ok ? "noticeMessage" : "warningMessage", Qt::DirectConnection, Q_ARG(QString, ok ? notice : notice + QLatin1Char(' ') + i18n("Question… offers it again.")), Q_ARG(int, -1));
+    };
+    const QUrl url = part->url();
+    if (!url.isLocalFile()) {
+        tell(false, i18n("Not asked: only a passage of a PDF on this computer, or of an HTML page of one, can be asked about."));
+        return;
+    }
+    // The document as Copy for agent names it, without its feedback: the question alone.
+    QString documentName = KLocalizedString::removeAcceleratorMarker(m_tabWidget->tabText(isHtmlAttachmentTab(tab) ? std::max(0, findTabIndex(url)) : tab));
+    if (documentName.endsWith(QStringLiteral(" *"))) documentName.chop(2);
+    if (documentName.isEmpty()) documentName = url.fileName();
+    const QString root = ShellUtils::docsRoot();
+    const QJsonArray projects = Thoughts::LibraryProjectStore(root).projects(false);
+    QString description = Thoughts::agentDocumentDescription(root, projects, url.toLocalFile(), documentName, QString());
+    const QString quote = request.value(QStringLiteral("quote")).toString();
+    if (request.value(QStringLiteral("html")).toBool() || isHtmlAttachmentTab(tab)) {
+        if (!isHtmlAttachmentTab(tab)) {
+            tell(false, i18n("Not asked: the page is no longer shown."));
+            return;
+        }
+        QVariantMap shown;
+        QMetaObject::invokeMethod(part, "htmlAttachmentState", Qt::DirectConnection, Q_RETURN_ARG(QVariantMap, shown));
+        if (shown.value(QStringLiteral("web")).toBool()) {
+            description += Thoughts::agentWebPageDescription(shown.value(QStringLiteral("title")).toString(), shown.value(QStringLiteral("web_url")).toString(), QString());
+        } else {
+            description += Thoughts::agentHtmlPageDescription(root, shown.value(QStringLiteral("path")).toString(), shown.value(QStringLiteral("title")).toString(),
+                                                              shown.value(QStringLiteral("page_state")).toMap().value(QStringLiteral("hash")).toString(), QString(),
+                                                              shown.value(QStringLiteral("live")).toBool() ? shown.value(QStringLiteral("live_url")).toString() : QString());
+        }
+        sendHtmlPageTabToSession(tab, session, Thoughts::agentQuestionText(description, 0, quote, question), tell, QStringLiteral("Question"), i18n("Asked %1", label));
+        return;
+    }
+    const int pageNumber = request.value(QStringLiteral("page")).toInt();
+    const auto capture = capturePdfPage(part, pageNumber, [part](const QString &path, const QString &documentId) { return readerDocumentTitle(part, path, documentId); });
+    const QImage drawn = capture && capture->render ? capture->render(1600) : QImage();
+    if (!capture || drawn.isNull()) {
+        tell(false, i18n("Not asked %1: the page could not be drawn.", label));
+        return;
+    }
+    Thoughts::AgentNotes::Center::Page page;
+    page.title = QStringLiteral("Question: %1 · page %2").arg(capture->documentName, QString::number(capture->page));
+    page.message = Thoughts::agentQuestionText(description, capture->page, quote, question);
+    page.verbatim = true;
+    page.documentId = capture->documentId;
+    page.documentFilename = capture->documentFilename;
+    page.documentName = capture->documentName;
+    page.page = capture->page;
+    page.pages = capture->pages;
+    // The passage marked as the question's highlight is.
+    page.image = washedReadingOverlayPage(drawn, request.value(QStringLiteral("regions")).toArray(),
+                                          Thoughts::FeedbackIcon::colour(Thoughts::ReviewCardFeedback::neutral(), false));
+    page.origin = QJsonObject{{QStringLiteral("copy_for_agent"), true}};
+    Thoughts::AgentSessionList::preparePage(page, session);
+    Thoughts::AgentSessionList::instance()->setLastSession(session);
+    Thoughts::AgentNotes::Center::instance()->sendPage(page, [tell, label, page, session](bool ok, const QString &error) {
+        if (ok) Thoughts::AgentSessionList::instance()->pageSent(page, session);
+        tell(ok, ok ? i18n("Asked %1", label) : i18n("Not asked %1: %2", label, error));
+    });
 }
 
 void Shell::fillSendToAgentMenu(QMenu *menu, std::function<int()> tab)
@@ -13827,6 +13930,7 @@ void Shell::connectPart(const KParts::ReadWritePart *part)
     connect(part, SIGNAL(requestOpenPageLink(QUrl)), this, SLOT(openReaderPageLink(QUrl))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestOpenPdfPlaceLink(QString)), this, SLOT(openReaderPdfPlaceLink(QString))); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestAskAboutReadingOverlayMark(QJsonObject)), this, SLOT(askAboutReadingOverlayMark(QJsonObject)), Qt::UniqueConnection); // clazy:exclude=old-style-connect
+    connect(part, SIGNAL(requestAskDocumentQuestion(QJsonObject)), this, SLOT(askDocumentQuestion(QJsonObject)), Qt::UniqueConnection); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestReadingOverlayMarkNote(QString)), this, SLOT(loadReadingOverlayMarkNote(QString)), Qt::UniqueConnection); // clazy:exclude=old-style-connect
     connect(part, SIGNAL(requestOpenAgentNote(QString)), this, SLOT(openReadingOverlayMarkNote(QString)), Qt::UniqueConnection); // clazy:exclude=old-style-connect
     // A dot on the tab while it keeps an earlier version (a newer one is ready). Queued: a Part

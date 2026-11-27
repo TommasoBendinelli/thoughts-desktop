@@ -100,6 +100,23 @@ inline QString agentDocumentDescription(const QString &docsRoot, const QJsonArra
     return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
 }
 
+// Ask Agent (a question on a passage; questions are asked, never kept, since 27 Nov 2026): after
+// the document's description (and an HTML page's), the passage, the question as typed and what to
+// do with it. @p page is the PDF page of the passage (0: an HTML page's passage). A long passage
+// is cut to its first 600 characters.
+inline QString agentQuestionText(const QString &description, int page, const QString &quote, const QString &question)
+{
+    QString passage = quote;
+    passage.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
+    passage = passage.trimmed();
+    if (passage.size() > 600) passage = passage.left(600).trimmed() + QStringLiteral("…");
+    QStringList lines;
+    lines.append(page > 0 ? QStringLiteral("My question (page %1) about \"%2\":").arg(page).arg(passage) : QStringLiteral("My question about \"%1\":").arg(passage));
+    lines.append(question.trimmed());
+    lines.append(QStringLiteral("Answer my question with an agent note on this document. It is a question, not a change request: make no proposals unless I ask."));
+    return description + lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
+}
+
 // "Copy for agent" on a web tab, after the description of the document whose link opened it: the
 // web page (its title, its address now) and the text selected in it. Its feedback names its
 // address as its page path.

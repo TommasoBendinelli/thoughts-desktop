@@ -1026,9 +1026,19 @@ void Part::saveAttachmentFeedback(const QString &polarity, const QJsonObject &se
     // Nothing is saved until Save; the pictures are in the editor, to keep or remove.
     QJsonObject draft = Thoughts::DocumentFeedback::withPictures(Thoughts::DocumentFeedback::withKind(make(polarity, QString()), kind), pictures);
     draft.insert(QStringLiteral("feedback_id"), QString());
+    // A question is asked, never kept (27 Nov 2026); one closed without asking comes back here.
+    if (kind == Thoughts::DocumentFeedback::question() && !m_pageView->unsentQuestion().isEmpty()) draft.insert(QStringLiteral("comment"), m_pageView->unsentQuestion());
     auto *editor = new Thoughts::ReviewFeedbackEditor(draft, true, widget(), true);
     editor->setAttribute(Qt::WA_DeleteOnClose);
     editor->enablePictures(m_pageView->feedbackPictureStore());
+    editor->setAskAvailable(true);
+    const QString quote = selection.value(QStringLiteral("text_quote")).toObject().value(QStringLiteral("exact")).toString();
+    connect(editor, &Thoughts::ReviewFeedbackEditor::askRequested, this, [this, quote](const QString &question) {
+        m_pageView->setUnsentQuestion(QString());
+        clearAttachmentSelection();
+        askDocumentQuestion(PageView::questionRequest(question, quote, {}, true));
+    });
+    connect(editor, &Thoughts::ReviewFeedbackEditor::unsentQuestion, this, [this](const QString &text) { m_pageView->setUnsentQuestion(text); });
     connect(editor, &Thoughts::ReviewFeedbackEditor::saveRequested, this, [make, save, editor](const QString &chosen, const QString &comment) {
         save(Thoughts::DocumentFeedback::withPictures(
             Thoughts::DocumentFeedback::withKind(make(editor->kind().isEmpty() ? chosen : Thoughts::ReviewCardFeedback::positive(), Thoughts::ReviewCardFeedback::cleanComment(comment)), editor->kind()),

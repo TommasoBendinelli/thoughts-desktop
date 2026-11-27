@@ -261,6 +261,12 @@ private Q_SLOTS:
     // the mark's page as Send Page to Agent draws it, the mark's lines washed and outlined in its
     // kind's colour, titled and worded for the agent that made the overlay, in Send Page's composer.
     void askAboutReadingOverlayMark(const QJsonObject &request);
+    // Ask Agent in a question's editor (Part::requestAskDocumentQuestion): to the session Send to
+    // Agent used last (a menu of sessions when none yet), at once: the document as Copy for agent
+    // names it, the passage and the question (agentQuestionText), with the passage's PDF page and
+    // the passage marked, or the HTML page as its tab shows it. Nothing else of Copy for agent (no
+    // feedback) goes with it. The reader says "Asked <session>" or why not.
+    void askDocumentQuestion(const QJsonObject &request);
     // A reading overlay mark's note (Part::requestReadingOverlayMarkNote): the agent note fetched by
     // its id (no list has it) and its picture, given back to the Part (null when not had).
     void loadReadingOverlayMarkNote(const QString &noteId);
@@ -458,7 +464,13 @@ private:
     void sendTabToSession(int tab, const Thoughts::AgentNotes::Recipient &session, std::function<void(bool ok, const QString &notice)> done = {});
     // sendTabToSession for an HTML page's tab: @p text with the picture its Part takes of the page.
     void sendHtmlPageTabToSession(int tab, const Thoughts::AgentNotes::Recipient &session, const QString &text,
-                                  const std::function<void(bool ok, const QString &notice)> &tell);
+                                  const std::function<void(bool ok, const QString &notice)> &tell, const QString &titlePrefix = QStringLiteral("Copy for agent"),
+                                  const QString &sentNotice = QString());
+    // @p act with the session Send to Agent used last; none yet: the sessions to pick from, in a
+    // menu over @p tab's reader, and @p act with the one chosen.
+    void withLastAgentSession(int tab, const std::function<void(const Thoughts::AgentNotes::Recipient &session)> &act);
+    // askDocumentQuestion's sending, to @p session, for @p part's tab.
+    void sendQuestionToSession(const QPointer<KParts::ReadWritePart> &part, const Thoughts::AgentNotes::Recipient &session, const QJsonObject &request);
     // Pictures asked of page tabs' Parts (requestHtmlAttachmentPicture), by request id.
     QHash<QString, std::function<void(const QImage &)>> m_htmlPagePictureRequests;
     // File > Send to Last Agent (⌘⇧A): to the session sent to last; none yet: the sessions to pick

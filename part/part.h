@@ -497,6 +497,12 @@ Q_SIGNALS:
     // screen), "regions" (the mark's rectangles on that page, [left, top, right, bottom]
     // normalized), "colour" (the kind's, #rrggbb) and "question" (as typed, may be empty).
     void requestAskAboutReadingOverlayMark(const QJsonObject &request);
+    // Ask Agent in a question's editor (questions are asked, never kept, since 27 Nov 2026): the
+    // Shell sends the question to the session Send to Agent used last (asking which when none),
+    // with the document as Copy for agent names it and the page with the passage marked (a PDF), or
+    // the HTML page as shown. @p request is PageView::questionRequest's. When it cannot be sent the
+    // Shell gives the question back with keepUnsentQuestion.
+    void requestAskDocumentQuestion(const QJsonObject &request);
     // A reading overlay mark's popup shows its note's picture (reading-overlays.md "Mark notes"):
     // the Shell fetches the agent note by its id and answers with setReadingOverlayMarkNoteImage.
     void requestReadingOverlayMarkNote(const QString &noteId);
@@ -679,6 +685,8 @@ public Q_SLOTS:
     void errorMessage(const QString &message, int duration = 0);
     void warningMessage(const QString &message, int duration = -1);
     void noticeMessage(const QString &message, int duration = -1);
+    // A question Ask Agent could not send: offered again by the next Question….
+    void keepUnsentQuestion(const QString &question);
 
     void moveSplitter(const int sideWidgetSize);
 #if HAVE_NEW_SIGNATURE_API
@@ -732,6 +740,8 @@ private:
     bool revealReadingOverlayMark(const QString &overlayId, const QString &markId);
     // A mark popup's Ask About This: requestAskAboutReadingOverlayMark for the mark's page.
     bool askAboutReadingOverlayMark(const QString &overlayId, const QString &markId, const QString &question);
+    // A question's Ask Agent: requestAskDocumentQuestion, or why it cannot be asked here.
+    void askDocumentQuestion(const QJsonObject &request);
     // The overlay a link asked for before the PDF's identity was known or Sync brought it
     // (showReadingOverlay), and whether the reader was told it is not here yet.
     QString m_pendingReadingOverlay;

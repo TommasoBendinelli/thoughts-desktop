@@ -366,6 +366,22 @@ public:
     using DocumentProvider = std::function<AgentNotes::DocumentSources()>;
     void populate(QMenu *menu, std::function<void(const AgentNotes::Recipient &)> send, bool refreshNow = true, DocumentProvider document = {});
 
+    // The Thoughts server's own agent (thoughts-server protocol/server-agents.md, server_agents_v1;
+    // 27 Nov 2026, for people without a computer that runs a reply waker): after the computers'
+    // sessions the menu offers "Server agent: new session" and, once one was started from here,
+    // that session. It runs on the server with the person's own Anthropic API key (Thoughts Web:
+    // Server agent…). Senders call preparePage before sending and pageSent after.
+    bool serverAgentsAvailable() const { return m_serverAgents; }
+    static bool isServerAgent(const QString &sessionId);
+    static AgentNotes::Recipient newServerSession();
+    static AgentNotes::Recipient serverSession(const QString &conversationId);
+    // @p page's origin for @p session: its conversation (it is woken, or the server session
+    // resumes), or a new server session's start (origin start_session and where "server").
+    static void preparePage(AgentNotes::Center::Page &page, const AgentNotes::Recipient &session);
+    // After @p page went to @p session: a new server session's id, from the server's claim of the
+    // page, becomes the server session the menu offers and the last session.
+    void pageSent(const AgentNotes::Center::Page &page, const AgentNotes::Recipient &session);
+
 Q_SIGNALS:
     void changed();
 
@@ -381,6 +397,9 @@ private:
     QString m_error;
     QList<AgentNotes::ProposalAuthorship> m_proposals;
     std::function<void()> m_loadProposals;
+    // The server lists server_agents_v1 (as last asked; asked once a run).
+    bool m_serverAgents = false;
+    bool m_capabilitiesAsked = false;
 };
 
 }

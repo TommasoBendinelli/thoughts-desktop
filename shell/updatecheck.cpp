@@ -293,28 +293,14 @@ void installAndRestart(QWidget *parent, const QString &installer)
     QCoreApplication::quit();
 }
 
-void download(QWidget *parent, const Release &release)
-{
-    // The installer is not signed: its SHA-256 in the release is all that
-    // ties the download to what was published. Without one nothing is run.
-    if (!isSha256(release.sha256)) {
-        KMessageBox::error(parent, i18n("The release of Thoughts %1 gives no SHA-256 checksum for its installer, so it is not downloaded. Install it from the release page.", release.version),
-                           i18n("Update Thoughts"));
-        return;
-    }
-    auto *progress = new QProgressDialog(i18n("Downloading Thoughts %1…", release.version), i18n("Cancel"), 0, 100, parent);
-    progress->setWindowTitle(i18n("Update Thoughts"));
-    progress->setAttribute(Qt::WA_DeleteOnClose);
-    progress->setMinimumDuration(0);
-    progress->setValue(0);
-    QPointer<QProgressDialog> guard(progress);
+KConfigGroup state();
 
-    auto fail = [parent, guard](const QString &message) {
-        if (guard) {
-            guard->close();
-        }
-        KMessageBox::error(parent, message, i18n("Update Thoughts"));
-    };
+// Fetches @p release's installer (following only allowed redirects), checks its digest and
+// saves it (saveInstaller). @p progress hears the percentage; @p started gets the reply (to
+// cancel it); @p done gets the saved path, or an error (empty for a cancel).
+void fetchInstaller(const Release &release, const std::function<void(int)> &progress, const std::function<void(QNetworkReply *)> &started,
+                    const std::function<void(const QString &path, const QString &error)> &done)
+{
     auto fetchFrom = std::make_shared<std::function<void(const QUrl &, bool, int)>>();
     *fetchFrom = [=](const QUrl &url, bool authorized, int redirects) {
         // The asset URL answers with a redirect to a signed download link, which
@@ -323,13 +309,13 @@ void download(QWidget *parent, const Release &release)
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
         request.setTransferTimeout(120000);
         QNetworkReply *reply = network()->get(request);
-        if (guard) {
-            QObject::connect(guard, &QProgressDialog::canceled, reply, &QNetworkReply::abort);
+        if (started) {
+            started(reply);
         }
-        QObject::connect(reply, &QNetworkReply::downloadProgress, reply, [guard, release](qint64 received, qint64 total) {
+        QObject::connect(reply, &QNetworkReply::downloadProgress, reply, [progress, release](qint64 received, qint64 total) {
             const qint64 size = total > 0 ? total : release.assetSize;
-            if (guard && size > 0) {
-                guard->setValue(int(received * 100 / size));
+            if (progress && size > 0) {
+                progress(int(received * 100 / size));
             }
         });
         QObject::connect(reply, &QNetworkReply::finished, reply, [=] {
@@ -339,43 +325,109 @@ void download(QWidget *parent, const Release &release)
                 const QUrl next = url.resolved(reply->header(QNetworkRequest::LocationHeader).toUrl());
                 bool sendToken = false;
                 if (redirects >= 5 || !redirectAllowed(url, next, &sendToken)) {
-                    fail(i18n("The download was redirected to an address Thoughts does not follow. Nothing was installed."));
+                    done({}, i18n("The download was redirected to an address Thoughts does not follow. Nothing was installed."));
                     return;
                 }
                 (*fetchFrom)(next, authorized && sendToken, redirects + 1);
                 return;
             }
             if (reply->error() == QNetworkReply::OperationCanceledError) {
+                done({}, {});
                 return;
             }
             if (reply->error() != QNetworkReply::NoError) {
-                fail(i18n("The download failed: %1", reply->errorString()));
+                done({}, i18n("The download failed: %1", reply->errorString()));
                 return;
             }
             const QByteArray bytes = reply->readAll();
             if (!installerMatches(release.sha256, bytes)) {
-                fail(i18n("The downloaded installer does not match the release's checksum. Nothing was installed."));
+                done({}, i18n("The downloaded installer does not match the release's checksum. Nothing was installed."));
                 return;
             }
             const QString target = saveInstaller(bytes, release.assetName);
             if (target.isEmpty()) {
-                fail(i18n("Could not save the installer in the temporary folder."));
+                done({}, i18n("Could not save the installer in the temporary folder."));
                 return;
             }
-            if (guard) {
-                guard->close();
-            }
-            const auto answer = KMessageBox::questionTwoActions(parent,
-                                                                i18n("Thoughts %1 is downloaded. Install it now? Thoughts closes, updates and opens again.", release.version),
-                                                                i18n("Update Thoughts"),
-                                                                KGuiItem(i18n("Install and Restart")),
-                                                                KGuiItem(i18n("Later")));
-            if (answer == KMessageBox::PrimaryAction) {
-                installAndRestart(parent, target);
-            }
+            rememberReadyInstaller(target, release.version, release.sha256);
+            done(target, {});
         });
     };
     (*fetchFrom)(release.assetUrl, true, 0);
+}
+
+// The installer at @p path is downloaded: install now, or later. It is checked again just
+// before it runs.
+void askToInstall(QWidget *parent, const Release &release, const QString &path, bool inBackground)
+{
+    QString text = i18n("Thoughts %1 is downloaded. Install it now? Thoughts closes, updates and opens again.", release.version);
+    if (inBackground) {
+        QString notes = release.notes.trimmed();
+        if (notes.size() > 1200) {
+            notes = notes.left(1200) + QStringLiteral("…");
+        }
+        text = notes.isEmpty() ? i18n("Thoughts %1 is downloaded and ready to install. You have %2. Install it now? Thoughts closes, updates and opens again.", release.version, currentVersion())
+                               : i18n("Thoughts %1 is downloaded and ready to install. You have %2. Install it now? Thoughts closes, updates and opens again.\n\n%3", release.version,
+                                      currentVersion(), notes);
+    }
+    const auto answer = KMessageBox::questionTwoActions(parent, text, i18n("Update Thoughts"), KGuiItem(i18n("Install and Restart")), KGuiItem(i18n("Later")));
+    if (answer != KMessageBox::PrimaryAction) {
+        return;
+    }
+    if (!installerFileMatches(path, release.sha256)) {
+        KMessageBox::error(parent, i18n("The downloaded installer changed since it was checked. Nothing was installed; Check for Updates downloads it again."), i18n("Update Thoughts"));
+        state().deleteEntry("ReadyPath");
+        return;
+    }
+    installAndRestart(parent, path);
+}
+
+void download(QWidget *parent, const Release &release)
+{
+    // The installer is not signed: its SHA-256 in the release is all that
+    // ties the download to what was published. Without one nothing is run.
+    if (!isSha256(release.sha256)) {
+        KMessageBox::error(parent, i18n("The release of Thoughts %1 gives no SHA-256 checksum for its installer, so it is not downloaded. Install it from the release page.", release.version),
+                           i18n("Update Thoughts"));
+        return;
+    }
+    // Downloaded in the background already: only the install is left.
+    const QString ready = readyInstaller(release.version, release.sha256);
+    if (!ready.isEmpty()) {
+        askToInstall(parent, release, ready, false);
+        return;
+    }
+    auto *progress = new QProgressDialog(i18n("Downloading Thoughts %1…", release.version), i18n("Cancel"), 0, 100, parent);
+    progress->setWindowTitle(i18n("Update Thoughts"));
+    progress->setAttribute(Qt::WA_DeleteOnClose);
+    progress->setMinimumDuration(0);
+    progress->setValue(0);
+    QPointer<QProgressDialog> guard(progress);
+    QPointer<QWidget> owner(parent);
+    fetchInstaller(
+        release,
+        [guard](int percent) {
+            if (guard) {
+                guard->setValue(percent);
+            }
+        },
+        [guard](QNetworkReply *reply) {
+            if (guard) {
+                QObject::connect(guard, &QProgressDialog::canceled, reply, &QNetworkReply::abort);
+            }
+        },
+        [guard, owner, release](const QString &path, const QString &error) {
+            if (guard) {
+                guard->close();
+            }
+            if (path.isEmpty()) {
+                if (!error.isEmpty()) {
+                    KMessageBox::error(owner, error, i18n("Update Thoughts"));
+                }
+                return;
+            }
+            askToInstall(owner, release, path, false);
+        });
 }
 
 void offer(QWidget *parent, const Release &release)
@@ -507,6 +559,8 @@ void checkInBackground(QWidget *parent)
     if (!available() || qEnvironmentVariableIsSet("THOUGHTS_NO_UPDATE_CHECK")) {
         return;
     }
+    // The installer of the version now running is not needed any more.
+    forgetInstalledInstaller();
     const qint64 last = state().readEntry("LastCheck", qint64(0));
     if (QDateTime::currentSecsSinceEpoch() - last < backgroundInterval) {
         return;
@@ -518,10 +572,97 @@ void checkInBackground(QWidget *parent)
                 return;
             }
             state().writeEntry("LastCheck", QDateTime::currentSecsSinceEpoch());
-            if (release) {
-                offer(guard, *release);
+            if (!release) {
+                return;
             }
+            // Downloaded at once, quietly: asked only when it is ready, so the update is only the
+            // install. A download that fails is offered as before.
+            const Release found = *release;
+            const QString ready = isSha256(found.sha256) ? readyInstaller(found.version, found.sha256) : QString();
+            if (!ready.isEmpty()) {
+                askToInstall(guard, found, ready, true);
+                return;
+            }
+            if (!isSha256(found.sha256)) {
+                offer(guard, found);
+                return;
+            }
+            fetchInstaller(found, {}, {}, [guard, found](const QString &path, const QString &) {
+                if (!guard) {
+                    return;
+                }
+                if (path.isEmpty()) {
+                    offer(guard, found);
+                    return;
+                }
+                askToInstall(guard, found, path, true);
+            });
         });
     });
+}
+
+bool installerFileMatches(const QString &path, const QByteArray &sha256)
+{
+    QFile file(path);
+    if (!isSha256(sha256) || !file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file)) {
+        return false;
+    }
+    return hash.result().toHex() == sha256;
+}
+
+QString readyInstaller(const QString &version, const QByteArray &sha256)
+{
+    KConfigGroup group = state();
+    const QString path = group.readEntry("ReadyPath", QString());
+    if (path.isEmpty()) {
+        return {};
+    }
+    if (group.readEntry("ReadyVersion", QString()) != version || group.readEntry("ReadySha256", QByteArray()) != sha256) {
+        return {};
+    }
+    if (!installerFileMatches(path, sha256)) {
+        // Changed or gone: never run, and not kept.
+        if (QFileInfo(path).dir().dirName().startsWith(QStringLiteral("Thoughts-update-"))) {
+            QDir(QFileInfo(path).absolutePath()).removeRecursively();
+        }
+        group.deleteEntry("ReadyPath");
+        group.sync();
+        return {};
+    }
+    return path;
+}
+
+void rememberReadyInstaller(const QString &path, const QString &version, const QByteArray &sha256)
+{
+    KConfigGroup group = state();
+    // One remembered installer: an older one goes.
+    const QString previous = group.readEntry("ReadyPath", QString());
+    if (!previous.isEmpty() && previous != path && QFileInfo(previous).dir().dirName().startsWith(QStringLiteral("Thoughts-update-"))) {
+        QDir(QFileInfo(previous).absolutePath()).removeRecursively();
+    }
+    group.writeEntry("ReadyPath", path);
+    group.writeEntry("ReadyVersion", version);
+    group.writeEntry("ReadySha256", sha256);
+    group.sync();
+}
+
+void forgetInstalledInstaller()
+{
+    KConfigGroup group = state();
+    const QString path = group.readEntry("ReadyPath", QString());
+    if (path.isEmpty() || compareVersions(group.readEntry("ReadyVersion", QString()), currentVersion()) > 0) {
+        return;
+    }
+    if (QFileInfo(path).dir().dirName().startsWith(QStringLiteral("Thoughts-update-"))) {
+        QDir(QFileInfo(path).absolutePath()).removeRecursively();
+    }
+    group.deleteEntry("ReadyPath");
+    group.deleteEntry("ReadyVersion");
+    group.deleteEntry("ReadySha256");
+    group.sync();
 }
 }

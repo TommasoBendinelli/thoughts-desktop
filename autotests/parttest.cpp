@@ -169,6 +169,20 @@
 
 namespace
 {
+// A question as one was kept before 27 Nov 2026 (questions are asked now, never kept): the
+// selected passage with the text.
+QJsonObject keptQuestion(PageView *view, const QString &text)
+{
+    QJsonObject record = Thoughts::DocumentFeedback::withKind(view->documentFeedbackForSelection(Thoughts::ReviewCardFeedback::positive(), QString(), nullptr, true),
+                                                              Thoughts::DocumentFeedback::question());
+    record.insert(QStringLiteral("polarity"), Thoughts::ReviewCardFeedback::neutral());
+    record.insert(QStringLiteral("comment"), text);
+    const QString now = Thoughts::ReviewCardFeedback::timestamp(QDateTime::currentDateTimeUtc());
+    record.insert(QStringLiteral("created_at"), now);
+    record.insert(QStringLiteral("updated_at"), now);
+    return record;
+}
+
 
 struct ScriptedHttpRequest {
     QByteArray method;
@@ -823,6 +837,7 @@ private Q_SLOTS:
     void testFeedbackEditorKeepsWhatWasWritten();
     void testProposalListDecidesSeveral();
     void testCommentKindsAndVersions();
+    void testQuestionsAreAskedNotKept();
     void testTextSelectionCreatesManualReviewRequest();
     void testTextSelectionOverAPageBreakCreatesOneMultiAreaRequest();
     void testSectionHeadingRightClickOffersSectionReviewCard();
@@ -2829,13 +2844,17 @@ void PartTest::testDocumentFeedbackChangePassage()
     const Okular::NormalizedRect inside(0.29, 0.162, 0.43, 0.171);
     const Okular::NormalizedRect later(0.44, 0.162, 0.7, 0.171);
 
-    // A resolved question on the passage.
+    // A resolved question on the passage. Questions are asked, never kept (27 Nov 2026): one kept
+    // before is written directly.
     select(inside);
     auto *editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::question());
     QVERIFY(editor);
     QVERIFY(!editor->findChild<QPushButton *>(QStringLiteral("reviewFeedbackChangePassage")));
     editor->findChild<QPlainTextEdit *>(QStringLiteral("reviewFeedbackComment"))->setPlainText(QStringLiteral("Why random?"));
     editor->close();
+    QVERIFY(written.isEmpty());
+    select(inside);
+    QVERIFY(feedback->write(keptQuestion(part.m_pageView, QStringLiteral("Why random?"))));
     QCOMPARE(written.size(), 1);
     const QString questionId = written.last().value(QStringLiteral("feedback_id")).toString();
     QVERIFY(part.m_pageView->resolveDocumentFeedback(questionId, true));
@@ -3292,6 +3311,7 @@ void PartTest::testFedoraRepositoryStaysOfflineUntilExplicitAction()
 namespace
 {
 const QString kDocumentFeedbackDocument = QStringLiteral("c1e62ecc-2dfb-4259-97cc-e319b1186848");
+
 
 // A document feedback record of @p documentId (document-feedback.md §1) on page 1.
 QJsonObject testDocumentFeedback(const QString &polarity, const QString &quote, const QString &comment, const QString &createdAt,
@@ -21034,6 +21054,113 @@ void PartTest::testRectSelectionCreatesManualReviewRequest()
     QVERIFY(rect.at(3).toDouble() <= 1.0);
 }
 
+void PartTest::testQuestionsAreAskedNotKept()
+{
+    // User, 27 Nov 2026: a question is not saved; Ask Agent sends it to the agent at once.
+    Okular::Part part(nullptr, {});
+    QVERIFY(openDocument(&part, QStringLiteral(KDESRCDIR "data/file1.pdf")));
+    part.widget()->resize(900, 800);
+    part.widget()->show();
+    part.m_document->requestTextPage(0);
+    QTRY_VERIFY(!part.m_document->page(0)->text().isEmpty());
+    QCoreApplication::processEvents();
+    const QSignalBlocker quietRepository(part.m_fedoraRepository);
+    auto *feedback = part.m_pageView->documentFeedback();
+    QList<QJsonObject> written;
+    feedback->setWriter([&written](const QJsonObject &record, QString *) {
+        written.append(record);
+        return true;
+    });
+    const QString shownSha = Thoughts::FeedbackVersion::cachedFileSha256(part.localFilePath());
+    feedback->setDocument(kDocumentFeedbackDocument, shownSha);
+    feedback->setReviewVersion({{QStringLiteral("pdf_sha256"), shownSha}, {QStringLiteral("source_built"), false}});
+    const auto select = [&part] {
+        auto area = std::make_unique<Okular::RegularAreaRect>();
+        area->appendShape(Okular::NormalizedRect(0.29, 0.162, 0.43, 0.171));
+        part.m_document->setPageTextSelection(0, std::move(area), QColor(Qt::blue));
+    };
+    QSignalSpy asked(part.m_pageView.data(), SIGNAL(documentQuestionAsked(QJsonObject)));
+
+    // Question…: Ask Agent, which needs words; no pictures (they would not go with it).
+    select();
+    auto *editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::question());
+    QVERIFY(editor);
+    auto *ask = editor->findChild<QPushButton *>(QStringLiteral("reviewFeedbackAsk"));
+    QVERIFY(ask && ask->isVisibleTo(editor));
+    QVERIFY(!ask->isEnabled());
+    QVERIFY(!editor->findChild<QWidget *>(QStringLiteral("reviewFeedbackPictures"))->isVisibleTo(editor));
+    // Comment instead: no Ask Agent, and kept as before.
+    editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackOther"))->click();
+    QVERIFY(!ask->isVisibleTo(editor));
+    editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackQuestion"))->click();
+    QVERIFY(ask->isVisibleTo(editor));
+    editor->findChild<QPlainTextEdit *>(QStringLiteral("reviewFeedbackComment"))->setPlainText(QStringLiteral("Is credit assignment the same problem?"));
+    QVERIFY(ask->isEnabled());
+    ask->click();
+    QVERIFY(!editor->isVisible());
+    QVERIFY(written.isEmpty());
+    QCOMPARE(asked.size(), 1);
+    const QJsonObject request = asked.constFirst().constFirst().toJsonObject();
+    QCOMPARE(request.value(QStringLiteral("question")).toString(), QStringLiteral("Is credit assignment the same problem?"));
+    QVERIFY(!request.value(QStringLiteral("quote")).toString().isEmpty());
+    QCOMPARE(request.value(QStringLiteral("page")).toInt(), 1);
+    QCOMPARE(request.value(QStringLiteral("html")).toBool(), false);
+    const QJsonArray region = request.value(QStringLiteral("regions")).toArray().first().toArray();
+    QCOMPARE(region.size(), 4);
+    QVERIFY(region.at(0).toDouble() < region.at(2).toDouble() && region.at(1).toDouble() < region.at(3).toDouble());
+    // Without the Thoughts app nobody sends it: it is offered again.
+    QCOMPARE(part.m_pageView->unsentQuestion(), QStringLiteral("Is credit assignment the same problem?"));
+    select();
+    editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::question());
+    QCOMPARE(editor->comment(), QStringLiteral("Is credit assignment the same problem?"));
+    editor->close();
+    QVERIFY(written.isEmpty());
+
+    // A comment kept in the document cannot become a question.
+    select();
+    editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::other());
+    editor->findChild<QPlainTextEdit *>(QStringLiteral("reviewFeedbackComment"))->setPlainText(QStringLiteral("Fix the bound."));
+    editor->close();
+    QCOMPARE(written.size(), 1);
+    editor = part.m_pageView->openDocumentFeedbackEditor(written.constLast().value(QStringLiteral("feedback_id")).toString());
+    QVERIFY(!editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackQuestion"))->isVisibleTo(editor));
+    QVERIFY(!editor->findChild<QPushButton *>(QStringLiteral("reviewFeedbackAsk"))->isVisibleTo(editor));
+    editor->close();
+
+    // A question kept before: Ask Agent sends it, then it goes (Undo brings it back).
+    select();
+    const QJsonObject old = keptQuestion(part.m_pageView, QStringLiteral("Why random?"));
+    QVERIFY(feedback->write(old));
+    const int before = written.size();
+    editor = part.m_pageView->openDocumentFeedbackEditor(old.value(QStringLiteral("feedback_id")).toString());
+    ask = editor->findChild<QPushButton *>(QStringLiteral("reviewFeedbackAsk"));
+    QVERIFY(ask->isVisibleTo(editor) && ask->isEnabled());
+    ask->click();
+    QCOMPARE(asked.size(), 2);
+    QCOMPARE(asked.constLast().constFirst().toJsonObject().value(QStringLiteral("question")).toString(), QStringLiteral("Why random?"));
+    QCOMPARE(written.size(), before + 1);
+    QVERIFY(written.constLast().value(QStringLiteral("deleted")).toBool());
+
+    // A comment of the other person of a shared Project (the server's shared_author) says whose it is.
+    select();
+    QJsonObject theirs = Thoughts::DocumentFeedback::withKind(part.m_pageView->documentFeedbackForSelection(Thoughts::ReviewCardFeedback::positive(), QString()),
+                                                             Thoughts::DocumentFeedback::other());
+    theirs.insert(QStringLiteral("polarity"), Thoughts::ReviewCardFeedback::neutral());
+    theirs.insert(QStringLiteral("comment"), QStringLiteral("Rewrite the first figure"));
+    const QString now = Thoughts::ReviewCardFeedback::timestamp(QDateTime::currentDateTimeUtc());
+    theirs.insert(QStringLiteral("created_at"), now);
+    theirs.insert(QStringLiteral("updated_at"), now);
+    theirs.insert(QStringLiteral("shared_author"), QJsonObject{{QStringLiteral("username"), QStringLiteral("alex")}});
+    QCOMPARE(Thoughts::DocumentFeedback::validationError(theirs), QString());
+    QVERIFY(feedback->write(theirs));
+    editor = part.m_pageView->openDocumentFeedbackEditor(theirs.value(QStringLiteral("feedback_id")).toString());
+    QVERIFY(editor->findChild<QLabel *>(QStringLiteral("reviewFeedbackDates"))->text().startsWith(QStringLiteral("By alex · Created ")));
+    editor->close();
+    QTRY_VERIFY(part.m_reviewsWidget->m_model->indexForFeedback(theirs.value(QStringLiteral("feedback_id")).toString()).isValid());
+    QVERIFY(part.m_reviewsWidget->m_model->indexForFeedback(theirs.value(QStringLiteral("feedback_id")).toString())
+                .data(AnnotationModel::ReviewCardStatusRole).toString().startsWith(QStringLiteral("by alex")));
+}
+
 void PartTest::testCommentKindsAndVersions()
 {
     // A comment on a passage is a like, a dislike, a question or something else (document-feedback.md
@@ -21081,6 +21208,10 @@ void PartTest::testCommentKindsAndVersions()
     editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::question());
     editor->findChild<QPlainTextEdit *>(QStringLiteral("reviewFeedbackComment"))->setPlainText(QStringLiteral("Why this bound?"));
     editor->close();
+    // Asked, never kept (27 Nov 2026); one kept before still lists as a question.
+    QVERIFY(written.isEmpty());
+    select();
+    QVERIFY(feedback->write(keptQuestion(part.m_pageView, QStringLiteral("Why this bound?"))));
     QCOMPARE(written.size(), 1);
     const QJsonObject question = written.constLast();
     QCOMPARE(Thoughts::DocumentFeedback::validationError(question), QString());
@@ -22177,14 +22308,16 @@ void PartTest::testFeedbackEditorKeepsWhatWasWritten()
     QCOMPARE(written.size(), 3);
     QCOMPARE(comment(), QStringLiteral("Escaped"));
 
-    // So does the choice of a kind, with the text it needs.
+    // So does the choice of a kind, with the text it needs. A dislike cannot become a question
+    // (questions are asked, never kept).
     editor = part.m_pageView->openDocumentFeedbackEditor(id);
-    editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackQuestion"))->click();
+    QVERIFY(!editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackQuestion"))->isVisibleTo(editor));
+    editor->findChild<QToolButton *>(QStringLiteral("reviewFeedbackOther"))->click();
     clickAway(editor);
     QCOMPARE(written.size(), 4);
-    QCOMPARE(Thoughts::DocumentFeedback::kindOf(written.constLast()), Thoughts::DocumentFeedback::question());
+    QCOMPARE(Thoughts::DocumentFeedback::kindOf(written.constLast()), Thoughts::DocumentFeedback::other());
 
-    // A question is its text: emptied, it stays what it was.
+    // A comment is its text: emptied, it stays what it was.
     editor = part.m_pageView->openDocumentFeedbackEditor(id);
     write(editor, QString());
     clickAway(editor);
@@ -22213,8 +22346,15 @@ void PartTest::testFeedbackEditorKeepsWhatWasWritten()
     editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::question());
     write(editor, QStringLiteral("Why?"));
     clickAway(editor);
+    // A question is asked, never kept: what was typed comes back with the next Question….
+    QCOMPARE(written.size(), 6);
+    QCOMPARE(part.m_pageView->unsentQuestion(), QStringLiteral("Why?"));
+    select();
+    editor = part.m_pageView->openNewDocumentFeedbackEditor(Thoughts::DocumentFeedback::other());
+    write(editor, QStringLiteral("Why?"));
+    clickAway(editor);
     QCOMPARE(written.size(), 7);
-    QCOMPARE(Thoughts::DocumentFeedback::kindOf(written.constLast()), Thoughts::DocumentFeedback::question());
+    QCOMPARE(Thoughts::DocumentFeedback::kindOf(written.constLast()), Thoughts::DocumentFeedback::other());
     QCOMPARE(comment(), QStringLiteral("Why?"));
 
     // Delete writes the delete and not what was typed before it.

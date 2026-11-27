@@ -505,6 +505,8 @@ public:
     Thoughts::DocumentFeedbackOverlay *documentFeedback = nullptr;
     // Where document feedback's pictures are kept (Part sets it with the repository).
     Thoughts::ReviewFeedbackEditor::PictureStore feedbackPictureStore;
+    // A question closed without Ask Agent (or not sent), for the next Question….
+    QString unsentQuestion;
     // Agents' reading guides (reading-overlays.md): the overlays of the PDF on screen; the mark the
     // Overlay tab asked for, flashed while overlayFlashTicks counts down; the comment marker pressed.
     Thoughts::ReadingOverlayLayer *readingOverlays = nullptr;
@@ -5807,12 +5809,44 @@ Thoughts::ReviewFeedbackEditor::PictureStore PageView::feedbackPictureStore() co
     return d->feedbackPictureStore;
 }
 
+void PageView::setUnsentQuestion(const QString &text)
+{
+    d->unsentQuestion = text;
+}
+
+QString PageView::unsentQuestion() const
+{
+    return d->unsentQuestion;
+}
+
+QJsonObject PageView::questionRequest(const QString &question, const QString &quote, const QList<QPair<int, QRectF>> &lines, bool html)
+{
+    QJsonObject request{{QStringLiteral("question"), question}, {QStringLiteral("quote"), quote.simplified()}, {QStringLiteral("html"), html}};
+    if (html || lines.isEmpty()) return request;
+    // The passage's first page, with its lines there (the page the agent is shown).
+    const int page = lines.constFirst().first;
+    QJsonArray regions;
+    for (const auto &[linePage, rect] : lines) {
+        if (linePage == page) regions.append(QJsonArray{rect.left(), rect.top(), rect.right(), rect.bottom()});
+    }
+    request.insert(QStringLiteral("page"), page);
+    request.insert(QStringLiteral("regions"), regions);
+    return request;
+}
+
 Thoughts::ReviewFeedbackEditor *PageView::openDocumentFeedbackEditor(const QString &feedbackId, const QRect &anchor)
 {
     const QJsonObject record = d->documentFeedback->record(feedbackId);
     if (record.isEmpty() || record.value(QStringLiteral("deleted")).toBool()) return nullptr;
     auto *editor = new Thoughts::ReviewFeedbackEditor(record, false, this, true);
     editor->enablePictures(d->feedbackPictureStore);
+    // A question kept before questions were asked: Ask Agent sends it, then it goes (Undo brings it back).
+    editor->setAskAvailable(true);
+    connect(editor, &Thoughts::ReviewFeedbackEditor::askRequested, this, [this, feedbackId, record, anchor](const QString &question) {
+        const QString quote = record.value(QStringLiteral("anchor")).toObject().value(QStringLiteral("quote")).toObject().value(QStringLiteral("exact")).toString();
+        Q_EMIT documentQuestionAsked(questionRequest(question, quote, d->documentFeedback->rectsOf(feedbackId), anchor.isValid()));
+        deleteDocumentFeedback(feedbackId);
+    });
     connect(editor, &Thoughts::ReviewFeedbackEditor::saveRequested, this, [this, feedbackId, editor](const QString &polarity, const QString &comment) {
         const QJsonObject current = d->documentFeedback->record(feedbackId);
         QString error;
@@ -5856,9 +5890,22 @@ Thoughts::ReviewFeedbackEditor *PageView::openNewDocumentFeedbackEditor(const QS
         d->messageWindow->display(error, QString(), PageViewMessage::Warning, 4000);
         return nullptr;
     }
-    // Nothing is saved until Save.
-    auto *editor = new Thoughts::ReviewFeedbackEditor(Thoughts::DocumentFeedback::withKind(draft, kind), true, this, true);
+    // Nothing is saved until Save; a question never is (Ask Agent sends it). A question closed
+    // without asking comes back here.
+    QJsonObject shown = Thoughts::DocumentFeedback::withKind(draft, kind);
+    if (kind == Thoughts::DocumentFeedback::question() && !d->unsentQuestion.isEmpty()) shown.insert(QStringLiteral("comment"), d->unsentQuestion);
+    auto *editor = new Thoughts::ReviewFeedbackEditor(shown, true, this, true);
     editor->enablePictures(d->feedbackPictureStore);
+    editor->setAskAvailable(true);
+    const QString quote = feedbackText();
+    const QList<QPair<int, QRectF>> lines = feedbackLines();
+    connect(editor, &Thoughts::ReviewFeedbackEditor::askRequested, this, [this, quote, lines](const QString &question) {
+        d->unsentQuestion.clear();
+        textSelectionClear();
+        clearFeedbackSelection(d->document);
+        Q_EMIT documentQuestionAsked(questionRequest(question, quote, lines, false));
+    });
+    connect(editor, &Thoughts::ReviewFeedbackEditor::unsentQuestion, this, [this](const QString &text) { d->unsentQuestion = text; });
     connect(editor, &Thoughts::ReviewFeedbackEditor::saveRequested, this, [this, draft, editor](const QString &polarity, const QString &comment) {
         QJsonObject record = Thoughts::DocumentFeedback::withPictures(Thoughts::DocumentFeedback::withKind(draft, editor->kind()), editor->pictures());
         record.insert(QStringLiteral("polarity"), polarity);

@@ -14,6 +14,54 @@ class UpdateCheckTest : public QObject
 {
     Q_OBJECT
 private Q_SLOTS:
+    void initTestCase()
+    {
+        QStandardPaths::setTestModeEnabled(true);
+    }
+
+    void backgroundDownloadIsRunOnlyWhileUnchanged()
+    {
+        // The background check downloads a release at once (27 Nov 2026); the installer is used
+        // later only for that version and digest, and only while the file still has the digest.
+        const QByteArray installer("MZ background installer");
+        const QByteArray digest = QCryptographicHash::hash(installer, QCryptographicHash::Sha256).toHex();
+        const QString path = saveInstaller(installer, QStringLiteral("Thoughts-9999.1.1.1-setup.exe"));
+        QVERIFY(!path.isEmpty());
+        QVERIFY(installerFileMatches(path, digest));
+        QVERIFY(!installerFileMatches(path, QByteArray(64, '0')));
+        rememberReadyInstaller(path, QStringLiteral("9999.1.1.1"), digest);
+        QCOMPARE(readyInstaller(QStringLiteral("9999.1.1.1"), digest), path);
+        QVERIFY(readyInstaller(QStringLiteral("9999.1.1.2"), digest).isEmpty());
+        QVERIFY(readyInstaller(QStringLiteral("9999.1.1.1"), QByteArray(64, '0')).isEmpty());
+        // A newer version than this build stays.
+        forgetInstalledInstaller();
+        QCOMPARE(readyInstaller(QStringLiteral("9999.1.1.1"), digest), path);
+        // Another download replaces it, and its folder goes.
+        const QString older = saveInstaller(installer, QStringLiteral("Thoughts-0-setup.exe"));
+        rememberReadyInstaller(older, QStringLiteral("0"), digest);
+        QVERIFY(!QFileInfo::exists(QFileInfo(path).absolutePath()));
+        QCOMPARE(readyInstaller(QStringLiteral("0"), digest), older);
+        // Changed on disk: forgotten and deleted, never run.
+        const QString changed = saveInstaller(installer, QStringLiteral("Thoughts-9999.1.1.2-setup.exe"));
+        rememberReadyInstaller(changed, QStringLiteral("9999.1.1.2"), digest);
+        {
+            QFile file(changed);
+            QVERIFY(file.open(QIODevice::Append));
+            file.write("x");
+        }
+        QVERIFY(readyInstaller(QStringLiteral("9999.1.1.2"), digest).isEmpty());
+        QVERIFY(!QFileInfo::exists(changed));
+        // The one it replaced went with it.
+        QVERIFY(!QFileInfo::exists(QFileInfo(older).absolutePath()));
+        // One not newer than this build is deleted at the next start.
+        const QString installed = saveInstaller(installer, QStringLiteral("Thoughts-0-setup.exe"));
+        rememberReadyInstaller(installed, QStringLiteral("0"), digest);
+        QCOMPARE(readyInstaller(QStringLiteral("0"), digest), installed);
+        forgetInstalledInstaller();
+        QVERIFY(readyInstaller(QStringLiteral("0"), digest).isEmpty());
+        QVERIFY(!QFileInfo::exists(QFileInfo(installed).absolutePath()));
+    }
+
     void installerRunsOnlyWithAMatchingDigest()
     {
         const QByteArray installer("MZ installer bytes");

@@ -32,6 +32,7 @@
 #include <QScrollBar>
 #include <QAction>
 #include <QSettings>
+#include <QUuid>
 #include <QShortcut>
 #include <QStyle>
 #include <QSplitter>
@@ -1861,6 +1862,10 @@ namespace
 const QString SessionsKey = QStringLiteral("AgentNotes/SendToSessions");
 const QString LastSessionKey = QStringLiteral("AgentNotes/SendToSession");
 const QString LastSessionLabelKey = QStringLiteral("AgentNotes/SendToSessionLabel");
+const QString ServerAgentsKey = QStringLiteral("AgentNotes/ServerAgents");
+const QString ServerSessionKey = QStringLiteral("AgentNotes/ServerSession");
+// A server session's conversation id (server-agents.md §1); "new" stands for one to start.
+const QString ServerAgentPrefix = QStringLiteral("server-agent:");
 }
 
 AgentSessionList::AgentSessionList(AgentNotes::Center *center, QObject *parent)
@@ -1869,6 +1874,48 @@ AgentSessionList::AgentSessionList(AgentNotes::Center *center, QObject *parent)
 {
     // The list as last fetched, at once.
     m_sessions = AgentNotes::recipientsFromJson(QJsonDocument::fromJson(QSettings().value(SessionsKey).toByteArray()).array());
+    m_serverAgents = QSettings().value(ServerAgentsKey, false).toBool();
+}
+
+bool AgentSessionList::isServerAgent(const QString &sessionId)
+{
+    return sessionId.startsWith(ServerAgentPrefix);
+}
+
+AgentNotes::Recipient AgentSessionList::newServerSession()
+{
+    return {ServerAgentPrefix + QStringLiteral("new"), i18n("Server agent (new session)"), i18n("Thoughts server"), QStringLiteral("idle"), true, {}};
+}
+
+AgentNotes::Recipient AgentSessionList::serverSession(const QString &conversationId)
+{
+    return {conversationId, i18n("Server agent"), i18n("Thoughts server"), QStringLiteral("idle"), true, {}};
+}
+
+void AgentSessionList::preparePage(AgentNotes::Center::Page &page, const AgentNotes::Recipient &session)
+{
+    if (page.noteId.isEmpty()) page.noteId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (session.sessionId == newServerSession().sessionId) {
+        page.origin.remove(QStringLiteral("conversation_id"));
+        page.origin.insert(QStringLiteral("start_session"), true);
+        page.origin.insert(QStringLiteral("where"), QStringLiteral("server"));
+        return;
+    }
+    page.origin.insert(QStringLiteral("conversation_id"), session.sessionId);
+}
+
+void AgentSessionList::pageSent(const AgentNotes::Center::Page &page, const AgentNotes::Recipient &session)
+{
+    if (session.sessionId != newServerSession().sessionId || !m_center || page.noteId.isEmpty()) return;
+    // The server claimed the page for the session it started before it answered (§1).
+    QPointer<AgentSessionList> guard(this);
+    m_center->client()->handling(page.noteId, this, [guard](const AgentNotes::Client::WriteResult &result) {
+        const QString conversation = result.json.value(QStringLiteral("claim")).toObject().value(QStringLiteral("conversation_id")).toString();
+        if (!guard || !isServerAgent(conversation) || conversation == newServerSession().sessionId) return;
+        QSettings().setValue(ServerSessionKey, conversation);
+        guard->setLastSession(serverSession(conversation));
+        Q_EMIT guard->changed();
+    });
 }
 
 AgentSessionList *AgentSessionList::instance()
@@ -1891,6 +1938,15 @@ void AgentSessionList::refresh()
     if (m_refreshing || !m_center) return;
     m_refreshing = true;
     QPointer<AgentSessionList> guard(this);
+    if (!m_capabilitiesAsked) {
+        m_capabilitiesAsked = true;
+        m_center->client()->capabilities(this, [guard](bool ok, const QStringList &capabilities) {
+            if (!guard || !ok) return;
+            guard->m_serverAgents = capabilities.contains(QStringLiteral("server_agents_v1"));
+            QSettings().setValue(ServerAgentsKey, guard->m_serverAgents);
+            Q_EMIT guard->changed();
+        });
+    }
     m_center->client()->wakers(this, [guard](const std::optional<QJsonObject> &answer, const QString &error) {
         if (!guard) return;
         guard->m_refreshing = false;
@@ -1955,14 +2011,42 @@ void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNot
     menu->clear();
     // The More Sessions of an earlier fill goes with its entry.
     for (QMenu *more : menu->findChildren<QMenu *>(QStringLiteral("sendToAgentMore"), Qt::FindDirectChildrenOnly)) more->deleteLater();
+    // The server's own agent, after the computers' sessions: a new session, and the one started
+    // from here last.
+    const auto addServer = [this, menu, send] {
+        if (!m_serverAgents) return;
+        if (!menu->isEmpty()) menu->addSeparator();
+        const QString started = QSettings().value(ServerSessionKey).toString();
+        if (isServerAgent(started)) {
+            const AgentNotes::Recipient session = serverSession(started);
+            QAction *action = menu->addAction(i18n("Server agent"));
+            action->setObjectName(QStringLiteral("sendToAgentServer"));
+            action->setData(session.sessionId);
+            action->setToolTip(i18n("Sends to the server agent session started from here last. It runs on the Thoughts server with your own Anthropic API key."));
+            connect(action, &QAction::triggered, menu, [send, session] {
+                if (send) send(session);
+            });
+        }
+        const AgentNotes::Recipient fresh = newServerSession();
+        QAction *action = menu->addAction(i18n("Server agent: new session"));
+        action->setObjectName(QStringLiteral("sendToAgentServerNew"));
+        action->setData(fresh.sessionId);
+        action->setToolTip(i18n("Starts a session of the server agent with this. It runs on the Thoughts server with your own Anthropic API key "
+                                "(Thoughts Web, account menu › Server agent…); no computer needs to be on."));
+        connect(action, &QAction::triggered, menu, [send, fresh] {
+            if (send) send(fresh);
+        });
+    };
     if (m_sessions.isEmpty()) {
         // Asked for now (or about to be), or why there are none.
         const QString why = m_refreshing || (m_error.isEmpty() && !m_answered) ? i18n("Listing the sessions…")
             : !m_error.isEmpty()                                            ? i18n("No sessions: %1", m_error)
+            : m_serverAgents                                                ? i18n("No session on a computer can be woken now")
                                                                             : i18n("No session can be woken now");
         QAction *none = menu->addAction(why);
         none->setObjectName(QStringLiteral("sendToAgentNone"));
         none->setEnabled(false);
+        addServer();
         return;
     }
     const QString last = lastSession();
@@ -1985,12 +2069,14 @@ void AgentSessionList::fill(QMenu *menu, const std::function<void(const AgentNot
         });
     };
     for (const AgentNotes::Recipient &session : order.shown) add(menu, session);
-    if (order.more.isEmpty()) return;
-    if (!order.shown.isEmpty()) menu->addSeparator();
-    auto *more = new QMenu(i18n("More Sessions"), menu);
-    more->setObjectName(QStringLiteral("sendToAgentMore"));
-    menu->addMenu(more);
-    for (const AgentNotes::Recipient &session : order.more) add(more, session);
+    if (!order.more.isEmpty()) {
+        if (!order.shown.isEmpty()) menu->addSeparator();
+        auto *more = new QMenu(i18n("More Sessions"), menu);
+        more->setObjectName(QStringLiteral("sendToAgentMore"));
+        menu->addMenu(more);
+        for (const AgentNotes::Recipient &session : order.more) add(more, session);
+    }
+    addServer();
 }
 
 }

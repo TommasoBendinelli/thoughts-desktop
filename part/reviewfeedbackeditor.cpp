@@ -17,6 +17,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QIcon>
 #include <QImage>
 #include <QImageReader>
 #include <QKeyEvent>
@@ -150,8 +151,8 @@ ReviewFeedbackEditor::ReviewFeedbackEditor(const QJsonObject &record, bool isNew
 
     m_comment = new QPlainTextEdit(this);
     m_comment->setObjectName(QStringLiteral("reviewFeedbackComment"));
-    m_comment->setPlaceholderText(DocumentFeedback::isTextBox(record) ? i18n("The text on the page")
-                                  : kinds ? i18n("Your comment") : i18n("What do you like or dislike here?"));
+    m_commentPlaceholder = DocumentFeedback::isTextBox(record) ? i18n("The text on the page") : kinds ? i18n("Your comment") : i18n("What do you like or dislike here?");
+    m_comment->setPlaceholderText(m_commentPlaceholder);
     m_comment->setPlainText(record.value(QStringLiteral("comment")).toString());
     m_comment->setTabChangesFocus(true);
     m_comment->setFixedHeight(m_comment->fontMetrics().lineSpacing() * 4 + 14);
@@ -186,6 +187,9 @@ ReviewFeedbackEditor::ReviewFeedbackEditor(const QJsonObject &record, bool isNew
         const QString updated = record.value(QStringLiteral("updated_at")).toString();
         QString dates = i18n("Created %1", dateText(created));
         if (!updated.isEmpty() && dateText(updated) != dateText(created)) dates += QStringLiteral(", ") + i18n("edited %1", dateText(updated));
+        // The other person of a shared Project wrote it (the server's shared_author).
+        const QString sharedBy = record.value(QStringLiteral("shared_author")).toObject().value(QStringLiteral("username")).toString().trimmed();
+        if (!sharedBy.isEmpty()) dates = i18n("By %1 · %2", sharedBy, dates);
         auto *datesLabel = new QLabel(dates, this);
         datesLabel->setObjectName(QStringLiteral("reviewFeedbackDates"));
         QPalette palette = datesLabel->palette();
@@ -232,14 +236,59 @@ ReviewFeedbackEditor::ReviewFeedbackEditor(const QJsonObject &record, bool isNew
         buttons->addWidget(m_changePassage);
     }
     // No Cancel: nothing written is ever thrown away. Clicking elsewhere and Esc keep the text,
-    // and only Delete removes a comment. A new one has no buttons at all.
+    // and only Delete removes a comment. A new one has no buttons at all, but Ask Agent for a
+    // question (hidden until setAskAvailable; an empty row takes no room).
     buttons->addStretch(1);
-    if (buttons->count() > 1) {
-        layout->addLayout(buttons);
-    } else {
-        delete buttons;
-    }
+    m_ask = new QPushButton(QIcon::fromTheme(QStringLiteral("document-send")), i18n("Ask Agent"), this);
+    m_ask->setObjectName(QStringLiteral("reviewFeedbackAsk"));
+    m_ask->setToolTip(i18n("Sends the passage, your question and the page to the agent you sent to last. Nothing is saved in the document."));
+    m_ask->setAutoDefault(false);
+    m_ask->hide();
+    connect(m_ask, &QPushButton::clicked, this, [this] {
+        const QString question = comment();
+        if (question.isEmpty() || !asking()) return;
+        m_finished = true;
+        Q_EMIT askRequested(question);
+        close();
+    });
+    buttons->addWidget(m_ask);
+    layout->addLayout(buttons);
+    connect(group, &QButtonGroup::buttonToggled, this, [this](QAbstractButton *, bool checked) {
+        if (checked) updateAskMode();
+    });
+    connect(m_comment, &QPlainTextEdit::textChanged, this, [this] {
+        if (m_ask) m_ask->setEnabled(!comment().isEmpty());
+    });
     m_comment->setFocus();
+}
+
+void ReviewFeedbackEditor::setAskAvailable(bool available)
+{
+    m_askAvailable = available && !DocumentFeedback::isPageMark(m_record);
+    // Only a new passage or a question kept before can be a question now: nothing becomes one
+    // that would be saved.
+    if (m_askAvailable && m_question && !m_new && DocumentFeedback::kindOf(m_record) != DocumentFeedback::question()) m_question->hide();
+    updateAskMode();
+}
+
+bool ReviewFeedbackEditor::asking() const
+{
+    return m_askAvailable && kind() == DocumentFeedback::question();
+}
+
+void ReviewFeedbackEditor::updateAskMode()
+{
+    if (!m_ask) return;
+    const bool ask = asking();
+    m_ask->setVisible(ask);
+    m_ask->setEnabled(!comment().isEmpty());
+    m_comment->setPlaceholderText(ask ? i18n("Your question for the agent") : m_commentPlaceholder);
+    // A question goes to the agent as words and the page: its pictures would not go with it.
+    if (m_picturesEnabled && m_new) {
+        m_picturesRow->setVisible(!ask);
+        if (ask) m_pictureMessage->hide();
+    }
+    if (isVisible()) adjustSize();
 }
 
 void ReviewFeedbackEditor::setChangePassageAvailable(bool available)
@@ -285,6 +334,11 @@ bool ReviewFeedbackEditor::changed() const
 void ReviewFeedbackEditor::keep()
 {
     if (std::exchange(m_finished, true)) return;
+    // A new question is asked or nothing: never kept in the document.
+    if (m_new && asking()) {
+        if (!comment().isEmpty()) Q_EMIT unsentQuestion(comment());
+        return;
+    }
     // A new one with nothing written is nothing to keep, and a question or a comment is its text,
     // or its pictures; a text box is its text alone. A new one's own pictures (a live page's
     // picture of what was shown) are not something the user wrote.
@@ -318,6 +372,7 @@ void ReviewFeedbackEditor::enablePictures(const PictureStore &store)
     m_picturesRow->installEventFilter(this);
     m_picturesRow->show();
     rebuildPictures();
+    updateAskMode();
 }
 
 QJsonArray ReviewFeedbackEditor::pictures() const

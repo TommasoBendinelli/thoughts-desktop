@@ -364,6 +364,14 @@ public Q_SLOTS:
     // editors offer no pictures.
     OKULARPART_EXPORT void setFeedbackPictureStore(const Thoughts::ReviewFeedbackEditor::PictureStore &store);
     OKULARPART_EXPORT Thoughts::ReviewFeedbackEditor::PictureStore feedbackPictureStore() const;
+    // A question that could not be asked, offered again by the next Question… (never saved).
+    OKULARPART_EXPORT void setUnsentQuestion(const QString &text);
+    OKULARPART_EXPORT QString unsentQuestion() const;
+    // Ask Agent's request for a question about @p quote (document-feedback.md: questions are asked,
+    // never kept, since 27 Nov 2026): question, quote, and for a PDF passage its first page (1-based)
+    // with that page's lines as normalized [left, top, right, bottom]; html true for a passage of an
+    // HTML page (no page).
+    OKULARPART_EXPORT static QJsonObject questionRequest(const QString &question, const QString &quote, const QList<QPair<int, QRectF>> &lines, bool html);
     // Goes to the passage of @p feedbackId; with @p edit also opens its editor there.
     OKULARPART_EXPORT bool showDocumentFeedback(const QString &feedbackId, bool edit);
     OKULARPART_EXPORT bool deleteDocumentFeedback(const QString &feedbackId);
@@ -415,6 +423,8 @@ Q_SIGNALS:
     void readingOverlayNoteOpenRequested(const QString &noteId);
     // The user gave new feedback or a new comment, already in the document.
     void documentFeedbackAdded(const QString &feedbackId);
+    // Ask Agent in a question's editor: questionRequest's request, for the agent (nothing was saved).
+    void documentQuestionAsked(const QJsonObject &request);
     // What canUndoAnnotation() answers may have changed.
     void annotationUndoChanged();
     // Feedback was deleted while this view is hidden. A slot that offers @p undo itself (the HTML

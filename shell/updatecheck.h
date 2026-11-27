@@ -41,6 +41,17 @@ QString installerFileName(const QString &assetName);
 // Another program therefore cannot put a file of its own where Thoughts
 // would start the installer from.
 QString saveInstaller(const QByteArray &bytes, const QString &assetName);
+// Background downloads (27 Nov 2026): the background check downloads a new release's
+// installer at once, so Install and Restart only installs. The installer is remembered with
+// its version and digest; it is run only while the file still has that digest.
+// The remembered installer for exactly @p version with digest @p sha256, else empty (a
+// remembered one that is missing or changed is forgotten).
+QString readyInstaller(const QString &version, const QByteArray &sha256);
+void rememberReadyInstaller(const QString &path, const QString &version, const QByteArray &sha256);
+// Forgets (and deletes) a remembered installer that is not newer than this build.
+void forgetInstalledInstaller();
+// Whether the file at @p path has the digest @p sha256.
+bool installerFileMatches(const QString &path, const QByteArray &sha256);
 // Whether a download may continue at `next` after a redirect from `from`:
 // only https, and *sendToken tells whether it is still the same origin (the
 // token goes nowhere else).
