@@ -926,6 +926,13 @@ void MainShellTest::testShell()
     QFETCH(bool, externalProcessExpectPresentation);
     QFETCH(bool, externalProcessExpectPrintDialog);
     QFETCH(QString, externalProcessExpectFind);
+#ifdef Q_OS_WIN
+    // On Windows every launch hands its files to the running Thoughts and exits (forwardToRunningThoughts in
+    // main.cpp), with or without tabs or -unique: no second process keeps running.
+    if (!externalProcessPath.isEmpty() && !useTabs && !unique) {
+        QSKIP("On Windows a second launch hands its files to the running Thoughts and exits");
+    }
+#endif
 
     QScopedPointer<ClosePrintDialogHelper> helper;
 
