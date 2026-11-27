@@ -6,6 +6,8 @@
 
 // clazy:excludeall=qstring-allocations
 
+#include <filesystem>
+#include <system_error>
 #include <KAboutData>
 #include "../part/documentfeedback.h"
 #include "../core/htmlattachment.h"
@@ -799,6 +801,13 @@ void MainShellTest::initTestCase()
     QStandardPaths::setTestModeEnabled(true);
     // Don't pollute people's okular settings
     Okular::Settings::instance(QStringLiteral("mainshelltest"));
+#ifdef Q_OS_WIN
+    // Without an organization name QSettings cannot write to the registry, so what the shell remembers (the last
+    // agent session, for one) reads back as unset. Settings in an INI file in the test's temporary home.
+    QCoreApplication::setOrganizationName(QStringLiteral("ThoughtsAutotests"));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QDir(qEnvironmentVariable("HOME")).filePath(QStringLiteral("settings")));
+#endif
 
     // Register in bus as okular
 #if HAVE_DBUS
@@ -946,7 +955,7 @@ void MainShellTest::testShell()
         QCOMPARE(s->m_tabs.count(), 1);
         Okular::Part *part = s->findChild<Okular::Part *>();
         QVERIFY(part);
-        QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+        QCOMPARE(part->url().url(), QUrl::fromLocalFile(paths[0]).url());
         QCOMPARE(partDocument(part)->currentPage(), expectedPage);
         // Testing if the transient sidebar search is shown or hidden as expected
         QCOMPARE(findWidget(part)->isHidden(), externalProcessExpectFind.isEmpty());
@@ -962,8 +971,8 @@ void MainShellTest::testShell()
             QCOMPARE(s->m_tabs.count(), 2);
             Okular::Part *part = dynamic_cast<Okular::Part *>(s->m_tabs[0].part);
             Okular::Part *part2 = dynamic_cast<Okular::Part *>(s->m_tabs[1].part);
-            QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
-            QCOMPARE(part2->url().url(), QStringLiteral("file://%1").arg(paths[1]));
+            QCOMPARE(part->url().url(), QUrl::fromLocalFile(paths[0]).url());
+            QCOMPARE(part2->url().url(), QUrl::fromLocalFile(paths[1]).url());
             QCOMPARE(partDocument(part)->currentPage(), expectedPage);
             QCOMPARE(partDocument(part2)->currentPage(), expectedPage);
         } else {
@@ -985,7 +994,7 @@ void MainShellTest::testShell()
             openUrls << part2->url().url();
 
             for (const QString &path : std::as_const(paths)) {
-                QVERIFY(openUrls.contains(QStringLiteral("file://%1").arg(path)));
+                QVERIFY(openUrls.contains(QUrl::fromLocalFile(path).url()));
             }
         }
     }
@@ -1021,13 +1030,13 @@ void MainShellTest::testShell()
             if (unique) {
                 // It is unique so part got "overwritten"
                 QCOMPARE(s->m_tabs.count(), 1);
-                QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(externalProcessPath));
+                QCOMPARE(part->url().url(), QUrl::fromLocalFile(externalProcessPath).url());
                 QCOMPARE(partDocument(part)->currentPage(), externalProcessExpectedPage);
             } else {
                 // It is attaching to us so a second tab is there
                 QCOMPARE(s->m_tabs.count(), 2);
                 Okular::Part *part2 = dynamic_cast<Okular::Part *>(s->m_tabs[1].part);
-                QCOMPARE(part2->url().url(), QStringLiteral("file://%1").arg(externalProcessPath));
+                QCOMPARE(part2->url().url(), QUrl::fromLocalFile(externalProcessPath).url());
                 QCOMPARE(partDocument(part2)->currentPage(), externalProcessExpectedPage);
             }
         } else {
@@ -1040,7 +1049,7 @@ void MainShellTest::testShell()
             QVERIFY(p.state() != QProcess::Running);
             // It opened on a new process, so no change for us
             QCOMPARE(s->m_tabs.count(), 1);
-            QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+            QCOMPARE(part->url().url(), QUrl::fromLocalFile(paths[0]).url());
             QCOMPARE(partDocument(part)->currentPage(), externalProcessExpectedPage);
         }
     }
@@ -1115,7 +1124,7 @@ void MainShellTest::testFileRemembersPagePosition()
     QVERIFY(s);
     Okular::Part *part = s->findChild<Okular::Part *>();
     QVERIFY(part);
-    QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+    QCOMPARE(part->url().url(), QUrl::fromLocalFile(paths[0]).url());
     QCOMPARE(partDocument(part)->currentPage(), 0u);
     partDocument(part)->setViewportPage(3);
     QCOMPARE(partDocument(part)->currentPage(), 3u);
@@ -1146,7 +1155,7 @@ void MainShellTest::testFileRemembersPagePosition()
     QVERIFY(s);
     part = s->findChild<Okular::Part *>();
     QVERIFY(part);
-    QCOMPARE(part->url().url(), QStringLiteral("file://%1").arg(paths[0]));
+    QCOMPARE(part->url().url(), QUrl::fromLocalFile(paths[0]).url());
     QCOMPARE(partDocument(part)->currentPage(), 3u);
 }
 
@@ -1678,7 +1687,16 @@ void MainShellTest::testExternalOpenUrlResolution()
     outside.write("%PDF-1.4\n");
     outside.close();
     const QString linkedPath = QDir(currentPdfs).filePath(QStringLiteral("linked.pdf"));
-    if (QFile::link(outsidePath, linkedPath)) {
+#ifdef Q_OS_WIN
+    // QFile::link makes a .lnk shortcut on Windows, an ordinary file; a symbolic link (where Windows allows one) needs
+    // std::filesystem.
+    std::error_code linkError;
+    std::filesystem::create_symlink(outsidePath.toStdWString(), linkedPath.toStdWString(), linkError);
+    const bool linked = !linkError;
+#else
+    const bool linked = QFile::link(outsidePath, linkedPath);
+#endif
+    if (linked) {
         QVERIFY(Okular::resolvedExternalOpenUrl(QUrl(QStringLiteral("thoughts://current-pdfs/linked.pdf")), temporary.path()).isEmpty());
     }
 }
@@ -2729,7 +2747,11 @@ void MainShellTest::testTabRevealInFinderAction()
     QCOMPARE(menu.actions().at(8)->text(), QStringLiteral("Show as HTML"));
     QAction *revealInFinderAction = menu.actions().constFirst();
     QCOMPARE(revealInFinderAction->objectName(), QStringLiteral("revealInFinderAction"));
+#ifdef Q_OS_WIN
+    QCOMPARE(revealInFinderAction->text(), QStringLiteral("Show in Explorer"));
+#else
     QCOMPARE(revealInFinderAction->text(), QStringLiteral("Reveal in Finder"));
+#endif
     QVERIFY(revealInFinderAction->isEnabled());
     QCOMPARE(revealInFinderAction->data().toUrl(), secondUrl);
     QAction *copyDocumentNameAction = menu.actions().at(1);
@@ -2822,7 +2844,8 @@ void MainShellTest::testKeptEarlierVersionInCopyForAgentAndHistory()
         generations.append(generation);
     }
     const QString current = root.filePath(QStringLiteral("current_pdfs"));
-    QVERIFY(QFile::link(generations.at(0), current));
+    // A junction on Windows, as Thoughts makes it there: QFile::link would make a .lnk file.
+    QVERIFY(Thoughts::Platform::replaceDirectoryLink(current, generations.at(0)));
     const QString pdf = QDir(current).filePath(QStringLiteral("open.pdf"));
     const QString shownFile = QDir(generations.at(0)).filePath(QStringLiteral("open.pdf"));
 
@@ -2840,8 +2863,7 @@ void MainShellTest::testKeptEarlierVersionInCopyForAgentAndHistory()
     // A Sync brings the newer version: the tab keeps the one on screen.
     Okular::FedoraRepository *repository = access.repository(part);
     QVERIFY(QMetaObject::invokeMethod(repository, "libraryGenerationWillActivate", Qt::DirectConnection));
-    QVERIFY(QFile::remove(current));
-    QVERIFY(QFile::link(generations.at(1), current));
+    QVERIFY(Thoughts::Platform::replaceDirectoryLink(current, generations.at(1)));
     QVERIFY(QMetaObject::invokeMethod(repository, "libraryGenerationActivated", Qt::DirectConnection,
                                       Q_ARG(QStringList, QStringList {QStringLiteral("open.pdf")}), Q_ARG(bool, true)));
     QVERIFY(part->keepsEarlierVersion());
@@ -2909,7 +2931,8 @@ void MainShellTest::testKeptEarlierVersionMarksItsTab()
         generations.append(generation);
     }
     const QString current = root.filePath(QStringLiteral("current_pdfs"));
-    QVERIFY(QFile::link(generations.at(0), current));
+    // A junction on Windows, as Thoughts makes it there: QFile::link would make a .lnk file.
+    QVERIFY(Thoughts::Platform::replaceDirectoryLink(current, generations.at(0)));
     const QString pdf = QDir(current).filePath(QStringLiteral("open.pdf"));
 
     auto *shell = new Shell;
@@ -2936,8 +2959,7 @@ void MainShellTest::testKeptEarlierVersionMarksItsTab()
     Okular::FedoraRepository *repository = access.repository(part);
     const auto activate = [&](int version) {
         QVERIFY(QMetaObject::invokeMethod(repository, "libraryGenerationWillActivate", Qt::DirectConnection));
-        QVERIFY(QFile::remove(current));
-        QVERIFY(QFile::link(generations.at(version), current));
+        QVERIFY(Thoughts::Platform::replaceDirectoryLink(current, generations.at(version)));
         QVERIFY(QMetaObject::invokeMethod(repository, "libraryGenerationActivated", Qt::DirectConnection,
                                           Q_ARG(QStringList, QStringList{QStringLiteral("open.pdf")}), Q_ARG(bool, true)));
     };
@@ -4094,7 +4116,14 @@ void MainShellTest::testOpenDocumentCommand()
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const QString pdf = temporary.filePath(QStringLiteral("stable.pdf"));
+#ifdef Q_OS_WIN
+    // QFile::link makes a .lnk shortcut on Windows, not a PDF. A symbolic link where Windows allows one, else a copy.
+    std::error_code linkError;
+    std::filesystem::create_symlink(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf").toStdWString(), pdf.toStdWString(), linkError);
+    QVERIFY(!linkError || QFile::copy(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), pdf));
+#else
     QVERIFY(QFile::link(QStringLiteral(KDESRCDIR "data/simple-multipage.pdf"), pdf));
+#endif
     QJsonObject request{{QStringLiteral("schema_version"), 1}, {QStringLiteral("command"), QStringLiteral("open")},
                         {QStringLiteral("document"), pdf}, {QStringLiteral("page"), 2}};
     QJsonObject result = shell->handleSyncCommandRequest(request);
@@ -17760,6 +17789,9 @@ void MainShellTest::testReviewDocumentPayloadUsesOpenPdf()
 
 void MainShellTest::testOpenCommentSourceFileWithoutLine()
 {
+#ifdef Q_OS_WIN
+    QSKIP("The stand-in `code` is a shell script found on a colon-separated PATH; Windows finds code.cmd");
+#endif
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const QDir directory(temporary.path());
