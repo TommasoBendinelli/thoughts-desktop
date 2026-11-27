@@ -20,6 +20,7 @@
 
 #include <QCryptographicHash>
 #include <QFile>
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QUrl>
 #include <QHash>
@@ -334,6 +335,57 @@ Json stringArray(QStringList values)
 // The HTML pages of projectName that the file at path links: `thoughts-html:` links (docs-root
 // paths) and relative .html links, resolved as the server resolves them (beside the file, in the
 // folder, in its tex/). A linked page that does not exist yet still counts.
+// The page names a text mentions: each run of characters that can be part of a path (no white
+// space, quotes, brackets, braces or backslash) that ends in .htm or .html, with thoughts-html:
+// when it begins so. One pass over the text: a regular expression for the same thing took time
+// in the square of a run's length, and a deck's 756,000-character embedded picture stopped
+// Sync for good (27 Nov 2026).
+QList<QPair<bool, QString>> scanHtmlPageMentions(const QString &text)
+{
+    static const QString excluded = QStringLiteral("{}()<>\"'[]\\|");
+    const auto allowed = [](QChar c) { return !c.isSpace() && !excluded.contains(c); };
+    const auto word = [](QChar c) { return (c >= QLatin1Char('A') && c <= QLatin1Char('Z')) || (c >= QLatin1Char('a') && c <= QLatin1Char('z'))
+                                           || (c >= QLatin1Char('0') && c <= QLatin1Char('9')) || c == QLatin1Char('_'); };
+    static const QString prefix = QStringLiteral("thoughts-html:");
+    QList<QPair<bool, QString>> mentions;
+    const qsizetype size = text.size();
+    qsizetype at = 0;
+    while (at < size) {
+        if (!allowed(text.at(at))) {
+            ++at;
+            continue;
+        }
+        const qsizetype start = at;
+        while (at < size && allowed(text.at(at))) {
+            ++at;
+        }
+        const qsizetype runEnd = at;
+        const bool prefixed = QStringView(text).mid(start, runEnd - start).startsWith(prefix, Qt::CaseInsensitive);
+        const qsizetype nameStart = prefixed ? start + prefix.size() : start;
+        // The longest mention: the last .htm(l) of the run that no letter, digit or _ follows.
+        qsizetype end = -1;
+        for (qsizetype dot = text.lastIndexOf(QStringLiteral(".htm"), runEnd - 1, Qt::CaseInsensitive); dot > nameStart; 
+             dot = dot > 0 ? text.lastIndexOf(QStringLiteral(".htm"), dot - 1, Qt::CaseInsensitive) : -1) {
+            if (dot + 4 > runEnd) {
+                continue;
+            }
+            const qsizetype withL = dot + 5;
+            if (withL <= runEnd && text.at(dot + 4).toLower() == QLatin1Char('l') && (withL == size || !word(text.at(withL)))) {
+                end = withL;
+                break;
+            }
+            if (dot + 4 == size || !word(text.at(dot + 4))) {
+                end = dot + 4;
+                break;
+            }
+        }
+        if (end > nameStart) {
+            mentions.append({prefixed, text.mid(nameStart, end - nameStart)});
+        }
+    }
+    return mentions;
+}
+
 QSet<QString> linkedHtmlPages(const Py::Path &docsRoot, const QString &projectName, const Py::Path &project, const Py::Path &path)
 {
     QSet<QString> pages;
@@ -341,17 +393,21 @@ QSet<QString> linkedHtmlPages(const Py::Path &docsRoot, const QString &projectNa
     if (!file.open(QIODevice::ReadOnly) || file.size() > 32 * 1024 * 1024) {
         return pages;
     }
-    const QString text = QString::fromUtf8(file.readAll());
-    static const QRegularExpression link(QStringLiteral(R"((thoughts-html:)?([^\s{}()<>"'\[\]\\|]+\.html?)(?![A-Za-z0-9_]))"),
-                                         QRegularExpression::CaseInsensitiveOption);
-    for (auto match = link.globalMatch(text); match.hasNext();) {
-        const QRegularExpressionMatch found = match.next();
-        const QString target = QUrl::fromPercentEncoding(found.captured(2).toUtf8());
+    // Every PDF of a folder asks about the same pages: each file is read once per run.
+    static QHash<QString, QList<QPair<bool, QString>>> cache;
+    const QString key = path.str() + QLatin1Char('\n') + QString::number(file.size()) + QLatin1Char('\n')
+        + QString::number(QFileInfo(file).lastModified().toMSecsSinceEpoch());
+    auto cached = cache.constFind(key);
+    if (cached == cache.constEnd()) {
+        cached = cache.insert(key, scanHtmlPageMentions(QString::fromUtf8(file.readAll())));
+    }
+    for (const auto &[prefixed, name] : *cached) {
+        const QString target = QUrl::fromPercentEncoding(name.toUtf8());
         if (target.contains(QLatin1String("://"))) {
             continue;
         }
         QStringList candidates;
-        if (!found.captured(1).isEmpty()) {
+        if (prefixed) {
             candidates.append(target);
         } else {
             for (const Py::Path &base : {path.parent(), project, project / QStringLiteral("tex")}) {
@@ -361,7 +417,7 @@ QSet<QString> linkedHtmlPages(const Py::Path &docsRoot, const QString &projectNa
             }
         }
         for (const QString &candidate : candidates) {
-            if (isHtmlSourcePath(candidate, projectName) && (!found.captured(1).isEmpty() || Py::isFile(docsRoot / candidate))) {
+            if (isHtmlSourcePath(candidate, projectName) && (prefixed || Py::isFile(docsRoot / candidate))) {
                 pages.insert(candidate);
                 break;
             }
@@ -471,6 +527,11 @@ QList<BuildInput> withCarriedPagesOnly(const Py::Path &docsRoot, const QString &
                                        const QString &target, const QList<BuildInput> &entries)
 {
     return carriedPagesOnly(docsRoot, projectName, project, target, entries);
+}
+
+QList<QPair<bool, QString>> htmlPageMentions(const QString &text)
+{
+    return scanHtmlPageMentions(text);
 }
 
 bool isHtmlSourcePath(const QString &path, const QString &project)

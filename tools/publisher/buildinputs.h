@@ -71,6 +71,9 @@ QString projectDiscoveryPolicy(const Py::Path &project);
 QList<Py::Path> stylesheetDependencies(const Py::Path &project);
 // is_html_source_path(path, project)
 bool isHtmlSourcePath(const QString &path, const QString &project);
+// The page names @p text mentions, in order: whether thoughts-html: began each, and the name
+// (a run of path characters ending in .htm or .html). Linear in the text's length.
+QList<QPair<bool, QString>> htmlPageMentions(const QString &text);
 // entries without the HTML pages target's PDF does not carry: thoughts-server makes a PDF carry the
 // pages its source links (and the pages those link), and the folder's alphabetically first PDF
 // all of them. So a page edit changes only the build inputs of the PDFs that carry the page.
