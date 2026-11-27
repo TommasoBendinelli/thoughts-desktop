@@ -7,13 +7,21 @@
 #include "../part/fileidentitycache.h"
 #include "../part/thoughtignore.h"
 
+#include <QDir>
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QTemporaryDir>
 #include <QTest>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <sys/time.h>
+#endif
 
 namespace
 {
@@ -29,12 +37,68 @@ bool replaceFile(const QString &path, const QByteArray &contents)
     return file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size() && file.commit();
 }
 
-// Sets the modification time back to what it was, as a copy that preserves it does.
-bool restoreModificationTime(const QString &path, const struct stat &before)
+// A file's access and modification times at full resolution.
+struct FileTimes {
+#ifdef Q_OS_WIN
+    FILETIME access {};
+    FILETIME modification {};
+#else
+    struct timeval access {};
+    struct timeval modification {};
+#endif
+};
+
+#ifdef Q_OS_WIN
+HANDLE openTimes(const QString &path, DWORD access)
 {
-    const struct timeval times[2] = {{before.st_atimespec.tv_sec, int(before.st_atimespec.tv_nsec / 1000)},
-                                     {before.st_mtimespec.tv_sec, int(before.st_mtimespec.tv_nsec / 1000)}};
+    return CreateFileW(reinterpret_cast<const wchar_t *>(QDir::toNativeSeparators(path).utf16()), access,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+#endif
+
+bool readFileTimes(const QString &path, FileTimes &times)
+{
+#ifdef Q_OS_WIN
+    const HANDLE handle = openTimes(path, FILE_READ_ATTRIBUTES);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const bool ok = GetFileTime(handle, nullptr, &times.access, &times.modification);
+    CloseHandle(handle);
+    return ok;
+#else
+    struct stat state {};
+    if (::stat(QFile::encodeName(path).constData(), &state) != 0) {
+        return false;
+    }
+#ifdef Q_OS_MACOS
+    const auto accessed = state.st_atimespec;
+    const auto modified = state.st_mtimespec;
+#else
+    const auto accessed = state.st_atim;
+    const auto modified = state.st_mtim;
+#endif
+    times.access = {accessed.tv_sec, decltype(times.access.tv_usec)(accessed.tv_nsec / 1000)};
+    times.modification = {modified.tv_sec, decltype(times.modification.tv_usec)(modified.tv_nsec / 1000)};
+    return true;
+#endif
+}
+
+// Sets the modification time back to what it was, as a copy that preserves it does.
+bool restoreModificationTime(const QString &path, const FileTimes &before)
+{
+#ifdef Q_OS_WIN
+    const HANDLE handle = openTimes(path, FILE_WRITE_ATTRIBUTES);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const bool ok = SetFileTime(handle, nullptr, &before.access, &before.modification);
+    CloseHandle(handle);
+    return ok;
+#else
+    const struct timeval times[2] = {before.access, before.modification};
     return ::utimes(QFile::encodeName(path).constData(), times) == 0;
+#endif
 }
 }
 
@@ -85,8 +149,8 @@ void FileIdentityCacheTest::testChangedFileIsReadAgain()
 
     // Edited in place to the same size, its modification time put back: the
     // inode stays, the status-change time does not.
-    struct stat before {};
-    QCOMPARE(::stat(QFile::encodeName(path).constData(), &before), 0);
+    FileTimes before;
+    QVERIFY(readFileTimes(path, before));
     QVERIFY(writeFile(path, R"({"value": 2})"));
     QVERIFY(restoreModificationTime(path, before));
     QCOMPARE(Thoughts::cachedJsonFile(path).object().value(QStringLiteral("value")).toInt(), 2);

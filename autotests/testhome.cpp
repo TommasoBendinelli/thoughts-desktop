@@ -4,7 +4,9 @@
 
 // Linked into every autotest. Before main() runs, HOME and the macOS user
 // domain point at a temporary directory, so QStandardPaths, KConfig and the
-// docdata store never touch the user's real application data. On macOS
+// docdata store never touch the user's real application data. On Windows,
+// where those follow the known folders rather than HOME, QStandardPaths test
+// mode moves them to qttest folders instead. On macOS
 // QStandardPaths ignores HOME and XDG_* (and test mode only rewrites paths
 // below QDir::homePath()), but Foundation honours CFFIXED_USER_HOME.
 // The directory is short-named: KIO places its worker sockets below it, and
@@ -71,6 +73,14 @@ struct TestHome {
         // a run that needs the real screen sets QT_QPA_PLATFORM itself.
         putDefault("QT_QPA_PLATFORM", "offscreen");
         putDefault("THOUGHTS_SOURCE_TOKEN", "autotest-source-token");
+#ifdef Q_OS_WIN
+        // Windows keeps application data and settings in the known folders (%LOCALAPPDATA%, %APPDATA%), which
+        // QStandardPaths and KConfig read whatever HOME says: without test mode a test writes the user's open tabs
+        // (thoughts-open-tabsrc) and docdata. Test mode moves every writable location to its qttest folder.
+        QStandardPaths::setTestModeEnabled(true);
+        // A Thoughts the test starts does the same (shell/main.cpp).
+        qputenv("THOUGHTS_AUTOTEST_APPDATA", "1");
+#endif
     }
 
     QTemporaryDir directory {QStringLiteral("/tmp/thoughts-test-XXXXXX")};
@@ -100,6 +110,11 @@ void refuseRealUserData()
             qFatal("Test application data resolves to the user's Library: %s", qPrintable(path));
         }
     }
+#ifdef Q_OS_WIN
+    if (!QStandardPaths::isTestModeEnabled()) {
+        qFatal("Test application data resolves to the user's AppData: QStandardPaths test mode is off");
+    }
+#endif
     // The build's own servers (config-thoughts.h) are the production ones.
     const QString serverHost = QUrl(qEnvironmentVariable("THOUGHTS_SERVER_URL")).host().toLower();
     for (const char *production : {THOUGHTS_DEFAULT_SERVER_URL, THOUGHTS_LEGACY_SERVER_URL}) {

@@ -4,6 +4,7 @@
 // from the page's serialized HTML, and the versions this computer wrote over a page.
 #include "core/htmllivepage.h"
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -44,6 +45,7 @@ class HtmlLivePageTest : public QObject
 {
     Q_OBJECT
 private Q_SLOTS:
+    void initTestCase();
     void theSpecStubIsLive();
     void malformedStubsAreEmbeddedPages();
     void addressRules();
@@ -247,6 +249,18 @@ void HtmlLivePageTest::snapshotWithoutHeadOrBody()
     QVERIFY2(bare.startsWith(QStringLiteral("<!doctype html>\n<head>\n<meta charset=\"utf-8\">")), qPrintable(bare));
     QVERIFY(bare.contains(QStringLiteral("</head><div data-thoughts-snapshot")));
     QVERIFY(bare.endsWith(QStringLiteral("<p>Fragment</p>")));
+}
+
+void HtmlLivePageTest::initTestCase()
+{
+    static QTemporaryDir settings;
+    QVERIFY(settings.isValid());
+    // Settings in a file of the test's own: without an organization name QSettings
+    // cannot write on Windows (the registry), and the user's settings stay untouched.
+    QCoreApplication::setOrganizationName(QStringLiteral("ThoughtsAutotests"));
+    QCoreApplication::setApplicationName(QStringLiteral("htmllivepagetest"));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings.path());
 }
 
 void HtmlLivePageTest::consentIsRememberedPerOrigin()

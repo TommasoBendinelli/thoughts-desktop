@@ -51,11 +51,14 @@
 #include <QScreen>
 #include <QShortcut>
 #include <QSettings>
+#include <QTemporaryDir>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
 #include <cstdio>
+#include <filesystem>
+#include <system_error>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeView>
@@ -150,6 +153,14 @@ void HtmlViewTest::initTestCase()
 {
     m_docs = qEnvironmentVariable("THOUGHTS_HOME");
     QVERIFY(!m_docs.isEmpty());
+    static QTemporaryDir settings;
+    QVERIFY(settings.isValid());
+    // Settings in a file of the test's own: without an organization name QSettings
+    // cannot write on Windows (the registry), and the user's settings stay untouched.
+    QCoreApplication::setOrganizationName(QStringLiteral("ThoughtsAutotests"));
+    QCoreApplication::setApplicationName(QStringLiteral("htmlviewtest"));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings.path());
     QDir().mkpath(m_docs + QStringLiteral("/current_pdfs"));
     // The sample edition, installed into the HTML edition cache as the server's objects would be.
     const QString dir = sampleEditionDir();
@@ -693,7 +704,10 @@ void HtmlViewTest::attachmentFollowsItsNewestVersion()
         QVERIFY(beside.open(QIODevice::WriteOnly));
         QCOMPARE(beside.write(thirdPointer), thirdPointer.size());
     }
-    QCOMPARE(std::rename(QFile::encodeName(pointer + QStringLiteral(".part")).constData(), QFile::encodeName(pointer).constData()), 0);
+    // Replaces the pointer in one step, as a download does; std::rename does not replace a file on Windows.
+    std::error_code renamed;
+    std::filesystem::rename(std::filesystem::path(QString(pointer + QStringLiteral(".part")).toStdWString()), std::filesystem::path(pointer.toStdWString()), renamed);
+    QVERIFY2(!renamed, renamed.message().c_str());
     QTRY_VERIFY_WITH_TIMEOUT(page.keepsEarlierPageVersion(), 10000);
     QCOMPARE(sha256(), second.sha256);
     QVERIFY(page.showNewestPageVersion());

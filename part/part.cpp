@@ -1206,14 +1206,14 @@ Part::Part(QObject *parent, const QVariantList &args)
         // The pages stay read from the immutable generation file (as a tab opens them), so a later
         // version kept on screen keeps its bytes.
         if (published.value(QStringLiteral("pdf_sha256")).toString() == shownSha256
-            && m_document->relocateUnchangedBackingFile(QFileInfo(currentPath).canonicalFilePath(), QUrl::fromLocalFile(currentPath))) {
+            && m_document->relocateUnchangedBackingFile(Thoughts::Platform::resolvedFilePath(currentPath), QUrl::fromLocalFile(currentPath))) {
             // The loaded bytes and selection remain valid; only storage moved.
             stopKeepingShownVersion();
             setUrl(QUrl::fromLocalFile(currentPath));
             setLocalFilePath(currentPath);
             m_docsCommentPdfPath = currentPath;
             m_docsSourcePdfPath = currentPath;
-            m_docsOpenedPdfPath = QFileInfo(currentPath).canonicalFilePath();
+            m_docsOpenedPdfPath = Thoughts::Platform::resolvedFilePath(currentPath);
             scheduleDocsCommentRefresh();
             setFileToWatch(currentPath);
             return;
@@ -2582,7 +2582,7 @@ bool Part::openFile()
     // Save As swaps the file under the comments already open: none to restore.
     m_document->setLocalAnnotationsFile(swappingBackingFile ? QString() : outsideComments);
     if (useSidecarReviewAnnotations) {
-        openedDocsPdfPath = QFileInfo(fileNameToOpen).canonicalFilePath();
+        openedDocsPdfPath = Thoughts::Platform::resolvedFilePath(fileNameToOpen);
         if (!openedDocsPdfPath.isEmpty()) {
             // Open the resolved immutable generation directly so the identity
             // recorded for comments is exactly the byte stream the generator
@@ -3393,7 +3393,7 @@ bool Part::keepShownVersion(const QString &newestPath)
         if (m_attachmentTab || m_attachmentShown || htmlViewActive() || !m_docsOpenedPdfIdentityVerified || m_docsOpenedPdfSha256.size() != 64
             || Thoughts::ProjectReadingContext::load(m_docsOpenedPdfPath))
             return false;
-        if (!isLibraryGenerationFile(m_docsRenderRoot, m_docsOpenedPdfPath) || newest.canonicalFilePath() == QFileInfo(m_docsOpenedPdfPath).canonicalFilePath())
+        if (!isLibraryGenerationFile(m_docsRenderRoot, m_docsOpenedPdfPath) || Thoughts::Platform::resolvedFilePath(newest.absoluteFilePath()) == Thoughts::Platform::resolvedFilePath(m_docsOpenedPdfPath))
             return false;
     }
     // The newest is the version on screen after all: the reload shows it as before.
@@ -7857,7 +7857,7 @@ void Part::startDocsPdfIdentityVerification(const QUrl &documentUrl, const QStri
     const QString keptPath = m_keepingShownVersion ? m_document->metaData(QStringLiteral("OpenedFilePath")).toString() : QString();
     const QString openedPath = !openedPathOverride.isEmpty() ? QFileInfo(openedPathOverride).absoluteFilePath()
         : !keptPath.isEmpty()                             ? QFileInfo(keptPath).absoluteFilePath()
-                                                          : QFileInfo(documentUrl.toLocalFile()).canonicalFilePath();
+                                                          : Thoughts::Platform::resolvedFilePath(documentUrl.toLocalFile());
     if (openedPath.isEmpty()) {
         return;
     }

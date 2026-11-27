@@ -215,6 +215,10 @@
 #include "syncstatuslabels.h"
 #include "syncstatewatch.h"
 
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
+
 static const char *shouldShowMenuBarComingFromFullScreen = "shouldShowMenuBarComingFromFullScreen";
 static const char *shouldShowToolBarComingFromFullScreen = "shouldShowToolBarComingFromFullScreen";
 
@@ -463,6 +467,24 @@ protected:
         tabBar()->setIconSize(tabBar()->iconSize());
     }
 };
+}
+
+// The KPart the shell makes its tabs from. A process that links okularpart, as mainshelltest does on Windows, has it
+// loaded already from its own folder; by name the plugin would load a second copy from the plugin folder (an installed
+// and perhaps older build) whose classes qobject_cast does not take for the linked ones. Use the copy that is loaded.
+static KPluginMetaData okularPartMetaData()
+{
+#ifdef Q_OS_WIN
+    if (HMODULE loaded = GetModuleHandleW(L"okularpart.dll")) {
+        wchar_t path[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(loaded, path, MAX_PATH);
+        if (length > 0 && length < MAX_PATH) {
+            const KPluginMetaData metaData(QString::fromWCharArray(path, int(length)));
+            if (metaData.isValid()) return metaData;
+        }
+    }
+#endif
+    return KPluginMetaData(QStringLiteral("kf6/parts/okularpart"));
 }
 
 static QString compactMenuDetail(const QString &detail)
@@ -2909,7 +2931,7 @@ Shell::Shell(KParts::ReadWritePart *initialPart, const QString &serializedOption
     // name which is a bad idea usually.. but it's alright in this
     // case since our Part is made for this Shell
 
-    const auto result = KPluginFactory::loadFactory(KPluginMetaData(QStringLiteral("kf6/parts/okularpart")));
+    const auto result = KPluginFactory::loadFactory(okularPartMetaData());
 
     if (!result) {
         // if we couldn't find our Part, we exit since the Shell by

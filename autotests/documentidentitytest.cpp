@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "part/documentidentity.h"
+#include "part/thoughtsplatform.h"
 #include <QTest>
 #include <QTemporaryDir>
 
@@ -67,7 +68,8 @@ private Q_SLOTS:
         const auto newest = writeGeneration(QLatin1Char('b'), "%PDF-newest", id);
         const auto other = writeGeneration(QLatin1Char('c'), "%PDF-other", QUuid::createUuid().toString(QUuid::WithoutBraces));
         QVERIFY(!earlier.isEmpty() && !newest.isEmpty() && !other.isEmpty());
-        QVERIFY(QFile::link(QFileInfo(newest).absolutePath(), root.filePath(QStringLiteral("current_pdfs"))));
+        // A junction on Windows, as Thoughts makes it there: QFile::link would make a .lnk file.
+        QVERIFY(Thoughts::Platform::replaceDirectoryLink(root.filePath(QStringLiteral("current_pdfs")), QFileInfo(newest).absolutePath()));
         const auto earlierSha = QString::fromLatin1(QCryptographicHash::hash("%PDF-earlier", QCryptographicHash::Sha256).toHex());
         const Thoughts::DocumentIdentityStore store(root.path());
 

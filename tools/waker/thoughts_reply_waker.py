@@ -237,6 +237,7 @@ HOME = Path(os.environ.get("REPLY_WAKER_HOME", Path.home() / "thoughts-reply-wak
 WAKERS_CAPABILITY = "agent_note_wakers_v1"
 PHONE_PAGE = "phone_page"
 WAKER_NOTICE = "waker_notice"
+WORK_BACKFILL = 3000  # change feed operations read back on the first scan (a few days of a busy Library)
 CAPTURE_NAME = re.compile(r"^(IMG|VID)_(\d{8})_(\d{6})(?:_[^/]*)?\.(jpg|jpeg|mp4)$", re.IGNORECASE)
 # What claude prints when this machine's login can no longer be used: nothing it runs works until the owner signs in.
 AUTH_FAILURE = re.compile(
@@ -588,6 +589,25 @@ class Thoughts:
 
     def note(self, note_id: str) -> dict:
         return self.get(f"/v1/agent-notes/{note_id}")
+
+    def changes(self, after: int, limit: int = 1000) -> dict:
+        """One page of the Library's change feed (operations after a server sequence)."""
+        return self.get("/v1/changes", {"after": after, "limit": limit}, timeout=60)
+
+    def change_head(self) -> int:
+        """The newest server sequence of the change feed: the first `after` with no change past it."""
+        if not self.changes(0, limit=1).get("changes"):
+            return 0
+        low, high = 0, 1024
+        while self.changes(high, limit=1).get("changes"):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self.changes(middle, limit=1).get("changes"):
+                low = middle
+            else:
+                high = middle
+        return high
 
     def owners(self) -> list[dict]:
         return self.get("/v1/agent-notes/owners").get("owners") or []
@@ -1000,6 +1020,9 @@ class State:
     CREATE TABLE IF NOT EXISTS reply_captures (capture TEXT PRIMARY KEY, reply_id TEXT NOT NULL, seen_at REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS captures (name TEXT PRIMARY KEY, path TEXT NOT NULL, first_seen REAL NOT NULL,
         size INTEGER NOT NULL, stable_since REAL, status TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS agent_work (key TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL,
+        seen_at REAL NOT NULL);
+    CREATE INDEX IF NOT EXISTS agent_work_conversation ON agent_work (conversation_id);
     """
 
     def __init__(self, path: Path | str):
@@ -1135,6 +1158,24 @@ class State:
                 "INSERT OR IGNORE INTO reply_captures (capture, reply_id, seen_at) VALUES (?, ?, ?)",
                 (capture_key(capture), reply_id, time.time()),
             )
+
+    def record_work(self, rows: list[tuple[str, str, str]], db=None) -> None:
+        """Proposals and reading overlays a session made: (key, conversation_id, created_at), each kept once, a week."""
+        now = time.time()
+        with self.lock:
+            target = db or self.db
+            target.executemany(
+                "INSERT OR IGNORE INTO agent_work (key, conversation_id, created_at, seen_at) VALUES (?, ?, ?, ?)",
+                [(key, conversation, created, now) for key, conversation, created in rows],
+            )
+            target.execute("DELETE FROM agent_work WHERE seen_at < ?", (now - 7 * 86400,))
+
+    def work_of(self, conversation_id: str) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT key, created_at FROM agent_work WHERE conversation_id = ? ORDER BY created_at", (conversation_id,)
+            ).fetchall()
+        return [{"key": row["key"], "created_at": row["created_at"]} for row in rows]
 
     def reply_for_capture(self, name: str) -> str | None:
         with self.lock:
@@ -1618,7 +1659,7 @@ def taken_up(path: Path | None, offset: int, ids: list[str]) -> bool:
     return False
 
 
-def answer_note(handling: dict, note: dict | None, notes: list[dict]) -> str | None:
+def answer_note(handling: dict, note: dict | None, notes: list[dict], work: list[dict] = ()) -> str | None:
     """The note that answered the item, or None: the server's own word (claim role "answered", an inferred answer),
     else a note of the claimant (same device and conversation) sent after the item arrived. A claim for a
     conversation is answered by that conversation's next note on any document, as the server infers for a
@@ -1626,7 +1667,10 @@ def answer_note(handling: dict, note: dict | None, notes: list[dict]) -> str | N
     one paper answered on a note about another were once reported to the owner as unanswered). A claim without a
     conversation needs a note on the same document or card as the note it replies to (or on none). The server only
     infers answers for unclaimed items, so a woken session's answer to an item claimed for it is seen here. The
-    owner's pages and the waker's notices never count; nor do responder notes, unless the claim is the responder's."""
+    owner's pages and the waker's notices never count; nor do responder notes, unless the claim is the responder's.
+    A claimed conversation that made a proposal or a reading overlay after the item arrived answered it too (`work`,
+    from that conversation, oldest first): a reply asking for a citation, answered with a proposal the owner accepted
+    a minute later, was once reported to the owner hours later as having no answer."""
     claim = handling.get("claim") or {}
     if claim.get("role") == "answered":
         return claim.get("answer_note_id") or "answered"
@@ -1658,7 +1702,41 @@ def answer_note(handling: dict, note: dict | None, notes: list[dict]) -> str | N
         if not claim.get("conversation_id") and places and own and not places & own:
             continue  # a note about something else
         return candidate.get("note_id") or "answered"
+    if claim.get("conversation_id"):
+        for made in work:
+            created = parse_time(made.get("created_at"))
+            if created is not None and created > arrived:
+                return made["key"]
     return None
+
+
+def work_rows(changes: list[dict]) -> list[tuple[str, str, str]]:
+    """(key, conversation_id, created_at) for every proposal and reading overlay a session made, from change feed
+    records. A proposal's session and time are those of its wrapper (snapshot), else when the server first saw it; an
+    overlay's are its author's. Accepted or rejected proposals count too: they leave the Library's projections, not the
+    feed."""
+    rows = []
+    for change in changes:
+        payload = change.get("payload") if isinstance(change.get("payload"), dict) else {}
+        if change.get("entity_type") == "proposal":
+            snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+            conversation = snapshot.get("conversation_id")
+            created = snapshot.get("created_at") or payload.get("first_seen_at")
+            key = f"proposal {change.get('entity_id') or payload.get('proposal_id')}"
+        elif change.get("entity_type") == "reading_overlay":
+            author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
+            conversation, created = author.get("conversation_id"), payload.get("created_at")
+            key = f"reading overlay {change.get('entity_id') or payload.get('overlay_id')}"
+        else:
+            continue
+        if isinstance(conversation, str) and conversation and isinstance(created, str) and parse_time(created):
+            rows.append((key, conversation, created))
+    return rows
+
+
+def answer_words(answer: str) -> str:
+    """How an answer from answer_note reads in a log line: a note's id, or what the session made."""
+    return answer if " " in answer else f"note {answer}"
 
 
 def fallback_reason(handling: dict, fallback: str | None) -> str:
@@ -1785,6 +1863,7 @@ class Waker:
         self.device_id: str | None = None
         self.busy: dict[str, threading.Thread] = {}
         self.busy_lock = threading.Lock()
+        self.work_lock = threading.Lock()
         self.registered: list[dict] = []
         self.note_conversations: set[str] = set()
         self.owner_conversations: set[str] = set()
@@ -2068,7 +2147,8 @@ class Waker:
             answered = self.answered(handling, payload)
             if answered:
                 return Decision(
-                    "finish", why=f"answered: {taken.get('conversation_id')} sent note {answered} after it arrived"
+                    "finish",
+                    why=f"answered: {taken.get('conversation_id')} sent {answer_words(answered)} after it arrived",
                 )
         if (
             taken
@@ -2217,7 +2297,35 @@ class Waker:
         if note is None and note_id:
             with contextlib.suppress(ThoughtsError):
                 note = self.thoughts.note(note_id)
-        return answer_note(handling, note, notes)
+        found = answer_note(handling, note, notes)
+        conversation = claim.get("conversation_id")
+        if found or not conversation:
+            return found
+        try:
+            self.scan_work()
+        except ThoughtsError as error:
+            log.warning("change feed for %s: %s", handling.get("item_id"), error)
+        return answer_note(handling, note, notes, self.state.work_of(conversation))
+
+    def scan_work(self, max_pages: int = 50) -> None:
+        """Reads the change feed from where it stopped and keeps the proposals and reading overlays sessions made. The
+        first time it starts WORK_BACKFILL operations back (about the last few days), so items already waiting count
+        what was made for them."""
+        with self.work_lock:
+            after = self.state.get("work_cursor")
+            if after is None:
+                after = max(0, self.thoughts.change_head() - WORK_BACKFILL)
+                self.state.put("work_cursor", after)
+                log.info("change feed: starting after operation %s", after)
+            for _ in range(max_pages):
+                page = self.thoughts.changes(after)
+                changes = page.get("changes") or []
+                with self.state.transaction() as db:
+                    self.state.record_work(work_rows(changes), db)
+                    after = max(after, int(page.get("next_cursor") or after))
+                    self.state.put("work_cursor", after, db)
+                if not page.get("has_more") or not changes:
+                    return
 
     def watch_claim(self, taken: dict) -> Decision:
         """Another waker's claim for its session: watched until that waker hands it over or the session answers, at most
@@ -2476,7 +2584,7 @@ class Waker:
         claim = handling.get("claim") or {}
         answered = self.answered(handling, payload)
         if answered:
-            self.finish(event, "answered", f"answered (note {answered})")
+            self.finish(event, "answered", f"answered ({answer_words(answered)})")
             return
         if claim and claim.get("conversation_id") != session_id:
             self.finish(event, "skipped", f"now claimed by {claim.get('conversation_id')} on {claim.get('device_id')}")

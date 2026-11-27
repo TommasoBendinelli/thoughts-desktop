@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tommaso Bendinelli
 """thoughts-reply-waker with a fake Thoughts server, a fake claude and a fake ~/.claude (made-up sessions and notes)."""
 
+import datetime as dt
 import json
 import os
 import sys
@@ -86,6 +87,18 @@ class FakeThoughts(Thoughts):
 
     def capabilities(self):
         return {"agent_note_wakers_v1"}
+
+    change_feed: list = []  # change feed records, server_sequence ascending
+
+    def changes(self, after, limit=1000):
+        self.calls.append(("changes", after))
+        rows = [row for row in self.change_feed if row["server_sequence"] > after]
+        page = rows[:limit]
+        return {
+            "changes": page,
+            "next_cursor": page[-1]["server_sequence"] if page else after,
+            "has_more": len(rows) > limit,
+        }
 
 
 class FakeClaude(Claude):
@@ -758,6 +771,8 @@ def test_the_mac_note_tool_with_a_dataclass_loads_and_lends_its_tls_context(tmp_
 
 from thoughts_reply_waker import (  # noqa: E402
     answer_note,
+    answer_words,
+    work_rows,
     fallback_reason,
     follow_up_action,
     live_status,
@@ -934,6 +949,56 @@ def test_answers_are_seen_from_the_server_or_the_claimants_later_note():
     as_responder = claimed(role="responder")
     assert answer_note(as_responder, note, [responder]) == responder["note_id"]
     assert answer_note({**handling, "claim": None}, note, [later]) is None  # unclaimed: the server's own inference
+
+
+def proposal_change(sequence, conversation=STUDY, minutes_ago=5, proposal_id="p1", status="pending"):
+    created = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
+    snapshot = {"proposal_id": proposal_id, "source_file": "docs-x/tex/source/a.tex", "conversation_id": conversation,
+                "created_at": created}
+    return {"server_sequence": sequence, "entity_type": "proposal", "entity_id": proposal_id,
+            "payload": {"proposal_id": proposal_id, "snapshot": snapshot, "status": status,
+                        "deleted": status != "pending", "first_seen_at": created}}
+
+
+def test_a_proposal_or_overlay_of_the_claimed_session_answers_the_item():
+    # A reply asking for a citation, answered with a proposal the owner accepted at once, was reported hours later as
+    # having no answer.
+    handling = claimed()
+    note = {"note_id": NOTE, "document_id": "doc-1"}
+    later = {"key": "proposal p1", "created_at": answer()["created_at"]}
+    assert answer_note(handling, note, [], [later]) == "proposal p1"
+    earlier = {"key": "proposal p0", "created_at": answer(minutes_ago=50)["created_at"]}
+    assert answer_note(handling, note, [], [earlier]) is None  # made before the reply arrived
+    deviceless = {**handling, "claim": {**handling["claim"], "conversation_id": None}}
+    assert answer_note(deviceless, note, [], [later]) is None
+    feed = [
+        proposal_change(10, minutes_ago=50, proposal_id="old"),
+        {"server_sequence": 11, "entity_type": "review_event", "entity_id": "r", "payload": {"conversation_id": STUDY}},
+        proposal_change(12, conversation=OWNER, proposal_id="other"),
+        proposal_change(13, proposal_id="p1", status="accepted"),  # accepted already: it left the projections
+        {"server_sequence": 14, "entity_type": "reading_overlay", "entity_id": "o1",
+         "payload": {"author": {"conversation_id": STUDY}, "created_at": answer()["created_at"]}},
+    ]
+    rows = work_rows(feed)
+    assert [row[0] for row in rows] == ["proposal old", "proposal other", "proposal p1", "reading overlay o1"]
+    assert answer_words("proposal p1") == "proposal p1" and answer_words("n1") == "note n1"
+
+
+def test_the_waker_reads_the_change_feed_for_what_the_session_made(home):
+    thoughts = FakeThoughts()
+    thoughts.handlings[REPLY] = claimed(minutes_ago=300, arrived_minutes_ago=301)
+    thoughts.change_feed = [proposal_change(5000 + n, minutes_ago=400, proposal_id=f"old{n}") for n in range(3)]
+    thoughts.change_feed += [proposal_change(5003, minutes_ago=290, proposal_id="p1", status="accepted")]
+    waker = make_waker(home, thoughts, fallback_session_id=DESK)
+    row = reply_row()
+    waker.state.add_event({"id": row["id"], "kind": "reply", "payload": json.loads(row["payload"])})
+    waker.handle(waker.state.ready(set()), set())
+    event = waker.state.event(row["id"])
+    assert event["status"] == "answered" and "proposal p1" in event["detail"] and thoughts.sent == []
+    assert waker.state.get("work_cursor") == 5003
+    thoughts.calls.clear()
+    waker.scan_work()
+    assert [call for call in thoughts.calls if call[0] == "changes"] == [("changes", 5003)]  # goes on from there
 
 
 def test_the_fallback_is_told_why_an_item_is_its_own():

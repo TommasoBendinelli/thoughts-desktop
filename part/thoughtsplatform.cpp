@@ -549,6 +549,37 @@ QString directoryLinkTarget(const QFileInfo &info)
 #endif
 }
 
+QString resolvedFilePath(const QString &path)
+{
+#ifdef Q_OS_WIN
+    const QString native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t *>(native.utf16()), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+    std::wstring buffer(MAX_PATH, wchar_t(0));
+    DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (length >= buffer.size()) {
+        buffer.resize(length + 1);
+        length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    }
+    CloseHandle(handle);
+    if (length == 0 || length >= buffer.size()) {
+        return {};
+    }
+    QString resolved = QString::fromWCharArray(buffer.data(), int(length));
+    if (resolved.startsWith(QLatin1String("\\\\?\\UNC\\"))) {
+        resolved = QLatin1String("\\\\") + resolved.mid(8);
+    } else if (resolved.startsWith(QLatin1String("\\\\?\\"))) {
+        resolved = resolved.mid(4);
+    }
+    return QFileInfo(QDir::fromNativeSeparators(resolved)).canonicalFilePath();
+#else
+    return QFileInfo(path).canonicalFilePath();
+#endif
+}
+
 bool replaceDirectoryLink(const QString &link, const QString &target, QString *error)
 {
 #ifdef Q_OS_WIN
@@ -781,6 +812,10 @@ bool markDownloaded(const QString &path)
     const QByteArray value = "0081;" + QByteArray::number(QDateTime::currentSecsSinceEpoch(), 16) + ";Thoughts;";
     return ::setxattr(QFile::encodeName(path).constData(), "com.apple.quarantine", value.constData(), size_t(value.size()), 0, XATTR_NOFOLLOW) == 0;
 #elif defined(Q_OS_WIN)
+    // Opening the stream of a missing file would create the file, empty.
+    if (!QFileInfo(path).isFile()) {
+        return false;
+    }
     QFile zone(path + QStringLiteral(":Zone.Identifier"));
     const QByteArray value("[ZoneTransfer]\r\nZoneId=3\r\n");
     return zone.open(QIODevice::WriteOnly | QIODevice::Truncate) && zone.write(value) == value.size();

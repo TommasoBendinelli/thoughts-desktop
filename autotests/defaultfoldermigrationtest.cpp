@@ -224,7 +224,10 @@ class DefaultFolderMigrationTest : public QObject
         QVERIFY(publication.contains(notes.toUtf8()));
         QVERIFY(!SourceOwner::containsLegacyDefaultFolder(publication));
         QVERIFY(publication.startsWith("{\"bases\": {\""));
+#ifndef Q_OS_WIN
+        // Windows has no group or other bits: the user's profile folder keeps the file private there.
         QCOMPARE(QFile::permissions(state(QStringLiteral("source-publication.json"))) & (QFileDevice::ReadGroup | QFileDevice::ReadOther), QFileDevice::Permissions());
+#endif
         for (const QString &path : {state(QStringLiteral("source-comment-snapshot.json")), QDir(m_paths.thoughtsDataRoot).filePath(QStringLiteral("source-manifest.json")),
                                     docs(QStringLiteral(".thoughts/library-projects.json")), docs(QStringLiteral(".thoughts/document-identities.json")),
                                     docs(QStringLiteral("comments/.history/proposal_events.jsonl"))}) {

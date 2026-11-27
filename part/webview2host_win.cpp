@@ -17,7 +17,17 @@
 #include <objbase.h>
 #include <wrl/implements.h>
 
+// Qt defines __has_attribute as 0 for a compiler without it (MSVC), and the options header takes
+// any definition as clang's: its __attribute__((annotate(…))) does not compile with MSVC. Without
+// Qt's definition while it is read, MSVC skips that branch; clang keeps its own.
+#pragma push_macro("__has_attribute")
+#ifdef _MSC_VER
+#ifndef __clang__
+#undef __has_attribute
+#endif
+#endif
 #include <WebView2EnvironmentOptions.h>
+#pragma pop_macro("__has_attribute")
 
 namespace Thoughts::WebView2
 {

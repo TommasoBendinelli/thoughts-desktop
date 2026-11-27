@@ -49,6 +49,7 @@ void EpubGeneratorTest::testDocumentStructure()
     QCOMPARE(m_document->metaData(QStringLiteral("DocumentTitle")).toString(), QStringLiteral("Okular Test"));
 
     const Okular::DocumentSynopsis *docSyn = m_document->documentSynopsis();
+    QVERIFY(docSyn);
     QDomElement heading1 = docSyn->documentElement();
     QCOMPARE(heading1.tagName(), QStringLiteral("Lorem ipsum Section 1"));
 

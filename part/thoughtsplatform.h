@@ -82,6 +82,9 @@ bool cloneOrLinkFile(const QString &source, const QString &destination);
 bool isDirectoryLink(const QFileInfo &info);
 // The absolute directory a link points to, or an empty string.
 QString directoryLinkTarget(const QFileInfo &info);
+// The canonical path of an existing file or directory with every link on the way resolved, junctions too: on
+// Windows QFileInfo::canonicalFilePath() leaves a junction such as current_pdfs in place. Empty when it does not exist.
+QString resolvedFilePath(const QString &path);
 // Points link at target in one step, creating it if needed. Existing PDFs
 // opened through the old target stay open.
 bool replaceDirectoryLink(const QString &link, const QString &target, QString *error = nullptr);

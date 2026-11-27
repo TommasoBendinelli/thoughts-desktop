@@ -2236,6 +2236,14 @@ Document::Document(QWidget *widget)
     : QObject(nullptr)
     , d(new DocumentPrivate(this))
 {
+    // Every generator names the elements of its DocumentSynopsis after the headings, "Chapter 1" for instance, which
+    // is no XML name. Since Qt 6.12 createElement() returns a null element for such a name, and the table of contents
+    // comes out empty. Keep the earlier policy, set once on the main thread before any generator runs.
+    static const bool synopsisNamesAccepted = [] {
+        QDomImplementation::setInvalidDataPolicy(QDomImplementation::AcceptInvalidChars);
+        return true;
+    }();
+    Q_UNUSED(synopsisNamesAccepted)
     d->m_widget = widget;
     d->m_bookmarkManager = new BookmarkManager(d);
     d->m_viewportIterator = d->m_viewportHistory.insert(d->m_viewportHistory.end(), DocumentViewport());
