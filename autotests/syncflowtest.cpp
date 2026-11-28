@@ -727,9 +727,15 @@ void SyncFlowTest::testVerifiedPublicationNeedsNoSecondInstallerPass()
     frontier.sourceFrontier = 9;
     QVERIFY2(store->setFrontier(frontier, &error), qPrintable(error));
     const QString mark = QDir(m_state->path()).filePath(QStringLiteral("installer-ran"));
+#ifdef Q_OS_WIN
+    // Windows runs no shell script; a batch file leaves the same mark.
+    const QString program = QDir(m_state->path()).filePath(QStringLiteral("installer.cmd"));
+    QVERIFY(writeFile(program, QByteArrayLiteral("@type nul > \"") + QDir::toNativeSeparators(mark).toLocal8Bit() + QByteArrayLiteral("\"\r\n@exit /b 3\r\n")));
+#else
     const QString program = QDir(m_state->path()).filePath(QStringLiteral("installer.sh"));
     QVERIFY(writeFile(program, QByteArrayLiteral("#!/bin/sh\n: > \"") + QFile::encodeName(mark) + QByteArrayLiteral("\"\nexit 3\n")));
     QVERIFY(QFile::setPermissions(program, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+#endif
     repository->m_sourceReconciliationProgram = program;
     m_server->setHandler([&](const Request &request) {
         if (request.target == "/v1/library/projects") return json({}, 404);
