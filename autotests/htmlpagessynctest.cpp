@@ -12,12 +12,15 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTest>
 
+#include <filesystem>
 #include <functional>
+#include <system_error>
 #include <utility>
 
 using namespace Thoughts::Publisher;
@@ -27,6 +30,45 @@ namespace
 QString sha(const QByteArray &bytes)
 {
     return QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+}
+
+// A link at @p link to @p target. On Windows QFile::link() makes a shortcut (a .lnk file), which the file
+// system does not follow. A symbolic link there needs Developer Mode; without it a directory gets a junction,
+// which any user can make, and which the page check refuses too (it resolves outside the folder).
+bool makeLink(const QString &target, const QString &link, bool directory)
+{
+#ifdef Q_OS_WIN
+    std::error_code error;
+    const std::filesystem::path to(target.toStdWString()), at(link.toStdWString());
+    if (directory) {
+        std::filesystem::create_directory_symlink(to, at, error);
+    } else {
+        std::filesystem::create_symlink(to, at, error);
+    }
+    if (!error) {
+        return true;
+    }
+    if (!directory) {
+        return false;
+    }
+    QProcess mklink;
+    mklink.start(QStringLiteral("cmd.exe"), {QStringLiteral("/c"), QStringLiteral("mklink"), QStringLiteral("/J"), QDir::toNativeSeparators(link), QDir::toNativeSeparators(target)});
+    return mklink.waitForFinished() && mklink.exitStatus() == QProcess::NormalExit && mklink.exitCode() == 0;
+#else
+    Q_UNUSED(directory)
+    return QFile::link(target, link);
+#endif
+}
+
+// Removes the link itself, never what it points to.
+bool removeLink(const QString &link)
+{
+#ifdef Q_OS_WIN
+    std::error_code error;
+    return std::filesystem::remove(std::filesystem::path(link.toStdWString()), error) && !error;
+#else
+    return QFile::remove(link);
+#endif
 }
 
 // Fedora's objects and page list, with the compare-and-swap of POST /v1/html-pages.
@@ -255,21 +297,23 @@ private Q_SLOTS:
         };
         // The page directory itself is a link.
         QVERIFY(QDir().mkpath(file(folder + QStringLiteral("/tex/support"))));
-        QVERIFY(QFile::link(outside + QStringLiteral("/html"), file(folder + QStringLiteral("/tex/support/html"))));
+        QVERIFY(makeLink(outside + QStringLiteral("/html"), file(folder + QStringLiteral("/tex/support/html")), true));
         refused();
         // A directory above it is one.
-        QVERIFY(QFile::remove(file(folder + QStringLiteral("/tex/support/html"))));
+        QVERIFY(removeLink(file(folder + QStringLiteral("/tex/support/html"))));
         QVERIFY(QDir().rmdir(file(folder + QStringLiteral("/tex/support"))));
-        QVERIFY(QFile::link(outside + QStringLiteral("/support"), file(folder + QStringLiteral("/tex/support"))));
+        QVERIFY(makeLink(outside + QStringLiteral("/support"), file(folder + QStringLiteral("/tex/support")), true));
         refused();
-        // The page's own name is one (dangling, so nothing "exists" there yet).
-        QVERIFY(QFile::remove(file(folder + QStringLiteral("/tex/support"))));
+        // The page's own name is one (dangling, so nothing "exists" there yet). A file needs a symbolic link,
+        // which Windows without Developer Mode does not let the test make.
+        QVERIFY(removeLink(file(folder + QStringLiteral("/tex/support"))));
         QVERIFY(QDir().mkpath(file(folder + QStringLiteral("/tex/support/html"))));
-        QVERIFY(QFile::link(outside + QStringLiteral("/planted.html"), file(page)));
-        refused();
-        QVERIFY(!QFileInfo::exists(outside + QStringLiteral("/planted.html")));
+        if (makeLink(outside + QStringLiteral("/planted.html"), file(page), false)) {
+            refused();
+            QVERIFY(!QFileInfo::exists(outside + QStringLiteral("/planted.html")));
+            QVERIFY(removeLink(file(page)));
+        }
         // Without links the same page is installed where it belongs.
-        QVERIFY(QFile::remove(file(page)));
         const HtmlPageSync result = sync(fedora);
         QCOMPARE(result.installed, QStringList{page});
         QVERIFY(result.errors.isEmpty());

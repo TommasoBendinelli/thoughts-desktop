@@ -2712,7 +2712,25 @@ void HtmlViewTest::webTabsOfADocumentAndOfNone()
     QVERIFY(opened.urls.isEmpty());
     part.openAttachmentLink(QUrl(QStringLiteral("mailto:ops@example.org")), true);
     QCOMPARE(opened.urls, QList<QUrl>{QUrl(QStringLiteral("mailto:ops@example.org"))});
+#ifndef Q_OS_MACOS
+    // Here Thoughts cannot see the page's clicks, so it asks first (Part::openAttachmentLink); the reader
+    // says Cancel. Unanswered, the question would wait offscreen until the watchdog.
+    QString asked;
+    auto *answer = new QTimer(&part);
+    answer->setInterval(10);
+    connect(answer, &QTimer::timeout, &part, [answer, &asked] {
+        auto *question = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!question) return;
+        answer->stop();
+        for (const auto *label : question->findChildren<QLabel *>()) asked += label->text();
+        question->reject();
+    });
+    answer->start();
+#endif
     part.openAttachmentLink(QUrl(QStringLiteral("https://collector.example.org/?x")), false);
+#ifndef Q_OS_MACOS
+    QVERIFY2(asked.contains(QStringLiteral("collector.example.org")), qPrintable(asked));
+#endif
     QCOMPARE(part.htmlAttachmentState().value(QStringLiteral("live_url")).toString(), other.toString());
     QCOMPARE(opened.urls.size(), 1);
     // Open in Browser: what the tab shows now.
