@@ -6,7 +6,8 @@
 // domain point at a temporary directory, so QStandardPaths, KConfig and the
 // docdata store never touch the user's real application data. On Windows,
 // where those follow the known folders rather than HOME, QStandardPaths test
-// mode moves them to qttest folders instead. On macOS
+// mode moves them to qttest folders instead, and offscreen tests read
+// Windows' own fonts in the Windows platform's default font. On macOS
 // QStandardPaths ignores HOME and XDG_* (and test mode only rewrites paths
 // below QDir::homePath()), but Foundation honours CFFIXED_USER_HOME.
 // The directory is short-named: KIO places its worker sockets below it, and
@@ -31,6 +32,11 @@
 #ifdef Q_OS_UNIX
 #include <pwd.h>
 #include <unistd.h>
+#endif
+
+#ifdef Q_OS_WIN
+#include <QFont>
+#include <QGuiApplication>
 #endif
 
 namespace
@@ -80,6 +86,9 @@ struct TestHome {
         QStandardPaths::setTestModeEnabled(true);
         // A Thoughts the test starts does the same (shell/main.cpp).
         qputenv("THOUGHTS_AUTOTEST_APPDATA", "1");
+        // Offscreen, Qt on Windows reads fonts only from its own lib/fonts folder, which Qt no longer ships:
+        // without fonts a PDF a test draws has no text at all. Windows' own folder has them.
+        putDefault("QT_QPA_FONTDIR", QFile::encodeName(QDir::fromNativeSeparators(qEnvironmentVariable("WINDIR", QStringLiteral("C:/Windows"))) + QStringLiteral("/Fonts")));
 #endif
     }
 
@@ -124,6 +133,21 @@ void refuseRealUserData()
         }
     }
 }
+
+#ifdef Q_OS_WIN
+// Offscreen, the default font is the first family in that folder, whatever the user installed: one with odd
+// metrics splits every word a test reads back from its PDF ("Alp h a beta"). Segoe UI 9 is the Windows
+// platform's own default, so the tests measure what the app shows.
+void useWindowsDefaultFont()
+{
+    if (qobject_cast<QGuiApplication *>(QCoreApplication::instance()) && QGuiApplication::platformName() == QLatin1String("offscreen")) {
+        QGuiApplication::setFont(QFont(QStringLiteral("Segoe UI"), 9));
+    }
+}
+#endif
 }
 
 Q_COREAPP_STARTUP_FUNCTION(refuseRealUserData)
+#ifdef Q_OS_WIN
+Q_COREAPP_STARTUP_FUNCTION(useWindowsDefaultFont)
+#endif
