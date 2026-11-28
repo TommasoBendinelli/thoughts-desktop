@@ -23,10 +23,14 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QLockFile>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QUrl>
 #include <QtGlobal>
+
+#include <filesystem>
+#include <system_error>
 
 #ifdef Q_OS_UNIX
 #include <pwd.h>
@@ -41,6 +45,29 @@ void putDefault(const char *name, const QByteArray &value)
         qputenv(name, value);
     }
 }
+
+#ifdef Q_OS_WIN
+// Test mode keeps every test's settings and data in the same qttest folders, and keeps them afterwards,
+// where a home made for one run goes with the run: what one test saved changed the tests after it. A fake
+// certificate store left in okular-generator-popplerrc made Settings > Apply ask for a restart, which waited
+// offscreen until the watchdog ended parttest. So a test starts with the folders empty, as with a new home
+// elsewhere, unless another test holds the lock: tests share these folders, so run them one at a time.
+// std::filesystem::remove_all() leaves the target of a junction alone; QDir::removeRecursively() empties it.
+void emptyTestModeFolders(QLockFile &lock)
+{
+    if (!lock.tryLock(0)) {
+        return;
+    }
+    for (const char *variable : {"LOCALAPPDATA", "APPDATA"}) {
+        const QString base = QDir::fromNativeSeparators(qEnvironmentVariable(variable));
+        if (!base.isEmpty() && QDir::isAbsolutePath(base)) {
+            const QString folder = base + QStringLiteral("/qttest");
+            std::error_code error;
+            std::filesystem::remove_all(std::filesystem::path(folder.toStdWString()), error);
+        }
+    }
+}
+#endif
 
 struct TestHome {
     TestHome()
@@ -78,12 +105,17 @@ struct TestHome {
         // QStandardPaths and KConfig read whatever HOME says: without test mode a test writes the user's open tabs
         // (thoughts-open-tabsrc) and docdata. Test mode moves every writable location to its qttest folder.
         QStandardPaths::setTestModeEnabled(true);
+        emptyTestModeFolders(testFolders);
         // A Thoughts the test starts does the same (shell/main.cpp).
         qputenv("THOUGHTS_AUTOTEST_APPDATA", "1");
 #endif
     }
 
     QTemporaryDir directory {QStringLiteral("/tmp/thoughts-test-XXXXXX")};
+#ifdef Q_OS_WIN
+    // Held while the test runs (see emptyTestModeFolders()).
+    QLockFile testFolders {QDir::tempPath() + QStringLiteral("/thoughts-autotest-folders.lock")};
+#endif
 };
 
 const TestHome testHome;
